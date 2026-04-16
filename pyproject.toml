@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datascale"
+version = "0.1.0"
+description = "Configurable AnnData to Zarr converter with strong validation"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "DataScale" }]
+dependencies = [
+  "anndata>=0.10.0",
+  "zarr>=2.18.0",
+  "numpy>=1.24.0",
+  "scipy>=1.10.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+datascale = "datascale.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datascale*"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+datascale = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.tasks]
