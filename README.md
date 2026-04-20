@@ -11,19 +11,21 @@ A configurable converter for AnnData (`.h5ad`) to Zarr focused on single-cell ge
 ## Install
 
 ```bash
-pip install -e .
+pixi init .
+pixi install
 ```
 
 ## Quickstart
 
 ```bash
-datascale convert \
+pixi run datascale convert \
   --input path/to/input.h5ad \
   --output path/to/output.zarr \
   --config path/to/config.toml
 ```
 
-## Example config (TOML)
+## Example config (TOML or YAML)
+# see example_config.toml
 
 ```toml
 [io]

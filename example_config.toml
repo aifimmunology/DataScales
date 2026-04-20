@@ -1,0 +1,12 @@
+overwrite = false
+consolidate_metadata = true
+
+[chunks]
+x_row_chunk = 2048
+x_col_chunk = 2048
+
+[validation]
+reject_spatial = true
+require_non_empty = true
+min_obs = 1
+min_vars = 1

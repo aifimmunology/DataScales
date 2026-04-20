@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Expression data files
+*.h5*
+*.rds*
+
 # C extensions
 *.so
 
