@@ -6,6 +6,8 @@ __pycache__/
 # Expression data files
 *.h5*
 *.rds*
+*.zarr
+data/
 
 # C extensions
 *.so

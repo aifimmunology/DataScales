@@ -1,9 +1,11 @@
+[io]
 overwrite = false
-consolidate_metadata = true
+consolidate_metadata = false
+x_storage = "auto"
 
 [chunks]
-x_row_chunk = 2048
-x_col_chunk = 2048
+x_row_chunk = 1000
+x_col_chunk = 1000
 
 [validation]
 reject_spatial = true
