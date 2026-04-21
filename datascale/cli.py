@@ -27,6 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable zarr metadata consolidation after write",
     )
+    convert.add_argument(
+        "--x-storage",
+        choices=["auto", "sparse", "dense"],
+        help="How to store X/layers/raw.X in output zarr (auto keeps original representation)",
+    )
 
     convert.add_argument("--x-row-chunk", type=int, help="Row chunk size for X")
     convert.add_argument("--x-col-chunk", type=int, help="Column chunk size for X")
@@ -47,6 +52,7 @@ def run(argv: list[str] | None = None) -> int:
             config,
             overwrite=True if args.overwrite else None,
             consolidate_metadata=False if args.no_consolidate_metadata else None,
+            x_storage=args.x_storage,
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
         )
@@ -63,6 +69,7 @@ def run(argv: list[str] | None = None) -> int:
         "Chunks: "
         f"({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})"
     )
+    print(f"X storage mode: {config.io.x_storage}")
 
     if warnings:
         print("Warnings:")

@@ -31,6 +31,7 @@ pixi run datascale convert \
 [io]
 overwrite = false
 consolidate_metadata = true
+x_storage = "auto" # auto | sparse | dense
 
 [chunks]
 x_row_chunk = 2048

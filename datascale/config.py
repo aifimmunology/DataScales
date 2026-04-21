@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomllib
 
@@ -12,10 +12,14 @@ except Exception:  # pragma: no cover
     yaml = None
 
 
+XStorageMode = Literal["auto", "sparse", "dense"]
+
+
 @dataclass(frozen=True)
 class IOConfig:
     overwrite: bool = False
     consolidate_metadata: bool = True
+    x_storage: XStorageMode = "auto"
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,19 @@ class AppConfig:
     io: IOConfig = IOConfig()
     chunks: ChunkConfig = ChunkConfig()
     validation: ValidationConfig = ValidationConfig()
+
+
+def _normalize_x_storage(value: str) -> XStorageMode:
+    mode = value.lower().strip()
+    allowed = {"auto", "sparse", "dense"}
+    if mode not in allowed:
+        allowed_list = ", ".join(sorted(allowed))
+        raise ValueError(f"Invalid io.x_storage '{value}'. Expected one of: {allowed_list}")
+    return mode  # type: ignore[return-value]
+
+
+def _validate_config(config: AppConfig) -> AppConfig:
+    return replace(config, io=replace(config.io, x_storage=_normalize_x_storage(config.io.x_storage)))
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
@@ -90,13 +107,14 @@ def load_config(config_path: str | None = None) -> AppConfig:
         validation=_merge_dataclass(config.validation, validation_patch),
     )
 
-    return config
+    return _validate_config(config)
 
 
 def apply_cli_overrides(
     config: AppConfig,
     overwrite: bool | None = None,
     consolidate_metadata: bool | None = None,
+    x_storage: str | None = None,
     x_row_chunk: int | None = None,
     x_col_chunk: int | None = None,
 ) -> AppConfig:
@@ -107,9 +125,11 @@ def apply_cli_overrides(
         io_cfg = replace(io_cfg, overwrite=overwrite)
     if consolidate_metadata is not None:
         io_cfg = replace(io_cfg, consolidate_metadata=consolidate_metadata)
+    if x_storage is not None:
+        io_cfg = replace(io_cfg, x_storage=_normalize_x_storage(x_storage))
     if x_row_chunk is not None:
         chunk_cfg = replace(chunk_cfg, x_row_chunk=x_row_chunk)
     if x_col_chunk is not None:
         chunk_cfg = replace(chunk_cfg, x_col_chunk=x_col_chunk)
 
-    return replace(config, io=io_cfg, chunks=chunk_cfg)
+    return _validate_config(replace(config, io=io_cfg, chunks=chunk_cfg))
