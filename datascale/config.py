@@ -12,13 +12,13 @@ except Exception:  # pragma: no cover
     yaml = None
 
 
-XStorageMode = Literal["auto", "sparse", "dense"]
+XStorageMode = Literal["auto", "sparse-csr", "sparse-csc", "dense"]
 
 
 @dataclass(frozen=True)
 class IOConfig:
     overwrite: bool = False
-    consolidate_metadata: bool = True
+    consolidate_metadata: bool = False
     x_storage: XStorageMode = "auto"
 
 
@@ -26,6 +26,7 @@ class IOConfig:
 class ChunkConfig:
     x_row_chunk: int = 2048
     x_col_chunk: int = 2048
+    sparse_flat_chunk: int = 4096
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class AppConfig:
 
 def _normalize_x_storage(value: str) -> XStorageMode:
     mode = value.lower().strip()
-    allowed = {"auto", "sparse", "dense"}
+    allowed = {"auto", "sparse-csr", "sparse-csc", "dense"}
     if mode not in allowed:
         allowed_list = ", ".join(sorted(allowed))
         raise ValueError(f"Invalid io.x_storage '{value}'. Expected one of: {allowed_list}")
@@ -117,6 +118,7 @@ def apply_cli_overrides(
     x_storage: str | None = None,
     x_row_chunk: int | None = None,
     x_col_chunk: int | None = None,
+    sparse_flat_chunk: int | None = None,
 ) -> AppConfig:
     io_cfg = config.io
     chunk_cfg = config.chunks
@@ -131,5 +133,7 @@ def apply_cli_overrides(
         chunk_cfg = replace(chunk_cfg, x_row_chunk=x_row_chunk)
     if x_col_chunk is not None:
         chunk_cfg = replace(chunk_cfg, x_col_chunk=x_col_chunk)
+    if sparse_flat_chunk is not None:
+        chunk_cfg = replace(chunk_cfg, sparse_flat_chunk=sparse_flat_chunk)
 
     return _validate_config(replace(config, io=io_cfg, chunks=chunk_cfg))

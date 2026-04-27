@@ -4,37 +4,66 @@ import argparse
 import sys
 
 from .config import apply_cli_overrides, load_config
-from .converter import convert_h5ad_to_zarr
+from .converter import convert_10x_h5_to_zarr, convert_10x_mtx_to_zarr, convert_h5ad_to_zarr
 from .validation import ValidationError
+
+_CONVERTERS = {
+    "convert-h5ad": convert_h5ad_to_zarr,
+    "convert-10x-mtx": convert_10x_mtx_to_zarr,
+    "convert-10x-h5": convert_10x_h5_to_zarr,
+}
+
+
+def _add_common_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("--output", required=True, help="Path to output .zarr directory")
+    sub.add_argument("--config", required=False, help="Path to YAML/TOML config file")
+    sub.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite output path if it already exists",
+    )
+    sub.add_argument(
+        "--consolidate-metadata",
+        action="store_true",
+        help="Enable zarr metadata consolidation after write",
+    )
+    sub.add_argument(
+        "--x-storage",
+        choices=["auto", "sparse-csr", "sparse-csc", "dense"],
+        help="How to store X/layers/raw.X in output zarr (auto keeps original format)",
+    )
+    sub.add_argument("--x-row-chunk", type=int, help="Row chunk size for X")
+    sub.add_argument("--x-col-chunk", type=int, help="Column chunk size for X")
+    sub.add_argument(
+        "--sparse-flat-chunk",
+        type=int,
+        help="Chunk size for sparse flat arrays (data/indices/indptr); tune to median nnz per cell",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="datascale")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    convert = subparsers.add_parser("convert", help="Convert non-spatial single-cell h5ad to zarr")
-    convert.add_argument("--input", required=True, help="Path to input .h5ad")
-    convert.add_argument("--output", required=True, help="Path to output .zarr directory")
-    convert.add_argument("--config", required=False, help="Path to YAML/TOML config file")
+    h5ad = subparsers.add_parser(
+        "convert-h5ad", help="Convert non-spatial single-cell .h5ad to zarr"
+    )
+    h5ad.add_argument("--input", required=True, help="Path to input .h5ad file")
+    _add_common_args(h5ad)
 
-    convert.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite output path if it already exists",
+    mtx = subparsers.add_parser(
+        "convert-10x-mtx", help="Convert 10x Genomics MTX directory to zarr"
     )
-    convert.add_argument(
-        "--no-consolidate-metadata",
-        action="store_true",
-        help="Disable zarr metadata consolidation after write",
+    mtx.add_argument(
+        "--input", required=True, help="Path to 10x MTX directory (must contain matrix.mtx)"
     )
-    convert.add_argument(
-        "--x-storage",
-        choices=["auto", "sparse", "dense"],
-        help="How to store X/layers/raw.X in output zarr (auto keeps original representation)",
-    )
+    _add_common_args(mtx)
 
-    convert.add_argument("--x-row-chunk", type=int, help="Row chunk size for X")
-    convert.add_argument("--x-col-chunk", type=int, help="Column chunk size for X")
+    h5 = subparsers.add_parser(
+        "convert-10x-h5", help="Convert 10x Genomics Cell Ranger HDF5 (.h5) to zarr"
+    )
+    h5.add_argument("--input", required=True, help="Path to 10x Cell Ranger .h5 file")
+    _add_common_args(h5)
 
     return parser
 
@@ -43,21 +72,23 @@ def run(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command != "convert":
-        parser.error("Unsupported command")
+    converter = _CONVERTERS.get(args.command)
+    if converter is None:
+        parser.error(f"Unsupported command: {args.command}")
 
     try:
         config = load_config(args.config)
         config = apply_cli_overrides(
             config,
             overwrite=True if args.overwrite else None,
-            consolidate_metadata=False if args.no_consolidate_metadata else None,
+            consolidate_metadata=True if args.consolidate_metadata else None,
             x_storage=args.x_storage,
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
+            sparse_flat_chunk=args.sparse_flat_chunk,
         )
 
-        warnings = convert_h5ad_to_zarr(args.input, args.output, config)
+        warnings = converter(args.input, args.output, config)
     except (FileNotFoundError, ValueError, ValidationError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -65,10 +96,7 @@ def run(argv: list[str] | None = None) -> int:
     print("Conversion complete.")
     print(f"Input: {args.input}")
     print(f"Output: {args.output}")
-    print(
-        "Chunks: "
-        f"({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})"
-    )
+    print(f"Chunks: ({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})")
     print(f"X storage mode: {config.io.x_storage}")
 
     if warnings:
@@ -85,3 +113,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
