@@ -1,11 +1,15 @@
 [io]
 overwrite = false
 consolidate_metadata = false
+# x_storage: "auto" (keep original), "sparse-csr" (force CSR), "sparse-csc" (force CSC), "dense" (force dense)
 x_storage = "auto"
 
 [chunks]
 x_row_chunk = 1000
 x_col_chunk = 1000
+# sparse_flat_chunk controls chunk size for sparse flat arrays (data/indices/indptr).
+# Tune to approximate median nnz per cell for CSR, or nnz per gene for CSC.
+sparse_flat_chunk = 4096
 
 [validation]
 reject_spatial = true
