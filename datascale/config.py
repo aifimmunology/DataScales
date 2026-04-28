@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from importlib.resources import path
 from pathlib import Path
 from typing import Any, Literal
 
@@ -58,6 +59,7 @@ def _validate_config(config: AppConfig) -> AppConfig:
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
+    """Physically reads the config file, and parses it according to the file extension."""
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
 
@@ -65,8 +67,6 @@ def _read_config_file(path: Path) -> dict[str, Any]:
         return tomllib.loads(text)
 
     if suffix in {".yaml", ".yml"}:
-        if yaml is None:
-            raise RuntimeError("YAML config requested but PyYAML is not installed.")
         data = yaml.safe_load(text)
         return data or {}
 
@@ -83,6 +83,11 @@ def _merge_dataclass(base: Any, patch: dict[str, Any]) -> Any:
 
 
 def load_config(config_path: str | None = None) -> AppConfig:
+    """
+    Loads a config file, and uses the valid config values to override the defaults.
+    If no path is provided, returns the default config.
+    """
+    
     config = AppConfig()
 
     if not config_path:
@@ -93,6 +98,15 @@ def load_config(config_path: str | None = None) -> AppConfig:
         raise FileNotFoundError(f"Config file not found: {path}")
 
     data = _read_config_file(path)
+
+    known_sections = {"io", "chunks", "validation"}
+    unknown_sections = set(data.keys()) - known_sections
+    if unknown_sections:
+        bad = ", ".join(sorted(unknown_sections))
+        raise ValueError(
+            f"Unknown top-level config sections: {bad}. "
+            f"Expected only: {', '.join(sorted(known_sections))}"
+        )
 
     io_patch = data.get("io", {})
     chunks_patch = data.get("chunks", {})

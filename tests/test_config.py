@@ -73,4 +73,15 @@ x_storage = "sparse-csc"
 
     cfg = load_config(str(cfg_file))
     assert cfg.io.x_storage == "sparse-csc"
+    
+    
+def test_unknown_top_level_section_rejected(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "bad.toml"
+    cfg_file.write_text("[chunk]\nx_row_chunk = 1000\n")
+
+    try:
+        load_config(str(cfg_file))
+        assert False
+    except ValueError as e:
+        assert "chunk" in str(e)
 

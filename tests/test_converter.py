@@ -10,7 +10,6 @@ from datascale.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 from datascale.converter import (
     ConversionError,
     convert_10x_h5_to_zarr,
-    convert_10x_mtx_to_zarr,
     convert_h5ad_to_zarr,
 )
 
@@ -35,7 +34,7 @@ def test_convert_forces_sparse_output_from_dense_input(tmp_path: Path) -> None:
     output_path = tmp_path / "output_sparse.zarr"
     _make_h5ad(input_path, np.array([[1.0, 0.0], [0.0, 2.0]]))
 
-    warnings = convert_h5ad_to_zarr(str(input_path), str(output_path), _minimal_cfg("sparse"))
+    warnings = convert_h5ad_to_zarr(str(input_path), str(output_path), _minimal_cfg("sparse-csr"))
     assert warnings == []
 
     out = ad.read_zarr(str(output_path))
@@ -74,7 +73,7 @@ def test_convert_non_auto_mode_uses_eager_read(tmp_path: Path) -> None:
     _make_h5ad(input_path, np.array([[1.0, 0.0], [0.0, 2.0]]))
 
     with patch("datascale.converter.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
-        warnings = convert_h5ad_to_zarr(str(input_path), str(output_path), _minimal_cfg("sparse"))
+        warnings = convert_h5ad_to_zarr(str(input_path), str(output_path), _minimal_cfg("sparse-csr"))
 
     assert warnings == []
     assert "backed" not in mocked.call_args_list[0].kwargs
@@ -189,22 +188,8 @@ def test_sparse_flat_chunk_not_applied_for_dense_output(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10x MTX fixtures and tests
+# 10x HDF5 tests
 # ---------------------------------------------------------------------------
-
-def _make_10x_mtx_dir(base: Path) -> Path:
-    """Create a minimal Cell Ranger v2 MTX directory (3 genes x 2 barcodes, 3 nnz)."""
-    mtx_dir = base / "10x_mtx"
-    mtx_dir.mkdir()
-    (mtx_dir / "barcodes.tsv").write_text("CELL1-1\nCELL2-1\n")
-    # genes.tsv: id <tab> symbol
-    (mtx_dir / "genes.tsv").write_text("ENSG001\tGENEA\nENSG002\tGENEB\nENSG003\tGENEC\n")
-    # MatrixMarket: (n_genes x n_barcodes), 1-indexed
-    (mtx_dir / "matrix.mtx").write_text(
-        "%%MatrixMarket matrix coordinate real general\n%\n3 2 3\n1 1 1.0\n2 2 2.0\n3 1 3.0\n"
-    )
-    return mtx_dir
-
 
 def _make_10x_h5(base: Path) -> Path:
     """Create a minimal Cell Ranger v3 HDF5 file (3 genes x 2 barcodes, 3 nnz)."""
@@ -226,61 +211,6 @@ def _make_10x_h5(base: Path) -> Path:
         feat.create_dataset("name", data=np.array([b"GENEA", b"GENEB", b"GENEC"]))
         feat.create_dataset("feature_type", data=np.array([b"Gene Expression"] * 3))
     return h5_path
-
-
-def test_convert_10x_mtx_sparse(tmp_path: Path) -> None:
-    mtx_dir = _make_10x_mtx_dir(tmp_path)
-    output_path = tmp_path / "output.zarr"
-
-    warnings = convert_10x_mtx_to_zarr(str(mtx_dir), str(output_path), _minimal_cfg("sparse-csr"))
-    assert warnings == []
-
-    out = ad.read_zarr(str(output_path))
-    assert out.n_obs == 2
-    assert out.n_vars == 3
-    assert sp.issparse(out.X)
-
-
-def test_convert_10x_mtx_csc(tmp_path: Path) -> None:
-    mtx_dir = _make_10x_mtx_dir(tmp_path)
-    output_path = tmp_path / "output.zarr"
-
-    convert_10x_mtx_to_zarr(str(mtx_dir), str(output_path), _minimal_cfg("sparse-csc"))
-
-    out = ad.read_zarr(str(output_path))
-    assert sp.isspmatrix_csc(out.X)
-
-
-def test_convert_10x_mtx_dense(tmp_path: Path) -> None:
-    mtx_dir = _make_10x_mtx_dir(tmp_path)
-    output_path = tmp_path / "output.zarr"
-
-    convert_10x_mtx_to_zarr(str(mtx_dir), str(output_path), _minimal_cfg("dense"))
-
-    out = ad.read_zarr(str(output_path))
-    assert not sp.issparse(out.X)
-
-
-def test_convert_10x_mtx_rejects_non_directory(tmp_path: Path) -> None:
-    fake = tmp_path / "not_a_dir.txt"
-    fake.write_text("x")
-
-    try:
-        convert_10x_mtx_to_zarr(str(fake), str(tmp_path / "out.zarr"), _minimal_cfg("sparse-csr"))
-        assert False, "Expected ConversionError"
-    except ConversionError:
-        pass
-
-
-def test_convert_10x_mtx_rejects_missing_matrix_mtx(tmp_path: Path) -> None:
-    empty_dir = tmp_path / "empty"
-    empty_dir.mkdir()
-
-    try:
-        convert_10x_mtx_to_zarr(str(empty_dir), str(tmp_path / "out.zarr"), _minimal_cfg("sparse-csr"))
-        assert False, "Expected ConversionError"
-    except ConversionError:
-        pass
 
 
 # ---------------------------------------------------------------------------

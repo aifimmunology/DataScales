@@ -76,13 +76,6 @@ def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnD
     return ad.read_h5ad(input_path), warnings
 
 
-def _load_10x_mtx(input_path: Path) -> tuple[ad.AnnData, list[str]]:
-    import scanpy as sc  # lazy import — scanpy is heavy and not needed for h5ad-only usage
-
-    adata = sc.read_10x_mtx(str(input_path), var_names="gene_symbols", cache=False)
-    return adata, []
-
-
 def _load_10x_h5(input_path: Path) -> tuple[ad.AnnData, list[str]]:
     import scanpy as sc
 
@@ -174,22 +167,6 @@ def convert_h5ad_to_zarr(input_h5ad: str, output_zarr: str, cfg: AppConfig) -> l
         return _write_adata_to_zarr(adata, output_path, cfg, load_warnings)
     finally:
         _close_backed_if_needed(adata)
-
-
-def convert_10x_mtx_to_zarr(input_dir: str, output_zarr: str, cfg: AppConfig) -> list[str]:
-    input_path = Path(input_dir)
-    output_path = Path(output_zarr)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input directory not found: {input_path}")
-    if not input_path.is_dir():
-        raise ConversionError(
-            "Input for convert-10x-mtx must be a directory containing matrix.mtx."
-        )
-    if not (input_path / "matrix.mtx").exists():
-        raise ConversionError(f"No matrix.mtx found in {input_path}.")
-
-    adata, load_warnings = _load_10x_mtx(input_path)
-    return _write_adata_to_zarr(adata, output_path, cfg, load_warnings)
 
 
 def convert_10x_h5_to_zarr(input_h5: str, output_zarr: str, cfg: AppConfig) -> list[str]:

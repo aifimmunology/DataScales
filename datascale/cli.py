@@ -43,6 +43,7 @@ def _add_common_args(sub: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="datascale")
+    #dest is what field to grab froms args object. EG args.command will be the below subparser name
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     h5ad = subparsers.add_parser(
@@ -50,14 +51,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     h5ad.add_argument("--input", required=True, help="Path to input .h5ad file")
     _add_common_args(h5ad)
-
-    mtx = subparsers.add_parser(
-        "convert-10x-mtx", help="Convert 10x Genomics MTX directory to zarr"
-    )
-    mtx.add_argument(
-        "--input", required=True, help="Path to 10x MTX directory (must contain matrix.mtx)"
-    )
-    _add_common_args(mtx)
 
     h5 = subparsers.add_parser(
         "convert-10x-h5", help="Convert 10x Genomics Cell Ranger HDF5 (.h5) to zarr"
@@ -89,7 +82,7 @@ def run(argv: list[str] | None = None) -> int:
         )
 
         warnings = converter(args.input, args.output, config)
-    except (FileNotFoundError, ValueError, ValidationError, RuntimeError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
