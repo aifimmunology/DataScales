@@ -43,25 +43,44 @@ def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnD
 
 
 
-def _write_sparse_as_dense(
+def _write_sparse_as_dense_dask(
     group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
 ) -> None:
     """Write a CSR matrix (in-memory or backed _CSRDataset) as a dense zarr array.
 
-    Writes one row-chunk at a time so the full dense matrix is never materialised.
-    row_chunk is capped adaptively so one chunk does not exceed 64 MB regardless
-    of how many columns the matrix has.
+    Uses da.store() to write one row-chunk at a time — the full dense matrix is never
+    materialised. For in-memory CSR, cfg.chunks.n_dense_workers threads process chunks
+    in parallel (each thread: .toarray() one slice, write one zarr chunk). For backed
+    _CSRDataset, synchronous scheduler is enforced because h5py is not thread-safe.
+
+    row_chunk is capped adaptively so one dense chunk stays under 64 MB regardless
+    of column count.
     """
     import numpy as np
+    import dask
+    import dask.array as da
 
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
-    # Cap row_chunk so a single dense chunk stays under 64 MB.
+    # Cap row_chunk so one dense chunk stays under 64 MB.
     bytes_per_row = n_cols * np.dtype(dtype).itemsize
     adaptive_row_chunk = max(1, (64 * 1024 * 1024) // bytes_per_row)
     row_chunk = min(cfg.chunks.x_row_chunk, adaptive_row_chunk)
     col_chunk = cfg.chunks.x_col_chunk
+
+    # Build a dask array from delayed row slices.
+    # da.from_delayed is used (not da.from_array) because backed _CSRDataset has no
+    # ndim / array protocol.
+    slices = [
+        da.from_delayed(
+            dask.delayed(lambda s=start: matrix[s : s + row_chunk].toarray())(),
+            shape=(min(row_chunk, n_rows - start), n_cols),
+            dtype=dtype,
+        )
+        for start in range(0, n_rows, row_chunk)
+    ]
+    dask_dense = da.concatenate(slices, axis=0)
 
     zarr_arr = group.require_array(
         key,
@@ -72,9 +91,16 @@ def _write_sparse_as_dense(
     )
     zarr_arr.attrs["encoding-type"] = "array"
     zarr_arr.attrs["encoding-version"] = "0.2.0"
-    for start in range(0, n_rows, row_chunk):
-        zarr_arr[start : start + row_chunk, :] = (
-            matrix[start : start + row_chunk].toarray()
+
+    backed = not hasattr(matrix, "indices")  # backed _CSRDataset lacks .indices
+    if backed:
+        # h5py is not thread-safe: one chunk at a time.
+        da.store(dask_dense, zarr_arr, scheduler="synchronous")
+    else:
+        da.store(
+            dask_dense, zarr_arr,
+            scheduler="threads",
+            num_workers=cfg.chunks.n_dense_workers,
         )
 
 
@@ -104,7 +130,7 @@ def _write_matrix_direct(
                 matrix = matrix.tocsr()  # backed CSC: load into memory and convert
             elif sp.issparse(matrix) and not sp.isspmatrix_csr(matrix):
                 matrix = matrix.tocsr() 
-            _write_sparse_as_dense(group, matrix, key, cfg)
+            _write_sparse_as_dense_dask(group, matrix, key, cfg)
             
         else:  #already dense #TODO make way for dense to be loaded chunk by chunk
             write_elem(group, key, matrix, dataset_kwargs={

@@ -38,6 +38,11 @@ def _add_common_args(sub: argparse.ArgumentParser) -> None:
         type=int,
         help="Chunk size for sparse flat arrays (data/indices/indptr); tune to median nnz per cell",
     )
+    sub.add_argument(
+        "--n-dense-workers",
+        type=int,
+        help="Threads for parallel dense chunk writes (default: 1). Raise on HPC. Ignored for --backed (h5py is not thread-safe).",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -83,6 +88,7 @@ def run(argv: list[str] | None = None) -> int:
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
             sparse_flat_chunk=args.sparse_flat_chunk,
+            n_dense_workers=getattr(args, "n_dense_workers", None),
             backed=True if getattr(args, "backed", False) else None,
         )
 
@@ -97,6 +103,8 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Chunks: ({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})")
     print(f"X storage mode: {config.io.x_storage}")
     print(f"Backed load: {config.io.backed}")
+    if config.io.x_storage == "dense" and not config.io.backed:
+        print(f"Dense workers: {config.chunks.n_dense_workers}")
 
     if warnings:
         print("Warnings:")
