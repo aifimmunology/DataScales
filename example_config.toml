@@ -8,11 +8,19 @@ x_storage = "sparse-csr"
 backed = false
 
 [chunks]
-#Chunk size for 2d dense arrays
+# Row/column chunk size for dense 2D arrays (X, layers, raw.X).
+# x_row_chunk is also capped automatically so one chunk stays under 64 MB,
+# so raising this only helps wide matrices if you have the RAM to spare.
 x_row_chunk = 1000
 x_col_chunk = 1000
-#Tune 1d Shunk size for sparse array storage. #Reccomended to tune to median nnz per row.
+# Flat chunk size for sparse 1D arrays (data / indices / indptr).
+# Tune to the median non-zero count per row for your dataset.
 sparse_flat_chunk = 4096
+# Number of worker threads used when writing dense chunks.
+# 1 (default) is safe everywhere. Raise on HPC or multi-core servers to
+# parallelise the .toarray() + zarr-write pipeline. Ignored when --backed
+# is set (h5py reads are not thread-safe).
+n_dense_workers = 1
 
 [validation]
 reject_spatial = true

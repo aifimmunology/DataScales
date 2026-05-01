@@ -7,8 +7,9 @@ A configurable converter for single-cell gene expression data to Zarr stores, fo
 - Converts `.h5ad` and 10x Genomics Cell Ranger `.h5` files to Zarr v3
 - Rejects spatial AnnData inputs during validation
 - Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking
-- Input must be CSR-formatted AnnData (`adata.X` in CSR); backed HDF5 loading is used automatically
-- Config via TOML or YAML with CLI overrides
+- Input must be CSR-formatted AnnData (`adata.X` in CSR)
+- Opt-in backed HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
+- Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
 
@@ -82,16 +83,19 @@ min_vars = 1
 
 All commands share the same optional flags:
 
-| Flag | Description |
-|---|---|
-| `--config` | Path to TOML/YAML config file |
-| `--overwrite` | Overwrite output path if it already exists |
-| `--backed` | Load h5ad in backed (HDF5-streamed) mode — avoids loading X into RAM upfront. Only on `convert-h5ad`. Errors if backed load fails. |
-| `--x-storage` | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
-| `--x-row-chunk` | Row chunk size for dense X |
-| `--x-col-chunk` | Column chunk size for dense X |
-| `--sparse-flat-chunk` | Flat array chunk size for sparse X |
-| `--consolidate-metadata` | Force zarr metadata consolidation after write |
+| Flag | Required? | Description |
+|---|---|---|
+| `--input` | **Required** | Path to input file (`.h5ad` or `.h5`) |
+| `--output` | **Required** | Path to output `.zarr` directory |
+| `--config` | Optional | Path to TOML/YAML config file |
+| `--overwrite` | Optional | Overwrite output path if it already exists |
+| `--x-storage` | Optional | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
+| `--backed` | Optional | Stream X from disk without loading into RAM. Only on `convert-h5ad`. Recommended for large files. |
+| `--n-dense-workers` | Optional | Threads for parallel dense chunk writes (default: 1). Raise on HPC. No effect with `--backed`. |
+| `--x-row-chunk` | Optional | Row chunk size for dense X (auto-capped at 64 MB per chunk) |
+| `--x-col-chunk` | Optional | Column chunk size for dense X |
+| `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays; tune to median nnz per row |
+| `--consolidate-metadata` | Optional | Write consolidated zarr metadata; useful for remote stores |
 
 ```bash
 pixi run datascale convert-h5ad --help

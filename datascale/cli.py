@@ -13,35 +13,47 @@ _CONVERTERS = {
 }
 
 
-def _add_common_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument("--output", required=True, help="Path to output .zarr directory")
-    sub.add_argument("--config", required=False, help="Path to YAML/TOML config file")
-    sub.add_argument(
+def _add_common_args(
+    required: argparse._ArgumentGroup,
+    optional: argparse._ArgumentGroup,
+) -> None:
+    required.add_argument("--output", required=True, help="Path to output .zarr directory")
+
+    optional.add_argument("--config", help="Path to YAML/TOML config file")
+    optional.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite output path if it already exists",
     )
-    sub.add_argument(
+    optional.add_argument(
         "--consolidate-metadata",
         action="store_true",
-        help="Enable zarr metadata consolidation after write",
+        help="Write consolidated zarr metadata after write; useful for remote stores (S3, GCS)",
     )
-    sub.add_argument(
+    optional.add_argument(
         "--x-storage",
         choices=["sparse-csr", "sparse-csc", "dense"],
-        help="How to store X/layers/raw.X in output zarr (default: sparse-csr)",
+        help="Output format for X/layers/raw.X (default: sparse-csr)",
     )
-    sub.add_argument("--x-row-chunk", type=int, help="Row chunk size for X")
-    sub.add_argument("--x-col-chunk", type=int, help="Column chunk size for X")
-    sub.add_argument(
+    optional.add_argument(
+        "--x-row-chunk",
+        type=int,
+        help="Row chunk size for dense X; auto-capped at 64 MB per chunk (default: 2048)",
+    )
+    optional.add_argument(
+        "--x-col-chunk",
+        type=int,
+        help="Column chunk size for dense X (default: 2048)",
+    )
+    optional.add_argument(
         "--sparse-flat-chunk",
         type=int,
-        help="Chunk size for sparse flat arrays (data/indices/indptr); tune to median nnz per cell",
+        help="Flat chunk size for sparse arrays (data/indices/indptr); tune to median nnz per row (default: 4096)",
     )
-    sub.add_argument(
+    optional.add_argument(
         "--n-dense-workers",
         type=int,
-        help="Threads for parallel dense chunk writes (default: 1). Raise on HPC. Ignored for --backed (h5py is not thread-safe).",
+        help="Threads for parallel dense chunk writes (default: 1). Raise on HPC. No effect with --backed.",
     )
 
 
@@ -53,19 +65,23 @@ def _build_parser() -> argparse.ArgumentParser:
     h5ad = subparsers.add_parser(
         "convert-h5ad", help="Convert non-spatial single-cell .h5ad to zarr"
     )
-    h5ad.add_argument("--input", required=True, help="Path to input .h5ad file")
-    h5ad.add_argument(
+    h5ad_required = h5ad.add_argument_group("required arguments")
+    h5ad_required.add_argument("--input", required=True, help="Path to input .h5ad file")
+    h5ad_optional = h5ad.add_argument_group("optional arguments")
+    h5ad_optional.add_argument(
         "--backed",
         action="store_true",
-        help="Load h5ad in backed (HDF5-streamed) mode. Avoids loading X into memory upfront. Errors if backed load fails.",
+        help="Stream X from disk without loading into RAM. Recommended for large files. Errors if backed load fails.",
     )
-    _add_common_args(h5ad)
+    _add_common_args(h5ad_required, h5ad_optional)
 
     h5 = subparsers.add_parser(
         "convert-10x-h5", help="Convert 10x Genomics Cell Ranger HDF5 (.h5) to zarr"
     )
-    h5.add_argument("--input", required=True, help="Path to 10x Cell Ranger .h5 file")
-    _add_common_args(h5)
+    h5_required = h5.add_argument_group("required arguments")
+    h5_required.add_argument("--input", required=True, help="Path to 10x Cell Ranger .h5 file")
+    h5_optional = h5.add_argument_group("optional arguments")
+    _add_common_args(h5_required, h5_optional)
 
     return parser
 
