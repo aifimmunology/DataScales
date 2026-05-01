@@ -4,12 +4,11 @@ import argparse
 import sys
 
 from .config import apply_cli_overrides, load_config
-from .converter import convert_10x_h5_to_zarr, convert_10x_mtx_to_zarr, convert_h5ad_to_zarr
+from .converter import convert_10x_h5_to_zarr, convert_h5ad_to_zarr
 from .validation import ValidationError
 
 _CONVERTERS = {
     "convert-h5ad": convert_h5ad_to_zarr,
-    "convert-10x-mtx": convert_10x_mtx_to_zarr,
     "convert-10x-h5": convert_10x_h5_to_zarr,
 }
 
@@ -29,8 +28,8 @@ def _add_common_args(sub: argparse.ArgumentParser) -> None:
     )
     sub.add_argument(
         "--x-storage",
-        choices=["auto", "sparse-csr", "sparse-csc", "dense"],
-        help="How to store X/layers/raw.X in output zarr (auto keeps original format)",
+        choices=["sparse-csr", "sparse-csc", "dense"],
+        help="How to store X/layers/raw.X in output zarr (default: sparse-csr)",
     )
     sub.add_argument("--x-row-chunk", type=int, help="Row chunk size for X")
     sub.add_argument("--x-col-chunk", type=int, help="Column chunk size for X")

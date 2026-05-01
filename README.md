@@ -7,12 +7,30 @@ A configurable converter for single-cell gene expression data to Zarr stores, fo
 - Converts `.h5ad` and 10x Genomics Cell Ranger `.h5` files to Zarr v3
 - Rejects spatial AnnData inputs during validation
 - Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking
+- Input must be CSR-formatted AnnData (`adata.X` in CSR); backed HDF5 loading is used automatically
 - Config via TOML or YAML with CLI overrides
 
 ## Install
 
+Requires Python 3.10+.
+
+**pixi (recommended)** — handles all dependencies automatically:
 ```bash
 pixi install
+```
+
+**pip** — with a virtual environment:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -e .
+```
+
+**From source** — for contributors:
+```bash
+git clone https://github.com/yourname/DataScale.git
+cd DataScale
+pip install -e .
 ```
 
 ## Commands
@@ -43,14 +61,14 @@ See `example_config.toml` for a full reference. Key options:
 [io]
 overwrite = false
 consolidate_metadata = false
-# x_storage: "auto" (keep original), "sparse-csr", "sparse-csc", "dense"
-x_storage = "auto"
+# x_storage: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense)
+x_storage = "sparse-csr"
 
 [chunks]
-x_row_chunk = 2048
-x_col_chunk = 2048
-# sparse_flat_chunk: chunk size for sparse flat arrays (data/indices/indptr)
-# tune to median nnz per cell for CSR, or nnz per gene for CSC
+#Chunk size for 2d dense arrays
+x_row_chunk = 1000
+x_col_chunk = 1000
+#Tune 1d Shunk size for sparse array storage. #Reccomended to tune to median nnz per row.
 sparse_flat_chunk = 4096
 
 [validation]
@@ -68,7 +86,7 @@ All commands share the same optional flags:
 |---|---|
 | `--config` | Path to TOML/YAML config file |
 | `--overwrite` | Overwrite output path if it already exists |
-| `--x-storage` | `auto` \| `sparse-csr` \| `sparse-csc` \| `dense` |
+| `--x-storage` | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
 | `--x-row-chunk` | Row chunk size for dense X |
 | `--x-col-chunk` | Column chunk size for dense X |
 | `--sparse-flat-chunk` | Flat array chunk size for sparse X |

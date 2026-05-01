@@ -16,38 +16,8 @@ class ConversionError(RuntimeError):
     """Raised when conversion cannot be completed."""
 
 
-def _convert_matrix_storage(matrix: Any, mode: str) -> Any:
-    if mode == "auto":
-        return matrix
-
-    if mode == "sparse-csr":
-        return matrix if sp.issparse(matrix) else sp.csr_matrix(matrix)
-
-    if mode == "sparse-csc":
-        return matrix.tocsc() if sp.issparse(matrix) else sp.csc_matrix(matrix)
-
-    if mode == "dense":
-        return matrix.toarray() if sp.issparse(matrix) else matrix
-
-    raise ConversionError(f"Unsupported x_storage mode: {mode}")
-
-
-def _apply_x_storage_mode(adata: ad.AnnData, mode: str) -> None:
-    if mode == "auto":
-        return
-
-    adata.X = _convert_matrix_storage(adata.X, mode)
-
-    for layer_name in list(adata.layers.keys()):
-        adata.layers[layer_name] = _convert_matrix_storage(adata.layers[layer_name], mode)
-
-    if adata.raw is not None:
-        raw_adata = adata.raw.to_adata()
-        raw_adata.X = _convert_matrix_storage(raw_adata.X, mode)
-        adata.raw = raw_adata
-
-
 def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
+    """"removes existing output path if overwrite is enabled, otherwise raises error"""
     if output_path.exists():
         if not overwrite:
             raise ConversionError(
@@ -62,57 +32,157 @@ def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
 
 def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnData, list[str]]:
     warnings: list[str] = []
-
-    #auto is used when its stored the same way as original h5ad, so we know we can 'backed' load the anndata
-    if cfg.io.x_storage == "auto":
-        try:
-            return ad.read_h5ad(input_path, backed="r"), warnings
-        except Exception as exc:
-            warnings.append(
-                "Backed read was unavailable; falling back to in-memory load "
-                f"({type(exc).__name__}: {exc})."
-            )
-
+    try: #always attempt to load in 'backed' first
+        return ad.read_h5ad(input_path, backed="r"), warnings
+    except Exception as exc:
+        warnings.append(
+            "Backed read was unavailable; falling back to in-memory load "
+            f"({type(exc).__name__}: {exc})."
+        )
     return ad.read_h5ad(input_path), warnings
 
 
-def _load_10x_h5(input_path: Path) -> tuple[ad.AnnData, list[str]]:
-    import scanpy as sc
 
-    adata = sc.read_10x_h5(str(input_path))
-    return adata, []
+def _write_sparse_as_dense_dask(
+    group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
+) -> None:
+    """Write a CSR sparse matrix as dense zarr using dask row-chunked conversion.
 
-
-def _apply_sparse_flat_chunks(output_path: Path, adata: ad.AnnData, sparse_flat_chunk: int) -> None:
-    """Re-write sparse matrix groups in the output zarr with a controlled flat chunk size.
-
-    This runs after write_zarr so that obs/var/etc. are already written, then only the
-    sparse flat arrays (data/indices/indptr) are deleted and rewritten with the requested
-    chunk size.  Dense matrices are not affected.
+    Peak memory: 1× sparse full load + (x_row_chunk × n_vars × dtype_bytes).
+    The full dense array is never allocated.
+    Uses synchronous dask scheduler if the matrix is HDF5-backed (not thread-safe).
     """
-    from anndata._io.specs import write_elem  # local import – not part of the public API
+    import dask
+    import dask.array as da
+    from anndata._io.specs import write_elem  # not part of the public API
 
-    store = zarr.open_group(str(output_path), mode="r+", use_consolidated=False)
+    row_chunk = cfg.chunks.x_row_chunk
+    col_chunk = cfg.chunks.x_col_chunk
 
-    def _rechunk(group: zarr.Group, matrix: Any, key: str) -> None:
-        # Cap chunk size at nnz so zarr v3 never creates a chunk larger than the array.
-        capped = min(sparse_flat_chunk, max(1, matrix.nnz))
-        del group[key]
+    backed = not hasattr(matrix, "indices")  # SparseDataset (backed) lacks .indices
+
+    if backed:
+        n_rows, n_cols = matrix.shape
+
+        chunks = [
+            da.from_delayed(
+                dask.delayed(lambda s=start: matrix[s : s + row_chunk].toarray())(),
+                shape=(min(row_chunk, n_rows - start), n_cols),
+                dtype=matrix.dtype,
+            )
+            for start in range(0, n_rows, row_chunk)
+        ]
+        dask_dense = da.concatenate(chunks, axis=0) #build chunks above, and store as dask array to be processed
+        with dask.config.set(scheduler="synchronous"):
+            write_elem(group, key, dask_dense, dataset_kwargs={"chunks": (row_chunk, col_chunk)})
+    else:
+        # In-memory CSR: wrap in dask and convert each row-chunk block to dense.
+        dask_sparse = da.from_array(matrix, chunks=(row_chunk, matrix.shape[1]))
+        dask_dense = dask_sparse.map_blocks(
+            lambda b: b.toarray() if sp.issparse(b) else b,
+            dtype=matrix.dtype,
+        )
+        with dask.config.set(scheduler="threads"):
+            write_elem(group, key, dask_dense, dataset_kwargs={"chunks": (row_chunk, col_chunk)})
+
+
+def _write_matrix_direct(
+    group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
+) -> None:
+    """Write a single matrix to zarr in the target format, directly.
+
+    Input may be any format (CSR, CSC, dense ndarray, backed SparseDataset) -> because vvv
+    NOTE adata.X is guaranteed CSR by the caller, but other layers and raw.X may not be.
+
+    Dispatches based on cfg.io.x_storage:
+      dense      → dask row-chunked write; CSC converted to CSR first for row slicing
+      sparse-csr → ensure CSR, write_elem with flat chunks
+      sparse-csc → ensure CSC, write_elem with flat chunks
+    """
+    from anndata._io.specs import write_elem  # not part of the public API
+
+    mode = cfg.io.x_storage
+
+    # Backed SparseDataset (anndata HDF5-backed): has .format but is not a scipy sparse matrix.
+    is_backed_sparse = not sp.issparse(matrix) and hasattr(matrix, "format")
+
+    if mode == "dense":
+        if sp.issparse(matrix) or is_backed_sparse:
+            if is_backed_sparse and getattr(matrix, "format", None) != "csr":
+                matrix = matrix.tocsr()  # backed CSC: load into memory and convert
+            elif sp.issparse(matrix) and not sp.isspmatrix_csr(matrix):
+                matrix = matrix.tocsr() 
+            _write_sparse_as_dense_dask(group, matrix, key, cfg)
+            
+        else:  #already dense #TODO make way for dense to be loaded chunk by chunk
+            write_elem(group, key, matrix, dataset_kwargs={
+                "chunks": (cfg.chunks.x_row_chunk, cfg.chunks.x_col_chunk)
+            })
+        return
+
+    # Sparse output (sparse-csr, sparse-csc).
+    if is_backed_sparse:
+        dataset_format = getattr(matrix, "format", None)
+        if mode == "sparse-csc" and dataset_format != "csc":
+            # _CSRDataset has no tocsc(); load into memory first then convert.
+            matrix = matrix[:].tocsc()
+        elif mode == "sparse-csr" and dataset_format != "csr":
+            matrix = matrix[:].tocsr()
+        
+
+        nnz = getattr(matrix, "nnz", None)
+        capped = min(cfg.chunks.sparse_flat_chunk, max(1, nnz)) if nnz is not None else cfg.chunks.sparse_flat_chunk
         write_elem(group, key, matrix, dataset_kwargs={"chunks": (capped,)})
+        return
+    
+    elif mode == "sparse-csr" and not sp.isspmatrix_csr(matrix):
+        matrix = matrix.tocsr()
+    elif mode == "sparse-csc" and not sp.isspmatrix_csc(matrix):
+        matrix = matrix.tocsc()
 
-    if sp.issparse(adata.X):
-        _rechunk(store, adata.X, "X")
+    capped = min(cfg.chunks.sparse_flat_chunk, max(1, matrix.nnz))  # matrix is always in-memory scipy here
+    write_elem(group, key, matrix, dataset_kwargs={"chunks": (capped,)})
 
+
+def _write_csr_adata_direct(adata: ad.AnnData, output_path: Path, cfg: AppConfig) -> None:
+    """Write an AnnData with CSR X (in-memory or backed SparseDataset) directly to zarr.
+
+    Matrices are written with the target format and chunking in one step.
+    """
+    from anndata._io.specs import write_elem  # not part of the public API
+
+    store = zarr.open_group(str(output_path), mode="w")
+
+    # Root encoding attrs — marks this as a valid anndata zarr store.
+    store.attrs["encoding-type"] = "anndata"
+    store.attrs["encoding-version"] = "0.1.0"
+
+    # Metadata components: write_elem sets the correct encoding-type on each.
+    write_elem(store, "obs", adata.obs)
+    write_elem(store, "var", adata.var)
+    write_elem(store, "uns", dict(adata.uns))
+    write_elem(store, "obsm", dict(adata.obsm))
+    write_elem(store, "varm", dict(adata.varm))
+    write_elem(store, "obsp", dict(adata.obsp))
+    write_elem(store, "varp", dict(adata.varp))
+
+    # X: written directly in target format (dask for dense, write_elem for sparse).
+    _write_matrix_direct(store, adata.X, "X", cfg)
+
+    #Other layers are written with same storage format, outside of the X matrix.
     if adata.layers:
+        write_elem(store, "layers", {})
         layers_group = store["layers"]
-        for layer_name, layer_data in adata.layers.items():
-            if sp.issparse(layer_data):
-                _rechunk(layers_group, layer_data, layer_name)
+        for name, data in adata.layers.items():
+            _write_matrix_direct(layers_group, data, name, cfg)
 
     if adata.raw is not None:
-        raw_X = adata.raw.X
-        if sp.issparse(raw_X):
-            _rechunk(store["raw"], raw_X, "X")
+        raw_group = store.require_group("raw")
+        raw_group.attrs["encoding-type"] = "raw"
+        raw_group.attrs["encoding-version"] = "0.1.0"
+        write_elem(raw_group, "var", adata.raw.var)
+        write_elem(raw_group, "varm", dict(adata.raw.varm))
+        _write_matrix_direct(raw_group, adata.raw.X, "X", cfg)
 
 
 def _close_backed_if_needed(adata: ad.AnnData) -> None:
@@ -128,54 +198,51 @@ def _write_adata_to_zarr(
     cfg: AppConfig,
     load_warnings: list[str],
 ) -> list[str]:
-    """Shared write core used by all three converter entry points."""
+    """Write AnnData to zarr. Requires adata.X to be CSR (in-memory or backed SparseDataset)."""
+    is_csr = sp.isspmatrix_csr(adata.X) or (
+        not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csr" #backed mode
+    )
+    if not is_csr:
+        raise ConversionError(
+            f"adata.X must be CSR format. Got: {type(adata.X).__name__}"
+        )
+
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
-
     _prepare_output_path(output_path, cfg.io.overwrite)
-
     ad.settings.zarr_write_format = 3
 
-    _apply_x_storage_mode(adata, cfg.io.x_storage)
-
-    chunks = (cfg.chunks.x_row_chunk, cfg.chunks.x_col_chunk)
-    adata.write_zarr(str(output_path), chunks=chunks)
-
-
-    rechunked = False
-    if not getattr(adata, "isbacked", False):
-        _apply_sparse_flat_chunks(output_path, adata, cfg.chunks.sparse_flat_chunk)
-        rechunked = True
-
-    # zarr v3 auto-consolidates during write_zarr.  Re-consolidate when rechunking
-    # happened (stale root zarr.json) or when the user explicitly requested it.
-    if rechunked or cfg.io.consolidate_metadata:
-        zarr.consolidate_metadata(str(output_path))
-
+    _write_csr_adata_direct(adata, output_path, cfg)
+    zarr.consolidate_metadata(str(output_path))
     return [*load_warnings, *validation_result.warnings]
 
 
 def convert_h5ad_to_zarr(input_h5ad: str, output_zarr: str, cfg: AppConfig) -> list[str]:
-    input_path = Path(input_h5ad)
-    output_path = Path(output_zarr)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-    if input_path.suffix.lower() != ".h5ad":
-        raise ConversionError("Input must be an .h5ad file for this command.")
-
-    adata, load_warnings = _load_h5ad_for_conversion(input_path, cfg)
+    """"Converts a .h5ad file to zarr, using the configuration for storage format,
+    chunk sizes, and validation. Returns a list of warnings encountered"""
+    adata = None
+    load_warnings: list[str] = []
     try:
-        return _write_adata_to_zarr(adata, output_path, cfg, load_warnings)
-    finally:
-        _close_backed_if_needed(adata)
+        adata, load_warnings = _load_h5ad_for_conversion(Path(input_h5ad), cfg) #attempts to load in 'backed' mode, where its not fully memory loaded
+        return _write_adata_to_zarr(adata, Path(output_zarr), cfg, load_warnings)
+    
+    except Exception as e:
+        load_warnings = f"Warnings: {load_warnings}" if load_warnings else ""
+        raise ConversionError(f"Failed to convert .h5ad file: {e}.{load_warnings}") from e
+    finally: #closing 'backed' mode
+        if adata is not None:
+            _close_backed_if_needed(adata)
 
 
 def convert_10x_h5_to_zarr(input_h5: str, output_zarr: str, cfg: AppConfig) -> list[str]:
-    input_path = Path(input_h5)
-    output_path = Path(output_zarr)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-    if input_path.suffix.lower() not in {".h5", ".hdf5"}:
-        raise ConversionError("Input for convert-10x-h5 must be a .h5 or .hdf5 file.")
-
-    adata, load_warnings = _load_10x_h5(input_path)
-    return _write_adata_to_zarr(adata, output_path, cfg, load_warnings)
+    """Converts .h5 file from 10x preprocessing into zarr with configured storage options and chunking"""
+    #TODO edit to not load into anndata object, but write directly to zarr chunks
+    
+    try:
+        import scanpy as sc
+        #NOTE Expecting CSR from this load
+        adata = sc.read_10x_h5(str(input_h5))
+        
+    except Exception as e:
+        raise ConversionError(f"Failed to read 10x H5 file: {e}") from e
+    
+    return _write_adata_to_zarr(adata, Path(output_zarr), cfg, [])

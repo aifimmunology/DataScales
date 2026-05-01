@@ -13,14 +13,14 @@ except Exception:  # pragma: no cover
     yaml = None
 
 
-XStorageMode = Literal["auto", "sparse-csr", "sparse-csc", "dense"]
+XStorageMode = Literal["sparse-csr", "sparse-csc", "dense"]
 
 
 @dataclass(frozen=True)
 class IOConfig:
     overwrite: bool = False
     consolidate_metadata: bool = False
-    x_storage: XStorageMode = "auto"
+    x_storage: XStorageMode = "sparse-csr"
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class AppConfig:
 
 def _normalize_x_storage(value: str) -> XStorageMode:
     mode = value.lower().strip()
-    allowed = {"auto", "sparse-csr", "sparse-csc", "dense"}
+    allowed = {"sparse-csr", "sparse-csc", "dense"}
     if mode not in allowed:
         allowed_list = ", ".join(sorted(allowed))
         raise ValueError(f"Invalid io.x_storage '{value}'. Expected one of: {allowed_list}")

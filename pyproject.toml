@@ -16,6 +16,7 @@ dependencies = [
   "scipy>=1.10.0",
   "PyYAML>=6.0",
   "scanpy>=1.9.0",
+  "dask[array]>=2023.1.0",
 ]
 
 [project.optional-dependencies]
@@ -45,3 +46,4 @@ dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.dependencies]
 scanpy = ">=1.12.1,<2"
+dask = ">=2026.3.0,<2027"

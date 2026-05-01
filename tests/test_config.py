@@ -7,7 +7,7 @@ def test_default_config() -> None:
     cfg = load_config(None)
     assert isinstance(cfg, AppConfig)
     assert cfg.chunks.x_row_chunk == 2048
-    assert cfg.io.x_storage == "auto"
+    assert cfg.io.x_storage == "sparse-csr"
 
 
 def test_toml_load(tmp_path: Path) -> None:
