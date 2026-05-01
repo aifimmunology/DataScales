@@ -7,13 +7,13 @@ A configurable converter for single-cell gene expression data to Zarr stores, fo
 - Converts `.h5ad` and 10x Genomics Cell Ranger `.h5` files to Zarr v3
 - Rejects spatial AnnData inputs during validation
 - Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking
-- Input must be CSR-formatted AnnData (`adata.X` in CSR)
-- Opt-in backed HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
+- Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it
+- Optional 'backed' HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
 - Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
 
-Requires Python 3.10+.
+Requires Python 3.10+. Run commands in repository directory after cloning.
 
 **pixi (recommended)** — handles all dependencies automatically:
 ```bash
@@ -62,13 +62,13 @@ See `example_config.toml` for a full reference. Key options:
 [io]
 overwrite = false
 consolidate_metadata = false
-# x_storage: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense)
+# x_storage: Zarr output storage format: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense). 
 x_storage = "sparse-csr"
 
 [chunks]
 #Chunk size for 2d dense arrays
-x_row_chunk = 1000
-x_col_chunk = 1000
+x_row_chunk = 2048
+x_col_chunk = 2048
 #Tune 1d Shunk size for sparse array storage. #Reccomended to tune to median nnz per row.
 sparse_flat_chunk = 4096
 
@@ -88,14 +88,14 @@ All commands share the same optional flags:
 | `--input` | **Required** | Path to input file (`.h5ad` or `.h5`) |
 | `--output` | **Required** | Path to output `.zarr` directory |
 | `--config` | Optional | Path to TOML/YAML config file |
-| `--overwrite` | Optional | Overwrite output path if it already exists |
+| `--overwrite` | Optional | Overwrite output path if it already exists, else it throws error that folder already exists |
 | `--x-storage` | Optional | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
-| `--backed` | Optional | Stream X from disk without loading into RAM. Only on `convert-h5ad`. Recommended for large files. |
-| `--n-dense-workers` | Optional | Threads for parallel dense chunk writes (default: 1). Raise on HPC. No effect with `--backed`. |
+| `--backed` | Optional | Stream X from disk without loading into RAM. Only on h5ad in `convert-h5ad`. Saves some peak memory at cost of a little speed |
+| `--n-dense-workers` | Optional | Threads for writing to dense output storage. Only works on dense, and without `--backed` flag on |
 | `--x-row-chunk` | Optional | Row chunk size for dense X (auto-capped at 64 MB per chunk) |
 | `--x-col-chunk` | Optional | Column chunk size for dense X |
-| `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays; tune to median nnz per row |
-| `--consolidate-metadata` | Optional | Write consolidated zarr metadata; useful for remote stores |
+| `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays. Best tuned to median nnz per row |
+| `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
 
 ```bash
 pixi run datascale convert-h5ad --help
