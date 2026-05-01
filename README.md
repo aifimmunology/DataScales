@@ -86,6 +86,7 @@ All commands share the same optional flags:
 |---|---|
 | `--config` | Path to TOML/YAML config file |
 | `--overwrite` | Overwrite output path if it already exists |
+| `--backed` | Load h5ad in backed (HDF5-streamed) mode — avoids loading X into RAM upfront. Only on `convert-h5ad`. Errors if backed load fails. |
 | `--x-storage` | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
 | `--x-row-chunk` | Row chunk size for dense X |
 | `--x-col-chunk` | Column chunk size for dense X |

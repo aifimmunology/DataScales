@@ -49,6 +49,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "convert-h5ad", help="Convert non-spatial single-cell .h5ad to zarr"
     )
     h5ad.add_argument("--input", required=True, help="Path to input .h5ad file")
+    h5ad.add_argument(
+        "--backed",
+        action="store_true",
+        help="Load h5ad in backed (HDF5-streamed) mode. Avoids loading X into memory upfront. Errors if backed load fails.",
+    )
     _add_common_args(h5ad)
 
     h5 = subparsers.add_parser(
@@ -78,6 +83,7 @@ def run(argv: list[str] | None = None) -> int:
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
             sparse_flat_chunk=args.sparse_flat_chunk,
+            backed=True if getattr(args, "backed", False) else None,
         )
 
         warnings = converter(args.input, args.output, config)
@@ -90,6 +96,7 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Output: {args.output}")
     print(f"Chunks: ({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})")
     print(f"X storage mode: {config.io.x_storage}")
+    print(f"Backed load: {config.io.backed}")
 
     if warnings:
         print("Warnings:")

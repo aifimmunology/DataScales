@@ -21,6 +21,7 @@ class IOConfig:
     overwrite: bool = False
     consolidate_metadata: bool = False
     x_storage: XStorageMode = "sparse-csr"
+    backed: bool = False  # load h5ad in backed (HDF5-streamed) mode; opt-in only
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ def apply_cli_overrides(
     x_row_chunk: int | None = None,
     x_col_chunk: int | None = None,
     sparse_flat_chunk: int | None = None,
+    backed: bool | None = None,
 ) -> AppConfig:
     io_cfg = config.io
     chunk_cfg = config.chunks
@@ -143,6 +145,8 @@ def apply_cli_overrides(
         io_cfg = replace(io_cfg, consolidate_metadata=consolidate_metadata)
     if x_storage is not None:
         io_cfg = replace(io_cfg, x_storage=_normalize_x_storage(x_storage))
+    if backed is not None:
+        io_cfg = replace(io_cfg, backed=backed)
     if x_row_chunk is not None:
         chunk_cfg = replace(chunk_cfg, x_row_chunk=x_row_chunk)
     if x_col_chunk is not None:

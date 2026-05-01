@@ -27,6 +27,14 @@ def _cfg(x_storage: str, sparse_flat_chunk: int = 2048) -> AppConfig:
     )
 
 
+def _cfg_backed(x_storage: str) -> AppConfig:
+    return AppConfig(
+        io=IOConfig(overwrite=False, consolidate_metadata=False, x_storage=x_storage, backed=True),
+        chunks=ChunkConfig(x_row_chunk=2, x_col_chunk=2, sparse_flat_chunk=2048),
+        validation=ValidationConfig(),
+    )
+
+
 def _make_h5ad(path: Path) -> None:
     """Write a small CSR h5ad with a layer and raw."""
     X = sp.csr_matrix(np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]]))
@@ -74,22 +82,61 @@ def _flat_chunks(zarr_path: Path, group_path: str) -> tuple[int, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Backed loading (h5ad → zarr)
-# convert_h5ad_to_zarr always loads backed — all h5ad tests exercise the
+# Eager loading — default (h5ad → zarr)
+# In-memory CSR matrix: exercises da.from_array + map_blocks dask path for
+# dense, and direct write_elem for sparse.
+# ---------------------------------------------------------------------------
+
+def test_h5ad_eager_csr_output(tmp_path: Path) -> None:
+    _make_h5ad(tmp_path / "input.h5ad")
+    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csr"))
+    out = ad.read_zarr(str(tmp_path / "out.zarr"))
+    assert sp.isspmatrix_csr(out.X)
+    assert sp.isspmatrix_csr(out.layers["counts"])
+
+
+def test_h5ad_eager_csc_output(tmp_path: Path) -> None:
+    _make_h5ad(tmp_path / "input.h5ad")
+    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csc"))
+    out = ad.read_zarr(str(tmp_path / "out.zarr"))
+    assert sp.isspmatrix_csc(out.X)
+    assert sp.isspmatrix_csc(out.layers["counts"])
+
+
+def test_h5ad_eager_dense_output(tmp_path: Path) -> None:
+    """In-memory CSR written as dense via dask map_blocks path."""
+    _make_h5ad(tmp_path / "input.h5ad")
+    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("dense"))
+    out = ad.read_zarr(str(tmp_path / "out.zarr"))
+    assert not sp.issparse(out.X)
+    assert not sp.issparse(out.layers["counts"])
+
+
+# ---------------------------------------------------------------------------
+# Backed loading (h5ad → zarr, --backed flag)
 # _CSRDataset code paths in _write_matrix_direct and _write_sparse_as_dense_dask.
 # ---------------------------------------------------------------------------
 
-def test_h5ad_always_attempts_backed_read(tmp_path: Path) -> None:
+def test_h5ad_backed_flag_uses_backed_read(tmp_path: Path) -> None:
+    """--backed causes backed="r" load; omitting it causes eager load."""
+    _make_h5ad(tmp_path / "input.h5ad")
+    with patch("datascale.converter.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
+        convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csr"))
+    assert mocked.call_args_list[0].kwargs.get("backed") == "r"
+
+
+def test_h5ad_eager_does_not_use_backed_read(tmp_path: Path) -> None:
+    """Default (backed=False) uses eager load."""
     _make_h5ad(tmp_path / "input.h5ad")
     with patch("datascale.converter.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
         convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csr"))
-    assert mocked.call_args_list[0].kwargs.get("backed") == "r"
+    assert "backed" not in mocked.call_args_list[0].kwargs
 
 
 def test_h5ad_backed_csr_output(tmp_path: Path) -> None:
     """Backed _CSRDataset written as CSR — no format conversion needed."""
     _make_h5ad(tmp_path / "input.h5ad")
-    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csr"))
+    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csr"))
     out = ad.read_zarr(str(tmp_path / "out.zarr"))
     assert sp.isspmatrix_csr(out.X)
     assert sp.isspmatrix_csr(out.layers["counts"])
@@ -98,7 +145,7 @@ def test_h5ad_backed_csr_output(tmp_path: Path) -> None:
 def test_h5ad_backed_csc_output(tmp_path: Path) -> None:
     """Backed _CSRDataset loaded into memory and converted to CSC on write."""
     _make_h5ad(tmp_path / "input.h5ad")
-    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csc"))
+    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csc"))
     out = ad.read_zarr(str(tmp_path / "out.zarr"))
     assert sp.isspmatrix_csc(out.X)
     assert sp.isspmatrix_csc(out.layers["counts"])
@@ -107,7 +154,7 @@ def test_h5ad_backed_csc_output(tmp_path: Path) -> None:
 def test_h5ad_backed_dense_output(tmp_path: Path) -> None:
     """Backed _CSRDataset written as dense via dask delayed row-slice path."""
     _make_h5ad(tmp_path / "input.h5ad")
-    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("dense"))
+    convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("dense"))
     out = ad.read_zarr(str(tmp_path / "out.zarr"))
     assert not sp.issparse(out.X)
     assert not sp.issparse(out.layers["counts"])

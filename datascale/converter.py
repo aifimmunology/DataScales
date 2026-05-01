@@ -31,59 +31,51 @@ def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
 
 
 def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnData, list[str]]:
-    warnings: list[str] = []
-    try: #always attempt to load in 'backed' first
-        return ad.read_h5ad(input_path, backed="r"), warnings
-    except Exception as exc:
-        warnings.append(
-            "Backed read was unavailable; falling back to in-memory load "
-            f"({type(exc).__name__}: {exc})."
-        )
-    return ad.read_h5ad(input_path), warnings
+    if cfg.io.backed:
+        try:
+            return ad.read_h5ad(input_path, backed="r"), []
+        except Exception as exc:
+            raise ConversionError(
+                f"Backed load failed for {input_path} ({type(exc).__name__}: {exc}). "
+                "Remove --backed / set backed=false to load eagerly."
+            ) from exc
+    return ad.read_h5ad(input_path), []
 
 
 
-def _write_sparse_as_dense_dask(
+def _write_sparse_as_dense(
     group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
 ) -> None:
-    """Write a CSR sparse matrix as dense zarr using dask row-chunked conversion.
+    """Write a CSR matrix (in-memory or backed _CSRDataset) as a dense zarr array.
 
-    Peak memory: 1× sparse full load + (x_row_chunk × n_vars × dtype_bytes).
-    The full dense array is never allocated.
-    Uses synchronous dask scheduler if the matrix is HDF5-backed (not thread-safe).
+    Writes one row-chunk at a time so the full dense matrix is never materialised.
+    row_chunk is capped adaptively so one chunk does not exceed 64 MB regardless
+    of how many columns the matrix has.
     """
-    import dask
-    import dask.array as da
-    from anndata._io.specs import write_elem  # not part of the public API
+    import numpy as np
 
-    row_chunk = cfg.chunks.x_row_chunk
+    n_rows, n_cols = matrix.shape
+    dtype = matrix.dtype
+
+    # Cap row_chunk so a single dense chunk stays under 64 MB.
+    bytes_per_row = n_cols * np.dtype(dtype).itemsize
+    adaptive_row_chunk = max(1, (64 * 1024 * 1024) // bytes_per_row)
+    row_chunk = min(cfg.chunks.x_row_chunk, adaptive_row_chunk)
     col_chunk = cfg.chunks.x_col_chunk
 
-    backed = not hasattr(matrix, "indices")  # SparseDataset (backed) lacks .indices
-
-    if backed:
-        n_rows, n_cols = matrix.shape
-
-        chunks = [
-            da.from_delayed(
-                dask.delayed(lambda s=start: matrix[s : s + row_chunk].toarray())(),
-                shape=(min(row_chunk, n_rows - start), n_cols),
-                dtype=matrix.dtype,
-            )
-            for start in range(0, n_rows, row_chunk)
-        ]
-        dask_dense = da.concatenate(chunks, axis=0) #build chunks above, and store as dask array to be processed
-        with dask.config.set(scheduler="synchronous"):
-            write_elem(group, key, dask_dense, dataset_kwargs={"chunks": (row_chunk, col_chunk)})
-    else:
-        # In-memory CSR: wrap in dask and convert each row-chunk block to dense.
-        dask_sparse = da.from_array(matrix, chunks=(row_chunk, matrix.shape[1]))
-        dask_dense = dask_sparse.map_blocks(
-            lambda b: b.toarray() if sp.issparse(b) else b,
-            dtype=matrix.dtype,
+    zarr_arr = group.require_array(
+        key,
+        shape=(n_rows, n_cols),
+        dtype=dtype,
+        chunks=(row_chunk, col_chunk),
+        overwrite=True,
+    )
+    zarr_arr.attrs["encoding-type"] = "array"
+    zarr_arr.attrs["encoding-version"] = "0.2.0"
+    for start in range(0, n_rows, row_chunk):
+        zarr_arr[start : start + row_chunk, :] = (
+            matrix[start : start + row_chunk].toarray()
         )
-        with dask.config.set(scheduler="threads"):
-            write_elem(group, key, dask_dense, dataset_kwargs={"chunks": (row_chunk, col_chunk)})
 
 
 def _write_matrix_direct(
@@ -112,7 +104,7 @@ def _write_matrix_direct(
                 matrix = matrix.tocsr()  # backed CSC: load into memory and convert
             elif sp.issparse(matrix) and not sp.isspmatrix_csr(matrix):
                 matrix = matrix.tocsr() 
-            _write_sparse_as_dense_dask(group, matrix, key, cfg)
+            _write_sparse_as_dense(group, matrix, key, cfg)
             
         else:  #already dense #TODO make way for dense to be loaded chunk by chunk
             write_elem(group, key, matrix, dataset_kwargs={

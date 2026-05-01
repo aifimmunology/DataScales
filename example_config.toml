@@ -3,6 +3,9 @@ overwrite = false
 consolidate_metadata = false
 # x_storage: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense)
 x_storage = "sparse-csr"
+# backed: load h5ad in backed (HDF5-streamed) mode. Avoids loading X into RAM upfront.
+# Use for large files where peak memory matters. Errors if backed load fails.
+backed = false
 
 [chunks]
 #Chunk size for 2d dense arrays
