@@ -8,7 +8,6 @@ __pycache__/
 *.rds*
 *.zarr
 data/
-my_scripts/
 
 # C extensions
 *.so
