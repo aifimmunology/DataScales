@@ -44,6 +44,15 @@ def _make_h5ad(path: Path) -> None:
     adata.write_h5ad(path)
 
 
+def _make_csc_h5ad(path: Path) -> None:
+    """Write a small CSC h5ad where X requires CSR conversion."""
+    X = sp.csc_matrix(np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]]))
+    adata = ad.AnnData(X=X)
+    adata.layers["counts"] = sp.csr_matrix(X)
+    adata.raw = adata.copy()
+    adata.write_h5ad(path)
+
+
 def _make_large_h5ad(path: Path) -> None:
     """Write a larger CSR h5ad so nnz > any small flat_chunk."""
     rng = np.random.default_rng(0)
@@ -112,6 +121,16 @@ def test_h5ad_eager_dense_output(tmp_path: Path) -> None:
     assert not sp.issparse(out.layers["counts"])
 
 
+def test_h5ad_eager_csc_x_converts_to_csr_with_warning(tmp_path: Path) -> None:
+    _make_csc_h5ad(tmp_path / "input_csc.h5ad")
+    warnings = convert_h5ad_to_zarr(
+        str(tmp_path / "input_csc.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csr")
+    )
+    out = ad.read_zarr(str(tmp_path / "out.zarr"))
+    assert sp.isspmatrix_csr(out.X)
+    assert any("adata.X was CSC and has been converted to CSR in memory" in w for w in warnings)
+
+
 # ---------------------------------------------------------------------------
 # Backed loading (h5ad → zarr, --backed flag)
 # _CSRDataset code paths in _write_matrix_direct and _write_sparse_as_dense_dask.
@@ -158,6 +177,16 @@ def test_h5ad_backed_dense_output(tmp_path: Path) -> None:
     out = ad.read_zarr(str(tmp_path / "out.zarr"))
     assert not sp.issparse(out.X)
     assert not sp.issparse(out.layers["counts"])
+
+
+def test_h5ad_backed_csc_x_converts_to_csr_with_warning(tmp_path: Path) -> None:
+    _make_csc_h5ad(tmp_path / "input_csc.h5ad")
+    warnings = convert_h5ad_to_zarr(
+        str(tmp_path / "input_csc.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csr")
+    )
+    out = ad.read_zarr(str(tmp_path / "out.zarr"))
+    assert sp.isspmatrix_csr(out.X)
+    assert any("adata.X was CSC and has been converted to CSR in memory" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------

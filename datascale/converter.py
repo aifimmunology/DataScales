@@ -162,7 +162,12 @@ def _write_matrix_direct(
     write_elem(group, key, matrix, dataset_kwargs={"chunks": (capped,)})
 
 
-def _write_csr_adata_direct(adata: ad.AnnData, output_path: Path, cfg: AppConfig) -> None:
+def _write_csr_adata_direct(
+    adata: ad.AnnData,
+    output_path: Path,
+    cfg: AppConfig,
+    x_override: Any | None = None,
+) -> None:
     """Write an AnnData with CSR X (in-memory or backed SparseDataset) directly to zarr.
 
     Matrices are written with the target format and chunking in one step.
@@ -185,7 +190,8 @@ def _write_csr_adata_direct(adata: ad.AnnData, output_path: Path, cfg: AppConfig
     write_elem(store, "varp", dict(adata.varp))
 
     # X: written directly in target format (dask for dense, write_elem for sparse).
-    _write_matrix_direct(store, adata.X, "X", cfg)
+    x_matrix = x_override if x_override is not None else adata.X
+    _write_matrix_direct(store, x_matrix, "X", cfg)
 
     #Other layers are written with same storage format, outside of the X matrix.
     if adata.layers:
@@ -216,22 +222,42 @@ def _write_adata_to_zarr(
     cfg: AppConfig,
     load_warnings: list[str],
 ) -> list[str]:
-    """Write AnnData to zarr. Requires adata.X to be CSR (in-memory or backed SparseDataset)."""
+    """Write AnnData to zarr.
+
+    adata.X is expected to be CSR, but CSC is accepted and converted to CSR
+    in memory with a warning.
+    """
+    warnings = list(load_warnings)
+    x_for_write: Any | None = None
+
     is_csr = sp.isspmatrix_csr(adata.X) or (
-        not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csr" #backed mode
+        not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csr"  # backed mode
     )
+    is_csc = sp.isspmatrix_csc(adata.X) or (
+        not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csc"  # backed mode
+    )
+
     if not is_csr:
-        raise ConversionError(
-            f"adata.X must be CSR format. Got: {type(adata.X).__name__}"
-        )
+        if is_csc:
+            if sp.issparse(adata.X):
+                x_for_write = adata.X.tocsr()
+            else:
+                x_for_write = adata.X[:].tocsr()
+            warnings.append(
+                "adata.X was CSC and has been converted to CSR in memory before zarr conversion."
+            )
+        else:
+            raise ConversionError(
+                f"adata.X must be CSR or CSC format. Got: {type(adata.X).__name__}"
+            )
 
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
     _prepare_output_path(output_path, cfg.io.overwrite)
     ad.settings.zarr_write_format = 3
 
-    _write_csr_adata_direct(adata, output_path, cfg)
+    _write_csr_adata_direct(adata, output_path, cfg, x_override=x_for_write)
     zarr.consolidate_metadata(str(output_path))
-    return [*load_warnings, *validation_result.warnings]
+    return [*warnings, *validation_result.warnings]
 
 
 def convert_h5ad_to_zarr(input_h5ad: str, output_zarr: str, cfg: AppConfig) -> list[str]:
