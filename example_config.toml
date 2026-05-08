@@ -3,23 +3,12 @@ overwrite = false
 consolidate_metadata = false
 # x_storage: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense)
 x_storage = "sparse-csr"
-# backed: load h5ad in backed (HDF5-streamed) mode. Avoids loading X into RAM upfront.
-# Use for large files where peak memory matters. Errors if backed load fails.
 backed = false
 
 [chunks]
-# Row/column chunk size for dense 2D arrays (X, layers, raw.X).
-# x_row_chunk is also capped automatically so one chunk stays under 64 MB,
-# so raising this only helps wide matrices if you have the RAM to spare.
 x_row_chunk = 1000
 x_col_chunk = 1000
-# Flat chunk size for sparse 1D arrays (data / indices / indptr).
-# Tune to the median non-zero count per row for your dataset.
 sparse_flat_chunk = 4096
-# Number of worker threads used when writing dense chunks.
-# 1 (default) is safe everywhere. Raise on HPC or multi-core servers to
-# parallelise the .toarray() + zarr-write pipeline. Ignored when --backed
-# is set (h5py reads are not thread-safe).
 n_dense_workers = 1
 
 [validation]

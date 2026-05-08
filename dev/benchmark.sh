@@ -21,10 +21,10 @@ JOBS=(
     "pbmc3k_raw     sparse-csr|pixi run datascale convert-h5ad --input ./data/pbmc3k_raw.h5ad --output $TMP_ZARR --overwrite --x-storage sparse-csr"
     "pbmc3k_raw     sparse-csc|pixi run datascale convert-h5ad --input ./data/pbmc3k_raw.h5ad --output $TMP_ZARR --overwrite --x-storage sparse-csc"
     "pbmc3k_raw     dense(eager)|pixi run datascale convert-h5ad --input ./data/pbmc3k_raw.h5ad --output $TMP_ZARR --overwrite --x-storage dense"
-    "pbmc3k_raw     dense(naive)|pixi run python my_scripts/naive_dense_convert.py --input ./data/pbmc3k_raw.h5ad --output $TMP_ZARR --overwrite"
+    "pbmc3k_raw     dense(naive)|pixi run python ./dev/naive_dense_convert.py --input ./data/pbmc3k_raw.h5ad --output $TMP_ZARR --overwrite"
     "scanpy_pbmc3k  sparse-csr|pixi run datascale convert-h5ad --input ./data/scanpy-pbmc3k.h5ad --output $TMP_ZARR --overwrite --x-storage sparse-csr"
     "scanpy_pbmc3k  dense(eager)|pixi run datascale convert-h5ad --input ./data/scanpy-pbmc3k.h5ad --output $TMP_ZARR --overwrite --x-storage dense"
-    "scanpy_pbmc3k  dense(naive)|pixi run python my_scripts/naive_dense_convert.py --input ./data/scanpy-pbmc3k.h5ad --output $TMP_ZARR --overwrite"
+    "scanpy_pbmc3k  dense(naive)|pixi run python ./dev/naive_dense_convert.py --input ./data/scanpy-pbmc3k.h5ad --output $TMP_ZARR --overwrite"
     "health_atlas   sparse-csr|pixi run datascale convert-h5ad --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite --x-storage sparse-csr"
     "health_atlas   sparse-csc|pixi run datascale convert-h5ad --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite --x-storage sparse-csc"
     "health_atlas   dense(w=1)|pixi run datascale convert-h5ad --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite --x-storage dense --n-dense-workers 1"
@@ -32,7 +32,7 @@ JOBS=(
     "health_atlas   dense(w=4)|pixi run datascale convert-h5ad --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite --x-storage dense --n-dense-workers 4"
     "health_atlas   dense(w=8)|pixi run datascale convert-h5ad --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite --x-storage dense --n-dense-workers 8"
     "health_atlas   dense(backed)|pixi run datascale convert-h5ad --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite --x-storage dense --backed"
-    "health_atlas   dense(naive)|pixi run python my_scripts/naive_dense_convert.py --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite"
+    "health_atlas   dense(naive)|pixi run python ./dev/naive_dense_convert.py --input ./data/human_immune_health_atlas_other.h5ad --output $TMP_ZARR --overwrite"
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
