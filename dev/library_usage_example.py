@@ -9,7 +9,7 @@ cfg = load_config("example_config.toml")
 
 cfg = AppConfig(
     io=IOConfig(overwrite=True, x_storage="dense", backed=True),
-    chunks=ChunkConfig(n_dense_workers=4),
+    chunks=ChunkConfig(cpus=4),
 )
 
 warnings = convert_h5ad_to_zarr(

@@ -91,7 +91,7 @@ All commands share the same optional flags:
 | `--overwrite` | Optional | Overwrite output path if it already exists, else it throws error that folder already exists |
 | `--x-storage` | Optional | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
 | `--backed` | Optional | Stream X from disk without loading into RAM. Only on h5ad in `convert-h5ad`. Saves some peak memory at cost of a little speed |
-| `--n-dense-workers` | Optional | Threads for writing to dense output storage. Only works on dense, and without `--backed` flag on |
+| `--cpus` | Optional | Threads for parallel matrix chunk writes (dense + sparse). No effect with `--backed` |
 | `--x-row-chunk` | Optional | Row chunk size for dense X (auto-capped at 64 MB per chunk) |
 | `--x-col-chunk` | Optional | Column chunk size for dense X |
 | `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays. Best tuned to median nnz per row |

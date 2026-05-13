@@ -64,7 +64,7 @@ def _write_sparse_as_dense_dask(
     """Write a CSR matrix (in-memory or backed _CSRDataset) as a dense zarr array.
 
     Uses da.store() to write one row-chunk at a time — the full dense matrix is never
-    materialised. For in-memory CSR, cfg.chunks.n_dense_workers threads process chunks
+    materialised. For in-memory CSR, cfg.chunks.cpus threads process chunks
     in parallel (each thread: .toarray() one slice, write one zarr chunk). For backed
     _CSRDataset, synchronous scheduler is enforced because h5py is not thread-safe.
 
@@ -128,7 +128,7 @@ def _write_sparse_as_dense_dask(
             da.store(
                 dask_dense, zarr_arr,
                 scheduler="threads",
-                num_workers=cfg.chunks.n_dense_workers,
+                num_workers=cfg.chunks.cpus,
             )
 
 
@@ -142,8 +142,8 @@ def _write_matrix_direct(
 
     Dispatches based on cfg.io.x_storage:
       dense      → dask row-chunked write; CSC converted to CSR first for row slicing
-      sparse-csr → ensure CSR, write_elem with flat chunks
-      sparse-csc → ensure CSC, write_elem with flat chunks
+      sparse-csr → ensure CSR, stream row-batches via dask (parallel for in-memory input)
+      sparse-csc → ensure CSC, stream col-batches via dask (parallel for in-memory input)
     """
     from anndata._io.specs import write_elem  # not part of the public API
 
@@ -167,6 +167,9 @@ def _write_matrix_direct(
         return
 
     # Sparse output (sparse-csr, sparse-csc).
+    # For backed input whose format doesn't match the target, we have no choice but to
+    # load into memory and convert (no incremental transpose). For matching format
+    # (CSR→CSR or CSC→CSC), streaming works directly from backed storage.
     if is_backed_sparse:
         dataset_format = getattr(matrix, "format", None)
         if mode == "sparse-csc" and dataset_format != "csc":
@@ -174,20 +177,132 @@ def _write_matrix_direct(
             matrix = matrix[:].tocsc()
         elif mode == "sparse-csr" and dataset_format != "csr":
             matrix = matrix[:].tocsr()
-        
-
-        nnz = getattr(matrix, "nnz", None)
-        capped = min(cfg.chunks.sparse_flat_chunk, max(1, nnz)) if nnz is not None else cfg.chunks.sparse_flat_chunk
-        write_elem(group, key, matrix, dataset_kwargs={"chunks": (capped,)})
-        return
-    
-    elif mode == "sparse-csr" and not sp.isspmatrix_csr(matrix):
+    elif mode == "sparse-csr" and sp.issparse(matrix) and not sp.isspmatrix_csr(matrix):
         matrix = matrix.tocsr()
-    elif mode == "sparse-csc" and not sp.isspmatrix_csc(matrix):
+    elif mode == "sparse-csc" and sp.issparse(matrix) and not sp.isspmatrix_csc(matrix):
         matrix = matrix.tocsc()
 
-    capped = min(cfg.chunks.sparse_flat_chunk, max(1, matrix.nnz))  # matrix is always in-memory scipy here
-    write_elem(group, key, matrix, dataset_kwargs={"chunks": (capped,)})
+    _write_sparse_streaming(group, matrix, key, cfg, csr=(mode == "sparse-csr"))
+
+
+def _write_sparse_streaming(
+    group: zarr.Group, matrix: Any, key: str, cfg: AppConfig, csr: bool
+) -> None:
+    """Stream a sparse matrix to zarr as a CSR/CSC group with per-batch dask writes.
+
+    Reads ``matrix.indptr`` upfront (small, ~8B per row/col) to know exact output
+    offsets, then writes ``data`` and ``indices`` in row/col batches in parallel.
+    Peak RAM per worker ≈ batch_rows × avg_nnz_per_row × (data_itemsize + 4).
+
+    Works for in-memory scipy sparse and backed _CSRDataset/_CSCDataset (h5py).
+    Backed input uses synchronous scheduler (h5py is not thread-safe);
+    in-memory uses ``cfg.chunks.cpus`` threads.
+    """
+    import warnings
+    import numpy as np
+    import dask
+    import dask.array as da
+    from dask.diagnostics import ProgressBar
+
+    n_rows, n_cols = matrix.shape
+    # CSR iterates over rows; CSC iterates over columns.
+    n_major = n_rows if csr else n_cols
+
+    # indptr is small (~8B per row); load fully to compute exact offsets.
+    # Backed _CSRDataset/_CSCDataset doesn't expose .indptr directly — read from
+    # the underlying h5py group instead.
+    if sp.issparse(matrix):
+        indptr_full = np.asarray(matrix.indptr)
+    elif hasattr(matrix, "indptr"):
+        indptr_full = np.asarray(matrix.indptr[:])
+    elif hasattr(matrix, "group"):
+        indptr_full = np.asarray(matrix.group["indptr"][:])
+    else:
+        raise ConversionError(
+            f"Cannot locate indptr on sparse input of type {type(matrix).__name__}"
+        )
+    nnz_total = int(indptr_full[-1])
+
+    backed = not sp.issparse(matrix)  # backed _CSRDataset / _CSCDataset
+    indices_dtype = np.int32  # match scipy default; values fit unless > 2^31 cols/rows
+
+    # ── Create output group + arrays ──────────────────────────────────────────
+    sp_group = group.require_group(key)
+    sp_group.attrs["encoding-type"] = "csr_matrix" if csr else "csc_matrix"
+    sp_group.attrs["encoding-version"] = "0.1.0"
+    sp_group.attrs["shape"] = [n_rows, n_cols]
+
+    flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
+    data_arr = sp_group.require_array(
+        "data", shape=(nnz_total,), dtype=matrix.dtype,
+        chunks=(flat_chunk,), overwrite=True,
+    )
+    indices_arr = sp_group.require_array(
+        "indices", shape=(nnz_total,), dtype=indices_dtype,
+        chunks=(flat_chunk,), overwrite=True,
+    )
+    indptr_arr = sp_group.require_array(
+        "indptr", shape=(n_major + 1,), dtype=indptr_full.dtype,
+        chunks=(n_major + 1,), overwrite=True,
+    )
+    for a in (data_arr, indices_arr, indptr_arr):
+        a.attrs["encoding-type"] = "array"
+        a.attrs["encoding-version"] = "0.2.0"
+
+    # indptr is small — write it directly.
+    indptr_arr[:] = indptr_full
+
+    # ── Build dask arrays for data + indices via delayed row/col batches ──────
+    batch_size = max(1, cfg.chunks.sparse_row_batch)
+    batch_starts = list(range(0, n_major, batch_size))
+
+    def _load_batch(m, b0: int, b1: int):
+        # Slicing returns scipy sparse for both backed and in-memory inputs.
+        return m[b0:b1] if csr else m[:, b0:b1]
+
+    data_parts = []
+    indices_parts = []
+    nonempty = 0
+    for b0 in batch_starts:
+        b1 = min(b0 + batch_size, n_major)
+        batch_nnz = int(indptr_full[b1] - indptr_full[b0])
+        if batch_nnz == 0:
+            continue
+        nonempty += 1
+        # One delayed batch shared by both data and indices to avoid loading twice.
+        batch = dask.delayed(_load_batch)(matrix, b0, b1)
+        data_parts.append(da.from_delayed(
+            dask.delayed(lambda b: np.asarray(b.data))(batch),
+            shape=(batch_nnz,), dtype=matrix.dtype,
+        ))
+        indices_parts.append(da.from_delayed(
+            dask.delayed(lambda b: np.asarray(b.indices, dtype=indices_dtype))(batch),
+            shape=(batch_nnz,), dtype=indices_dtype,
+        ))
+
+    if nonempty == 0:
+        # all-zero matrix: indptr already written, data/indices are empty
+        return
+
+    data_dask = da.concatenate(data_parts)
+    indices_dask = da.concatenate(indices_parts)
+
+    # ── Store: parallel threads for in-memory, synchronous for backed (h5py) ──
+    if backed and cfg.chunks.cpus > 1:
+        warnings.warn(
+            f"Backed sparse input forces synchronous writes "
+            f"(cpus={cfg.chunks.cpus} ignored; h5py is not thread-safe).",
+            UserWarning, stacklevel=2,
+        )
+
+    scheduler = "synchronous" if backed else "threads"
+    with ProgressBar():
+        da.store(
+            [data_dask, indices_dask],
+            [data_arr, indices_arr],
+            scheduler=scheduler,
+            num_workers=1 if backed else cfg.chunks.cpus,
+        )
 
 
 def _write_csr_adata_direct(
