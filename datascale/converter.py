@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import shutil
+import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,18 @@ from .validation import validate_single_cell_anndata
 
 class ConversionError(RuntimeError):
     """Raised when conversion cannot be completed."""
+
+
+@contextmanager
+def _stage(label: str):
+    """Print a labelled progress line with elapsed time. Flushes immediately."""
+    print(f"  → {label} ...", end="", flush=True, file=sys.stderr)
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        print(f" done ({dt:.2f}s)", flush=True, file=sys.stderr)
 
 
 def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
@@ -103,15 +118,18 @@ def _write_sparse_as_dense_dask(
     zarr_arr.attrs["encoding-version"] = "0.2.0"
 
     backed = not hasattr(matrix, "indices")  # backed _CSRDataset lacks .indices
+    from dask.diagnostics import ProgressBar
     if backed:
         # h5py is not thread-safe: one chunk at a time.
-        da.store(dask_dense, zarr_arr, scheduler="synchronous")
+        with ProgressBar():
+            da.store(dask_dense, zarr_arr, scheduler="synchronous")
     else:
-        da.store(
-            dask_dense, zarr_arr,
-            scheduler="threads",
-            num_workers=cfg.chunks.n_dense_workers,
-        )
+        with ProgressBar():
+            da.store(
+                dask_dense, zarr_arr,
+                scheduler="threads",
+                num_workers=cfg.chunks.n_dense_workers,
+            )
 
 
 def _write_matrix_direct(
@@ -191,32 +209,48 @@ def _write_csr_adata_direct(
     store.attrs["encoding-version"] = "0.1.0"
 
     # Metadata components: write_elem sets the correct encoding-type on each.
-    write_elem(store, "obs", adata.obs)
-    write_elem(store, "var", adata.var)
-    write_elem(store, "uns", dict(adata.uns))
-    write_elem(store, "obsm", dict(adata.obsm))
-    write_elem(store, "varm", dict(adata.varm))
-    write_elem(store, "obsp", dict(adata.obsp))
-    write_elem(store, "varp", dict(adata.varp))
+    with _stage(f"obs ({adata.n_obs} rows, {len(adata.obs.columns)} cols)"):
+        write_elem(store, "obs", adata.obs)
+    with _stage(f"var ({adata.n_vars} rows, {len(adata.var.columns)} cols)"):
+        write_elem(store, "var", adata.var)
+    with _stage("uns"):
+        write_elem(store, "uns", dict(adata.uns))
+    with _stage(f"obsm ({len(adata.obsm)} keys)"):
+        write_elem(store, "obsm", dict(adata.obsm))
+    with _stage(f"varm ({len(adata.varm)} keys)"):
+        write_elem(store, "varm", dict(adata.varm))
+    with _stage(f"obsp ({len(adata.obsp)} keys)"):
+        write_elem(store, "obsp", dict(adata.obsp))
+    with _stage(f"varp ({len(adata.varp)} keys)"):
+        write_elem(store, "varp", dict(adata.varp))
 
     # X: written directly in target format (dask for dense, write_elem for sparse).
     x_matrix = x_override if x_override is not None else adata.X
-    _write_matrix_direct(store, x_matrix, "X", cfg)
+    x_nnz = getattr(x_matrix, "nnz", None)
+    x_info = f"shape={x_matrix.shape}, mode={cfg.io.x_storage}"
+    if x_nnz is not None:
+        x_info += f", nnz={x_nnz}"
+    with _stage(f"X ({x_info})"):
+        _write_matrix_direct(store, x_matrix, "X", cfg)
 
     #Other layers are written with same storage format, outside of the X matrix.
     if adata.layers:
         write_elem(store, "layers", {})
         layers_group = store["layers"]
         for name, data in adata.layers.items():
-            _write_matrix_direct(layers_group, data, name, cfg)
+            with _stage(f"layers/{name} (shape={data.shape})"):
+                _write_matrix_direct(layers_group, data, name, cfg)
 
     if adata.raw is not None:
         raw_group = store.require_group("raw")
         raw_group.attrs["encoding-type"] = "raw"
         raw_group.attrs["encoding-version"] = "0.1.0"
-        write_elem(raw_group, "var", adata.raw.var)
-        write_elem(raw_group, "varm", dict(adata.raw.varm))
-        _write_matrix_direct(raw_group, adata.raw.X, "X", cfg)
+        with _stage("raw/var"):
+            write_elem(raw_group, "var", adata.raw.var)
+        with _stage(f"raw/varm ({len(adata.raw.varm)} keys)"):
+            write_elem(raw_group, "varm", dict(adata.raw.varm))
+        with _stage(f"raw/X (shape={adata.raw.X.shape})"):
+            _write_matrix_direct(raw_group, adata.raw.X, "X", cfg)
 
 
 def _close_backed_if_needed(adata: ad.AnnData) -> None:
@@ -265,8 +299,19 @@ def _write_adata_to_zarr(
     _prepare_output_path(output_path, cfg.io.overwrite)
     ad.settings.zarr_write_format = 3
 
+    print(
+        f"Converting AnnData to zarr → {output_path} "
+        f"(n_obs={adata.n_obs}, n_vars={adata.n_vars}, x_storage={cfg.io.x_storage})",
+        flush=True, file=sys.stderr,
+    )
+    t0 = time.perf_counter()
     _write_csr_adata_direct(adata, output_path, cfg, x_override=x_for_write)
-    zarr.consolidate_metadata(str(output_path))
+    with _stage("consolidate_metadata"):
+        zarr.consolidate_metadata(str(output_path))
+    print(
+        f"Total write time: {time.perf_counter() - t0:.2f}s",
+        flush=True, file=sys.stderr,
+    )
     return [*warnings, *validation_result.warnings]
 
 
