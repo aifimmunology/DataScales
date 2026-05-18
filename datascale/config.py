@@ -29,7 +29,7 @@ class ChunkConfig:
     x_row_chunk: int = 2048
     x_col_chunk: int = 2048
     sparse_flat_chunk: int = 4096
-    n_dense_workers: int = 1  # threads for parallel dense chunk writes; raise on HPC, keep 1 for backed
+    cpus: int = 1  # threads for parallel matrix chunk writes (dense + sparse); raise on HPC, ignored when backed
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,7 @@ def apply_cli_overrides(
     x_row_chunk: int | None = None,
     x_col_chunk: int | None = None,
     sparse_flat_chunk: int | None = None,
-    n_dense_workers: int | None = None,
+    cpus: int | None = None,
     backed: bool | None = None,
 ) -> AppConfig:
     io_cfg = config.io
@@ -155,7 +155,7 @@ def apply_cli_overrides(
         chunk_cfg = replace(chunk_cfg, x_col_chunk=x_col_chunk)
     if sparse_flat_chunk is not None:
         chunk_cfg = replace(chunk_cfg, sparse_flat_chunk=sparse_flat_chunk)
-    if n_dense_workers is not None:
-        chunk_cfg = replace(chunk_cfg, n_dense_workers=n_dense_workers)
+    if cpus is not None:
+        chunk_cfg = replace(chunk_cfg, cpus=cpus)
 
     return _validate_config(replace(config, io=io_cfg, chunks=chunk_cfg))

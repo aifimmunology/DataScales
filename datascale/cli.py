@@ -51,9 +51,9 @@ def _add_common_args(
         help="Flat chunk size for sparse arrays (data/indices/indptr); tune to median nnz per row (default: 4096)",
     )
     optional.add_argument(
-        "--n-dense-workers",
+        "--cpus",
         type=int,
-        help="Threads for parallel dense chunk writes (default: 1). Raise on HPC. No effect with --backed.",
+        help="Threads for parallel matrix chunk writes, dense and sparse (default: 1). Raise on HPC. No effect with --backed.",
     )
 
 
@@ -104,7 +104,7 @@ def run(argv: list[str] | None = None) -> int:
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
             sparse_flat_chunk=args.sparse_flat_chunk,
-            n_dense_workers=getattr(args, "n_dense_workers", None),
+            cpus=getattr(args, "cpus", None),
             backed=True if getattr(args, "backed", False) else None,
         )
 
@@ -119,8 +119,8 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Chunks: ({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})")
     print(f"X storage mode: {config.io.x_storage}")
     print(f"Backed load: {config.io.backed}")
-    if config.io.x_storage == "dense" and not config.io.backed:
-        print(f"Dense workers: {config.chunks.n_dense_workers}")
+    if not config.io.backed:
+        print(f"CPUs: {config.chunks.cpus}")
 
     if warnings:
         print("Warnings:")

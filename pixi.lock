@@ -5358,7 +5358,7 @@ packages:
 - pypi: ./
   name: datascale
   version: 0.1.0
-  sha256: f969bc2f76b7846269be7ccbd7df2b06b842cb817d525628c252140d65d7ae12
+  sha256: 1070615b555792e07478093d13cfc1bd99461a269636a957b40682b9733b28b5
   requires_dist:
   - anndata>=0.10.0
   - zarr>=2.18.0
