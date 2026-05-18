@@ -45,15 +45,17 @@ def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
 
 
 def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnData, list[str]]:
-    if cfg.io.backed:
-        try:
-            return ad.read_h5ad(input_path, backed="r"), []
-        except Exception as exc:
-            raise ConversionError(
-                f"Backed load failed for {input_path} ({type(exc).__name__}: {exc}). "
-                "Remove --backed / set backed=false to load eagerly."
-            ) from exc
-    return ad.read_h5ad(input_path), []
+    mode = "backed (streaming)" if cfg.io.backed else "eager (full load)"
+    with _stage(f"Reading {input_path} [{mode}]"):
+        if cfg.io.backed:
+            try:
+                return ad.read_h5ad(input_path, backed="r"), []
+            except Exception as exc:
+                raise ConversionError(
+                    f"Backed load failed for {input_path} ({type(exc).__name__}: {exc}). "
+                    "Remove --backed / set backed=false to load eagerly."
+                ) from exc
+        return ad.read_h5ad(input_path), []
 
 
 
