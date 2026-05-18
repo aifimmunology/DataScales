@@ -28,7 +28,7 @@ class IOConfig:
 class ChunkConfig:
     x_row_chunk: int = 2048
     x_col_chunk: int = 2048
-    sparse_flat_chunk: int = 4096
+    sparse_flat_chunk: int = 1_000_000
     cpus: int = 1  # threads for parallel matrix chunk writes (dense + sparse); raise on HPC, ignored when backed
 
 

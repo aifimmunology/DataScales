@@ -70,7 +70,7 @@ x_storage = "sparse-csr"
 x_row_chunk = 2048
 x_col_chunk = 2048
 #Tune 1d Shunk size for sparse array storage. #Reccomended to tune to median nnz per row.
-sparse_flat_chunk = 4096
+sparse_flat_chunk = 1000000
 
 [validation]
 reject_spatial = true

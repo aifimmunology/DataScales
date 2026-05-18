@@ -48,7 +48,7 @@ def _add_common_args(
     optional.add_argument(
         "--sparse-flat-chunk",
         type=int,
-        help="Flat chunk size for sparse arrays (data/indices/indptr); tune to median nnz per row (default: 4096)",
+        help="Flat chunk size for sparse arrays (data/indices/indptr); tune to median nnz per row (default: 1000000)",
     )
     optional.add_argument(
         "--cpus",
