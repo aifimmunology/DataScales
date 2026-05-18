@@ -253,7 +253,15 @@ def _write_sparse_streaming(
     indptr_arr[:] = indptr_full
 
     # ── Build dask arrays for data + indices via delayed row/col batches ──────
-    batch_size = max(1, cfg.chunks.sparse_row_batch)
+    # Auto-tune batch size: target ~256 MB per batch in RAM so multiple workers
+    # fit comfortably even on tight memory. RAM per batch ≈ batch × avg_nnz ×
+    # (data_itemsize + indices_itemsize). Clamped to [1k, 200k] majors.
+    _TARGET_BATCH_BYTES = 256 * 1024 * 1024
+    avg_nnz_per_major = max(1, nnz_total // max(1, n_major))
+    bytes_per_major = avg_nnz_per_major * (
+        np.dtype(matrix.dtype).itemsize + np.dtype(indices_dtype).itemsize
+    )
+    batch_size = max(1_000, min(200_000, _TARGET_BATCH_BYTES // max(1, bytes_per_major)))
     batch_starts = list(range(0, n_major, batch_size))
 
     def _load_batch(m, b0: int, b1: int):

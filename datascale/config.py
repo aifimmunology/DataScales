@@ -29,7 +29,6 @@ class ChunkConfig:
     x_row_chunk: int = 2048
     x_col_chunk: int = 2048
     sparse_flat_chunk: int = 4096
-    sparse_row_batch: int = 50_000  # rows per streaming batch for sparse writes
     cpus: int = 1  # threads for parallel matrix chunk writes (dense + sparse); raise on HPC, ignored when backed
 
 
@@ -136,7 +135,6 @@ def apply_cli_overrides(
     x_row_chunk: int | None = None,
     x_col_chunk: int | None = None,
     sparse_flat_chunk: int | None = None,
-    sparse_row_batch: int | None = None,
     cpus: int | None = None,
     backed: bool | None = None,
 ) -> AppConfig:
@@ -157,8 +155,6 @@ def apply_cli_overrides(
         chunk_cfg = replace(chunk_cfg, x_col_chunk=x_col_chunk)
     if sparse_flat_chunk is not None:
         chunk_cfg = replace(chunk_cfg, sparse_flat_chunk=sparse_flat_chunk)
-    if sparse_row_batch is not None:
-        chunk_cfg = replace(chunk_cfg, sparse_row_batch=sparse_row_batch)
     if cpus is not None:
         chunk_cfg = replace(chunk_cfg, cpus=cpus)
 

@@ -51,11 +51,6 @@ def _add_common_args(
         help="Flat chunk size for sparse arrays (data/indices/indptr); tune to median nnz per row (default: 4096)",
     )
     optional.add_argument(
-        "--sparse-row-batch",
-        type=int,
-        help="Rows per streaming batch for sparse writes (default: 50000). Larger = more RAM per worker, fewer round-trips.",
-    )
-    optional.add_argument(
         "--cpus",
         type=int,
         help="Threads for parallel matrix chunk writes, dense and sparse (default: 1). Raise on HPC. No effect with --backed.",
@@ -109,7 +104,6 @@ def run(argv: list[str] | None = None) -> int:
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
             sparse_flat_chunk=args.sparse_flat_chunk,
-            sparse_row_batch=args.sparse_row_batch,
             cpus=getattr(args, "cpus", None),
             backed=True if getattr(args, "backed", False) else None,
         )
