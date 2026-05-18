@@ -22,13 +22,12 @@ class ConversionError(RuntimeError):
 @contextmanager
 def _stage(label: str):
     """Print a labelled progress line with elapsed time. Flushes immediately."""
-    print(f"  → {label} ...", end="", flush=True, file=sys.stderr)
+    print(f"→ {label} ...", flush=True, file=sys.stderr)
     t0 = time.perf_counter()
     try:
         yield
     finally:
-        dt = time.perf_counter() - t0
-        print(f" done ({dt:.2f}s)", flush=True, file=sys.stderr)
+        print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True, file=sys.stderr)
 
 
 def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
@@ -79,14 +78,14 @@ def _write_sparse_as_dense_dask(
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
-    # Cap row_chunk so one dense chunk stays under 64 MB.
+    # Cap row_chunk so one dense chunk stays under 512 MB.
     bytes_per_row = n_cols * np.dtype(dtype).itemsize
-    adaptive_row_chunk = max(1, (64 * 1024 * 1024) // bytes_per_row)
+    adaptive_row_chunk = max(1, (512 * 1024 * 1024) // bytes_per_row)
     row_chunk = min(cfg.chunks.x_row_chunk, adaptive_row_chunk)
     if adaptive_row_chunk < cfg.chunks.x_row_chunk:
         warnings.warn(
             f"x_row_chunk reduced from {cfg.chunks.x_row_chunk} to {row_chunk} "
-            f"for key '{key}' to keep one dense chunk under 64 MB "
+            f"for key '{key}' to keep one dense chunk under 512 MB "
             f"({n_cols} cols × {np.dtype(dtype).itemsize} bytes = "
             f"{bytes_per_row / (1024 * 1024):.1f} MB/row).",
             UserWarning,
@@ -121,10 +120,10 @@ def _write_sparse_as_dense_dask(
     from dask.diagnostics import ProgressBar
     if backed:
         # h5py is not thread-safe: one chunk at a time.
-        with ProgressBar():
+        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
             da.store(dask_dense, zarr_arr, scheduler="synchronous")
     else:
-        with ProgressBar():
+        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
             da.store(
                 dask_dense, zarr_arr,
                 scheduler="threads",
@@ -304,7 +303,7 @@ def _write_sparse_streaming(
         )
 
     scheduler = "synchronous" if backed else "threads"
-    with ProgressBar():
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(
             [data_dask, indices_dask],
             [data_arr, indices_arr],
@@ -331,48 +330,39 @@ def _write_csr_adata_direct(
     store.attrs["encoding-type"] = "anndata"
     store.attrs["encoding-version"] = "0.1.0"
 
-    # Metadata components: write_elem sets the correct encoding-type on each.
-    with _stage(f"obs ({adata.n_obs} rows, {len(adata.obs.columns)} cols)"):
+    # Metadata components — all small, written as one stage.
+    with _stage("Writing metadata (obs/var/uns/obsm/varm/obsp/varp)"):
         write_elem(store, "obs", adata.obs)
-    with _stage(f"var ({adata.n_vars} rows, {len(adata.var.columns)} cols)"):
         write_elem(store, "var", adata.var)
-    with _stage("uns"):
         write_elem(store, "uns", dict(adata.uns))
-    with _stage(f"obsm ({len(adata.obsm)} keys)"):
         write_elem(store, "obsm", dict(adata.obsm))
-    with _stage(f"varm ({len(adata.varm)} keys)"):
         write_elem(store, "varm", dict(adata.varm))
-    with _stage(f"obsp ({len(adata.obsp)} keys)"):
         write_elem(store, "obsp", dict(adata.obsp))
-    with _stage(f"varp ({len(adata.varp)} keys)"):
         write_elem(store, "varp", dict(adata.varp))
 
-    # X: written directly in target format (dask for dense, write_elem for sparse).
+    # X: the heavy step — sub-progress comes from dask's ProgressBar inside.
     x_matrix = x_override if x_override is not None else adata.X
     x_nnz = getattr(x_matrix, "nnz", None)
-    x_info = f"shape={x_matrix.shape}, mode={cfg.io.x_storage}"
+    x_info = f"shape={x_matrix.shape}, {cfg.io.x_storage}"
     if x_nnz is not None:
         x_info += f", nnz={x_nnz}"
-    with _stage(f"X ({x_info})"):
+    with _stage(f"Writing X ({x_info})"):
         _write_matrix_direct(store, x_matrix, "X", cfg)
 
-    #Other layers are written with same storage format, outside of the X matrix.
     if adata.layers:
         write_elem(store, "layers", {})
         layers_group = store["layers"]
         for name, data in adata.layers.items():
-            with _stage(f"layers/{name} (shape={data.shape})"):
+            with _stage(f"Writing layers/{name} (shape={data.shape})"):
                 _write_matrix_direct(layers_group, data, name, cfg)
 
     if adata.raw is not None:
         raw_group = store.require_group("raw")
         raw_group.attrs["encoding-type"] = "raw"
         raw_group.attrs["encoding-version"] = "0.1.0"
-        with _stage("raw/var"):
-            write_elem(raw_group, "var", adata.raw.var)
-        with _stage(f"raw/varm ({len(adata.raw.varm)} keys)"):
-            write_elem(raw_group, "varm", dict(adata.raw.varm))
-        with _stage(f"raw/X (shape={adata.raw.X.shape})"):
+        write_elem(raw_group, "var", adata.raw.var)
+        write_elem(raw_group, "varm", dict(adata.raw.varm))
+        with _stage(f"Writing raw/X (shape={adata.raw.X.shape})"):
             _write_matrix_direct(raw_group, adata.raw.X, "X", cfg)
 
 
@@ -423,16 +413,15 @@ def _write_adata_to_zarr(
     ad.settings.zarr_write_format = 3
 
     print(
-        f"Converting AnnData to zarr → {output_path} "
-        f"(n_obs={adata.n_obs}, n_vars={adata.n_vars}, x_storage={cfg.io.x_storage})",
+        f"Converting → {output_path} "
+        f"(n_obs={adata.n_obs}, n_vars={adata.n_vars}, {cfg.io.x_storage})",
         flush=True, file=sys.stderr,
     )
     t0 = time.perf_counter()
     _write_csr_adata_direct(adata, output_path, cfg, x_override=x_for_write)
-    with _stage("consolidate_metadata"):
-        zarr.consolidate_metadata(str(output_path))
+    zarr.consolidate_metadata(str(output_path))
     print(
-        f"Total write time: {time.perf_counter() - t0:.2f}s",
+        f"Done in {time.perf_counter() - t0:.1f}s",
         flush=True, file=sys.stderr,
     )
     return [*warnings, *validation_result.warnings]
