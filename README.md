@@ -54,6 +54,41 @@ pixi run datascale convert-10x-h5 \
   --config example_config.toml
 ```
 
+### Concatenate multiple `.h5ad` files into one Zarr
+
+Combines several `.h5ad` files (e.g. one per sample/batch) into a single Zarr
+store along the `obs` axis (rows). Each file's `X` is streamed directly into
+its slice of the output — the full concatenated matrix is never materialised in
+memory.
+
+```bash
+pixi run datascale concat-h5ads \
+  --inputs path/to/sample_A.h5ad path/to/sample_B.h5ad path/to/sample_C.h5ad \
+  --output path/to/combined.zarr \
+  --backed \
+  --x-storage sparse-csr
+```
+
+Requirements (strict; conversion errors otherwise):
+
+- All inputs must share the **same `var`** — identical gene names *and* order.
+- All inputs must share the **same `obs` schema** — identical column names.
+- `adata.X` in each file must be CSR or CSC (CSC is auto-converted to CSR).
+- All `X` matrices must share the same dtype.
+
+What gets written:
+
+- `X` — concatenated along rows, written in the configured `--x-storage`
+  format (`sparse-csr` or `dense`; `sparse-csc` is not supported here).
+- `obs` — concatenated via `pandas.concat` (duplicate `obs_names` are kept as-is).
+- `var` — taken from the first file (already verified identical across all files).
+- Empty `obsm` / `varm` / `uns` / `obsp` / `varp` groups for anndata-zarr
+  compatibility. **`layers`, `raw`, `obsm`, etc. are not concatenated.** Use
+  `convert-h5ad` per-file if you need those.
+
+`--backed` is recommended for large inputs: each file's `X` is streamed from
+HDF5 instead of being fully loaded.
+
 ## Config (TOML or YAML)
 
 See `example_config.toml` for a full reference. Key options:
@@ -85,12 +120,13 @@ All commands share the same optional flags:
 
 | Flag | Required? | Description |
 |---|---|---|
-| `--input` | **Required** | Path to input file (`.h5ad` or `.h5`) |
+| `--input` | **Required** (`convert-h5ad`, `convert-10x-h5`) | Path to input file (`.h5ad` or `.h5`) |
+| `--inputs` | **Required** (`concat-h5ads`) | Two or more input `.h5ad` paths, space-separated |
 | `--output` | **Required** | Path to output `.zarr` directory |
 | `--config` | Optional | Path to TOML/YAML config file |
 | `--overwrite` | Optional | Overwrite output path if it already exists, else it throws error that folder already exists |
-| `--x-storage` | Optional | `sparse-csr` (default) \| `sparse-csc` \| `dense` |
-| `--backed` | Optional | Stream X from disk without loading into RAM. Only on h5ad in `convert-h5ad`. Saves some peak memory at cost of a little speed |
+| `--x-storage` | Optional | `sparse-csr` (default) \| `sparse-csc` \| `dense` (note: `concat-h5ads` does not support `sparse-csc`) |
+| `--backed` | Optional | Stream X from disk without loading into RAM. Available on `convert-h5ad` and `concat-h5ads`. Saves peak memory at a small speed cost |
 | `--cpus` | Optional | Threads for parallel matrix chunk writes (dense + sparse). No effect with `--backed` |
 | `--x-row-chunk` | Optional | Row chunk size for dense X (auto-capped at 64 MB per chunk) |
 | `--x-col-chunk` | Optional | Column chunk size for dense X |
@@ -100,6 +136,7 @@ All commands share the same optional flags:
 ```bash
 pixi run datascale convert-h5ad --help
 pixi run datascale convert-10x-h5 --help
+pixi run datascale concat-h5ads --help
 ```
 
 ## Development

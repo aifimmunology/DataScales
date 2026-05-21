@@ -4,12 +4,17 @@ import argparse
 import sys
 
 from .config import apply_cli_overrides, load_config
-from .converter import convert_10x_h5_to_zarr, convert_h5ad_to_zarr
+from .converter import (
+    convert_10x_h5_to_zarr,
+    convert_h5ad_to_zarr,
+    convert_h5ads_to_zarr,
+)
 from .validation import ValidationError
 
 _CONVERTERS = {
     "convert-h5ad": convert_h5ad_to_zarr,
     "convert-10x-h5": convert_10x_h5_to_zarr,
+    "concat-h5ads": convert_h5ads_to_zarr,
 }
 
 
@@ -83,6 +88,23 @@ def _build_parser() -> argparse.ArgumentParser:
     h5_optional = h5.add_argument_group("optional arguments")
     _add_common_args(h5_required, h5_optional)
 
+    concat = subparsers.add_parser(
+        "concat-h5ads",
+        help="Concatenate multiple .h5ad files along obs (rows) into one zarr. "
+             "Requires identical var (genes) and obs schema across files.",
+    )
+    concat_required = concat.add_argument_group("required arguments")
+    concat_required.add_argument(
+        "--inputs", nargs="+", required=True,
+        help="Two or more input .h5ad file paths",
+    )
+    concat_optional = concat.add_argument_group("optional arguments")
+    concat_optional.add_argument(
+        "--backed", action="store_true",
+        help="Stream X from disk without loading into RAM. Recommended for large files.",
+    )
+    _add_common_args(concat_required, concat_optional)
+
     return parser
 
 
@@ -108,13 +130,18 @@ def run(argv: list[str] | None = None) -> int:
             backed=True if getattr(args, "backed", False) else None,
         )
 
-        warnings = converter(args.input, args.output, config)
+        if args.command == "concat-h5ads":
+            warnings = converter(args.inputs, args.output, config)
+            input_label = ", ".join(args.inputs)
+        else:
+            warnings = converter(args.input, args.output, config)
+            input_label = args.input
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     print("Conversion complete.")
-    print(f"Input: {args.input}")
+    print(f"Input: {input_label}")
     print(f"Output: {args.output}")
     print(f"Chunks: ({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})")
     print(f"X storage mode: {config.io.x_storage}")

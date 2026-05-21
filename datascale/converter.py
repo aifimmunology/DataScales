@@ -459,3 +459,380 @@ def convert_10x_h5_to_zarr(input_h5: str, output_zarr: str, cfg: AppConfig) -> l
         raise ConversionError(f"Failed to read 10x H5 file: {e}") from e
     
     return _write_adata_to_zarr(adata, Path(output_zarr), cfg, [])
+
+
+# =============================================================================
+# Multi-h5ad concatenation along obs (rows)
+# =============================================================================
+
+def _get_indptr(matrix: Any):
+    """Return indptr as a numpy array for in-memory or backed sparse input."""
+    import numpy as np
+    if sp.issparse(matrix):
+        return np.asarray(matrix.indptr)
+    if hasattr(matrix, "indptr"):
+        return np.asarray(matrix.indptr[:])
+    if hasattr(matrix, "group"):
+        return np.asarray(matrix.group["indptr"][:])
+    raise ConversionError(
+        f"Cannot locate indptr on sparse input of type {type(matrix).__name__}"
+    )
+
+
+def _ensure_csr(matrix: Any, label: str) -> tuple[Any, str | None]:
+    """Return (csr_matrix, optional warning). Accepts CSR or CSC (in-memory or backed)."""
+    is_csr = sp.isspmatrix_csr(matrix) or (
+        not sp.issparse(matrix) and getattr(matrix, "format", None) == "csr"
+    )
+    is_csc = sp.isspmatrix_csc(matrix) or (
+        not sp.issparse(matrix) and getattr(matrix, "format", None) == "csc"
+    )
+    if is_csr:
+        return matrix, None
+    if is_csc:
+        if sp.issparse(matrix):
+            converted = matrix.tocsr()
+        else:
+            converted = matrix[:].tocsr()
+        return converted, f"[{label}] adata.X was CSC and converted to CSR in memory."
+    raise ConversionError(
+        f"[{label}] adata.X must be CSR or CSC; got {type(matrix).__name__}"
+    )
+
+
+def _append_dense_region(
+    zarr_arr: Any,
+    matrix: Any,
+    row_offset: int,
+    row_chunk: int,
+    cfg: AppConfig,
+) -> None:
+    """Write a single matrix into zarr_arr[row_offset:row_offset+n_rows, :]."""
+    import numpy as np
+    import dask
+    import dask.array as da
+    from dask.diagnostics import ProgressBar
+
+    n_rows, n_cols = matrix.shape
+    dtype = matrix.dtype
+
+    is_backed_sparse = not sp.issparse(matrix) and hasattr(matrix, "format")
+    if not sp.issparse(matrix) and not is_backed_sparse:
+        # Already dense (ndarray-like); write in chunks via dask region store.
+        arr = da.from_array(np.asarray(matrix), chunks=(row_chunk, n_cols))
+        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+            da.store(
+                arr, zarr_arr,
+                regions=(slice(row_offset, row_offset + n_rows), slice(None)),
+                scheduler="threads",
+                num_workers=cfg.chunks.cpus,
+            )
+        return
+
+    backed = is_backed_sparse
+    slices = [
+        da.from_delayed(
+            dask.delayed(lambda s=start: matrix[s : s + row_chunk].toarray())(),
+            shape=(min(row_chunk, n_rows - start), n_cols),
+            dtype=dtype,
+        )
+        for start in range(0, n_rows, row_chunk)
+    ]
+    dask_dense = da.concatenate(slices, axis=0)
+    scheduler = "synchronous" if backed else "threads"
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+        da.store(
+            dask_dense, zarr_arr,
+            regions=(slice(row_offset, row_offset + n_rows), slice(None)),
+            scheduler=scheduler,
+            num_workers=1 if backed else cfg.chunks.cpus,
+        )
+
+
+def _append_sparse_csr_region(
+    data_arr: Any,
+    indices_arr: Any,
+    matrix: Any,
+    indptr_full: Any,
+    nnz_offset: int,
+    n_rows: int,
+    nnz_total: int,
+    data_dtype: Any,
+    indices_dtype: Any,
+    cfg: AppConfig,
+) -> None:
+    """Stream one CSR matrix's data + indices into existing zarr arrays at nnz_offset."""
+    import numpy as np
+    import dask
+    import dask.array as da
+    from dask.diagnostics import ProgressBar
+
+    backed = not sp.issparse(matrix)
+
+    _TARGET_BATCH_BYTES = 256 * 1024 * 1024
+    avg_nnz = max(1, nnz_total // max(1, n_rows))
+    bpm = avg_nnz * (np.dtype(data_dtype).itemsize + np.dtype(indices_dtype).itemsize)
+    batch_size = max(1_000, min(200_000, _TARGET_BATCH_BYTES // max(1, bpm)))
+
+    data_parts, indices_parts = [], []
+    for b0 in range(0, n_rows, batch_size):
+        b1 = min(b0 + batch_size, n_rows)
+        bnnz = int(indptr_full[b1] - indptr_full[b0])
+        if bnnz == 0:
+            continue
+        batch = dask.delayed(lambda m, a, b: m[a:b])(matrix, b0, b1)
+        data_parts.append(da.from_delayed(
+            dask.delayed(lambda b: np.asarray(b.data, dtype=data_dtype))(batch),
+            shape=(bnnz,), dtype=data_dtype,
+        ))
+        indices_parts.append(da.from_delayed(
+            dask.delayed(lambda b: np.asarray(b.indices, dtype=indices_dtype))(batch),
+            shape=(bnnz,), dtype=indices_dtype,
+        ))
+
+    if not data_parts:
+        return
+
+    data_dask = da.concatenate(data_parts)
+    indices_dask = da.concatenate(indices_parts)
+    region = (slice(nnz_offset, nnz_offset + nnz_total),)
+    scheduler = "synchronous" if backed else "threads"
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+        da.store(
+            [data_dask, indices_dask],
+            [data_arr, indices_arr],
+            regions=[region, region],
+            scheduler=scheduler,
+            num_workers=1 if backed else cfg.chunks.cpus,
+        )
+
+
+def _write_concatenated_csr(
+    group: zarr.Group,
+    key: str,
+    matrices: list[Any],
+    n_obs_each: list[int],
+    n_vars: int,
+    data_dtype: Any,
+    cfg: AppConfig,
+) -> None:
+    import numpy as np
+
+    indptrs = [_get_indptr(m) for m in matrices]
+    nnz_each = [int(ip[-1]) for ip in indptrs]
+    nnz_total = sum(nnz_each)
+    n_obs_total = sum(n_obs_each)
+
+    indices_dtype = np.int32
+    indptr_dtype = np.int64 if nnz_total > np.iinfo(np.int32).max else np.int32
+
+    sp_group = group.require_group(key)
+    sp_group.attrs["encoding-type"] = "csr_matrix"
+    sp_group.attrs["encoding-version"] = "0.1.0"
+    sp_group.attrs["shape"] = [n_obs_total, n_vars]
+
+    flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
+    data_arr = sp_group.require_array(
+        "data", shape=(nnz_total,), dtype=data_dtype,
+        chunks=(flat_chunk,), overwrite=True,
+    )
+    indices_arr = sp_group.require_array(
+        "indices", shape=(nnz_total,), dtype=indices_dtype,
+        chunks=(flat_chunk,), overwrite=True,
+    )
+    indptr_arr = sp_group.require_array(
+        "indptr", shape=(n_obs_total + 1,), dtype=indptr_dtype,
+        chunks=(n_obs_total + 1,), overwrite=True,
+    )
+    for a in (data_arr, indices_arr, indptr_arr):
+        a.attrs["encoding-type"] = "array"
+        a.attrs["encoding-version"] = "0.2.0"
+
+    # Build full indptr in memory (small: ~8B per row) then write once.
+    full_indptr = np.empty(n_obs_total + 1, dtype=indptr_dtype)
+    full_indptr[0] = 0
+    row_offset = 0
+    nnz_offset = 0
+    for ip, n_obs_i, nnz_i in zip(indptrs, n_obs_each, nnz_each):
+        full_indptr[row_offset + 1 : row_offset + 1 + n_obs_i] = (
+            ip[1:].astype(indptr_dtype, copy=False) + nnz_offset
+        )
+        row_offset += n_obs_i
+        nnz_offset += nnz_i
+    indptr_arr[:] = full_indptr
+
+    # Stream each matrix's data + indices to its nnz region.
+    nnz_offset = 0
+    for matrix, ip, n_obs_i, nnz_i in zip(matrices, indptrs, n_obs_each, nnz_each):
+        if nnz_i > 0:
+            _append_sparse_csr_region(
+                data_arr, indices_arr, matrix, ip,
+                nnz_offset, n_obs_i, nnz_i,
+                data_dtype, indices_dtype, cfg,
+            )
+        nnz_offset += nnz_i
+
+
+def _write_concatenated_dense(
+    group: zarr.Group,
+    key: str,
+    matrices: list[Any],
+    n_obs_each: list[int],
+    n_vars: int,
+    data_dtype: Any,
+    cfg: AppConfig,
+) -> None:
+    import warnings
+    import numpy as np
+
+    n_obs_total = sum(n_obs_each)
+
+    bytes_per_row = n_vars * np.dtype(data_dtype).itemsize
+    adaptive = max(1, (512 * 1024 * 1024) // bytes_per_row)
+    row_chunk = min(cfg.chunks.x_row_chunk, adaptive)
+    if adaptive < cfg.chunks.x_row_chunk:
+        warnings.warn(
+            f"x_row_chunk reduced from {cfg.chunks.x_row_chunk} to {row_chunk} "
+            f"for key '{key}' to keep one dense chunk under 512 MB.",
+            UserWarning, stacklevel=2,
+        )
+    col_chunk = cfg.chunks.x_col_chunk
+
+    zarr_arr = group.require_array(
+        key, shape=(n_obs_total, n_vars), dtype=data_dtype,
+        chunks=(row_chunk, col_chunk), overwrite=True,
+    )
+    zarr_arr.attrs["encoding-type"] = "array"
+    zarr_arr.attrs["encoding-version"] = "0.2.0"
+
+    row_offset = 0
+    for matrix, n_rows in zip(matrices, n_obs_each):
+        _append_dense_region(zarr_arr, matrix, row_offset, row_chunk, cfg)
+        row_offset += n_rows
+
+
+def convert_h5ads_to_zarr(
+    input_h5ads: list[str], output_zarr: str, cfg: AppConfig
+) -> list[str]:
+    """Concatenate multiple .h5ad files along obs (rows) into a single zarr store.
+
+    Requirements:
+      - All inputs must share the same `var` (gene names + order, strict match).
+      - All inputs must share the same `obs` columns (strict schema match).
+      - Only X, obs, var are written. layers/raw/uns/obsm/etc. are ignored.
+
+    Sparse output uses CSR; dense output is supported. CSC output is not supported
+    for multi-file concat (would require costly transpose).
+    """
+    from anndata._io.specs import write_elem
+    import pandas as pd
+
+    if not input_h5ads:
+        raise ConversionError("convert_h5ads_to_zarr requires at least one input file.")
+
+    if cfg.io.x_storage == "sparse-csc":
+        raise ConversionError(
+            "x_storage='sparse-csc' is not supported for multi-h5ad concat. "
+            "Use 'sparse-csr' or 'dense'."
+        )
+
+    inputs = [Path(p) for p in input_h5ads]
+    output_path = Path(output_zarr)
+    _prepare_output_path(output_path, cfg.io.overwrite)
+    ad.settings.zarr_write_format = 3
+
+    adatas: list[ad.AnnData] = []
+    all_warnings: list[str] = []
+    try:
+        # ── Pass 1: load + validate ───────────────────────────────────────────
+        for p in inputs:
+            adata, _ = _load_h5ad_for_conversion(p, cfg)
+            adatas.append(adata)
+
+        ref_var_names = adatas[0].var_names
+        ref_var = adatas[0].var
+        n_vars = adatas[0].n_vars
+        for i, a in enumerate(adatas[1:], start=1):
+            if a.n_vars != n_vars or not (a.var_names == ref_var_names).all():
+                raise ConversionError(
+                    f"var mismatch in {inputs[i]}: expected {n_vars} vars matching "
+                    f"{inputs[0].name}, got {a.n_vars} (names+order must be identical)."
+                )
+
+        ref_obs_cols = list(adatas[0].obs.columns)
+        for i, a in enumerate(adatas[1:], start=1):
+            if list(a.obs.columns) != ref_obs_cols:
+                raise ConversionError(
+                    f"obs schema mismatch in {inputs[i]}: expected columns "
+                    f"{ref_obs_cols}, got {list(a.obs.columns)}."
+                )
+
+        for i, a in enumerate(adatas):
+            vr = validate_single_cell_anndata(a, cfg.validation)
+            all_warnings.extend(f"[{inputs[i].name}] {w}" for w in vr.warnings)
+
+        # ── Ensure CSR for X; verify common dtype ─────────────────────────────
+        x_matrices: list[Any] = []
+        x_dtype = None
+        for i, a in enumerate(adatas):
+            x, warn = _ensure_csr(a.X, inputs[i].name)
+            if warn:
+                all_warnings.append(warn)
+            if x_dtype is None:
+                x_dtype = x.dtype
+            elif x.dtype != x_dtype:
+                raise ConversionError(
+                    f"X dtype mismatch: {inputs[i].name} has {x.dtype}, "
+                    f"expected {x_dtype}."
+                )
+            x_matrices.append(x)
+
+        n_obs_each = [a.n_obs for a in adatas]
+        n_obs_total = sum(n_obs_each)
+
+        # ── Concat obs (small; pandas) ────────────────────────────────────────
+        obs_concat = pd.concat([a.obs for a in adatas], axis=0)
+
+        print(
+            f"Concatenating {len(inputs)} h5ads → {output_path} "
+            f"(n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})",
+            flush=True, file=sys.stderr,
+        )
+        t0 = time.perf_counter()
+
+        # ── Open store + write metadata ───────────────────────────────────────
+        store = zarr.open_group(str(output_path), mode="w")
+        store.attrs["encoding-type"] = "anndata"
+        store.attrs["encoding-version"] = "0.1.0"
+
+        with _stage("Writing metadata (obs, var, empty obsm/varm/uns/obsp/varp)"):
+            write_elem(store, "obs", obs_concat)
+            write_elem(store, "var", ref_var)
+            write_elem(store, "uns", {})
+            write_elem(store, "obsm", {})
+            write_elem(store, "varm", {})
+            write_elem(store, "obsp", {})
+            write_elem(store, "varp", {})
+
+        with _stage(f"Writing X (n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"):
+            if cfg.io.x_storage == "dense":
+                _write_concatenated_dense(
+                    store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg,
+                )
+            else:  # sparse-csr
+                _write_concatenated_csr(
+                    store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg,
+                )
+
+        zarr.consolidate_metadata(str(output_path))
+        print(
+            f"Done in {time.perf_counter() - t0:.1f}s",
+            flush=True, file=sys.stderr,
+        )
+        return all_warnings
+
+    except Exception as e:
+        raise ConversionError(f"Failed to concatenate h5ads: {e}") from e
+    finally:
+        for a in adatas:
+            _close_backed_if_needed(a)
