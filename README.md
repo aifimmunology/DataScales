@@ -1,4 +1,4 @@
-# DataScale
+# DataScales
 
 A configurable converter for single-cell gene expression data to Zarr stores, focused on non-spatial single-cell AnnData.
 
