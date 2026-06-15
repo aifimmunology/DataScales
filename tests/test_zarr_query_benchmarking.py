@@ -90,24 +90,50 @@ def test_validate_rejects_bad_requests(stores: dict[str, Path]) -> None:
     with pytest.raises(QueryError):  # missing store
         validate_request(QueryRequest(store=stores["csr"].parent / "nope.zarr"))
     with pytest.raises(QueryError):  # unsupported final format
-        validate_request(QueryRequest(store=stores["csr"], final_format="csr"))  # type: ignore[arg-type]
+        validate_request(QueryRequest(store=stores["csr"], final_format="csc"))  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
-# run_query — correctness across formats, axes, and modes                     #
+# run_query — correctness across formats, axes, modes, and final formats      #
 # --------------------------------------------------------------------------- #
+
+
+def _expected_slice(axis: str, idx: np.ndarray) -> np.ndarray:
+    return DENSE[idx, :] if axis == "obs" else DENSE[:, idx]
 
 
 @pytest.mark.parametrize("mode,kw", [("contiguous", {"offset": 1}), ("random", {"seed": 1})])
 @pytest.mark.parametrize("axis", ["obs", "var"])
-def test_all_formats_agree(stores: dict[str, Path], axis: str, mode: str, kw: dict) -> None:
+def test_csr_output_matches_known_data(
+    stores: dict[str, Path], axis: str, mode: str, kw: dict
+) -> None:
+    """The csr final format gives back the exact selected data, for every source."""
     count = 2 if axis == "obs" else 3
-    out = {
-        fmt: run_query(QueryRequest(store=p, axis=axis, count=count, mode=mode, **kw))
-        for fmt, p in stores.items()
-    }
-    assert np.allclose(out["csr"], out["dense"])
-    assert np.allclose(out["csc"], out["dense"])
+    from zarr_query_benchmarking.query import _select_indices  # noqa: PLC0415
+
+    idx = _select_indices(QueryRequest(store=stores["dense"], axis=axis, count=count, mode=mode, **kw), DENSE.shape[0 if axis == "obs" else 1])
+    expected = _expected_slice(axis, idx)
+    for fmt, p in stores.items():
+        res = run_query(QueryRequest(store=p, axis=axis, count=count, mode=mode, final_format="csr", **kw))
+        assert res.matrix is not None, fmt
+        assert np.allclose(res.matrix.toarray(), expected), fmt
+
+
+@pytest.mark.parametrize("mode,kw", [("contiguous", {"offset": 1}), ("random", {"seed": 1})])
+@pytest.mark.parametrize("axis", ["obs", "var"])
+def test_dense_and_csr_summaries_agree(
+    stores: dict[str, Path], axis: str, mode: str, kw: dict
+) -> None:
+    """Dense (streamed/discarded) and csr outputs touch the same data per store."""
+    count = 2 if axis == "obs" else 3
+    for p in stores.values():
+        base = dict(store=p, axis=axis, count=count, mode=mode, **kw)
+        dense = run_query(QueryRequest(final_format="dense", **base))
+        csr = run_query(QueryRequest(final_format="csr", **base))
+        assert dense.matrix is None  # dense output is streamed & discarded
+        assert dense.shape == csr.shape
+        assert dense.nnz == csr.nnz
+        assert np.isclose(dense.checksum, csr.checksum)
 
 
 def test_result_orientation(stores: dict[str, Path]) -> None:
@@ -118,8 +144,23 @@ def test_result_orientation(stores: dict[str, Path]) -> None:
 
 
 def test_contiguous_matches_known_slice(stores: dict[str, Path]) -> None:
-    out = run_query(QueryRequest(store=stores["csr"], axis="obs", count=2, offset=1))
-    assert np.allclose(out, DENSE[1:3, :])
+    res = run_query(
+        QueryRequest(store=stores["csr"], axis="obs", count=2, offset=1, final_format="csr")
+    )
+    assert res.matrix is not None
+    assert np.allclose(res.matrix.toarray(), DENSE[1:3, :])
+
+
+def test_dense_source_streams_multiple_bands(tmp_path: Path) -> None:
+    """A selection spanning several native row-chunks must stream in >1 band."""
+    big = np.arange(60, dtype=np.float32).reshape(20, 3)
+    root = zarr.open_group(str(tmp_path / "big.zarr"), mode="w")
+    arr = root.create_array("X", shape=big.shape, chunks=(4, 3), dtype="float32")
+    arr[:] = big
+    arr.attrs["encoding-type"] = "array"
+    res = run_query(QueryRequest(store=tmp_path / "big.zarr", axis="obs", count=20))
+    assert res.n_bands == 5  # 20 rows / chunk of 4
+    assert np.isclose(res.checksum, big.sum())
 
 
 # --------------------------------------------------------------------------- #

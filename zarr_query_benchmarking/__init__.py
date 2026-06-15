@@ -7,6 +7,7 @@ times the operation. Supports dense and sparse-CSR (and CSC) ``X`` encodings.
 
 from .query import (
     QueryRequest,
+    QueryResult,
     StoreInfo,
     inspect_store,
     validate_request,
@@ -16,6 +17,7 @@ from .benchmark import BenchmarkResult, benchmark_request
 
 __all__ = [
     "QueryRequest",
+    "QueryResult",
     "StoreInfo",
     "inspect_store",
     "validate_request",

@@ -80,19 +80,7 @@ def _write_sparse_as_dense_dask(
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
-    # Cap row_chunk so one dense chunk stays under 512 MB.
-    bytes_per_row = n_cols * np.dtype(dtype).itemsize
-    adaptive_row_chunk = max(1, (512 * 1024 * 1024) // bytes_per_row)
-    row_chunk = min(cfg.chunks.x_row_chunk, adaptive_row_chunk)
-    if adaptive_row_chunk < cfg.chunks.x_row_chunk:
-        warnings.warn(
-            f"x_row_chunk reduced from {cfg.chunks.x_row_chunk} to {row_chunk} "
-            f"for key '{key}' to keep one dense chunk under 512 MB "
-            f"({n_cols} cols × {np.dtype(dtype).itemsize} bytes = "
-            f"{bytes_per_row / (1024 * 1024):.1f} MB/row).",
-            UserWarning,
-            stacklevel=2,
-        )
+    row_chunk = cfg.chunks.x_row_chunk
     col_chunk = cfg.chunks.x_col_chunk
 
     # Build a dask array from delayed row slices.

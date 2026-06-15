@@ -16,8 +16,6 @@ import statistics
 import time
 from dataclasses import dataclass, field
 
-import numpy as np
-
 from .query import QueryRequest, StoreInfo, run_query, validate_request
 
 
@@ -28,6 +26,9 @@ class BenchmarkResult:
     timings_s: list[float] = field(default_factory=list)
     result_shape: tuple[int, ...] = ()
     result_nbytes: int = 0
+    result_nnz: int = 0
+    result_checksum: float = 0.0
+    n_bands: int = 0
     error: str | None = None
 
     @property
@@ -56,6 +57,9 @@ class BenchmarkResult:
             "final_format": r.final_format,
             "result_shape": list(self.result_shape),
             "result_mb": round(self.result_nbytes / 1e6, 3),
+            "result_nnz": self.result_nnz,
+            "result_checksum": round(self.result_checksum, 4),
+            "n_bands": self.n_bands,
             "timings_s": [round(t, 6) for t in self.timings_s],
             "min_s": round(self.min_s, 6) if self.timings_s else None,
             "median_s": round(self.median_s, 6) if self.timings_s else None,
@@ -80,12 +84,17 @@ def benchmark_request(
     try:
         for _ in range(max(0, warmup)):
             run_query(req, info)
+        res = None
         for _ in range(max(1, repeats)):
             t0 = time.perf_counter()
-            arr = run_query(req, info)
+            res = run_query(req, info)
             result.timings_s.append(time.perf_counter() - t0)
-        result.result_shape = tuple(int(s) for s in np.shape(arr))
-        result.result_nbytes = int(np.asarray(arr).nbytes)
+        assert res is not None
+        result.result_shape = res.shape
+        result.result_nbytes = res.nbytes
+        result.result_nnz = res.nnz
+        result.result_checksum = res.checksum
+        result.n_bands = res.n_bands
     except Exception as exc:  # noqa: BLE001
         result.error = f"{type(exc).__name__}: {exc}"
     return result

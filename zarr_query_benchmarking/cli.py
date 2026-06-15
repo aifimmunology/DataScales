@@ -48,8 +48,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start index for contiguous mode. Default: 0.",
     )
     p.add_argument(
-        "--final-format", choices=["dense"], default="dense",
-        help="Format the pulled data is converted to before timing ends. Default: dense.",
+        "--final-format", choices=["dense", "csr"], default="dense",
+        help="Format the pulled data is converted to before timing ends. "
+        "'dense' streams and discards (summary only); 'csr' returns a single "
+        "compact matrix. Default: dense.",
     )
     p.add_argument(
         "--array", dest="array_path", default="X",
@@ -91,18 +93,22 @@ def _print_inspect(stores: list[str], array_path: str) -> int:
 
 
 def _print_table(results: list[BenchmarkResult]) -> None:
-    header = f"{'store':<44} {'fmt':<6} {'result':<16} {'MB':>8} {'min(s)':>10} {'med(s)':>10}"
+    header = (
+        f"{'store':<40} {'src':<5} {'out':<5} {'result':<14} {'MB':>8} "
+        f"{'nnz':>10} {'bands':>6} {'min(s)':>10} {'med(s)':>10}"
+    )
     print(header)
     print("-" * len(header))
     for r in results:
         name = r.request.store.name
         if not r.ok:
-            print(f"{name:<44} {'-':<6} ERROR: {r.error}")
+            print(f"{name:<40} ERROR: {r.error}")
             continue
         shp = "x".join(map(str, r.result_shape))
         print(
-            f"{name:<44} {r.info.storage_format:<6} {shp:<16} "
-            f"{r.result_nbytes / 1e6:>8.2f} {r.min_s:>10.4f} {r.median_s:>10.4f}"
+            f"{name:<40} {r.info.storage_format:<5} {r.request.final_format:<5} "
+            f"{shp:<14} {r.result_nbytes / 1e6:>8.2f} {r.result_nnz:>10} "
+            f"{r.n_bands:>6} {r.min_s:>10.4f} {r.median_s:>10.4f}"
         )
 
 
