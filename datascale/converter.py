@@ -59,20 +59,18 @@ def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnD
 
 
 
-def _write_sparse_as_dense_dask(
-    group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
-) -> None:
-    """Write a CSR matrix (in-memory or backed _CSRDataset) as a dense zarr array.
+def _build_tiled_dense_dask(matrix: Any, row_chunk: int, col_chunk: int) -> Any:
+    """Build a 2D-tiled dask array from a (backed or in-memory) CSR matrix.
 
-    Uses da.store() to write one row-chunk at a time — the full dense matrix is never
-    materialised. For in-memory CSR, cfg.chunks.cpus threads process chunks
-    in parallel (each thread: .toarray() one slice, write one zarr chunk). For backed
-    _CSRDataset, synchronous scheduler is enforced because h5py is not thread-safe.
+    Each block is exactly (row_chunk × col_chunk), matching the zarr chunk grid so
+    da.store() writes whole chunks (no read-modify-write) and never materialises more
+    than one chunk-sized dense block per worker — peak RAM is bounded by the chunk
+    size, independent of total column count.
 
-    row_chunk is capped adaptively so one dense chunk stays under 64 MB regardless
-    of column count.
+    A single delayed row-slice (sparse CSR) is shared across that band's column tiles,
+    so each row band is sliced from source storage only once. da.from_delayed is used
+    (not da.from_array) because backed _CSRDataset has no ndim / array protocol.
     """
-    import warnings
     import numpy as np
     import dask
     import dask.array as da
@@ -80,21 +78,48 @@ def _write_sparse_as_dense_dask(
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
-    row_chunk = cfg.chunks.x_row_chunk
-    col_chunk = cfg.chunks.x_col_chunk
+    def _row_band(r0: int, r1: int):
+        # Row-slicing returns scipy CSR for both backed and in-memory inputs.
+        return matrix[r0:r1]
 
-    # Build a dask array from delayed row slices.
-    # da.from_delayed is used (not da.from_array) because backed _CSRDataset has no
-    # ndim / array protocol.
-    slices = [
-        da.from_delayed(
-            dask.delayed(lambda s=start: matrix[s : s + row_chunk].toarray())(),
-            shape=(min(row_chunk, n_rows - start), n_cols),
-            dtype=dtype,
-        )
-        for start in range(0, n_rows, row_chunk)
-    ]
-    dask_dense = da.concatenate(slices, axis=0)
+    row_blocks = []
+    for r0 in range(0, n_rows, row_chunk):
+        r1 = min(r0 + row_chunk, n_rows)
+        band = dask.delayed(_row_band)(r0, r1)  # sparse; computed once, reused per tile
+        col_blocks = []
+        for c0 in range(0, n_cols, col_chunk):
+            c1 = min(c0 + col_chunk, n_cols)
+            col_blocks.append(da.from_delayed(
+                dask.delayed(lambda b, a=c0, z=c1: np.asarray(b[:, a:z].toarray()))(band),
+                shape=(r1 - r0, c1 - c0),
+                dtype=dtype,
+            ))
+        row_blocks.append(da.concatenate(col_blocks, axis=1))
+    return da.concatenate(row_blocks, axis=0)
+
+
+def _write_sparse_as_dense_dask(
+    group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
+) -> None:
+    """Write a CSR matrix (in-memory or backed _CSRDataset) as a dense zarr array.
+
+    The matrix is streamed through a 2D-tiled dask array whose blocks match the zarr
+    chunk grid (row_chunk × col_chunk), so the full dense matrix is never materialised
+    and peak RAM per worker is bounded by one chunk regardless of column count.
+
+    For in-memory CSR, cfg.chunks.cpus threads process tiles in parallel. For backed
+    _CSRDataset the synchronous scheduler is enforced because h5py is not thread-safe.
+    """
+    import dask.array as da
+    from dask.diagnostics import ProgressBar
+
+    n_rows, n_cols = matrix.shape
+    dtype = matrix.dtype
+
+    row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
+    col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
+
+    dask_dense = _build_tiled_dense_dask(matrix, row_chunk, col_chunk)
 
     zarr_arr = group.require_array(
         key,
@@ -107,18 +132,13 @@ def _write_sparse_as_dense_dask(
     zarr_arr.attrs["encoding-version"] = "0.2.0"
 
     backed = not hasattr(matrix, "indices")  # backed _CSRDataset lacks .indices
-    from dask.diagnostics import ProgressBar
-    if backed:
-        # h5py is not thread-safe: one chunk at a time.
-        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
-            da.store(dask_dense, zarr_arr, scheduler="synchronous")
-    else:
-        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
-            da.store(
-                dask_dense, zarr_arr,
-                scheduler="threads",
-                num_workers=cfg.chunks.cpus,
-            )
+    scheduler = "synchronous" if backed else "threads"
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+        da.store(
+            dask_dense, zarr_arr,
+            scheduler=scheduler,
+            num_workers=1 if backed else cfg.chunks.cpus,
+        )
 
 
 def _write_matrix_direct(
@@ -497,41 +517,34 @@ def _append_dense_region(
 ) -> None:
     """Write a single matrix into zarr_arr[row_offset:row_offset+n_rows, :]."""
     import numpy as np
-    import dask
     import dask.array as da
     from dask.diagnostics import ProgressBar
 
     n_rows, n_cols = matrix.shape
-    dtype = matrix.dtype
+    col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
+    row_chunk = min(row_chunk, n_rows)
+    region = (slice(row_offset, row_offset + n_rows), slice(None))
 
     is_backed_sparse = not sp.issparse(matrix) and hasattr(matrix, "format")
     if not sp.issparse(matrix) and not is_backed_sparse:
-        # Already dense (ndarray-like); write in chunks via dask region store.
-        arr = da.from_array(np.asarray(matrix), chunks=(row_chunk, n_cols))
+        # Already dense (ndarray-like); 2D-tile to the zarr chunk grid via region store.
+        arr = da.from_array(np.asarray(matrix), chunks=(row_chunk, col_chunk))
         with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
             da.store(
                 arr, zarr_arr,
-                regions=(slice(row_offset, row_offset + n_rows), slice(None)),
+                regions=region,
                 scheduler="threads",
                 num_workers=cfg.chunks.cpus,
             )
         return
 
     backed = is_backed_sparse
-    slices = [
-        da.from_delayed(
-            dask.delayed(lambda s=start: matrix[s : s + row_chunk].toarray())(),
-            shape=(min(row_chunk, n_rows - start), n_cols),
-            dtype=dtype,
-        )
-        for start in range(0, n_rows, row_chunk)
-    ]
-    dask_dense = da.concatenate(slices, axis=0)
+    dask_dense = _build_tiled_dense_dask(matrix, row_chunk, col_chunk)
     scheduler = "synchronous" if backed else "threads"
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(
             dask_dense, zarr_arr,
-            regions=(slice(row_offset, row_offset + n_rows), slice(None)),
+            regions=region,
             scheduler=scheduler,
             num_workers=1 if backed else cfg.chunks.cpus,
         )
@@ -670,21 +683,12 @@ def _write_concatenated_dense(
     data_dtype: Any,
     cfg: AppConfig,
 ) -> None:
-    import warnings
-    import numpy as np
-
     n_obs_total = sum(n_obs_each)
 
-    bytes_per_row = n_vars * np.dtype(data_dtype).itemsize
-    adaptive = max(1, (512 * 1024 * 1024) // bytes_per_row)
-    row_chunk = min(cfg.chunks.x_row_chunk, adaptive)
-    if adaptive < cfg.chunks.x_row_chunk:
-        warnings.warn(
-            f"x_row_chunk reduced from {cfg.chunks.x_row_chunk} to {row_chunk} "
-            f"for key '{key}' to keep one dense chunk under 512 MB.",
-            UserWarning, stacklevel=2,
-        )
-    col_chunk = cfg.chunks.x_col_chunk
+    # Blocks are 2D-tiled to (row_chunk × col_chunk) by _append_dense_region, so peak
+    # RAM is bounded by chunk size — no need to shrink row_chunk for wide matrices.
+    row_chunk = min(cfg.chunks.x_row_chunk, n_obs_total)
+    col_chunk = min(cfg.chunks.x_col_chunk, n_vars)
 
     zarr_arr = group.require_array(
         key, shape=(n_obs_total, n_vars), dtype=data_dtype,

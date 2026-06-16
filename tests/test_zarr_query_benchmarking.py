@@ -124,16 +124,32 @@ def test_csr_output_matches_known_data(
 def test_dense_and_csr_summaries_agree(
     stores: dict[str, Path], axis: str, mode: str, kw: dict
 ) -> None:
-    """Dense (streamed/discarded) and csr outputs touch the same data per store."""
+    """Dense (materialised then summarised) and csr outputs touch the same data."""
     count = 2 if axis == "obs" else 3
     for p in stores.values():
         base = dict(store=p, axis=axis, count=count, mode=mode, **kw)
         dense = run_query(QueryRequest(final_format="dense", **base))
         csr = run_query(QueryRequest(final_format="csr", **base))
-        assert dense.matrix is None  # dense output is streamed & discarded
+        assert dense.matrix is None  # dense output is summarised, not retained
         assert dense.shape == csr.shape
         assert dense.nnz == csr.nnz
         assert np.isclose(dense.checksum, csr.checksum)
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_threads_do_not_change_results(stores: dict[str, Path], threads: int) -> None:
+    """Parallel read + conversion must produce identical data regardless of threads."""
+    for p in stores.values():
+        for fmt in ("dense", "csr"):
+            res = run_query(
+                QueryRequest(store=p, axis="obs", count=4, final_format=fmt, threads=threads)
+            )
+            assert res.threads == threads
+            if fmt == "csr":
+                assert np.allclose(res.matrix.toarray(), DENSE[0:4, :])
+            else:
+                assert res.shape == (4, DENSE.shape[1])
+                assert np.isclose(res.checksum, DENSE[0:4, :].sum())
 
 
 def test_result_orientation(stores: dict[str, Path]) -> None:
@@ -151,15 +167,17 @@ def test_contiguous_matches_known_slice(stores: dict[str, Path]) -> None:
     assert np.allclose(res.matrix.toarray(), DENSE[1:3, :])
 
 
-def test_dense_source_streams_multiple_bands(tmp_path: Path) -> None:
-    """A selection spanning several native row-chunks must stream in >1 band."""
+def test_parallel_read_matches_direct_across_chunks(tmp_path: Path) -> None:
+    """A selection spanning several native chunks reads correctly in one parallel call."""
     big = np.arange(60, dtype=np.float32).reshape(20, 3)
     root = zarr.open_group(str(tmp_path / "big.zarr"), mode="w")
     arr = root.create_array("X", shape=big.shape, chunks=(4, 3), dtype="float32")
     arr[:] = big
     arr.attrs["encoding-type"] = "array"
-    res = run_query(QueryRequest(store=tmp_path / "big.zarr", axis="obs", count=20))
-    assert res.n_bands == 5  # 20 rows / chunk of 4
+    res = run_query(
+        QueryRequest(store=tmp_path / "big.zarr", axis="obs", count=20, final_format="csr", threads=4)
+    )
+    assert np.allclose(res.matrix.toarray(), big)
     assert np.isclose(res.checksum, big.sum())
 
 
