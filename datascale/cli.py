@@ -43,7 +43,7 @@ def _add_common_args(
     optional.add_argument(
         "--x-row-chunk",
         type=int,
-        help="Row chunk size for dense X; auto-capped at 64 MB per chunk (default: 2048)",
+        help="Row chunk size for dense X; honored exactly via 2D tiling (default: 2048)",
     )
     optional.add_argument(
         "--x-col-chunk",
