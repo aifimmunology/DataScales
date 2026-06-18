@@ -1,3 +1,0 @@
-## Buffer
-
-::: zarr.testing.buffer

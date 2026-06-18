@@ -1,2 +1,0 @@
-::: zarr.Array
-::: zarr.AsyncArray

@@ -1,5 +1,0 @@
----
-title: dtype
----
-
-::: zarr.dtype

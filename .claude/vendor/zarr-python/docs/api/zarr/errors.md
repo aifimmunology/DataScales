@@ -1,5 +1,0 @@
----
-title: errors
----
-
-::: zarr.errors

@@ -75,11 +75,60 @@ def read_convert(handle, axis_dim, sel, final_format):
     return sub.tocsr() if sp.issparse(sub) else sp.csr_matrix(sub)
 
 
+def _decompressed_bytes(result):
+    """Working-set size of the materialized result (decompressed, in-memory).
+
+    This is the footprint that drives RAM / host->device transfer, not the
+    compressed `bytes_read` pulled from the store: a dense block holds
+    rows*cols values, a CSR block only nnz (+ index overhead).
+    """
+    if sp.issparse(result):
+        return int(result.data.nbytes + result.indices.nbytes + result.indptr.nbytes)
+    return int(result.nbytes)
+
+
 def _git_commit():
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL, text=True
         ).strip()
+    except Exception:
+        return None
+
+
+def run_rss_probe(args):
+    """Do exactly one open + read_convert and print peak RSS (ru_maxrss, raw).
+
+    Runs in a fresh process so the high-water mark reflects this one read, not
+    contamination from warmup/repeats. Unit normalization happens in the parent.
+    """
+    import resource
+
+    handle, _is_sparse, _src_format, shape, _dtype = open_x(LocalStore(args.store, read_only=True))
+    axis_dim = 0 if args.axis == "row" else 1
+    axis_len = shape[axis_dim]
+    sel = select(axis_len, args.count, args.mode, args.seed)
+    read_convert(handle, axis_dim, sel, args.format)
+    print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+
+
+def _measure_peak_rss(args):
+    """Spawn an isolated probe process and return its peak RSS in bytes.
+
+    ru_maxrss is bytes on macOS but KiB on Linux, so normalize to bytes.
+    Returns None on any failure — the memory probe must never break the run.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                sys.executable, "-m", "zarr_query_benchmarking", "--_rss-probe",
+                "--store", args.store, "--axis", args.axis, "--count", str(args.count),
+                "--mode", args.mode, "--format", args.format, "--seed", str(args.seed),
+            ],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        rss = int(out)
+        return rss if sys.platform == "darwin" else rss * 1024
     except Exception:
         return None
 
@@ -130,6 +179,8 @@ def run_benchmark(args):
     read_convert(chandle, axis_dim, sel, args.format)
 
     nnz_out = int(result.nnz) if sp.issparse(result) else int(np.count_nonzero(result))
+    decompressed_bytes = _decompressed_bytes(result)
+    peak_rss_bytes = _measure_peak_rss(args)
     summary = {
         "store": args.store,
         "source_format": src_format,
@@ -144,6 +195,8 @@ def run_benchmark(args):
         "result_nnz": nnz_out,
         "chunks_fetched": counter.gets,
         "bytes_read": counter.bytes,
+        "result_decompressed_bytes": decompressed_bytes,
+        "peak_rss_bytes": peak_rss_bytes,
         "warmup": args.warmup,
         "repeats": args.repeats,
         "median_s": float(np.median(times)),
@@ -163,6 +216,11 @@ def run_benchmark(args):
     print(f"Concurrency: {concurrency}  (warm cache)")
     print(f"Result: shape={tuple(result.shape)}  nnz={nnz_out}")
     print(f"Chunks fetched: {counter.gets}   Bytes read: {counter.bytes / 1e6:.1f} MB")
+    rss_str = "n/a" if peak_rss_bytes is None else f"{peak_rss_bytes / 1e6:.1f} MB"
+    print(
+        f"Decompressed result: {decompressed_bytes / 1e6:.1f} MB   "
+        f"Peak RSS: {rss_str}"
+    )
     print(
         f"Wall time (s): median={summary['median_s']:.4f} "
         f"min={summary['min_s']:.4f} p95={summary['p95_s']:.4f}  "
@@ -184,6 +242,7 @@ def main(argv=None):
     p.add_argument("--warmup", type=int, default=1, help="Warmup runs discarded before timing (default: 1).")
     p.add_argument("--seed", type=int, default=0, help="RNG seed for --mode random (default: 0).")
     p.add_argument("--json", action="store_true", help="Emit one JSON object (incl. raw timings + provenance).")
+    p.add_argument("--_rss-probe", dest="rss_probe", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     if args.inspect:
@@ -192,6 +251,9 @@ def main(argv=None):
     missing = [n for n in ("axis", "count", "format") if getattr(args, n) is None]
     if missing:
         p.error("the following are required unless --inspect: " + ", ".join("--" + m for m in missing))
+    if args.rss_probe:
+        run_rss_probe(args)
+        return
     run_benchmark(args)
 
 

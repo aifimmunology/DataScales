@@ -1,4 +1,0 @@
-
-## Store
-
-::: zarr.testing.store

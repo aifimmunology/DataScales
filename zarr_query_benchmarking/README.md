@@ -34,6 +34,14 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 - **Chunks fetched** — real `store.get()` calls, counted in a *separate untimed pass*
   through a `WrapperStore` so counting never inflates the timing.
 - **Bytes read** — compressed bytes pulled from the store (≈ GCS egress for remote stores).
+- **Decompressed result bytes** (`result_decompressed_bytes`) — working-set size of the
+  materialized result (dense: `rows*cols`; CSR: `data+indices+indptr`). This — **not**
+  compressed `bytes_read` — is what drives RAM and host→device (GPU) transfer. scRNA dense
+  data Blosc-compresses extremely well, so `bytes_read` can look similar across formats while
+  this reveals the real (often ~10×) gap.
+- **Peak RSS** (`peak_rss_bytes`) — peak resident memory of a single read+convert, measured
+  in an *isolated subprocess* (so warmup/repeats don't contaminate the high-water mark) and
+  normalized to bytes across macOS/Linux. `null` if the probe fails.
 - **Result shape / nnz**, source format, dtype, concurrency, library versions, git commit.
 
 ## How reads work
@@ -45,6 +53,23 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 Querying the *aligned* axis is cheap (CSR→rows, CSC→cols); the *cross* axis
 (CSR→cols, CSC→rows) reads most of the store and is intentionally expensive — that
 contrast is the point of the benchmark.
+
+## Comparing dense vs. sparse fairly
+
+`--format` is the **output** format and is *included in the timing*. A common `--format`
+across two stores answers "cost to get format X out, regardless of how it's stored" — but
+it charges the CSR store a `.toarray()` densify cost (and a dense store a sparsify cost)
+that real **rapids-singlecell + dask** analysis *never pays*: that pipeline keeps each
+store in its native on-device representation (cupyx CSR vs. dense CuPy) and reads
+row-blocks (the aligned axis).
+
+So for an **analysis-faithful read comparison**, query each store at its **native** format
+on **`--axis row`** — CSR store → `--format csr`, dense store → `--format dense`. The
+common-format mode answers a different question and will understate CSR's advantage.
+
+Either way, read the comparison off **`result_decompressed_bytes`** and **`peak_rss_bytes`**,
+not just `bytes_read`: the decompressed footprint is what real analysis pays in RAM and
+PCIe transfer, and it's where the dense-vs-sparse difference actually shows up.
 
 ## Example: sweep row + col across many stores
 

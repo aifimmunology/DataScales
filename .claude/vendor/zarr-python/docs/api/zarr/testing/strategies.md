@@ -1,4 +1,0 @@
-
-## Strategies
-
-::: zarr.testing.strategies
