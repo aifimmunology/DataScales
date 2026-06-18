@@ -3,6 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 dev/benchmark*
+CLAUDE*
+.claude/
 
 # Expression data files
 *.h5*
