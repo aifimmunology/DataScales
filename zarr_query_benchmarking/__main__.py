@@ -5,6 +5,12 @@ asks for `dense` from a sparse store pays the densification cost (and vice
 versa) — keeping comparisons across layouts fair. Chunk-fetch counts come from
 a separate untimed pass through a counting store wrapper, so they never inflate
 the wall-clock numbers.
+
+Row selection has three modes: `sequential` (first N), `random` (N seeded
+indices), and `celltype` (all obs rows whose `--obs-column` equals
+`--cell-type`). The celltype mode forces `--axis row`, ignores `--count`, and
+reads the obs column + builds the match mask *inside* the timed region, modeling
+a real "filter by cell type, then fetch X" query.
 """
 
 from __future__ import annotations
@@ -68,6 +74,47 @@ def select(axis_len, count, mode, seed):
     return np.sort(np.random.default_rng(seed).choice(axis_len, size=count, replace=False))
 
 
+def _read_obs_column(group, obs_column):
+    """Read a single obs column into a 1-D array (categorical or plain)."""
+    from anndata.io import read_elem
+
+    return np.asarray(read_elem(group["obs"][obs_column]))
+
+
+def celltype_indices(group, obs_column, cell_type):
+    """Sorted obs-row indices whose `obs[obs_column]` equals `cell_type`.
+
+    Reads the obs column and builds the match mask live, so callers can put
+    this inside the timed region (cell-type queries model 'filter then fetch').
+    """
+    return np.flatnonzero(_read_obs_column(group, obs_column) == cell_type)
+
+
+def resolve_celltype_selection(group, obs_column, cell_type):
+    """Validate obs column / cell-type and return matching indices, or exit.
+
+    Exits non-zero with the available columns / values on a typo, since an
+    empty selection almost always means a misspelled name rather than a real
+    benchmark target.
+    """
+    obs = group["obs"]
+    columns = list(obs.attrs.get("column-order", []))
+    if obs_column not in obs:
+        avail = ", ".join(columns) if columns else "(none)"
+        sys.exit(f"ERROR: obs column '{obs_column}' not found. Available columns: {avail}")
+    values = _read_obs_column(group, obs_column)
+    sel = np.flatnonzero(values == cell_type)
+    if sel.size == 0:
+        uniq = np.unique(values)
+        preview = ", ".join(map(str, uniq[:50]))
+        more = "" if uniq.size <= 50 else f" (+{uniq.size - 50} more)"
+        sys.exit(
+            f"ERROR: no rows in obs['{obs_column}'] match cell type '{cell_type}'. "
+            f"Available values: {preview}{more}"
+        )
+    return sel
+
+
 def read_convert(handle, axis_dim, sel, final_format):
     sub = handle[sel, :] if axis_dim == 0 else handle[:, sel]
     if final_format == "dense":
@@ -104,11 +151,16 @@ def run_rss_probe(args):
     """
     import resource
 
-    handle, _is_sparse, _src_format, shape, _dtype = open_x(LocalStore(args.store, read_only=True))
-    axis_dim = 0 if args.axis == "row" else 1
-    axis_len = shape[axis_dim]
-    sel = select(axis_len, args.count, args.mode, args.seed)
-    read_convert(handle, axis_dim, sel, args.format)
+    store = LocalStore(args.store, read_only=True)
+    handle, _is_sparse, _src_format, shape, _dtype = open_x(store)
+    if args.mode == "celltype":
+        group = zarr.open_group(store=store, mode="r")
+        sel = celltype_indices(group, args.obs_column, args.cell_type)
+        read_convert(handle, 0, sel, args.format)
+    else:
+        axis_dim = 0 if args.axis == "row" else 1
+        sel = select(shape[axis_dim], args.count, args.mode, args.seed)
+        read_convert(handle, axis_dim, sel, args.format)
     print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
@@ -118,15 +170,17 @@ def _measure_peak_rss(args):
     ru_maxrss is bytes on macOS but KiB on Linux, so normalize to bytes.
     Returns None on any failure — the memory probe must never break the run.
     """
+    cmd = [
+        sys.executable, "-m", "zarr_query_benchmarking", "--_rss-probe",
+        "--store", args.store, "--axis", args.axis,
+        "--mode", args.mode, "--format", args.format, "--seed", str(args.seed),
+    ]
+    if args.mode == "celltype":
+        cmd += ["--obs-column", args.obs_column, "--cell-type", args.cell_type]
+    else:
+        cmd += ["--count", str(args.count)]
     try:
-        out = subprocess.check_output(
-            [
-                sys.executable, "-m", "zarr_query_benchmarking", "--_rss-probe",
-                "--store", args.store, "--axis", args.axis, "--count", str(args.count),
-                "--mode", args.mode, "--format", args.format, "--seed", str(args.seed),
-            ],
-            stderr=subprocess.DEVNULL, text=True,
-        ).strip()
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
         rss = int(out)
         return rss if sys.platform == "darwin" else rss * 1024
     except Exception:
@@ -157,26 +211,44 @@ def run_benchmark(args):
     axis_dim = 0 if args.axis == "row" else 1
 
     # Timing pass on a plain store.
-    handle, is_sparse, src_format, shape, dtype = open_x(LocalStore(args.store, read_only=True))
+    store = LocalStore(args.store, read_only=True)
+    handle, is_sparse, src_format, shape, dtype = open_x(store)
     axis_len = shape[axis_dim]
-    if args.count > axis_len:
-        sys.exit(f"ERROR: count={args.count} exceeds axis length {axis_len} for axis '{args.axis}'.")
-    sel = select(axis_len, args.count, args.mode, args.seed)
+
+    if args.mode == "celltype":
+        # Validate up front (exits on a bad column / unmatched cell type), but
+        # re-read obs inside the timed query so the obs read + mask build are
+        # part of the measured "filter by cell type then fetch" cost.
+        group = zarr.open_group(store=store, mode="r")
+        resolve_celltype_selection(group, args.obs_column, args.cell_type)
+
+        def do_query(h, g):
+            sel = celltype_indices(g, args.obs_column, args.cell_type)
+            return read_convert(h, 0, sel, args.format)
+    else:
+        if args.count > axis_len:
+            sys.exit(f"ERROR: count={args.count} exceeds axis length {axis_len} for axis '{args.axis}'.")
+        sel = select(axis_len, args.count, args.mode, args.seed)
+        group = None
+
+        def do_query(h, g):
+            return read_convert(h, axis_dim, sel, args.format)
 
     for _ in range(args.warmup):
-        read_convert(handle, axis_dim, sel, args.format)
+        do_query(handle, group)
     times = []
     result = None
     for _ in range(args.repeats):
         t0 = perf_counter()
-        result = read_convert(handle, axis_dim, sel, args.format)
+        result = do_query(handle, group)
         times.append(perf_counter() - t0)
 
-    # Untimed counting pass on a wrapped store.
+    # Untimed counting pass on a wrapped store (obs reads included for celltype).
     counter = CountingStore(LocalStore(args.store, read_only=True))
     chandle = open_x(counter)[0]
+    cgroup = zarr.open_group(store=counter, mode="r") if args.mode == "celltype" else None
     counter.reset()
-    read_convert(chandle, axis_dim, sel, args.format)
+    do_query(chandle, cgroup)
 
     nnz_out = int(result.nnz) if sp.issparse(result) else int(np.count_nonzero(result))
     decompressed_bytes = _decompressed_bytes(result)
@@ -189,6 +261,9 @@ def run_benchmark(args):
         "axis": args.axis,
         "count": args.count,
         "mode": args.mode,
+        "obs_column": args.obs_column,
+        "cell_type": args.cell_type,
+        "selected": int(result.shape[axis_dim]),
         "final_format": args.format,
         "concurrency": concurrency,
         "result_shape": list(result.shape),
@@ -212,7 +287,13 @@ def run_benchmark(args):
         return
     print(f"Store: {summary['store']}")
     print(f"Source: {src_format}  shape={tuple(shape)}  dtype={dtype}")
-    print(f"Query: axis={args.axis} count={args.count} mode={args.mode} -> {args.format}")
+    if args.mode == "celltype":
+        print(
+            f"Query: axis=row mode=celltype obs['{args.obs_column}']=='{args.cell_type}' "
+            f"selected={summary['selected']} -> {args.format}"
+        )
+    else:
+        print(f"Query: axis={args.axis} count={args.count} mode={args.mode} -> {args.format}")
     print(f"Concurrency: {concurrency}  (warm cache)")
     print(f"Result: shape={tuple(result.shape)}  nnz={nnz_out}")
     print(f"Chunks fetched: {counter.gets}   Bytes read: {counter.bytes / 1e6:.1f} MB")
@@ -233,9 +314,15 @@ def main(argv=None):
     p.add_argument("--store", required=True, help="Path to the .zarr store to query (reads its X).")
     p.add_argument("--inspect", action="store_true", help="Print X layout (format/shape/chunks/codec) and exit; no timing.")
     p.add_argument("--axis", choices=["row", "col"], help="Query rows (obs) or columns (var).")
-    p.add_argument("--count", type=int, help="Number of rows/columns to select.")
-    p.add_argument("--mode", choices=["sequential", "random"], default="sequential",
-                   help="sequential = first N; random = N seeded random indices (default: sequential).")
+    p.add_argument("--count", type=int, help="Number of rows/columns to select (ignored when --mode celltype).")
+    p.add_argument("--mode", choices=["sequential", "random", "celltype"], default="sequential",
+                   help="sequential = first N; random = N seeded random indices; "
+                        "celltype = all obs rows whose --obs-column equals --cell-type "
+                        "(forces --axis row, ignores --count). Default: sequential.")
+    p.add_argument("--obs-column", dest="obs_column",
+                   help="obs column to filter on (required for --mode celltype).")
+    p.add_argument("--cell-type", dest="cell_type",
+                   help="Value in --obs-column to select rows by (required for --mode celltype).")
     p.add_argument("--format", choices=["csr", "dense"], help="Final format the data is converted to (timed).")
     p.add_argument("--concurrency", type=int, help="zarr async.concurrency (parallel chunk fetches).")
     p.add_argument("--repeats", type=int, default=5, help="Timed repeats (default: 5).")
@@ -248,9 +335,18 @@ def main(argv=None):
     if args.inspect:
         run_inspect(args.store)
         return
-    missing = [n for n in ("axis", "count", "format") if getattr(args, n) is None]
-    if missing:
-        p.error("the following are required unless --inspect: " + ", ".join("--" + m for m in missing))
+    if args.mode == "celltype":
+        if args.axis == "col":
+            p.error("--mode celltype selects obs rows; --axis col is not supported.")
+        args.axis = "row"
+        missing = [n for n in ("obs_column", "cell_type", "format") if getattr(args, n) is None]
+        if missing:
+            p.error("--mode celltype requires: "
+                    + ", ".join("--" + m.replace("_", "-") for m in missing))
+    else:
+        missing = [n for n in ("axis", "count", "format") if getattr(args, n) is None]
+        if missing:
+            p.error("the following are required unless --inspect: " + ", ".join("--" + m for m in missing))
     if args.rss_probe:
         run_rss_probe(args)
         return
