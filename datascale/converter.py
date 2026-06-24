@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import shutil
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +12,76 @@ import scipy.sparse as sp
 import zarr
 
 from .config import AppConfig
+from .storage import open_output_store
 from .validation import validate_single_cell_anndata
 
 
 class ConversionError(RuntimeError):
     """Raised when conversion cannot be completed."""
+
+
+def _x_compressors():
+    """Blosc(zstd) + byte-shuffle. zarr's default is bare zstd level-0 with no
+    shuffle; the shuffle gives a large ratio/throughput win on numeric matrices."""
+    from zarr.codecs import BloscCodec
+    return (BloscCodec(cname="zstd", clevel=5, shuffle="shuffle"),)
+
+
+# ── Backed-sparse parallel workers ───────────────────────────────────────────
+# These run in separate processes (h5py is not thread-safe, but independent
+# read-only file handles across processes are). They are module-level so the
+# process pool can pickle them. Each worker writes a chunk-aligned region, so
+# no two workers ever touch the same zarr chunk and no lock is needed.
+
+def _copy_sparse_segment(out_root, data_path, indices_path, src_file, src_group,
+                         s0, s1, indices_dtype):
+    """Copy a chunk-aligned nnz segment [s0:s1) from a backed sparse h5ad to zarr.
+
+    CSR→CSR / CSC→CSC keeps row/col order, so source and output flat positions
+    map 1:1 — this is a straight flat copy, no scipy needed.
+    """
+    import h5py
+    import numpy as np
+    import zarr
+    from zarr.storage import LocalStore
+
+    with h5py.File(src_file, "r") as f:
+        g = f[src_group]
+        data = g["data"][s0:s1]
+        indices = np.asarray(g["indices"][s0:s1], dtype=indices_dtype)
+    root = zarr.open_group(store=LocalStore(str(out_root)), mode="r+")
+    root[data_path][s0:s1] = data
+    root[indices_path][s0:s1] = indices
+
+
+def _densify_band_segment(out_root, data_path, src_file, src_group, r0, r1,
+                          col_chunk, n_cols):
+    """Read CSR row band [r0:r1) from a backed sparse h5ad and write it dense,
+    one column tile at a time so dense RAM is bounded by one chunk."""
+    import zarr
+    import h5py
+    from anndata.io import sparse_dataset
+    from zarr.storage import LocalStore
+
+    with h5py.File(src_file, "r") as f:
+        band = sparse_dataset(f[src_group])[r0:r1]
+    arr = zarr.open_group(store=LocalStore(str(out_root)), mode="r+")[data_path]
+    for c0 in range(0, n_cols, col_chunk):
+        c1 = min(c0 + col_chunk, n_cols)
+        arr[r0:r1, c0:c1] = band[:, c0:c1].toarray()
+
+
+def _run_parallel(worker, jobs, cpus):
+    """Run worker(*job) for each job — in a process pool when cpus>1, else inline.
+    With a single job the pool would be pure spawn overhead, so run inline."""
+    if cpus <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            worker(*job)
+        return
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=cpus) as ex:
+        for fut in [ex.submit(worker, *job) for job in jobs]:
+            fut.result()
 
 
 @contextmanager
@@ -30,18 +95,30 @@ def _stage(label: str):
         print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True, file=sys.stderr)
 
 
-def _prepare_output_path(output_path: Path, overwrite: bool) -> None:
-    """"removes existing output path if overwrite is enabled, otherwise raises error"""
-    if output_path.exists():
-        if not overwrite:
-            raise ConversionError(
-                f"Output path already exists: {output_path}. "
-                "Use overwrite=true in config or --overwrite flag."
-            )
-        if output_path.is_dir():
-            shutil.rmtree(output_path)
-        else:
-            output_path.unlink()
+def _resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
+    """Validate + adapt config for the chosen storage backend.
+
+    The icechunk backend writes through an in-process session; the backed-input writers
+    fan out to worker processes that reopen the store by filesystem path, which an
+    IcechunkStore can't provide — so backed + icechunk is rejected for now. To keep the
+    single-session write thread-safe we also force a single worker for icechunk.
+    """
+    if cfg.io.backend != "icechunk":
+        return cfg
+    if cfg.io.backed:
+        raise ConversionError(
+            "backend='icechunk' does not support --backed input yet (backed writers use "
+            "worker processes that reopen the store by path; the icechunk session is "
+            "in-process only). Convert eagerly (omit --backed), or use backend='zarr'."
+        )
+    if cfg.chunks.cpus > 1:
+        print(
+            f"→ icechunk backend: forcing cpus=1 (was {cfg.chunks.cpus}; single-session "
+            "writes are not parallelised yet).",
+            flush=True, file=sys.stderr,
+        )
+        cfg = replace(cfg, chunks=replace(cfg.chunks, cpus=1))
+    return cfg
 
 
 def _load_h5ad_for_conversion(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnData, list[str]]:
@@ -103,12 +180,10 @@ def _write_sparse_as_dense_dask(
 ) -> None:
     """Write a CSR matrix (in-memory or backed _CSRDataset) as a dense zarr array.
 
-    The matrix is streamed through a 2D-tiled dask array whose blocks match the zarr
-    chunk grid (row_chunk × col_chunk), so the full dense matrix is never materialised
-    and peak RAM per worker is bounded by one chunk regardless of column count.
-
-    For in-memory CSR, cfg.chunks.cpus threads process tiles in parallel. For backed
-    _CSRDataset the synchronous scheduler is enforced because h5py is not thread-safe.
+    Blocks match the zarr chunk grid (row_chunk × col_chunk) so the full dense
+    matrix is never materialised. In-memory CSR streams through a 2D-tiled dask
+    array (cfg.chunks.cpus threads). Backed _CSRDataset is written by row band in
+    parallel processes (each opens its own h5py handle; bands are chunk-aligned).
     """
     import dask.array as da
     from dask.diagnostics import ProgressBar
@@ -119,24 +194,63 @@ def _write_sparse_as_dense_dask(
     row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
     col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
 
-    dask_dense = _build_tiled_dense_dask(matrix, row_chunk, col_chunk)
-
     zarr_arr = group.require_array(
         key,
         shape=(n_rows, n_cols),
         dtype=dtype,
         chunks=(row_chunk, col_chunk),
+        compressors=_x_compressors(),
         overwrite=True,
     )
     zarr_arr.attrs["encoding-type"] = "array"
     zarr_arr.attrs["encoding-version"] = "0.2.0"
 
     backed = not hasattr(matrix, "indices")  # backed _CSRDataset lacks .indices
-    scheduler = "synchronous" if backed else "threads"
+    if backed:
+        src = matrix.group
+        out_root = zarr_arr.store_path.store.root
+        jobs = [
+            (out_root, zarr_arr.store_path.path, src.file.filename, src.name,
+             r0, min(r0 + row_chunk, n_rows), col_chunk, n_cols)
+            for r0 in range(0, n_rows, row_chunk)
+        ]
+        _run_parallel(_densify_band_segment, jobs, cfg.chunks.cpus)
+        return
+
+    dask_dense = _build_tiled_dense_dask(matrix, row_chunk, col_chunk)
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+        da.store(dask_dense, zarr_arr, scheduler="threads", num_workers=cfg.chunks.cpus)
+
+
+def _write_dense_streaming(
+    group: zarr.Group, matrix: Any, key: str, cfg: AppConfig
+) -> None:
+    """Stream an already-dense matrix to a dense zarr array via da.store.
+
+    anndata's write_elem assigns the whole array at once (full materialisation);
+    da.from_array + da.store writes chunk-by-chunk to the zarr grid instead.
+    """
+    import numpy as np
+    import dask.array as da
+    from dask.diagnostics import ProgressBar
+
+    n_rows, n_cols = matrix.shape
+    row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
+    col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
+
+    zarr_arr = group.require_array(
+        key, shape=(n_rows, n_cols), dtype=matrix.dtype,
+        chunks=(row_chunk, col_chunk), compressors=_x_compressors(), overwrite=True,
+    )
+    zarr_arr.attrs["encoding-type"] = "array"
+    zarr_arr.attrs["encoding-version"] = "0.2.0"
+
+    backed = not isinstance(matrix, np.ndarray)  # h5py-backed dense isn't thread-safe
+    arr = da.from_array(matrix, chunks=(row_chunk, col_chunk))
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(
-            dask_dense, zarr_arr,
-            scheduler=scheduler,
+            arr, zarr_arr,
+            scheduler="synchronous" if backed else "threads",
             num_workers=1 if backed else cfg.chunks.cpus,
         )
 
@@ -154,8 +268,6 @@ def _write_matrix_direct(
       sparse-csr → ensure CSR, stream row-batches via dask (parallel for in-memory input)
       sparse-csc → ensure CSC, stream col-batches via dask (parallel for in-memory input)
     """
-    from anndata._io.specs import write_elem  # not part of the public API
-
     mode = cfg.io.x_storage
 
     # Backed SparseDataset (anndata HDF5-backed): has .format but is not a scipy sparse matrix.
@@ -169,10 +281,8 @@ def _write_matrix_direct(
                 matrix = matrix.tocsr() 
             _write_sparse_as_dense_dask(group, matrix, key, cfg)
             
-        else:  #already dense #TODO make way for dense to be loaded chunk by chunk
-            write_elem(group, key, matrix, dataset_kwargs={
-                "chunks": (cfg.chunks.x_row_chunk, cfg.chunks.x_col_chunk)
-            })
+        else:  # already dense
+            _write_dense_streaming(group, matrix, key, cfg)
         return
 
     # Sparse output (sparse-csr, sparse-csc).
@@ -199,15 +309,12 @@ def _write_sparse_streaming(
 ) -> None:
     """Stream a sparse matrix to zarr as a CSR/CSC group with per-batch dask writes.
 
-    Reads ``matrix.indptr`` upfront (small, ~8B per row/col) to know exact output
-    offsets, then writes ``data`` and ``indices`` in row/col batches in parallel.
-    Peak RAM per worker ≈ batch_rows × avg_nnz_per_row × (data_itemsize + 4).
-
-    Works for in-memory scipy sparse and backed _CSRDataset/_CSCDataset (h5py).
-    Backed input uses synchronous scheduler (h5py is not thread-safe);
-    in-memory uses ``cfg.chunks.cpus`` threads.
+    Reads ``indptr`` upfront (small, ~8B per row/col) to know exact output offsets.
+    In-memory scipy sparse is written in row/col batches via dask threads. Backed
+    _CSRDataset/_CSCDataset is the same format as the output, so its data/indices
+    map 1:1 to the output — workers flat-copy chunk-aligned nnz segments in parallel
+    processes (h5py is not thread-safe, but independent process handles are).
     """
-    import warnings
     import numpy as np
     import dask
     import dask.array as da
@@ -244,11 +351,11 @@ def _write_sparse_streaming(
     flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
     data_arr = sp_group.require_array(
         "data", shape=(nnz_total,), dtype=matrix.dtype,
-        chunks=(flat_chunk,), overwrite=True,
+        chunks=(flat_chunk,), compressors=_x_compressors(), overwrite=True,
     )
     indices_arr = sp_group.require_array(
         "indices", shape=(nnz_total,), dtype=indices_dtype,
-        chunks=(flat_chunk,), overwrite=True,
+        chunks=(flat_chunk,), compressors=_x_compressors(), overwrite=True,
     )
     indptr_arr = sp_group.require_array(
         "indptr", shape=(n_major + 1,), dtype=indptr_full.dtype,
@@ -261,11 +368,25 @@ def _write_sparse_streaming(
     # indptr is small — write it directly.
     indptr_arr[:] = indptr_full
 
-    # ── Build dask arrays for data + indices via delayed row/col batches ──────
-    # Auto-tune batch size: target ~256 MB per batch in RAM so multiple workers
-    # fit comfortably even on tight memory. RAM per batch ≈ batch × avg_nnz ×
-    # (data_itemsize + indices_itemsize). Clamped to [1k, 200k] majors.
     _TARGET_BATCH_BYTES = 256 * 1024 * 1024
+
+    if backed:
+        # Flat-copy chunk-aligned nnz segments in parallel processes. Segments are
+        # multiples of flat_chunk, so each zarr chunk is owned by exactly one worker.
+        src = matrix.group
+        out_root = data_arr.store_path.store.root
+        bytes_per_nnz = np.dtype(matrix.dtype).itemsize + np.dtype(indices_dtype).itemsize
+        seg = max(1, _TARGET_BATCH_BYTES // (flat_chunk * bytes_per_nnz)) * flat_chunk
+        jobs = [
+            (out_root, data_arr.store_path.path, indices_arr.store_path.path,
+             src.file.filename, src.name, s, min(s + seg, nnz_total), indices_dtype)
+            for s in range(0, nnz_total, seg)
+        ]
+        _run_parallel(_copy_sparse_segment, jobs, cfg.chunks.cpus)
+        return
+
+    # ── In-memory: build dask arrays for data + indices via delayed row/col batches.
+    # Auto-tune batch size: target ~256 MB per batch in RAM. Clamped to [1k, 200k] majors.
     avg_nnz_per_major = max(1, nnz_total // max(1, n_major))
     bytes_per_major = avg_nnz_per_major * (
         np.dtype(matrix.dtype).itemsize + np.dtype(indices_dtype).itemsize
@@ -304,37 +425,27 @@ def _write_sparse_streaming(
     data_dask = da.concatenate(data_parts)
     indices_dask = da.concatenate(indices_parts)
 
-    # ── Store: parallel threads for in-memory, synchronous for backed (h5py) ──
-    if backed and cfg.chunks.cpus > 1:
-        warnings.warn(
-            f"Backed sparse input forces synchronous writes "
-            f"(cpus={cfg.chunks.cpus} ignored; h5py is not thread-safe).",
-            UserWarning, stacklevel=2,
-        )
-
-    scheduler = "synchronous" if backed else "threads"
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(
             [data_dask, indices_dask],
             [data_arr, indices_arr],
-            scheduler=scheduler,
-            num_workers=1 if backed else cfg.chunks.cpus,
+            scheduler="threads",
+            num_workers=cfg.chunks.cpus,
         )
 
 
 def _write_csr_adata_direct(
     adata: ad.AnnData,
-    output_path: Path,
+    store: zarr.Group,
     cfg: AppConfig,
     x_override: Any | None = None,
 ) -> None:
-    """Write an AnnData with CSR X (in-memory or backed SparseDataset) directly to zarr.
+    """Write an AnnData with CSR X (in-memory or backed SparseDataset) into ``store``.
 
-    Matrices are written with the target format and chunking in one step.
+    Matrices are written with the target format and chunking in one step. The caller
+    owns opening the store and finalising it (consolidate / icechunk commit).
     """
     from anndata._io.specs import write_elem  # not part of the public API
-
-    store = zarr.open_group(str(output_path), mode="w")
 
     # Root encoding attrs — marks this as a valid anndata zarr store.
     store.attrs["encoding-type"] = "anndata"
@@ -383,20 +494,127 @@ def _close_backed_if_needed(adata: ad.AnnData) -> None:
             file_manager.close()
 
 
+# =============================================================================
+# Sort + partition by obs columns (Feature B)
+# =============================================================================
+
+def _compute_sort(adata: ad.AnnData, sort_by: tuple[str, ...]):
+    """Compute the row permutation + contiguous range table for sorting by ``sort_by``.
+
+    Returns ``(perm, ranges_df)`` where ``perm`` is the int64 permutation (original row
+    position for each sorted position) and ``ranges_df`` has one row per distinct key tuple
+    with the sort-key columns plus ``start``/``end`` (half-open) row offsets into the
+    sorted store. Sort is lexicographic with ``sort_by[0]`` as the primary key, stable.
+    """
+    import numpy as np
+    import pandas as pd
+
+    obs = adata.obs
+    missing = [c for c in sort_by if c not in obs.columns]
+    if missing:
+        raise ConversionError(
+            f"grouping sort_by columns not found in obs: {missing}. "
+            f"Available: {list(obs.columns)}"
+        )
+
+    keys = []
+    for col in sort_by:
+        codes, _ = pd.factorize(obs[col], sort=True)  # codes follow sorted value order
+        if (np.asarray(codes) < 0).any():
+            raise ConversionError(
+                f"obs column '{col}' has missing (NaN) values; cannot sort by it."
+            )
+        keys.append(np.asarray(codes))
+
+    # np.lexsort treats the LAST key as primary, so reverse to make sort_by[0] primary.
+    perm = np.lexsort(keys[::-1]).astype(np.int64)
+
+    obs_sorted = obs.iloc[perm]
+    sizes = obs_sorted.groupby(list(sort_by), sort=False, observed=True).size()
+    ends = np.cumsum(sizes.to_numpy())
+    starts = ends - sizes.to_numpy()
+    ranges = sizes.index.to_frame(index=False)
+    ranges["start"] = starts.astype(np.int64)
+    ranges["end"] = ends.astype(np.int64)
+    return perm, ranges
+
+
+def _write_sort_index(store: zarr.Group, perm, ranges_df) -> None:
+    """Write the dedicated sort index under ``uns/datascale_sort_index``.
+
+    Parented under ``uns`` (rather than a top-level group) so the store stays openable by
+    stock ``anndata.read_zarr`` — that reader passes every root key to ``AnnData(**…)``, so a
+    non-standard top-level group would break it, while ``uns`` round-trips arbitrary nested
+    data. The group holds the ``ranges`` table (one row per key tuple, with start/end) and the
+    ``obs_order`` reverse permutation; the sort keys are the ranges columns minus start/end.
+    """
+    from anndata._io.specs import write_elem
+    import numpy as np
+
+    write_elem(
+        store["uns"], "datascale_sort_index",
+        {"ranges": ranges_df, "obs_order": np.asarray(perm)},
+    )
+
+
+def _maybe_sort_adata(
+    adata: ad.AnnData, cfg: AppConfig, warnings: list[str]
+) -> tuple[ad.AnnData, tuple[str, ...], Any, Any]:
+    """If grouping is enabled, reorder all obs-aligned arrays by the sort keys.
+
+    Returns ``(adata, sort_by, perm, ranges_df)``; ``perm``/``ranges_df`` are None when
+    grouping is off. Reordering uses anndata fancy indexing so obs/obsm/obsp/layers/raw
+    all share one permutation and the store stays a valid AnnData.
+    """
+    if not cfg.grouping.enabled:
+        return adata, (), None, None
+
+    sort_by = cfg.grouping.sort_by
+    if cfg.io.x_storage != "sparse-csr":
+        raise ConversionError(
+            f"grouping (sort_by) requires x_storage='sparse-csr'; got '{cfg.io.x_storage}'."
+        )
+    if cfg.io.backed:
+        raise ConversionError(
+            "grouping (sort_by) requires an eager (in-memory) load; not supported with "
+            "--backed yet. Omit --backed to sort."
+        )
+
+    perm, ranges_df = _compute_sort(adata, sort_by)
+    with _stage(f"Sorting {adata.n_obs} cells by {list(sort_by)} ({len(ranges_df)} groups)"):
+        adata = adata[perm].copy()  # reorders X/obs/obsm/obsp/layers/raw consistently
+    warnings.append(
+        f"Rows sorted by {list(sort_by)} into {len(ranges_df)} contiguous groups; "
+        "obs/obsm/obsp/layers/raw reordered to match (see sort_index group)."
+    )
+    return adata, sort_by, perm, ranges_df
+
+
 def _write_adata_to_zarr(
     adata: ad.AnnData,
     output_path: Path,
     cfg: AppConfig,
     load_warnings: list[str],
+    allow_grouping: bool = False,
 ) -> list[str]:
-    """Write AnnData to zarr.
+    """Write AnnData to zarr (or icechunk).
 
-    adata.X is expected to be CSR, but CSC is accepted and converted to CSR
-    in memory with a warning.
+    adata.X is expected to be CSR, but CSC is accepted and converted to CSR in memory with
+    a warning. When ``allow_grouping`` and grouping is enabled, rows are sorted first.
     """
+    cfg = _resolve_backend_cfg(cfg)
     warnings = list(load_warnings)
-    x_for_write: Any | None = None
 
+    if allow_grouping:
+        adata, sort_by, perm, ranges_df = _maybe_sort_adata(adata, cfg, warnings)
+    else:
+        if cfg.grouping.enabled:
+            raise ConversionError(
+                "grouping (sort_by) is only supported by convert-h5ad for now."
+            )
+        sort_by, perm, ranges_df = (), None, None
+
+    x_for_write: Any | None = None
     is_csr = sp.isspmatrix_csr(adata.X) or (
         not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csr"  # backed mode
     )
@@ -419,17 +637,22 @@ def _write_adata_to_zarr(
             )
 
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
-    _prepare_output_path(output_path, cfg.io.overwrite)
     ad.settings.zarr_write_format = 3
 
     print(
         f"Converting → {output_path} "
-        f"(n_obs={adata.n_obs}, n_vars={adata.n_vars}, {cfg.io.x_storage})",
+        f"(n_obs={adata.n_obs}, n_vars={adata.n_vars}, {cfg.io.x_storage}, backend={cfg.io.backend})",
         flush=True, file=sys.stderr,
     )
     t0 = time.perf_counter()
-    _write_csr_adata_direct(adata, output_path, cfg, x_override=x_for_write)
-    zarr.consolidate_metadata(str(output_path))
+    store, finalize = open_output_store(
+        output_path, cfg, commit_message=f"datascale convert-h5ad → {output_path.name}",
+    )
+    _write_csr_adata_direct(adata, store, cfg, x_override=x_for_write)
+    if perm is not None:
+        with _stage(f"Writing sort_index ({len(ranges_df)} groups)"):
+            _write_sort_index(store, perm, ranges_df)
+    finalize()
     print(
         f"Done in {time.perf_counter() - t0:.1f}s",
         flush=True, file=sys.stderr,
@@ -444,7 +667,7 @@ def convert_h5ad_to_zarr(input_h5ad: str, output_zarr: str, cfg: AppConfig) -> l
     load_warnings: list[str] = []
     try:
         adata, load_warnings = _load_h5ad_for_conversion(Path(input_h5ad), cfg) #attempts to load in 'backed' mode, where its not fully memory loaded
-        return _write_adata_to_zarr(adata, Path(output_zarr), cfg, load_warnings)
+        return _write_adata_to_zarr(adata, Path(output_zarr), cfg, load_warnings, allow_grouping=True)
     
     except Exception as e:
         load_warnings = f"Warnings: {load_warnings}" if load_warnings else ""
@@ -635,11 +858,11 @@ def _write_concatenated_csr(
     flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
     data_arr = sp_group.require_array(
         "data", shape=(nnz_total,), dtype=data_dtype,
-        chunks=(flat_chunk,), overwrite=True,
+        chunks=(flat_chunk,), compressors=_x_compressors(), overwrite=True,
     )
     indices_arr = sp_group.require_array(
         "indices", shape=(nnz_total,), dtype=indices_dtype,
-        chunks=(flat_chunk,), overwrite=True,
+        chunks=(flat_chunk,), compressors=_x_compressors(), overwrite=True,
     )
     indptr_arr = sp_group.require_array(
         "indptr", shape=(n_obs_total + 1,), dtype=indptr_dtype,
@@ -692,7 +915,7 @@ def _write_concatenated_dense(
 
     zarr_arr = group.require_array(
         key, shape=(n_obs_total, n_vars), dtype=data_dtype,
-        chunks=(row_chunk, col_chunk), overwrite=True,
+        chunks=(row_chunk, col_chunk), compressors=_x_compressors(), overwrite=True,
     )
     zarr_arr.attrs["encoding-type"] = "array"
     zarr_arr.attrs["encoding-version"] = "0.2.0"
@@ -728,9 +951,19 @@ def convert_h5ads_to_zarr(
             "Use 'sparse-csr' or 'dense'."
         )
 
+    cfg = _resolve_backend_cfg(cfg)
+    if cfg.grouping.enabled:
+        raise ConversionError("grouping (sort_by) is only supported by convert-h5ad for now.")
+
     inputs = [Path(p) for p in input_h5ads]
     output_path = Path(output_zarr)
-    _prepare_output_path(output_path, cfg.io.overwrite)
+    # Fail fast on a pre-existing output before the (expensive) multi-file load; the actual
+    # prepare/overwrite happens in open_output_store below.
+    if output_path.exists() and not cfg.io.overwrite:
+        raise ConversionError(
+            f"Output path already exists: {output_path}. "
+            "Use overwrite=true in config or --overwrite flag."
+        )
     ad.settings.zarr_write_format = 3
 
     adatas: list[ad.AnnData] = []
@@ -793,7 +1026,9 @@ def convert_h5ads_to_zarr(
         t0 = time.perf_counter()
 
         # ── Open store + write metadata ───────────────────────────────────────
-        store = zarr.open_group(str(output_path), mode="w")
+        store, finalize = open_output_store(
+            output_path, cfg, commit_message=f"datascale concat-h5ads → {output_path.name}",
+        )
         store.attrs["encoding-type"] = "anndata"
         store.attrs["encoding-version"] = "0.1.0"
 
@@ -816,7 +1051,7 @@ def convert_h5ads_to_zarr(
                     store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg,
                 )
 
-        zarr.consolidate_metadata(str(output_path))
+        finalize()
         print(
             f"Done in {time.perf_counter() - t0:.1f}s",
             flush=True, file=sys.stderr,

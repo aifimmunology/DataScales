@@ -102,18 +102,46 @@ appends one JSON line per run:
 dev/run_query_sweep.sh zarr_dbs 1000 csr sequential bench_results.jsonl
 ```
 
-Summarize the JSONL into a table:
-
-```bash
-pixi run python - <<'PY'
-import json
-rows = [json.loads(l) for l in open("bench_results.jsonl")]
-print(f"{'store':40} {'axis':4} {'chunks':>8} {'MB':>7} {'median_s':>9}")
-for r in rows:
-    print(f"{r['store'].split('/')[-1]:40} {r['axis']:4} "
-          f"{r['chunks_fetched']:>8} {r['bytes_read']/1e6:>7.1f} {r['median_s']:>9.4f}")
-PY
-```
-
 > Note: cross-axis sparse queries (e.g. `--axis col` on a CSR store) are slow by
 > design — keep `--count` modest when sweeping sparse stores on both axes.
+
+## Comparing runs (`compare`)
+
+`compare` reads one or more `--json` result files and prints an aligned comparison
+table, so differences between store layouts / axes / thread counts are easy to
+eyeball. It accepts a single JSON object, a JSON **array** of them (e.g. a
+hand-collected `output1.json`), or **JSON Lines** (the format
+`dev/run_query_sweep.sh` appends) — and globs are expanded.
+
+```bash
+# one file, sorted by median wall time
+pixi run python -m zarr_query_benchmarking.compare bench_results.jsonl --sort median_s
+
+# several files at once (a "file" column is added automatically)
+pixi run python -m zarr_query_benchmarking.compare 'runs/*.json' --sort store
+
+# emit a GitHub-flavored markdown table for a PR / notes
+pixi run python -m zarr_query_benchmarking.compare output1.json --md > table.md
+```
+
+| Flag | Meaning |
+|------|---------|
+| `files…` | One or more JSON / JSONL result files; shell globs are expanded. |
+| `--sort FIELD` | Sort rows ascending by any run field (e.g. `median_s`, `store`, `chunks_fetched`). |
+| `--md` | Emit a GitHub-flavored markdown table (numeric columns right-aligned). |
+
+Columns: `store` · `src` (source format) · `shape` · `axis` · `mode` · `out`
+(final format) · `conc` · `n` · `result` shape · `chunks` fetched · `read_MB` ·
+`rss_GB` (peak) · `med_s` · `p95_s` · `commit`, plus a trailing **`xslow`** column
+— each run's median relative to the fastest run in the table (`1.00x` = fastest).
+That last column is usually the quickest way to see how much a layout choice costs:
+
+```
+store                  src    axis  ...  read_MB  rss_GB    med_s    xslow
+5M_sparse_9.zarr       csr    row   ...     1391    10.5    2.875    1.00x
+13M_..._soundlife.zarr csr    row   ...     1523    12.0    4.111    1.43x
+5M_dense_5x11.zarr     dense  row   ...     1637    58.1  132.419   46.06x
+```
+
+(Read the dense-vs-sparse gap off `read_MB`/`rss_GB` alongside `xslow`, per the
+fairness note above — `bytes_read` alone understates it.)
