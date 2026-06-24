@@ -9,6 +9,8 @@ A configurable converter for single-cell gene expression data to Zarr stores, fo
 - Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking
 - Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it
 - Optional 'backed' HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
+- Optional [Icechunk](#icechunk-storage-backend) storage backend (`--icechunk`) — writes the store through a transactional, versioned repository instead of a plain zarr directory
+- Optional [sort + partition](#sorted-stores---sort-by) of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous row range for fast subset reads via `datascale.open_sorted`
 - Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
@@ -89,6 +91,62 @@ What gets written:
 `--backed` is recommended for large inputs: each file's `X` is streamed from
 HDF5 instead of being fully loaded.
 
+## Sorted stores (`--sort-by`)
+
+`convert-h5ad` can physically **sort and partition** the output by one or more
+`obs` columns. Rows are reordered so that every distinct key tuple becomes a
+single contiguous row range, and a range table is written under
+`uns/datascale_sort_index`. All obs-aligned arrays (`obs`, `obsm`, …) are
+reordered consistently, so the store stays a valid AnnData.
+
+```bash
+pixi run datascale convert-h5ad \
+  --input path/to/input.h5ad \
+  --output path/to/sorted.zarr \
+  --sort-by cell_type demographic        # primary sort key first
+```
+
+Constraints: requires an **eager** (non-`--backed`) load and **`sparse-csr`**
+storage.
+
+Once written, query subsets without materialising the full matrix using the
+importable reader:
+
+```python
+from datascale import open_sorted
+
+store = open_sorted("path/to/sorted.zarr")          # or open_sorted("repo", icechunk=True)
+store.groups()                                       # range table: key tuple → start/end
+adata = store.select(cell_type="Tcell")              # one contiguous block → in-memory AnnData
+adata = store.select(cell_type="Tcell", demographic="adult")   # narrower sub-range
+adata = store.select(demographic="adult")            # cross-cut: gathered from runs + concatenated
+```
+
+Only the matching `X[start:end]` rows (plus the corresponding `obs`/`var`/`obsm`)
+are read, so subsets of a large store come back fast.
+
+## Icechunk storage backend
+
+Pass `--icechunk` to write the output through an
+[Icechunk](https://icechunk.io) repository — a transactional, versioned Zarr
+store — instead of a plain zarr directory. The whole conversion is staged and
+made durable as a **single commit** on the target branch.
+
+```bash
+pixi run datascale convert-h5ad \
+  --input path/to/input.h5ad \
+  --output path/to/repo \
+  --icechunk \
+  --icechunk-branch main
+```
+
+Notes:
+
+- Available on all subcommands via `--icechunk` / `--icechunk-branch`.
+- Local storage only for now (GCS is scaffolded but not wired up).
+- Requires an **eager** input (not compatible with `--backed`).
+- Read an icechunk-backed sorted store with `open_sorted(path, icechunk=True, branch="main")`.
+
 ## Config (TOML or YAML)
 
 See `example_config.toml` for a full reference. Key options:
@@ -99,6 +157,12 @@ overwrite = false
 consolidate_metadata = false
 # x_storage: Zarr output storage format: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense). 
 x_storage = "sparse-csr"
+backed = false
+# backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
+# one commit per conversion). icechunk requires eager input (not backed) for now.
+backend = "zarr"
+icechunk_branch = "main"
+icechunk_storage = "local"   # "gcs" is scaffolded but not wired up yet
 
 [chunks]
 #Chunk size for 2d dense arrays
@@ -112,6 +176,14 @@ reject_spatial = true
 require_non_empty = true
 min_obs = 1
 min_vars = 1
+
+# Sort + partition X by obs columns (convert-h5ad, sparse-csr, eager only). When enabled,
+# rows are physically sorted by sort_by (primary key first) so each distinct key tuple is a
+# contiguous row range, recorded under uns/datascale_sort_index and queryable via
+# datascale.open_sorted(...).select(...).
+[grouping]
+enabled = false
+sort_by = ["cell_type", "demographic"]
 ```
 
 ## CLI options
@@ -132,6 +204,9 @@ All commands share the same optional flags:
 | `--x-col-chunk` | Optional | Column chunk size for dense X |
 | `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays. Best tuned to median nnz per row |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
+| `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Local storage; eager input only (not `--backed`). All subcommands |
+| `--icechunk-branch` | Optional | Icechunk branch to commit to (default: `main`). Only used with `--icechunk` |
+| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by cell_type demographic`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` |
 
 ```bash
 pixi run datascale convert-h5ad --help
