@@ -98,8 +98,8 @@ PCIe transfer, and it's where the dense-vs-sparse difference actually shows up.
 appends one JSON line per run:
 
 ```bash
-# dev/run_query_sweep.sh [STORE_DIR] [COUNT] [FORMAT] [MODE] [OUT]
-dev/run_query_sweep.sh zarr_dbs 1000 csr sequential bench_results.jsonl
+# dev/run_query_sweep.sh [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
+dev/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench_results.jsonl
 ```
 
 > Note: cross-axis sparse queries (e.g. `--axis col` on a CSR store) are slow by
