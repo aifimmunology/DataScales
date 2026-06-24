@@ -6,6 +6,7 @@ dev/benchmark*
 CLAUDE*
 .claude/
 *0*.json
+comparisons/
 
 # Expression data files
 *.h5*

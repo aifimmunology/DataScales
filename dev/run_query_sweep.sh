@@ -14,7 +14,7 @@ MODE="${5:-sequential}" # sequential | random
 OUT="${6:-bench_results.jsonl}"
 
 : > "$OUT"
-for store in "$STORE_DIR"/*/*/*.zarr; do
+for store in "$STORE_DIR"/*.zarr; do
   for axis in row; do
     echo ">> $store  axis=$axis  count=$COUNT  ASYNC=$ASYNC format=$FORMAT  mode=$MODE" >&2
     pixi run -q zarr-bench --store "$store" --axis "$axis" --concurrency "$ASYNC" --count "$COUNT" \
