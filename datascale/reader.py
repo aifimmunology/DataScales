@@ -6,10 +6,10 @@ group. This reader turns a key selection into a minimal slice read:
 
     from datascale import open_sorted
     store = open_sorted("atlas.zarr")                 # or open_sorted("repo", icechunk=True)
-    store.groups()                                    # the (cell_type[, demographic, …]) table
-    adata = store.select(cell_type="Tcell")           # contiguous block → in-memory AnnData
-    adata = store.select(cell_type="Tcell", demographic="adult")   # sub-range
-    adata = store.select(demographic="adult")         # cross-cut: gathered + concatenated
+    store.groups()                                    # the (AIFI_L1[, batch_id, …]) table
+    adata = store.select(AIFI_L1="T cell")            # contiguous block → in-memory AnnData
+    adata = store.select(AIFI_L1="T cell", batch_id="B001")   # sub-range
+    adata = store.select(batch_id="B001")             # cross-cut: gathered + concatenated
 
 Only ``X[start:end]`` (plus the matching obs/var/obsm rows) is read, so a subset of a large
 store comes back fast without materialising the full matrix.

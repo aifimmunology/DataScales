@@ -64,11 +64,8 @@ def _add_common_args(
         "--icechunk",
         action="store_true",
         help="Write the output through an Icechunk repository (transactional, versioned) "
-             "instead of a plain zarr directory. Local storage; eager input only (not --backed).",
-    )
-    optional.add_argument(
-        "--icechunk-branch",
-        help="Icechunk branch to commit to (default: main). Only used with --icechunk.",
+             "instead of a plain zarr directory. Commits to the 'main' branch. "
+             "Local storage; eager input only (not --backed).",
     )
 
 
@@ -93,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="OBS_COLUMN",
         help="Sort + partition rows by these obs column(s), primary key first "
-             "(e.g. --sort-by cell_type demographic). Each distinct key tuple becomes a "
+             "(e.g. --sort-by AIFI_L1 batch_id). Each distinct key tuple becomes a "
              "contiguous row range queryable via datascale.open_sorted. Requires eager "
              "(non-backed) load and sparse-csr storage.",
     )
@@ -148,7 +145,6 @@ def run(argv: list[str] | None = None) -> int:
             cpus=getattr(args, "cpus", None),
             backed=True if getattr(args, "backed", False) else None,
             backend="icechunk" if getattr(args, "icechunk", False) else None,
-            icechunk_branch=getattr(args, "icechunk_branch", None),
             sort_by=getattr(args, "sort_by", None),
         )
 
@@ -168,8 +164,6 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Chunks: ({config.chunks.x_row_chunk}, {config.chunks.x_col_chunk})")
     print(f"X storage mode: {config.io.x_storage}")
     print(f"Storage backend: {config.io.backend}")
-    if config.io.backend == "icechunk":
-        print(f"Icechunk branch: {config.io.icechunk_branch}")
     if config.grouping.enabled:
         print(f"Sorted by: {list(config.grouping.sort_by)}")
     print(f"Backed load: {config.io.backed}")

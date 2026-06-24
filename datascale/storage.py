@@ -77,14 +77,14 @@ def open_output_store(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         storage = _icechunk_storage(output_path, cfg)
         repo = icechunk.Repository.open_or_create(storage)
-        session = repo.writable_session(cfg.io.icechunk_branch)
+        session = repo.writable_session("main")
         root = zarr.open_group(store=session.store, mode="w")
 
         def finalize() -> None:
             msg = commit_message or f"datascale convert → {output_path.name}"
             snapshot_id = session.commit(msg)
             print(
-                f"  icechunk commit {snapshot_id} on branch '{cfg.io.icechunk_branch}'",
+                f"  icechunk commit {snapshot_id} on branch 'main'",
                 flush=True, file=sys.stderr,
             )
 

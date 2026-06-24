@@ -103,7 +103,7 @@ reordered consistently, so the store stays a valid AnnData.
 pixi run datascale convert-h5ad \
   --input path/to/input.h5ad \
   --output path/to/sorted.zarr \
-  --sort-by cell_type demographic        # primary sort key first
+  --sort-by AIFI_L1 batch_id             # primary sort key first
 ```
 
 Constraints: requires an **eager** (non-`--backed`) load and **`sparse-csr`**
@@ -117,9 +117,9 @@ from datascale import open_sorted
 
 store = open_sorted("path/to/sorted.zarr")          # or open_sorted("repo", icechunk=True)
 store.groups()                                       # range table: key tuple → start/end
-adata = store.select(cell_type="Tcell")              # one contiguous block → in-memory AnnData
-adata = store.select(cell_type="Tcell", demographic="adult")   # narrower sub-range
-adata = store.select(demographic="adult")            # cross-cut: gathered from runs + concatenated
+adata = store.select(AIFI_L1="T cell")               # one contiguous block → in-memory AnnData
+adata = store.select(AIFI_L1="T cell", batch_id="B001")   # narrower sub-range
+adata = store.select(batch_id="B001")                # cross-cut: gathered from runs + concatenated
 ```
 
 Only the matching `X[start:end]` rows (plus the corresponding `obs`/`var`/`obsm`)
@@ -130,22 +130,21 @@ are read, so subsets of a large store come back fast.
 Pass `--icechunk` to write the output through an
 [Icechunk](https://icechunk.io) repository — a transactional, versioned Zarr
 store — instead of a plain zarr directory. The whole conversion is staged and
-made durable as a **single commit** on the target branch.
+made durable as a **single commit** on the `main` branch.
 
 ```bash
 pixi run datascale convert-h5ad \
   --input path/to/input.h5ad \
   --output path/to/repo \
-  --icechunk \
-  --icechunk-branch main
+  --icechunk
 ```
 
 Notes:
 
-- Available on all subcommands via `--icechunk` / `--icechunk-branch`.
+- Available on all subcommands via `--icechunk`. The conversion always commits to `main`.
 - Local storage only for now (GCS is scaffolded but not wired up).
 - Requires an **eager** input (not compatible with `--backed`).
-- Read an icechunk-backed sorted store with `open_sorted(path, icechunk=True, branch="main")`.
+- Read an icechunk-backed sorted store with `open_sorted(path, icechunk=True)`.
 
 ## Config (TOML or YAML)
 
@@ -161,7 +160,6 @@ backed = false
 # backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
 # one commit per conversion). icechunk requires eager input (not backed) for now.
 backend = "zarr"
-icechunk_branch = "main"
 icechunk_storage = "local"   # "gcs" is scaffolded but not wired up yet
 
 [chunks]
@@ -183,7 +181,7 @@ min_vars = 1
 # datascale.open_sorted(...).select(...).
 [grouping]
 enabled = false
-sort_by = ["cell_type", "demographic"]
+sort_by = ["AIFI_L1", "batch_id"]
 ```
 
 ## CLI options
@@ -204,9 +202,8 @@ All commands share the same optional flags:
 | `--x-col-chunk` | Optional | Column chunk size for dense X |
 | `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays. Best tuned to median nnz per row |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
-| `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Local storage; eager input only (not `--backed`). All subcommands |
-| `--icechunk-branch` | Optional | Icechunk branch to commit to (default: `main`). Only used with `--icechunk` |
-| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by cell_type demographic`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` |
+| `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Commits to the `main` branch. Local storage; eager input only (not `--backed`). All subcommands |
+| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` |
 
 ```bash
 pixi run datascale convert-h5ad --help

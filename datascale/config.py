@@ -27,7 +27,6 @@ class IOConfig:
     # Storage backend for the output store. "zarr" writes a plain on-disk zarr; "icechunk"
     # writes through a transactional, versioned Icechunk repository (one commit per convert).
     backend: BackendMode = "zarr"
-    icechunk_branch: str = "main"
     icechunk_storage: IcechunkStorageMode = "local"
     # GCS scaffolding — not wired into a working path yet (local only for now).
     gcs_bucket: str | None = None
@@ -96,7 +95,7 @@ def _validate_config(config: AppConfig) -> AppConfig:
         backend=_normalize_backend(config.io.backend),
     )
     # sort_by may arrive from TOML/YAML as a list; freeze it to a tuple. A bare string
-    # ("cell_type") is treated as a single key.
+    # ("AIFI_L1") is treated as a single key.
     sort_by = config.grouping.sort_by
     if isinstance(sort_by, str):
         sort_by = (sort_by,)
@@ -186,7 +185,6 @@ def apply_cli_overrides(
     cpus: int | None = None,
     backed: bool | None = None,
     backend: str | None = None,
-    icechunk_branch: str | None = None,
     sort_by: list[str] | None = None,
 ) -> AppConfig:
     io_cfg = config.io
@@ -203,8 +201,6 @@ def apply_cli_overrides(
         io_cfg = replace(io_cfg, backed=backed)
     if backend is not None:
         io_cfg = replace(io_cfg, backend=_normalize_backend(backend))
-    if icechunk_branch is not None:
-        io_cfg = replace(io_cfg, icechunk_branch=icechunk_branch)
     if x_row_chunk is not None:
         chunk_cfg = replace(chunk_cfg, x_row_chunk=x_row_chunk)
     if x_col_chunk is not None:

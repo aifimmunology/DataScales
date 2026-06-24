@@ -7,7 +7,6 @@ backed = false
 # backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
 # one commit per conversion). icechunk requires eager input (not backed) for now.
 backend = "zarr"
-icechunk_branch = "main"
 icechunk_storage = "local"   # "gcs" is scaffolded but not wired up yet
 # gcs_bucket = "my-bucket"
 # gcs_prefix = ""
@@ -27,7 +26,7 @@ min_vars = 1
 # Sort + partition X by obs columns (convert-h5ad, sparse-csr, eager only). When enabled,
 # rows are physically sorted by sort_by (primary key first) so each distinct key tuple is a
 # contiguous row range, recorded under uns/datascale_sort_index and queryable via
-# datascale.open_sorted(...).select(cell_type=..., demographic=...).
+# datascale.open_sorted(...).select(AIFI_L1=..., batch_id=...).
 [grouping]
 enabled = false
-sort_by = ["cell_type", "demographic"]
+sort_by = ["AIFI_L1", "batch_id"]
