@@ -8,9 +8,9 @@ the wall-clock numbers.
 
 Row selection has three modes: `sequential` (first N), `random` (N seeded
 indices), and `celltype` (all obs rows whose `--obs-column` equals
-`--cell-type`). The celltype mode forces `--axis row`, ignores `--count`, and
+`--obs-value`). The celltype mode forces `--axis row`, ignores `--count`, and
 reads the obs column + builds the match mask *inside* the timed region, modeling
-a real "filter by cell type, then fetch X" query.
+a real "filter by obs value, then fetch X" query.
 """
 
 from __future__ import annotations
@@ -81,17 +81,17 @@ def _read_obs_column(group, obs_column):
     return np.asarray(read_elem(group["obs"][obs_column]))
 
 
-def celltype_indices(group, obs_column, cell_type):
-    """Sorted obs-row indices whose `obs[obs_column]` equals `cell_type`.
+def celltype_indices(group, obs_column, obs_value):
+    """Sorted obs-row indices whose `obs[obs_column]` equals `obs_value`.
 
     Reads the obs column and builds the match mask live, so callers can put
-    this inside the timed region (cell-type queries model 'filter then fetch').
+    this inside the timed region (obs-value queries model 'filter then fetch').
     """
-    return np.flatnonzero(_read_obs_column(group, obs_column) == cell_type)
+    return np.flatnonzero(_read_obs_column(group, obs_column) == obs_value)
 
 
-def resolve_celltype_selection(group, obs_column, cell_type):
-    """Validate obs column / cell-type and return matching indices, or exit.
+def resolve_celltype_selection(group, obs_column, obs_value):
+    """Validate obs column / obs-value and return matching indices, or exit.
 
     Exits non-zero with the available columns / values on a typo, since an
     empty selection almost always means a misspelled name rather than a real
@@ -103,13 +103,13 @@ def resolve_celltype_selection(group, obs_column, cell_type):
         avail = ", ".join(columns) if columns else "(none)"
         sys.exit(f"ERROR: obs column '{obs_column}' not found. Available columns: {avail}")
     values = _read_obs_column(group, obs_column)
-    sel = np.flatnonzero(values == cell_type)
+    sel = np.flatnonzero(values == obs_value)
     if sel.size == 0:
         uniq = np.unique(values)
         preview = ", ".join(map(str, uniq[:50]))
         more = "" if uniq.size <= 50 else f" (+{uniq.size - 50} more)"
         sys.exit(
-            f"ERROR: no rows in obs['{obs_column}'] match cell type '{cell_type}'. "
+            f"ERROR: no rows in obs['{obs_column}'] match obs value '{obs_value}'. "
             f"Available values: {preview}{more}"
         )
     return sel
@@ -155,7 +155,7 @@ def run_rss_probe(args):
     handle, _is_sparse, _src_format, shape, _dtype = open_x(store)
     if args.mode == "celltype":
         group = zarr.open_group(store=store, mode="r")
-        sel = celltype_indices(group, args.obs_column, args.cell_type)
+        sel = celltype_indices(group, args.obs_column, args.obs_value)
         read_convert(handle, 0, sel, args.format)
     else:
         axis_dim = 0 if args.axis == "row" else 1
@@ -176,7 +176,7 @@ def _measure_peak_rss(args):
         "--mode", args.mode, "--format", args.format, "--seed", str(args.seed),
     ]
     if args.mode == "celltype":
-        cmd += ["--obs-column", args.obs_column, "--cell-type", args.cell_type]
+        cmd += ["--obs-column", args.obs_column, "--obs-value", args.obs_value]
     else:
         cmd += ["--count", str(args.count)]
     try:
@@ -216,14 +216,14 @@ def run_benchmark(args):
     axis_len = shape[axis_dim]
 
     if args.mode == "celltype":
-        # Validate up front (exits on a bad column / unmatched cell type), but
+        # Validate up front (exits on a bad column / unmatched obs value), but
         # re-read obs inside the timed query so the obs read + mask build are
-        # part of the measured "filter by cell type then fetch" cost.
+        # part of the measured "filter by obs value then fetch" cost.
         group = zarr.open_group(store=store, mode="r")
-        resolve_celltype_selection(group, args.obs_column, args.cell_type)
+        resolve_celltype_selection(group, args.obs_column, args.obs_value)
 
         def do_query(h, g):
-            sel = celltype_indices(g, args.obs_column, args.cell_type)
+            sel = celltype_indices(g, args.obs_column, args.obs_value)
             return read_convert(h, 0, sel, args.format)
     else:
         if args.count > axis_len:
@@ -262,7 +262,7 @@ def run_benchmark(args):
         "count": args.count,
         "mode": args.mode,
         "obs_column": args.obs_column,
-        "cell_type": args.cell_type,
+        "obs_value": args.obs_value,
         "selected": int(result.shape[axis_dim]),
         "final_format": args.format,
         "concurrency": concurrency,
@@ -289,7 +289,7 @@ def run_benchmark(args):
     print(f"Source: {src_format}  shape={tuple(shape)}  dtype={dtype}")
     if args.mode == "celltype":
         print(
-            f"Query: axis=row mode=celltype obs['{args.obs_column}']=='{args.cell_type}' "
+            f"Query: axis=row mode=celltype obs['{args.obs_column}']=='{args.obs_value}' "
             f"selected={summary['selected']} -> {args.format}"
         )
     else:
@@ -317,11 +317,11 @@ def main(argv=None):
     p.add_argument("--count", type=int, help="Number of rows/columns to select (ignored when --mode celltype).")
     p.add_argument("--mode", choices=["sequential", "random", "celltype"], default="sequential",
                    help="sequential = first N; random = N seeded random indices; "
-                        "celltype = all obs rows whose --obs-column equals --cell-type "
+                        "celltype = all obs rows whose --obs-column equals --obs-value "
                         "(forces --axis row, ignores --count). Default: sequential.")
     p.add_argument("--obs-column", dest="obs_column",
                    help="obs column to filter on (required for --mode celltype).")
-    p.add_argument("--cell-type", dest="cell_type",
+    p.add_argument("--obs-value", dest="obs_value",
                    help="Value in --obs-column to select rows by (required for --mode celltype).")
     p.add_argument("--format", choices=["csr", "dense"], help="Final format the data is converted to (timed).")
     p.add_argument("--concurrency", type=int, help="zarr async.concurrency (parallel chunk fetches).")
@@ -339,7 +339,7 @@ def main(argv=None):
         if args.axis == "col":
             p.error("--mode celltype selects obs rows; --axis col is not supported.")
         args.axis = "row"
-        missing = [n for n in ("obs_column", "cell_type", "format") if getattr(args, n) is None]
+        missing = [n for n in ("obs_column", "obs_value", "format") if getattr(args, n) is None]
         if missing:
             p.error("--mode celltype requires: "
                     + ", ".join("--" + m.replace("_", "-") for m in missing))

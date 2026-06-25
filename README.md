@@ -6,11 +6,11 @@ A configurable converter for single-cell gene expression data to Zarr stores, fo
 
 - Converts `.h5ad` and 10x Genomics Cell Ranger `.h5` files to Zarr v3
 - Rejects spatial AnnData inputs during validation
-- Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking
+- Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking and optional sharding for dense X (`--x-shard-factor`)
 - Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it
 - Optional 'backed' HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
-- Optional [Icechunk](#icechunk-storage-backend) storage backend (`--icechunk`) — writes the store through a transactional, versioned repository instead of a plain zarr directory
-- Optional [sort + partition](#sorted-stores---sort-by) of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous row range for fast subset reads via `datascale.open_sorted`
+- Optional Icechunk storage backend (`--icechunk`) — writes the store through a transactional, versioned repository instead of a plain zarr directory
+- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous row range for fast subset reads via `datascale.open_sorted`
 - Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
@@ -78,73 +78,6 @@ Requirements (strict; conversion errors otherwise):
 - `adata.X` in each file must be CSR or CSC (CSC is auto-converted to CSR).
 - All `X` matrices must share the same dtype.
 
-What gets written:
-
-- `X` — concatenated along rows, written in the configured `--x-storage`
-  format (`sparse-csr` or `dense`; `sparse-csc` is not supported here).
-- `obs` — concatenated via `pandas.concat` (duplicate `obs_names` are kept as-is).
-- `var` — taken from the first file (already verified identical across all files).
-- Empty `obsm` / `varm` / `uns` / `obsp` / `varp` groups for anndata-zarr
-  compatibility. **`layers`, `raw`, `obsm`, etc. are not concatenated.** Use
-  `convert-h5ad` per-file if you need those.
-
-`--backed` is recommended for large inputs: each file's `X` is streamed from
-HDF5 instead of being fully loaded.
-
-## Sorted stores (`--sort-by`)
-
-`convert-h5ad` can physically **sort and partition** the output by one or more
-`obs` columns. Rows are reordered so that every distinct key tuple becomes a
-single contiguous row range, and a range table is written under
-`uns/datascale_sort_index`. All obs-aligned arrays (`obs`, `obsm`, …) are
-reordered consistently, so the store stays a valid AnnData.
-
-```bash
-pixi run datascale convert-h5ad \
-  --input path/to/input.h5ad \
-  --output path/to/sorted.zarr \
-  --sort-by AIFI_L1 batch_id             # primary sort key first
-```
-
-Constraints: requires an **eager** (non-`--backed`) load and **`sparse-csr`**
-storage.
-
-Once written, query subsets without materialising the full matrix using the
-importable reader:
-
-```python
-from datascale import open_sorted
-
-store = open_sorted("path/to/sorted.zarr")          # or open_sorted("repo", icechunk=True)
-store.groups()                                       # range table: key tuple → start/end
-adata = store.select(AIFI_L1="T cell")               # one contiguous block → in-memory AnnData
-adata = store.select(AIFI_L1="T cell", batch_id="B001")   # narrower sub-range
-adata = store.select(batch_id="B001")                # cross-cut: gathered from runs + concatenated
-```
-
-Only the matching `X[start:end]` rows (plus the corresponding `obs`/`var`/`obsm`)
-are read, so subsets of a large store come back fast.
-
-## Icechunk storage backend
-
-Pass `--icechunk` to write the output through an
-[Icechunk](https://icechunk.io) repository — a transactional, versioned Zarr
-store — instead of a plain zarr directory. The whole conversion is staged and
-made durable as a **single commit** on the `main` branch.
-
-```bash
-pixi run datascale convert-h5ad \
-  --input path/to/input.h5ad \
-  --output path/to/repo \
-  --icechunk
-```
-
-Notes:
-
-- Available on all subcommands via `--icechunk`. The conversion always commits to `main`.
-- Local storage only for now (GCS is scaffolded but not wired up).
-- Requires an **eager** input (not compatible with `--backed`).
-- Read an icechunk-backed sorted store with `open_sorted(path, icechunk=True)`.
 
 ## Config (TOML or YAML)
 
@@ -168,6 +101,9 @@ x_row_chunk = 2048
 x_col_chunk = 2048
 #Tune 1d Shunk size for sparse array storage. #Reccomended to tune to median nnz per row.
 sparse_flat_chunk = 1000000
+#Pack dense X chunks into shards of (x_row_chunk, x_col_chunk) * factor. 1 = no sharding.
+#Use >1 with small chunks to keep read granularity fine while cutting file/object count.
+x_shard_factor = 1
 
 [validation]
 reject_spatial = true
@@ -201,6 +137,7 @@ All commands share the same optional flags:
 | `--x-row-chunk` | Optional | Row chunk size for dense X (auto-capped at 64 MB per chunk) |
 | `--x-col-chunk` | Optional | Column chunk size for dense X |
 | `--sparse-flat-chunk` | Optional | Flat array chunk size for sparse arrays. Best tuned to median nnz per row |
+| `--x-shard-factor` | Optional | Pack dense X chunks into shards of `(x_row_chunk, x_col_chunk)` × factor. `1` (default) = no sharding. Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only) |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
 | `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Commits to the `main` branch. Local storage; eager input only (not `--backed`). All subcommands |
 | `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` |

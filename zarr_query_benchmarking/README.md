@@ -19,9 +19,9 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 | `--store` | path | (required) | `.zarr` store to query (reads its `X`). |
 | `--axis` | `row` \| `col` | (required¹) | Query rows (obs/cells) or columns (var/genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
-| `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded random indices; `celltype` = all obs rows whose `--obs-column` equals `--cell-type` (see below). |
+| `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded random indices; `celltype` = all obs rows whose `--obs-column` equals `--obs-value` (see below). |
 | `--obs-column` | str | (required for `celltype`) | obs column to filter on (e.g. a cell-type annotation). |
-| `--cell-type` | str | (required for `celltype`) | Value in `--obs-column` to select rows by. |
+| `--obs-value` | str | (required for `celltype`) | Value in `--obs-column` to select rows by. |
 | `--format` | `csr` \| `dense` | (required) | Final format the result is converted to (**included in the timing**). |
 | `--concurrency` | int | zarr default (10) | `zarr` `async.concurrency` — parallel chunk fetches. |
 | `--repeats` | int | 5 | Timed repeats (reports median/min/p95). |
@@ -32,21 +32,21 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 
 ¹ `--axis` and `--count` are required for `sequential`/`random`. `--mode celltype`
 forces `--axis row` (rejects `--axis col`), **ignores `--count`**, and requires
-`--obs-column` + `--cell-type` instead.
+`--obs-column` + `--obs-value` instead.
 
 ## Selecting by cell type (`--mode celltype`)
 
 ```bash
 pixi run zarr-bench --store <path.zarr> --mode celltype \
-    --obs-column AIFI_L1 --cell-type Platelet --format csr
+    --obs-column AIFI_L1 --obs-value Platelet --format csr
 ```
 
-Reads `obs[<obs-column>]`, builds the `== <cell-type>` mask, and selects **all**
+Reads `obs[<obs-column>]`, builds the `== <obs-value>` mask, and selects **all**
 matching obs rows (the row count is whatever matches; `--count` is ignored). The
 obs read + mask build happen **inside the timed region**, so the wall time models
 a real "filter cells by type, then fetch their `X`" query rather than a bare slice.
-A typo in the column or cell-type name exits non-zero and prints the available
-columns / values. The JSON output adds `obs_column`, `cell_type`, and `selected`
+A typo in the column or obs-value name exits non-zero and prints the available
+columns / values. The JSON output adds `obs_column`, `obs_value`, and `selected`
 (number of matched rows).
 
 ## Metrics reported
