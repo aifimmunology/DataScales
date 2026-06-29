@@ -39,6 +39,9 @@ class ChunkConfig:
     x_col_chunk: int = 2048
     sparse_flat_chunk: int = 1_000_000
     cpus: int = 1  # workers for parallel matrix chunk writes; threads in-memory, processes when backed; raise on HPC
+    # Pack dense X inner chunks into shards of (x_row_chunk, x_col_chunk) * factor.
+    # 1 = no sharding. Dense X only (sparse output ignores it). See converter._dense_shards.
+    x_shard_factor: int = 1
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,10 @@ def _validate_config(config: AppConfig) -> AppConfig:
     grouping = replace(config.grouping, sort_by=tuple(sort_by))
     if grouping.enabled and not grouping.sort_by:
         raise ValueError("grouping.enabled is true but grouping.sort_by is empty.")
+    if config.chunks.x_shard_factor < 1:
+        raise ValueError(
+            f"chunks.x_shard_factor must be >= 1 (1 = no sharding); got {config.chunks.x_shard_factor}."
+        )
     return replace(config, io=io, grouping=grouping)
 
 
@@ -182,6 +189,7 @@ def apply_cli_overrides(
     x_row_chunk: int | None = None,
     x_col_chunk: int | None = None,
     sparse_flat_chunk: int | None = None,
+    x_shard_factor: int | None = None,
     cpus: int | None = None,
     backed: bool | None = None,
     backend: str | None = None,
@@ -207,6 +215,8 @@ def apply_cli_overrides(
         chunk_cfg = replace(chunk_cfg, x_col_chunk=x_col_chunk)
     if sparse_flat_chunk is not None:
         chunk_cfg = replace(chunk_cfg, sparse_flat_chunk=sparse_flat_chunk)
+    if x_shard_factor is not None:
+        chunk_cfg = replace(chunk_cfg, x_shard_factor=x_shard_factor)
     if cpus is not None:
         chunk_cfg = replace(chunk_cfg, cpus=cpus)
     if sort_by is not None:

@@ -23,7 +23,8 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 | `--obs-column` | str | (required for `celltype`) | obs column to filter on (e.g. a cell-type annotation). |
 | `--obs-value` | str | (required for `celltype`) | Value in `--obs-column` to select rows by. |
 | `--format` | `csr` \| `dense` | (required) | Final format the result is converted to (**included in the timing**). |
-| `--concurrency` | int | zarr default (10) | `zarr` `async.concurrency` — parallel chunk fetches. |
+| `--concurrency` | int | zarr default (10) | `zarr` `async.concurrency` — how many chunks are *dispatched* at once (a semaphore). Pair with `--max-workers`. |
+| `--max-workers` | int | `min(32, cpu+4)` | `zarr` `threading.max_workers` — size of the pool that actually *decodes* chunks (Blosc/zstd). **The dominant stage of a dense read.** Set ≈ physical cores. |
 | `--repeats` | int | 5 | Timed repeats (reports median/min/p95). |
 | `--warmup` | int | 1 | Warmup runs discarded before timing. |
 | `--seed` | int | 0 | RNG seed for `--mode random`. |
@@ -48,6 +49,22 @@ a real "filter cells by type, then fetch their `X`" query rather than a bare sli
 A typo in the column or obs-value name exits non-zero and prints the available
 columns / values. The JSON output adds `obs_column`, `obs_value`, and `selected`
 (number of matched rows).
+
+## Two knobs, both required for parallelism
+
+A dense read uses **two independent** zarr settings, and raising only one pins you near 1 core:
+
+- `--concurrency` (`async.concurrency`) only *dispatches* chunks — it's an `asyncio.Semaphore`,
+  it runs no CPU work.
+- `--max-workers` (`threading.max_workers`) sizes the `ThreadPoolExecutor` that runs **Blosc/zstd
+  decompression**, which is **~70% of a warm dense read** (`BloscCodec._decode_single` →
+  `asyncio.to_thread`). Decode releases the GIL, so it scales across cores.
+
+So `--concurrency 60 --max-workers 1` ≈ 1 core (decode serialized); `--concurrency 1` starves the
+pool regardless of workers. **Set both** (e.g. `--concurrency 64 --max-workers <physical cores>`).
+Measured on a 12-core box, `X[0:100000, :]` (500k×34k dense, 1k×1k chunks): `conc=60/mw=1` = 10.1 s
+@ 1.1 cores → `conc=60/mw=12` = 2.63 s @ 5.2 cores. See `thread_scaling_probe.py` for the full
+stage decomposition (IO / decompress / assemble) and the dask comparison.
 
 ## Metrics reported
 

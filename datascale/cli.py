@@ -56,6 +56,13 @@ def _add_common_args(
         help="Flat chunk size for sparse arrays (data/indices/indptr); tune to median nnz per row (default: 1000000)",
     )
     optional.add_argument(
+        "--x-shard-factor",
+        type=int,
+        help="Pack dense X inner chunks into shards of (x-row-chunk, x-col-chunk) * factor. "
+             "1 (default) = no sharding. Use >1 with small chunks to keep read granularity "
+             "fine while cutting file/object count (dense X only; sparse output ignores it).",
+    )
+    optional.add_argument(
         "--cpus",
         type=int,
         help="Workers for parallel matrix chunk writes (default: 1). Raise on HPC. In-memory uses threads; backed uses processes (most effective for dense output).",
@@ -142,6 +149,7 @@ def run(argv: list[str] | None = None) -> int:
             x_row_chunk=args.x_row_chunk,
             x_col_chunk=args.x_col_chunk,
             sparse_flat_chunk=args.sparse_flat_chunk,
+            x_shard_factor=getattr(args, "x_shard_factor", None),
             cpus=getattr(args, "cpus", None),
             backed=True if getattr(args, "backed", False) else None,
             backend="icechunk" if getattr(args, "icechunk", False) else None,

@@ -204,9 +204,21 @@ def run_inspect(path):
 
 
 def run_benchmark(args):
+    # Two independent knobs, both needed to use multiple cores:
+    #   async.concurrency  -- how many chunks are *dispatched* at once (a semaphore)
+    #   threading.max_workers -- size of the pool that actually *decodes* them
+    #                            (Blosc decode runs via asyncio.to_thread on this pool)
+    # Raising concurrency alone leaves decode single-threaded -> ~1 core; raising
+    # max_workers alone starves the pool if concurrency is low. Set both.
+    cfg = {}
     if args.concurrency is not None:
-        zarr.config.set({"async.concurrency": args.concurrency})
+        cfg["async.concurrency"] = args.concurrency
+    if args.max_workers is not None:
+        cfg["threading.max_workers"] = args.max_workers
+    if cfg:
+        zarr.config.set(cfg)
     concurrency = zarr.config.get("async.concurrency")
+    max_workers = zarr.config.get("threading.max_workers")
 
     axis_dim = 0 if args.axis == "row" else 1
 
@@ -266,6 +278,7 @@ def run_benchmark(args):
         "selected": int(result.shape[axis_dim]),
         "final_format": args.format,
         "concurrency": concurrency,
+        "max_workers": max_workers,
         "result_shape": list(result.shape),
         "result_nnz": nnz_out,
         "chunks_fetched": counter.gets,
@@ -294,7 +307,7 @@ def run_benchmark(args):
         )
     else:
         print(f"Query: axis={args.axis} count={args.count} mode={args.mode} -> {args.format}")
-    print(f"Concurrency: {concurrency}  (warm cache)")
+    print(f"Concurrency: {concurrency}  max_workers: {max_workers}  (warm cache)")
     print(f"Result: shape={tuple(result.shape)}  nnz={nnz_out}")
     print(f"Chunks fetched: {counter.gets}   Bytes read: {counter.bytes / 1e6:.1f} MB")
     rss_str = "n/a" if peak_rss_bytes is None else f"{peak_rss_bytes / 1e6:.1f} MB"
@@ -324,7 +337,12 @@ def main(argv=None):
     p.add_argument("--obs-value", dest="obs_value",
                    help="Value in --obs-column to select rows by (required for --mode celltype).")
     p.add_argument("--format", choices=["csr", "dense"], help="Final format the data is converted to (timed).")
-    p.add_argument("--concurrency", type=int, help="zarr async.concurrency (parallel chunk fetches).")
+    p.add_argument("--concurrency", type=int, help="zarr async.concurrency: how many chunks are dispatched at once (a semaphore). Pair with --max-workers.")
+    p.add_argument("--max-workers", dest="max_workers", type=int,
+                   help="zarr threading.max_workers: size of the decode thread pool that runs "
+                        "Blosc/zstd decompression (the dominant stage of a dense read). Defaults "
+                        "to min(32, cpu+4). Set ~= physical cores; raising --concurrency without "
+                        "this leaves decode single-threaded (~1 core).")
     p.add_argument("--repeats", type=int, default=5, help="Timed repeats (default: 5).")
     p.add_argument("--warmup", type=int, default=1, help="Warmup runs discarded before timing (default: 1).")
     p.add_argument("--seed", type=int, default=0, help="RNG seed for --mode random (default: 0).")

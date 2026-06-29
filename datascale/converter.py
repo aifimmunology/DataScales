@@ -27,6 +27,32 @@ def _x_compressors():
     return (BloscCodec(cname="zstd", clevel=5, shuffle="shuffle"),)
 
 
+def _dense_shards(row_chunk, col_chunk, n_rows, n_cols, factor):
+    """Resolve the zarr v3 shard shape and the write-block shape for a dense X array.
+
+    With sharding on (``factor`` > 1) the inner chunk stays (row_chunk, col_chunk) — that
+    remains the read granularity — and many inner chunks are packed into one shard object,
+    cutting file/object count. zarr requires the shard shape to be an integer multiple of the
+    inner chunk shape, so the shard is ``chunk * factor`` per axis, capped at the number of
+    chunks the array actually spans (no point in a shard reaching far past the data).
+
+    Returns ``(shards, block_row, block_col)`` where ``shards`` is the shards= kwarg (None when
+    no sharding) and (block_row, block_col) is the granularity callers must write at. Writing a
+    *partial* shard makes zarr's sharding codec read-modify-write the whole shard (silent perf
+    killer #2), so the block shape equals the shard shape when sharding is on, and the inner
+    chunk shape otherwise. Peak dense RAM per write block therefore grows by ~factor**2 when
+    sharding — the documented cost of fewer, larger objects.
+    """
+    if factor <= 1:
+        return None, row_chunk, col_chunk
+    import math
+    rf = min(factor, math.ceil(n_rows / row_chunk))
+    cf = min(factor, math.ceil(n_cols / col_chunk))
+    shard_row = row_chunk * rf
+    shard_col = col_chunk * cf
+    return (shard_row, shard_col), shard_row, shard_col
+
+
 # ── Backed-sparse parallel workers ───────────────────────────────────────────
 # These run in separate processes (h5py is not thread-safe, but independent
 # read-only file handles across processes are). They are module-level so the
@@ -103,6 +129,12 @@ def _resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
     IcechunkStore can't provide — so backed + icechunk is rejected for now. To keep the
     single-session write thread-safe we also force a single worker for icechunk.
     """
+    if cfg.chunks.x_shard_factor > 1 and cfg.io.x_storage != "dense":
+        print(
+            f"→ x_shard_factor={cfg.chunks.x_shard_factor} only applies to dense X; "
+            f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored.",
+            flush=True, file=sys.stderr,
+        )
     if cfg.io.backend != "icechunk":
         return cfg
     if cfg.io.backed:
@@ -193,12 +225,16 @@ def _write_sparse_as_dense_dask(
 
     row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
     col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
+    shards, block_row, block_col = _dense_shards(
+        row_chunk, col_chunk, n_rows, n_cols, cfg.chunks.x_shard_factor
+    )
 
     zarr_arr = group.require_array(
         key,
         shape=(n_rows, n_cols),
         dtype=dtype,
         chunks=(row_chunk, col_chunk),
+        shards=shards,
         compressors=_x_compressors(),
         overwrite=True,
     )
@@ -207,17 +243,20 @@ def _write_sparse_as_dense_dask(
 
     backed = not hasattr(matrix, "indices")  # backed _CSRDataset lacks .indices
     if backed:
+        # Bands are block_row tall and densified in block_col-wide tiles so each write
+        # covers whole shards (or whole chunks when unsharded) — no read-modify-write,
+        # and disjoint bands never share a shard so the parallel workers need no lock.
         src = matrix.group
         out_root = zarr_arr.store_path.store.root
         jobs = [
             (out_root, zarr_arr.store_path.path, src.file.filename, src.name,
-             r0, min(r0 + row_chunk, n_rows), col_chunk, n_cols)
-            for r0 in range(0, n_rows, row_chunk)
+             r0, min(r0 + block_row, n_rows), block_col, n_cols)
+            for r0 in range(0, n_rows, block_row)
         ]
         _run_parallel(_densify_band_segment, jobs, cfg.chunks.cpus)
         return
 
-    dask_dense = _build_tiled_dense_dask(matrix, row_chunk, col_chunk)
+    dask_dense = _build_tiled_dense_dask(matrix, block_row, block_col)
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(dask_dense, zarr_arr, scheduler="threads", num_workers=cfg.chunks.cpus)
 
@@ -237,16 +276,22 @@ def _write_dense_streaming(
     n_rows, n_cols = matrix.shape
     row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
     col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
+    shards, block_row, block_col = _dense_shards(
+        row_chunk, col_chunk, n_rows, n_cols, cfg.chunks.x_shard_factor
+    )
 
     zarr_arr = group.require_array(
         key, shape=(n_rows, n_cols), dtype=matrix.dtype,
-        chunks=(row_chunk, col_chunk), compressors=_x_compressors(), overwrite=True,
+        chunks=(row_chunk, col_chunk), shards=shards,
+        compressors=_x_compressors(), overwrite=True,
     )
     zarr_arr.attrs["encoding-type"] = "array"
     zarr_arr.attrs["encoding-version"] = "0.2.0"
 
+    # Block to the shard grid (or chunk grid when unsharded) so each da.store write covers
+    # whole shards and never triggers a read-modify-write of a partial shard.
     backed = not isinstance(matrix, np.ndarray)  # h5py-backed dense isn't thread-safe
-    arr = da.from_array(matrix, chunks=(row_chunk, col_chunk))
+    arr = da.from_array(matrix, chunks=(block_row, block_col))
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(
             arr, zarr_arr,
@@ -735,7 +780,6 @@ def _append_dense_region(
     zarr_arr: Any,
     matrix: Any,
     row_offset: int,
-    row_chunk: int,
     cfg: AppConfig,
 ) -> None:
     """Write a single matrix into zarr_arr[row_offset:row_offset+n_rows, :]."""
@@ -744,14 +788,18 @@ def _append_dense_region(
     from dask.diagnostics import ProgressBar
 
     n_rows, n_cols = matrix.shape
-    col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
-    row_chunk = min(row_chunk, n_rows)
+    # Block to the array's shard grid (or chunk grid when unsharded) so writes cover whole
+    # shards. NB: each input file starts at an arbitrary row_offset, so the shard straddling
+    # a file seam is read-modify-written — unavoidable with per-file concat region writes.
+    block_row, block_col = zarr_arr.shards or zarr_arr.chunks
+    block_row = min(block_row, n_rows)
+    block_col = min(block_col, n_cols)
     region = (slice(row_offset, row_offset + n_rows), slice(None))
 
     is_backed_sparse = not sp.issparse(matrix) and hasattr(matrix, "format")
     if not sp.issparse(matrix) and not is_backed_sparse:
         # Already dense (ndarray-like); 2D-tile to the zarr chunk grid via region store.
-        arr = da.from_array(np.asarray(matrix), chunks=(row_chunk, col_chunk))
+        arr = da.from_array(np.asarray(matrix), chunks=(block_row, block_col))
         with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
             da.store(
                 arr, zarr_arr,
@@ -762,7 +810,7 @@ def _append_dense_region(
         return
 
     backed = is_backed_sparse
-    dask_dense = _build_tiled_dense_dask(matrix, row_chunk, col_chunk)
+    dask_dense = _build_tiled_dense_dask(matrix, block_row, block_col)
     scheduler = "synchronous" if backed else "threads"
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
         da.store(
@@ -908,21 +956,26 @@ def _write_concatenated_dense(
 ) -> None:
     n_obs_total = sum(n_obs_each)
 
-    # Blocks are 2D-tiled to (row_chunk × col_chunk) by _append_dense_region, so peak
-    # RAM is bounded by chunk size — no need to shrink row_chunk for wide matrices.
+    # _append_dense_region 2D-tiles each file to the array's write-block grid (shard shape
+    # when sharding, else chunk shape), so peak RAM is bounded by one block — no need to
+    # shrink row_chunk for wide matrices.
     row_chunk = min(cfg.chunks.x_row_chunk, n_obs_total)
     col_chunk = min(cfg.chunks.x_col_chunk, n_vars)
+    shards, _, _ = _dense_shards(
+        row_chunk, col_chunk, n_obs_total, n_vars, cfg.chunks.x_shard_factor
+    )
 
     zarr_arr = group.require_array(
         key, shape=(n_obs_total, n_vars), dtype=data_dtype,
-        chunks=(row_chunk, col_chunk), compressors=_x_compressors(), overwrite=True,
+        chunks=(row_chunk, col_chunk), shards=shards,
+        compressors=_x_compressors(), overwrite=True,
     )
     zarr_arr.attrs["encoding-type"] = "array"
     zarr_arr.attrs["encoding-version"] = "0.2.0"
 
     row_offset = 0
     for matrix, n_rows in zip(matrices, n_obs_each):
-        _append_dense_region(zarr_arr, matrix, row_offset, row_chunk, cfg)
+        _append_dense_region(zarr_arr, matrix, row_offset, cfg)
         row_offset += n_rows
 
 

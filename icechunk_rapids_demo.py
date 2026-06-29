@@ -13,6 +13,11 @@ GPU/CUDA only — runs on the server, not the laptop. Mirrors rapids_zarr_exampl
 """
 from __future__ import annotations
 
+import os
+import shutil
+import sys
+import time
+
 import dask
 dask.config.set({"distributed.scheduler.worker-ttl": None})
 
@@ -40,8 +45,38 @@ SPARSE_CHUNK_SIZE = 24_000
 N_TOP_GENES = 2000
 RANDOM_SEED = 5671
 
+# ── parallelism config (CPU copy/codec path) ───────────────────────────────────
+# These tune the zarr v3 chunk-level parallelism used by _copy_csr's slice
+# read/writes (no host dask needed — it's a pure chunk-aligned byte copy):
+#   async.concurrency   -> max chunk get/decode/encode/set ops in flight per op
+#   threading.max_workers -> size of the codec (Blosc/Zstd) thread pool
+ZARR_ASYNC_CONCURRENCY = 60
+ZARR_CODEC_WORKERS = 60
+# Blosc has its OWN internal threads; with a 60-wide codec pool above, leaving
+# Blosc multi-threaded would multiply to ~60*N threads (silent killer #1:
+# oversubscription). Pin it to 1 so all parallelism lives in the zarr layer.
+BLOSC_NTHREADS = 1
+
 
 # ── helpers ─────────────────────────────────────────────────────────────────--
+def _log(msg):
+    """Timestamped, flushed progress line (block-buffered stdout looks 'hung')."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True, file=sys.stderr)
+
+
+def _configure_parallelism():
+    """Set zarr chunk-level concurrency + codec threads, and record them (provenance)."""
+    zarr.config.set({
+        "async.concurrency": ZARR_ASYNC_CONCURRENCY,
+        "threading.max_workers": ZARR_CODEC_WORKERS,
+    })
+    from numcodecs import blosc
+    blosc.set_nthreads(BLOSC_NTHREADS)
+    _log(f"parallelism: zarr async.concurrency={ZARR_ASYNC_CONCURRENCY} "
+         f"threading.max_workers={ZARR_CODEC_WORKERS} blosc.nthreads={BLOSC_NTHREADS} "
+         f"| zarr {zarr.__version__}")
+
+
 def _copy_csr(src_grp, dst_parent, name):
     """Stream-copy a csr group (data/indices/indptr 1D arrays) into dst_parent[name]."""
     dst = dst_parent.require_group(name)
@@ -55,8 +90,15 @@ def _copy_csr(src_grp, dst_parent, name):
         d.attrs["encoding-type"] = "array"
         d.attrs["encoding-version"] = "0.2.0"
         step = s.chunks[0] * 16
-        for i in range(0, s.shape[0], step):
+        n = s.shape[0]
+        t0 = time.perf_counter()
+        _log(f"    _copy_csr/{name}/{child}: {n:,} elems ({s.dtype}), "
+             f"step={step:,}, src_chunks={s.chunks}")
+        for i in range(0, n, step):
             d[i:i + step] = s[i:i + step]
+            _log(f"      {name}/{child}: {min(i + step, n):,}/{n:,} "
+                 f"({100 * min(i + step, n) / n:.0f}%)")
+        _log(f"    _copy_csr/{name}/{child}: done in {time.perf_counter() - t0:.1f}s")
 
 
 def _load_adata(store):
@@ -72,13 +114,23 @@ def _load_adata(store):
 
 def _host_csr(X):
     """Materialize a dask CSR block-by-block onto the host (peak RAM ≈ one CSR)."""
+    nblocks = X.numblocks[0]
+    _log(f"  _host_csr: materializing {nblocks} row-blocks "
+         f"(shape={X.shape}, chunks={X.chunksize}) GPU->host")
     parts = []
-    for bi in range(X.numblocks[0]):
+    t0 = time.perf_counter()
+    for bi in range(nblocks):
+        tb = time.perf_counter()
         ck = X.blocks[bi, 0].compute()
-        if hasattr(ck, "get"):
+        if hasattr(ck, "get"):          # CuPy/cupyx -> host
             ck = ck.get()
         parts.append(ck)
-    return sp.vstack(parts, format="csr")
+        _log(f"    block {bi + 1}/{nblocks}: rows={ck.shape[0]:,} nnz={ck.nnz:,} "
+             f"({time.perf_counter() - tb:.1f}s)")
+    _log(f"  _host_csr: vstacking {nblocks} blocks -> single CSR")
+    out = sp.vstack(parts, format="csr")
+    _log(f"  _host_csr: done, nnz={out.nnz:,} in {time.perf_counter() - t0:.1f}s")
+    return out
 
 
 # ── steps ───────────────────────────────────────────────────────────────────--
@@ -95,26 +147,45 @@ def ingest(repo):
 
 
 def user1_normalize(repo):
+    _log("step1 user1_normalize: START")
     repo.create_branch("user1-normalize", repo.lookup_branch("main"))
     s = repo.writable_session("user1-normalize")
     root = zarr.open_group(store=s.store, mode="a")
+    _log("  branch 'user1-normalize' created from main; writable session open")
 
     raw = root.require_group("raw")
     raw.attrs["encoding-type"] = "raw"
     raw.attrs["encoding-version"] = "0.1.0"
+    _log("  stashing raw counts: copying X -> raw/X (serial, single-thread)")
     _copy_csr(root["X"], raw, "X")
     write_elem(raw, "var", read_elem(root["var"]))
+    _log("  raw/ stash complete (raw/X + raw/var)")
 
-    adata = _load_adata(s.store)
+    # Read through a read-only session: its store is picklable, so dask-distributed
+    # can ship the lazy-X graph to the GPU workers. A writable session refuses to
+    # pickle (uncommitted changeset state) and would raise on .compute()/.persist().
+    # X (raw counts) is already committed on main, which this branch was forked from.
+    _log("  loading lazy AnnData (read-only session, dask-backed X)")
+    adata = _load_adata(repo.readonly_session(branch="user1-normalize").store)
+    _log(f"  AnnData: X.shape={adata.X.shape} dtype={adata.X.dtype} "
+         f"chunks={adata.X.chunksize}; moving to GPU")
     rsc.get.anndata_to_GPU(adata)
+    _log("  on GPU; calculate_qc_metrics")
     rsc.pp.calculate_qc_metrics(adata)
+    _log("  normalize_total")
     rsc.pp.normalize_total(adata)
+    _log("  log1p")
     rsc.pp.log1p(adata)
+    _log("  normalization done; materializing normalized X to host CSR")
 
-    write_elem(root, "X", _host_csr(adata.X))
+    host = _host_csr(adata.X)
+    _log("  writing normalized X back to store (write_elem root/X)")
+    write_elem(root, "X", host)
+    _log("  committing user1 snapshot")
     snap = s.commit("user1: normalized + log1p; raw counts in raw/")
     repo.reset_branch("main", snap)
-    print("step1 user1:", snap)
+    print("step1 user1:", snap, flush=True)
+    _log("step1 user1_normalize: DONE")
 
 
 def user2_subset(repo):
@@ -126,7 +197,9 @@ def user2_subset(repo):
     s = repo.writable_session("user2-subset")
     root = zarr.open_group(store=s.store, mode="a")
 
-    adata = _load_adata(s.store)
+    # Read via a picklable read-only session (see user1_normalize); the normalized
+    # X is already committed on main, which user2-subset was forked from.
+    adata = _load_adata(repo.readonly_session(branch="user2-subset").store)
     mask = (adata.obs[CELL_TYPE_COL] == CELL_TYPE_VAL).to_numpy()
     idx = np.where(mask)[0]
     adata = adata[mask].copy()
@@ -182,7 +255,16 @@ def main():
     rmm.reinitialize(managed_memory=True, pool_allocator=False, devices=[0, 1, 2, 3])
     cp.cuda.set_allocator(rmm_cupy_allocator)
 
-    repo = Repository.create(local_filesystem_storage(REPO_PATH))
+    _configure_parallelism()
+
+    # Icechunk only creates into a *clean* prefix (root_is_clean: rejects if any
+    # object exists under REPO_PATH). The demo is meant to start fresh each run, so
+    # wipe the prefix in-process — this uses the script's cwd, immune to a shell
+    # `rm` that ran against a different working directory than the script sees.
+    abs_repo = os.path.abspath(REPO_PATH)
+    print("repo prefix:", abs_repo)
+    shutil.rmtree(abs_repo, ignore_errors=True)
+    repo = Repository.create(local_filesystem_storage(abs_repo))
     ingest(repo)
     user1_normalize(repo)
     user2_subset(repo)

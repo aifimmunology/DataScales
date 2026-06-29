@@ -16,6 +16,7 @@ from datascale.config import (
     ValidationConfig,
 )
 from datascale.converter import ConversionError, convert_h5ad_to_zarr
+from datascale.config import _validate_config
 from datascale.reader import QueryError
 from datascale.storage import open_input_group
 
@@ -197,3 +198,101 @@ def test_sort_through_icechunk_and_read(tmp_path: Path) -> None:
     store = open_sorted(str(out), icechunk=True, branch="main")
     assert _ids(store.select(cell_type="A")) == {2, 3, 5}
     assert _ids(store.select(demographic="x")) == {2, 4, 5}
+
+
+# ---------------------------------------------------------------------------
+# Dense X sharding (--x-shard-factor)
+# ---------------------------------------------------------------------------
+
+def _dense_cfg(shard_factor: int = 1, **chunk_kw) -> AppConfig:
+    return AppConfig(
+        io=IOConfig(overwrite=True, x_storage="dense"),
+        chunks=_chunks(x_shard_factor=shard_factor, **chunk_kw),
+        validation=ValidationConfig(),
+    )
+
+
+def _x_object_count(store_dir: Path) -> int:
+    """Count stored chunk/shard objects under the X array (not metadata)."""
+    xdir = store_dir / "X"
+    return sum(1 for p in xdir.rglob("*") if p.is_file() and p.name != "zarr.json")
+
+
+def _expected_dense(in_h5ad: Path) -> np.ndarray:
+    a = ad.read_h5ad(str(in_h5ad))
+    return np.asarray(a.X.todense() if sp.issparse(a.X) else a.X)
+
+
+def test_dense_sharding_metadata_and_roundtrip(tmp_path: Path) -> None:
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    out = tmp_path / "sharded.zarr"
+    # 6x3 X, chunks 2x2, factor 2 -> shard 4x4 (capped at the array's chunk extent).
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _dense_cfg(shard_factor=2))
+
+    g = open_input_group(str(out))
+    xa = g["X"]
+    assert xa.chunks == (2, 2)          # inner chunk = read granularity, unchanged
+    assert xa.shards == (4, 4)          # shard = chunk * factor
+    assert xa.attrs["encoding-type"] == "array"
+
+    # Still a valid, byte-identical anndata store.
+    got = np.asarray(ad.read_zarr(str(out)).X)
+    assert np.array_equal(got, _expected_dense(tmp_path / "in.h5ad"))
+
+
+def test_sharding_cuts_object_count(tmp_path: Path) -> None:
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    sharded = tmp_path / "sharded.zarr"
+    plain = tmp_path / "plain.zarr"
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(sharded), _dense_cfg(shard_factor=2))
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(plain), _dense_cfg(shard_factor=1))
+
+    # Same logical layout (chunks 2x2), but shards pack many inner chunks per object.
+    assert _x_object_count(sharded) < _x_object_count(plain)
+    # ...and the data is identical between the two.
+    assert np.array_equal(
+        np.asarray(ad.read_zarr(str(sharded)).X),
+        np.asarray(ad.read_zarr(str(plain)).X),
+    )
+
+
+def test_sharding_backed_dense_parallel_roundtrip(tmp_path: Path) -> None:
+    """Backed input + cpus>1 fans densify-bands across processes; each band must write
+    whole shards (no read-modify-write, no inter-worker shard sharing)."""
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    out = tmp_path / "backed_sharded.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="dense", backed=True),
+        chunks=_chunks(x_shard_factor=2, cpus=2),
+        validation=ValidationConfig(),
+    )
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), cfg)
+
+    xa = open_input_group(str(out))["X"]
+    assert xa.chunks == (2, 2) and xa.shards == (4, 4)
+    assert np.array_equal(
+        np.asarray(ad.read_zarr(str(out)).X), _expected_dense(tmp_path / "in.h5ad")
+    )
+
+
+def test_sharding_ignored_for_sparse(tmp_path: Path, capsys) -> None:
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    out = tmp_path / "sparse.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csr"),
+        chunks=_chunks(x_shard_factor=4),
+        validation=ValidationConfig(),
+    )
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), cfg)
+
+    # Sparse X is a group of 1-D arrays; none of them are sharded.
+    g = open_input_group(str(out))
+    for name in ("data", "indices", "indptr"):
+        assert g["X"][name].shards is None
+    assert "only applies to dense X" in capsys.readouterr().err
+
+
+def test_shard_factor_below_one_rejected() -> None:
+    cfg = AppConfig(chunks=ChunkConfig(x_shard_factor=0))
+    with pytest.raises(ValueError, match="x_shard_factor must be >= 1"):
+        _validate_config(cfg)
