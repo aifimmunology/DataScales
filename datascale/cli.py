@@ -99,7 +99,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Sort + partition rows by these obs column(s), primary key first "
              "(e.g. --sort-by AIFI_L1 batch_id). Each distinct key tuple becomes a "
              "contiguous row range queryable via datascale.open_sorted. Requires eager "
-             "(non-backed) load and sparse-csr storage.",
+             "(non-backed) load and sparse-csr or dense storage (datascale.open_sorted "
+             "reads back sparse-csr only; dense ranges are read directly from X[start:end]).",
     )
     _add_common_args(h5ad_required, h5ad_optional)
 

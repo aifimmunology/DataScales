@@ -111,10 +111,11 @@ require_non_empty = true
 min_obs = 1
 min_vars = 1
 
-# Sort + partition X by obs columns (convert-h5ad, sparse-csr, eager only). When enabled,
-# rows are physically sorted by sort_by (primary key first) so each distinct key tuple is a
-# contiguous row range, recorded under uns/datascale_sort_index and queryable via
-# datascale.open_sorted(...).select(...).
+# Sort + partition X by obs columns (convert-h5ad, sparse-csr or dense, eager only). When
+# enabled, rows are physically sorted by sort_by (primary key first) so each distinct key tuple
+# is a contiguous row range, recorded under uns/datascale_sort_index. sparse-csr stores are
+# queryable via datascale.open_sorted(...).select(...); for dense stores the reader is not yet
+# wired up, so read ranges directly from X[start:end] using the recorded sort_index.
 [grouping]
 enabled = false
 sort_by = ["AIFI_L1", "batch_id"]
@@ -140,7 +141,7 @@ All commands share the same optional flags:
 | `--x-shard-factor` | Optional | Pack dense X chunks into shards of `(x_row_chunk, x_col_chunk)` × factor. `1` (default) = no sharding. Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only) |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
 | `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Commits to the `main` branch. Local storage; eager input only (not `--backed`). All subcommands |
-| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` |
+| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` or `dense` (`datascale.open_sorted` reads back `sparse-csr` only; dense ranges are read directly from `X[start:end]`) |
 
 ```bash
 pixi run datascale convert-h5ad --help

@@ -174,15 +174,50 @@ def test_open_sorted_on_unsorted_store_errors(tmp_path: Path) -> None:
         open_sorted(str(out))
 
 
-def test_sort_requires_sparse_csr(tmp_path: Path) -> None:
+def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
+    """Dense X supports --sort-by: rows are physically sorted and the sort_index ranges
+    line up with X[start:end] (the reader stays sparse-only, so we read X directly)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
+    out = tmp_path / "sorted_dense.zarr"
     cfg = AppConfig(
         io=IOConfig(overwrite=True, x_storage="dense"),
         chunks=_chunks(),
         validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
+    )
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), cfg)
+
+    # X is a plain dense zarr array, rows sorted by the keys, still a valid anndata store.
+    g = open_input_group(str(out))
+    from anndata.io import read_elem
+    import zarr
+
+    assert isinstance(g["X"], zarr.Array)
+    adata = ad.read_zarr(str(out))
+    ct = list(adata.obs["cell_type"])
+    assert ct == sorted(ct)
+    assert list(np.asarray(adata.X[:, 0]).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
+
+    # Each sort_index range is a contiguous block whose obs rows share the key tuple,
+    # readable directly from the dense X with a single slice.
+    ranges = read_elem(g["uns"]["datascale_sort_index"]["ranges"])
+    obs_full = read_elem(g["obs"])
+    for _, row in ranges.iterrows():
+        s, e = int(row["start"]), int(row["end"])
+        block = g["X"][s:e]
+        assert block.shape == (e - s, adata.n_vars)
+        assert (obs_full["cell_type"].to_numpy()[s:e] == row["cell_type"]).all()
+
+
+def test_sort_rejects_sparse_csc(tmp_path: Path) -> None:
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csc"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
     )
-    with pytest.raises(ConversionError, match="requires x_storage='sparse-csr'"):
+    with pytest.raises(ConversionError, match="requires x_storage='sparse-csr' or 'dense'"):
         convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(tmp_path / "o.zarr"), cfg)
 
 

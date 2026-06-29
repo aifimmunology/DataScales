@@ -615,9 +615,10 @@ def _maybe_sort_adata(
         return adata, (), None, None
 
     sort_by = cfg.grouping.sort_by
-    if cfg.io.x_storage != "sparse-csr":
+    if cfg.io.x_storage not in ("sparse-csr", "dense"):
         raise ConversionError(
-            f"grouping (sort_by) requires x_storage='sparse-csr'; got '{cfg.io.x_storage}'."
+            f"grouping (sort_by) requires x_storage='sparse-csr' or 'dense'; "
+            f"got '{cfg.io.x_storage}'."
         )
     if cfg.io.backed:
         raise ConversionError(
@@ -632,6 +633,12 @@ def _maybe_sort_adata(
         f"Rows sorted by {list(sort_by)} into {len(ranges_df)} contiguous groups; "
         "obs/obsm/obsp/layers/raw reordered to match (see sort_index group)."
     )
+    if cfg.io.x_storage == "dense":
+        warnings.append(
+            "Sorted store has dense X: the sort_index makes contiguous row ranges "
+            "queryable, but datascale.open_sorted().select() reads X via sparse_dataset "
+            "and does not yet support dense X — read dense ranges directly from X[start:end]."
+        )
     return adata, sort_by, perm, ranges_df
 
 

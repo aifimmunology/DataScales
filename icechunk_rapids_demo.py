@@ -2,11 +2,13 @@
 on one large dataset, where unchanged data is shared across snapshots.
 
   Step 0  create repo, ingest an existing anndata CSR zarr (raw counts) on main
-  Step 1  User 1 branches, normalizes + log1p's all cells, stashes counts to
-          raw/, overwrites X, commits, pushes to main
+  Step 1  User 1 branches, normalizes + log1p's all cells, and writes the result
+          to a NEW layer 'layers/norm' — raw counts stay in X untouched (zero
+          copy). The normalized matrix is streamed to disk block-by-block
+          (peak host RAM ~= one block, never the whole CSR). Commits, pushes to main
   Step 2  User 2 sees the changes, checks out one cell type, runs the clustering
-          pipeline on that subset, commits the subset results into a scoped
-          group (X is never rewritten), pushes to main
+          pipeline on that subset (reading layers/norm), commits the subset
+          results into a scoped group (X/layers are never rewritten), pushes to main
   Step 3  open main and show the final repo + history
 
 GPU/CUDA only — runs on the server, not the laptop. Mirrors rapids_zarr_example.py.
@@ -17,6 +19,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 
 import dask
 dask.config.set({"distributed.scheduler.worker-ttl": None})
@@ -26,7 +29,6 @@ from dask.distributed import Client
 import cupy as cp
 
 import numpy as np
-import scipy.sparse as sp
 import zarr
 import anndata as ad
 from anndata.io import read_elem, write_elem
@@ -72,6 +74,12 @@ def _configure_parallelism():
     })
     from numcodecs import blosc
     blosc.set_nthreads(BLOSC_NTHREADS)
+    # anndata's writer warns once per element that zarr v3 autosharding will become
+    # the default. It's informational (we don't autoshard here, so layout is
+    # unchanged) and floods stderr with one line per obs/var column written. Silence
+    # only that exact message — never blanket-mute warnings.
+    warnings.filterwarnings("ignore", message=".*autosharding will be the default.*",
+                            category=UserWarning)
     _log(f"parallelism: zarr async.concurrency={ZARR_ASYNC_CONCURRENCY} "
          f"threading.max_workers={ZARR_CODEC_WORKERS} blosc.nthreads={BLOSC_NTHREADS} "
          f"| zarr {zarr.__version__}")
@@ -101,36 +109,22 @@ def _copy_csr(src_grp, dst_parent, name):
         _log(f"    _copy_csr/{name}/{child}: done in {time.perf_counter() - t0:.1f}s")
 
 
-def _load_adata(store):
-    """Lazy AnnData (dask X) backed by a zarr/icechunk store."""
+def _load_adata(store, x_key="X"):
+    """Lazy AnnData (dask X) backed by a zarr/icechunk store.
+
+    x_key may be a nested path (e.g. "layers/norm") — we walk it so X can be
+    sourced from a layer instead of the root X.
+    """
     f = zarr.open_group(store=store, mode="r")
-    X = f["X"]
+    node = f
+    for part in x_key.split("/"):
+        node = node[part]
+    X = node
     shape = tuple(X.attrs["shape"]) if "shape" in X.attrs else tuple(X.shape)
     X_dask = read_elem_lazy(X, (SPARSE_CHUNK_SIZE, shape[1]))
     if np.issubdtype(X_dask.dtype, np.integer):
         X_dask = X_dask.astype(np.float32)
     return ad.AnnData(X=X_dask, obs=read_elem(f["obs"]), var=read_elem(f["var"]))
-
-
-def _host_csr(X):
-    """Materialize a dask CSR block-by-block onto the host (peak RAM ≈ one CSR)."""
-    nblocks = X.numblocks[0]
-    _log(f"  _host_csr: materializing {nblocks} row-blocks "
-         f"(shape={X.shape}, chunks={X.chunksize}) GPU->host")
-    parts = []
-    t0 = time.perf_counter()
-    for bi in range(nblocks):
-        tb = time.perf_counter()
-        ck = X.blocks[bi, 0].compute()
-        if hasattr(ck, "get"):          # CuPy/cupyx -> host
-            ck = ck.get()
-        parts.append(ck)
-        _log(f"    block {bi + 1}/{nblocks}: rows={ck.shape[0]:,} nnz={ck.nnz:,} "
-             f"({time.perf_counter() - tb:.1f}s)")
-    _log(f"  _host_csr: vstacking {nblocks} blocks -> single CSR")
-    out = sp.vstack(parts, format="csr")
-    _log(f"  _host_csr: done, nnz={out.nnz:,} in {time.perf_counter() - t0:.1f}s")
-    return out
 
 
 # ── steps ───────────────────────────────────────────────────────────────────--
@@ -153,19 +147,15 @@ def user1_normalize(repo):
     root = zarr.open_group(store=s.store, mode="a")
     _log("  branch 'user1-normalize' created from main; writable session open")
 
-    raw = root.require_group("raw")
-    raw.attrs["encoding-type"] = "raw"
-    raw.attrs["encoding-version"] = "0.1.0"
-    _log("  stashing raw counts: copying X -> raw/X (serial, single-thread)")
-    _copy_csr(root["X"], raw, "X")
-    write_elem(raw, "var", read_elem(root["var"]))
-    _log("  raw/ stash complete (raw/X + raw/var)")
-
+    # NO physical stash of raw counts: X is left untouched as the raw-count
+    # matrix. The normalized result is written to a NEW layer 'layers/norm', so
+    # nothing in X is copied or rewritten (zero data movement for the raw counts).
+    #
     # Read through a read-only session: its store is picklable, so dask-distributed
     # can ship the lazy-X graph to the GPU workers. A writable session refuses to
     # pickle (uncommitted changeset state) and would raise on .compute()/.persist().
     # X (raw counts) is already committed on main, which this branch was forked from.
-    _log("  loading lazy AnnData (read-only session, dask-backed X)")
+    _log("  loading lazy AnnData (read-only session, dask-backed X = raw counts)")
     adata = _load_adata(repo.readonly_session(branch="user1-normalize").store)
     _log(f"  AnnData: X.shape={adata.X.shape} dtype={adata.X.dtype} "
          f"chunks={adata.X.chunksize}; moving to GPU")
@@ -176,13 +166,18 @@ def user1_normalize(repo):
     rsc.pp.normalize_total(adata)
     _log("  log1p")
     rsc.pp.log1p(adata)
-    _log("  normalization done; materializing normalized X to host CSR")
+    _log("  normalization done; streaming normalized X -> layers/norm")
 
-    host = _host_csr(adata.X)
-    _log("  writing normalized X back to store (write_elem root/X)")
-    write_elem(root, "X", host)
-    _log("  committing user1 snapshot")
-    snap = s.commit("user1: normalized + log1p; raw counts in raw/")
+    # anndata's dask-sparse writer streams: it writes the first row-block, then
+    # appends each subsequent block. write_cupy_dask maps .get() per block so the
+    # device->host transfer is also one block at a time. Peak host RAM ~= one
+    # block, never the full CSR (this replaces the old _host_csr full-materialize).
+    layers = root.require_group("layers")
+    layers.attrs["encoding-type"] = "dict"
+    layers.attrs["encoding-version"] = "0.1.0"
+    write_elem(layers, "norm", adata.X)
+    _log("  layers/norm written; committing user1 snapshot")
+    snap = s.commit("user1: normalized+log1p in layers/norm; raw counts kept in X")
     repo.reset_branch("main", snap)
     print("step1 user1:", snap, flush=True)
     _log("step1 user1_normalize: DONE")
@@ -197,9 +192,10 @@ def user2_subset(repo):
     s = repo.writable_session("user2-subset")
     root = zarr.open_group(store=s.store, mode="a")
 
-    # Read via a picklable read-only session (see user1_normalize); the normalized
-    # X is already committed on main, which user2-subset was forked from.
-    adata = _load_adata(repo.readonly_session(branch="user2-subset").store)
+    # Read via a picklable read-only session (see user1_normalize); user1 wrote the
+    # normalized matrix to layers/norm (X is still raw counts), so source X from there.
+    adata = _load_adata(repo.readonly_session(branch="user2-subset").store,
+                        x_key="layers/norm")
     mask = (adata.obs[CELL_TYPE_COL] == CELL_TYPE_VAL).to_numpy()
     idx = np.where(mask)[0]
     adata = adata[mask].copy()
@@ -241,7 +237,10 @@ def user2_subset(repo):
 def show(repo):
     root = zarr.open_group(store=repo.readonly_session(branch="main").store, mode="r")
     print("step3 final main root keys:", list(root.keys()))
-    print("   X shape:", tuple(root["X"].attrs["shape"]))
+    print("   X shape (raw counts):", tuple(root["X"].attrs["shape"]))
+    if "layers" in root and "norm" in root["layers"]:
+        print("   layers/norm shape (normalized):",
+              tuple(root["layers"]["norm"].attrs["shape"]))
     a = root["analyses"][CELL_TYPE_VAL]
     print("   analyses/%s:" % CELL_TYPE_VAL, {k: a[k].shape for k in a.keys()})
     print("   history:")

@@ -7,6 +7,7 @@ CLAUDE*
 .claude/
 *0*.json
 comparisons/
+query_results/
 
 # Expression data files
 *.h5*
