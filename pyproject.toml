@@ -58,3 +58,4 @@ kernel = "python -m ipykernel install --user --name <kernelname> --display-name 
 scanpy = ">=1.12.1,<2"
 dask = ">=2026.3.0,<2027"
 notebook = ">=7.5.6,<8"
+gcsfs = ">=2026.3.0"

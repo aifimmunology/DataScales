@@ -26,7 +26,21 @@ import numpy as np
 import scipy.sparse as sp
 import zarr
 from anndata.io import sparse_dataset
-from zarr.storage import LocalStore, WrapperStore
+from zarr.storage import FsspecStore, LocalStore, WrapperStore
+
+
+def open_store(path, read_only=True):
+    """Open a zarr store from a local path or an fsspec URL.
+
+    A URL with a scheme (``gs://``, ``s3://``, ``http://`` ...) goes through
+    zarr's ``FsspecStore`` — the documented, stable remote path (``ObjectStore``
+    is still flagged experimental). ``gs://`` requires ``gcsfs`` installed, which
+    picks up gcloud Application Default Credentials automatically, so no token is
+    threaded through here. Anything without a scheme is a local directory store.
+    """
+    if "://" in str(path):
+        return FsspecStore.from_url(str(path), read_only=read_only)
+    return LocalStore(path, read_only=read_only)
 
 
 class CountingStore(WrapperStore):
@@ -151,7 +165,7 @@ def run_rss_probe(args):
     """
     import resource
 
-    store = LocalStore(args.store, read_only=True)
+    store = open_store(args.store)
     handle, _is_sparse, _src_format, shape, _dtype = open_x(store)
     if args.mode == "celltype":
         group = zarr.open_group(store=store, mode="r")
@@ -188,7 +202,7 @@ def _measure_peak_rss(args):
 
 
 def run_inspect(path):
-    x = zarr.open_group(store=LocalStore(path, read_only=True), mode="r")["X"]
+    x = zarr.open_group(store=open_store(path), mode="r")["X"]
     print(f"Store: {path}")
     if isinstance(x, zarr.Group):
         n_obs, n_vars = x.attrs["shape"]
@@ -223,7 +237,7 @@ def run_benchmark(args):
     axis_dim = 0 if args.axis == "row" else 1
 
     # Timing pass on a plain store.
-    store = LocalStore(args.store, read_only=True)
+    store = open_store(args.store)
     handle, is_sparse, src_format, shape, dtype = open_x(store)
     axis_len = shape[axis_dim]
 
@@ -256,7 +270,7 @@ def run_benchmark(args):
         times.append(perf_counter() - t0)
 
     # Untimed counting pass on a wrapped store (obs reads included for celltype).
-    counter = CountingStore(LocalStore(args.store, read_only=True))
+    counter = CountingStore(open_store(args.store))
     chandle = open_x(counter)[0]
     cgroup = zarr.open_group(store=counter, mode="r") if args.mode == "celltype" else None
     counter.reset()
@@ -324,7 +338,9 @@ def run_benchmark(args):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="zarr-bench", description=__doc__)
-    p.add_argument("--store", required=True, help="Path to the .zarr store to query (reads its X).")
+    p.add_argument("--store", required=True,
+                   help="Local path OR fsspec URL (gs://bucket/store.zarr, s3://...) of the "
+                        ".zarr store to query (reads its X). gs:// needs gcsfs + gcloud ADC.")
     p.add_argument("--inspect", action="store_true", help="Print X layout (format/shape/chunks/codec) and exit; no timing.")
     p.add_argument("--axis", choices=["row", "col"], help="Query rows (obs) or columns (var).")
     p.add_argument("--count", type=int, help="Number of rows/columns to select (ignored when --mode celltype).")

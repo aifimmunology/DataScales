@@ -16,7 +16,7 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 
 | Flag | Values | Default | Meaning |
 |------|--------|---------|---------|
-| `--store` | path | (required) | `.zarr` store to query (reads its `X`). |
+| `--store` | path \| URL | (required) | `.zarr` store to query (reads its `X`). Local path **or** an fsspec URL — `gs://bucket/store.zarr`, `s3://…` (see [Remote stores](#remote-stores)). |
 | `--axis` | `row` \| `col` | (required¹) | Query rows (obs/cells) or columns (var/genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
 | `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded random indices; `celltype` = all obs rows whose `--obs-column` equals `--obs-value` (see below). |
@@ -109,6 +109,28 @@ Either way, read the comparison off **`result_decompressed_bytes`** and **`peak_
 not just `bytes_read`: the decompressed footprint is what real analysis pays in RAM and
 PCIe transfer, and it's where the dense-vs-sparse difference actually shows up.
 
+## Remote stores
+
+`--store` accepts an fsspec URL, not just a local path. A URL with a scheme is
+opened through zarr's `FsspecStore` (the documented, stable remote backend —
+`ObjectStore`/`obstore` is still flagged experimental):
+
+```bash
+pixi run zarr-bench --store gs://my-bucket/health_atlas_csr.zarr \
+    --axis row --count 1000 --format csr --json
+```
+
+- **Google Cloud Storage** (`gs://`) requires `gcsfs` (a pixi dependency) and uses
+  **gcloud Application Default Credentials** automatically — run
+  `gcloud auth application-default login` once; no token is passed in code.
+- **`bytes_read`** is now real **GCS egress** (compressed bytes pulled over the
+  network), and **`chunks_fetched`** is the number of object GETs — both are the
+  numbers that matter for remote cost.
+- The "warm cache" in the timing reflects gcsfs/OS caching after the warmup read,
+  **not** a cold first-touch network read. For a cold-vs-warm split, run with
+  `--warmup 0 --repeats 1` in a fresh process for cold, and the normal settings
+  for warm. (Object stores can't be page-cache-dropped from userspace.)
+
 ## Example: sweep row + col across many stores
 
 `dev/run_query_sweep.sh` runs both axes against every `.zarr` in a directory and
@@ -117,6 +139,10 @@ appends one JSON line per run:
 ```bash
 # dev/run_query_sweep.sh [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
 dev/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench_results.jsonl
+
+# STORE_DIR may be a gs:// prefix — every *.zarr at that prefix is listed via
+# gcsfs (a bucket can't be shell-globbed) and benchmarked in turn:
+dev/run_query_sweep.sh gs://my-bucket/stores 1000 csr 32 sequential bench_results.jsonl
 ```
 
 > Note: cross-axis sparse queries (e.g. `--axis col` on a CSR store) are slow by

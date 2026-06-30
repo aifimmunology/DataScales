@@ -48,7 +48,7 @@ import rapids_singlecell as rsc
 SOURCE_ZARR = "/home/workspace/zarrs/13M_50M_pbmc_soundlife.zarr"   # anndata CSR zarr
 REPO_PATH = "/home/workspace/zarrs/demo_repo"                       # icechunk repo
 CELL_TYPE_COL = "predicted_AIFI_L1"
-CELL_TYPE_VAL = "b_cells"
+CELL_TYPE_VAL = "B cell"
 SPARSE_CHUNK_SIZE = 5_000
 N_TOP_GENES = 2000
 RANDOM_SEED = 5671
