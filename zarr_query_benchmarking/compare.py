@@ -76,6 +76,19 @@ def _cell(run, key_or_fn):
     return key_or_fn(run) if callable(key_or_fn) else run.get(key_or_fn)
 
 
+# Map a --sort field name to the value actually used for ordering. By default we
+# sort on the raw run field, but for display-derived columns (e.g. "store" shows
+# the basename, not the full path) we must sort on the *displayed* value so that
+# identically-named stores from different runs line up. Anything not listed here
+# falls back to the raw run field via run.get(...).
+_SORT_KEYS = {col[0]: col[1] for col in _COLUMNS}
+
+
+def _sort_value(run, field):
+    extractor = _SORT_KEYS.get(field, field)
+    return _cell(run, extractor)
+
+
 def _parse(text):
     """Accept a JSON array, a single JSON object, or JSON Lines (one object per line)."""
     text = text.strip()
@@ -173,7 +186,21 @@ def main(argv=None):
         return 1
 
     if args.sort:
-        runs.sort(key=lambda r: (r.get(args.sort) is None, r.get(args.sort)))
+        # Resolve through the column extractors so --sort store orders by the
+        # displayed basename, not the full path; tie-break on store name then
+        # file so the same store from two runs lands on adjacent rows. The
+        # primary value keeps its native type (so numeric fields like median_s
+        # sort numerically); None is pushed last via the leading flag.
+        def sort_key(r):
+            primary = _sort_value(r, args.sort)
+            return (
+                primary is None,
+                primary if primary is not None else "",
+                _store_name(r),
+                r.get("_file") or "",
+            )
+
+        runs.sort(key=sort_key)
 
     headers, rows, numeric = build_table(runs, multi_file=len(paths) > 1)
     render = render_md if args.md else render_plain
