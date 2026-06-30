@@ -17,6 +17,7 @@ dependencies = [
   "PyYAML>=6.0",
   "scanpy>=1.9.0",
   "dask[array]>=2023.1.0",
+  "icechunk>=2.0.6",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +44,13 @@ default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
+# Run the zarr query benchmark CLI; pass flags after the task name, e.g.
+#   pixi run zarr-bench --store zarr_dbs/health_atlas_csr_1000.zarr --axis obs --count 1000
+zarr-bench = "python -m zarr_query_benchmarking"
+zarr-bench-inspect = "python -m zarr_query_benchmarking --inspect"
+# Tests live in the dev environment: pixi run -e dev test-zarr-bench
+test-zarr-bench = "python -m pytest tests/test_zarr_query_benchmarking.py -q"
+
 [tasks]
 kernel = "python -m ipykernel install --user --name <kernelname> --display-name 'Python (<kernelname>)'"
 
@@ -50,3 +58,4 @@ kernel = "python -m ipykernel install --user --name <kernelname> --display-name 
 scanpy = ">=1.12.1,<2"
 dask = ">=2026.3.0,<2027"
 notebook = ">=7.5.6,<8"
+gcsfs = ">=2026.3.0"

@@ -2,6 +2,13 @@
 __pycache__/
 *.py[codz]
 *$py.class
+dev/benchmark*
+CLAUDE*
+.claude/
+*0*.json
+comparisons/
+query_results/
+rapids_den*
 
 # Expression data files
 *.h5*
@@ -31,6 +38,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+query_runs*
+dev/DELET*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
