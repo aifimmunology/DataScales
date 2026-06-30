@@ -2,21 +2,21 @@
 on one large dataset, where unchanged data is shared across snapshots.
 
   Step 0  create repo, ingest an existing anndata CSR zarr (raw counts) on main
-  Step 1  User 1 branches, normalizes + log1p's all cells, and writes the result
-          to a NEW layer 'layers/norm' — raw counts stay in X untouched (zero
-          copy). The normalized matrix is streamed to disk block-by-block
-          (peak host RAM ~= one block, never the whole CSR). Commits, pushes to main
-  Step 2  User 2 sees the changes, checks out one cell type, runs the clustering
-          pipeline on that subset (reading layers/norm), commits the subset
-          results into a scoped group (X/layers are never rewritten), pushes to main
-  Step 3  open main and show the final repo + history
+  Step 1  User 1 branches, normalizes + log1p's all cells (multi-GPU dask), and
+          writes the result to a NEW layer 'layers/norm' — raw counts stay in X
+          untouched (zero copy). The normalized matrix is streamed to disk
+          block-by-block (peak host RAM ~= one block). Commits, pushes to main.
+  Step 2  User 2 checks out one cell type from layers/norm, runs the clustering
+          pipeline on that (bounded) subset in-memory on a single GPU, and commits
+          the results into a scoped group (X/layers are never rewritten).
+  Step 3  open main and show the final repo + history.
 
-Reruns are incremental: if REPO_PATH already holds a repo it is reused (not wiped),
-and any step whose output is already committed on main is skipped — layers/norm present
-=> skip Step 1, analyses/<cell_type> present => skip Step 2. Delete REPO_PATH to force a
+Reruns are incremental: an existing REPO_PATH is reused (not wiped), and any step
+whose output is already committed on main is skipped — layers/norm present => skip
+Step 1, analyses/<cell_type> present => skip Step 2. Delete REPO_PATH to force a
 full fresh run.
 
-GPU/CUDA only — runs on the server, not the laptop. Mirrors rapids_zarr_example.py.
+GPU/CUDA only — runs on the server, not the laptop.
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from dask.distributed import Client
 import cupy as cp
 
 import numpy as np
+import scipy.sparse as sp
 import zarr
 import anndata as ad
 from anndata.io import read_elem, write_elem
@@ -43,51 +44,28 @@ from icechunk import Repository, local_filesystem_storage
 
 import rapids_singlecell as rsc
 
-# ── config ────────────────────────────────────────────────────────────────────
-SOURCE_ZARR = "zarrs/13M_50M_pbmc_soundlife.zarr"   # existing anndata CSR zarr
-REPO_PATH = "zarrs/demo_repo"                       # icechunk repo (created fresh)
+# ── config ──────────────────────────────────────────────────────────────────--
+SOURCE_ZARR = "/home/workspace/zarrs/13M_50M_pbmc_soundlife.zarr"   # anndata CSR zarr
+REPO_PATH = "/home/workspace/zarrs/demo_repo"                       # icechunk repo
 CELL_TYPE_COL = "predicted_AIFI_L1"
-CELL_TYPE_VAL = "b_cells"                           # User 2's subset
-SPARSE_CHUNK_SIZE = 24_000
+CELL_TYPE_VAL = "b_cells"
+SPARSE_CHUNK_SIZE = 5_000
 N_TOP_GENES = 2000
 RANDOM_SEED = 5671
 
-# ── parallelism config (CPU copy/codec path) ───────────────────────────────────
-# These tune the zarr v3 chunk-level parallelism used by _copy_csr's slice
-# read/writes (no host dask needed — it's a pure chunk-aligned byte copy):
-#   async.concurrency   -> max chunk get/decode/encode/set ops in flight per op
-#   threading.max_workers -> size of the codec (Blosc/Zstd) thread pool
+# zarr v3 chunk-level parallelism for the CSR byte-copy (no host dask needed):
+#   async.concurrency     -> max chunk get/decode/encode/set ops in flight
+#   threading.max_workers -> Blosc/Zstd codec thread-pool size
+# Blosc has its own internal threads; pinning it to 1 keeps all parallelism in the
+# zarr layer instead of multiplying to ~workers*N threads (oversubscription).
 ZARR_ASYNC_CONCURRENCY = 60
 ZARR_CODEC_WORKERS = 60
-# Blosc has its OWN internal threads; with a 60-wide codec pool above, leaving
-# Blosc multi-threaded would multiply to ~60*N threads (silent killer #1:
-# oversubscription). Pin it to 1 so all parallelism lives in the zarr layer.
 BLOSC_NTHREADS = 1
 
 
-# ── helpers ─────────────────────────────────────────────────────────────────--
 def _log(msg):
     """Timestamped, flushed progress line (block-buffered stdout looks 'hung')."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True, file=sys.stderr)
-
-
-def _configure_parallelism():
-    """Set zarr chunk-level concurrency + codec threads, and record them (provenance)."""
-    zarr.config.set({
-        "async.concurrency": ZARR_ASYNC_CONCURRENCY,
-        "threading.max_workers": ZARR_CODEC_WORKERS,
-    })
-    from numcodecs import blosc
-    blosc.set_nthreads(BLOSC_NTHREADS)
-    # anndata's writer warns once per element that zarr v3 autosharding will become
-    # the default. It's informational (we don't autoshard here, so layout is
-    # unchanged) and floods stderr with one line per obs/var column written. Silence
-    # only that exact message — never blanket-mute warnings.
-    warnings.filterwarnings("ignore", message=".*autosharding will be the default.*",
-                            category=UserWarning)
-    _log(f"parallelism: zarr async.concurrency={ZARR_ASYNC_CONCURRENCY} "
-         f"threading.max_workers={ZARR_CODEC_WORKERS} blosc.nthreads={BLOSC_NTHREADS} "
-         f"| zarr {zarr.__version__}")
 
 
 def _copy_csr(src_grp, dst_parent, name):
@@ -104,87 +82,48 @@ def _copy_csr(src_grp, dst_parent, name):
         d.attrs["encoding-version"] = "0.2.0"
         step = s.chunks[0] * 16
         n = s.shape[0]
-        t0 = time.perf_counter()
-        _log(f"    _copy_csr/{name}/{child}: {n:,} elems ({s.dtype}), "
-             f"step={step:,}, src_chunks={s.chunks}")
+        _log(f"    _copy_csr/{name}/{child}: {n:,} elems ({s.dtype})")
         for i in range(0, n, step):
             d[i:i + step] = s[i:i + step]
-            _log(f"      {name}/{child}: {min(i + step, n):,}/{n:,} "
-                 f"({100 * min(i + step, n) / n:.0f}%)")
-        _log(f"    _copy_csr/{name}/{child}: done in {time.perf_counter() - t0:.1f}s")
 
 
 def _load_adata(store, x_key="X"):
-    """Lazy AnnData (dask X) backed by a zarr/icechunk store.
-
-    x_key may be a nested path (e.g. "layers/norm") — we walk it so X can be
-    sourced from a layer instead of the root X.
-    """
+    """Lazy AnnData (dask X) backed by a zarr/icechunk store; x_key may be nested."""
     f = zarr.open_group(store=store, mode="r")
     node = f
     for part in x_key.split("/"):
         node = node[part]
-    X = node
-    shape = tuple(X.attrs["shape"]) if "shape" in X.attrs else tuple(X.shape)
-    X_dask = read_elem_lazy(X, (SPARSE_CHUNK_SIZE, shape[1]))
+    shape = tuple(node.attrs["shape"]) if "shape" in node.attrs else tuple(node.shape)
+    X_dask = read_elem_lazy(node, (SPARSE_CHUNK_SIZE, shape[1]))
     if np.issubdtype(X_dask.dtype, np.integer):
         X_dask = X_dask.astype(np.float32)
     return ad.AnnData(X=X_dask, obs=read_elem(f["obs"]), var=read_elem(f["var"]))
 
 
-def _canonical_int32_csr_block(block):
-    """Rebuild one CSR block as canonical, C-contiguous, int32-indexed.
+def _canon_csr(m):
+    """Clean, C-contiguous, int32-indexed, float32 CSR.
 
-    This store holds 13.7M cells with total nnz > 2**31, so anndata/scipy wrote
-    its CSR with **int64** indptr AND indices (see the int64 indptr in the ingest
-    log). read_elem_lazy preserves that on read, and the boolean-mask cell-type
-    gather (`adata[mask]`) can additionally leave a block's data/indices as a
-    non-contiguous view. rapids-singlecell's HVG-seurat path feeds blocks straight
-    to the compiled `mean_var_minor` kernel (_utils.py), whose nanobind overloads
-    only bind {int32,int64} + float{32,64} arrays that are C-contiguous and on one
-    device class — a non-contiguous or otherwise off-layout block matches *no*
-    overload and raises the TypeError we saw.
-
-    The working rapids_dense-csr_benchmark.py never hits this because it builds
-    blocks via `map_blocks(sp.csr_matrix)` from a dense store → already clean,
-    contiguous, int32 CSR. We reproduce that clean state here. Downcasting to int32
-    is safe for a cell-type subset: a block's nnz and the 33,538 gene indices both
-    fit well inside int32.
+    This store has total nnz > 2**31, so anndata wrote int64 indptr/indices, and a
+    dask boolean-mask gather can leave blocks non-contiguous. Both make cupyx CSR
+    blocks miss every `mean_var_minor` nanobind overload (it binds only contiguous
+    {int32,int64}+{float32,float64}). For a single cell-type subset every value fits
+    int32, so we rebuild one clean in-memory CSR before moving to the GPU.
     """
-    import numpy as _np
-    import scipy.sparse as sp
-    b = block if sp.isspmatrix_csr(block) else sp.csr_matrix(block)
+    m = m if sp.isspmatrix_csr(m) else sp.csr_matrix(m)
     return sp.csr_matrix(
-        (
-            _np.ascontiguousarray(b.data),
-            _np.ascontiguousarray(b.indices, dtype=_np.int32),
-            _np.ascontiguousarray(b.indptr, dtype=_np.int32),
-        ),
-        shape=b.shape,
+        (np.ascontiguousarray(m.data, dtype=np.float32),
+         np.ascontiguousarray(m.indices, dtype=np.int32),
+         np.ascontiguousarray(m.indptr, dtype=np.int32)),
+        shape=m.shape,
     )
-
-
-def _normalize_csr_blocks(adata):
-    """Force adata.X (dask or in-memory CSR) into clean int32 contiguous blocks."""
-    import scipy.sparse as sp
-    X = adata.X
-    if hasattr(X, "map_blocks"):  # dask array
-        adata.X = X.map_blocks(
-            _canonical_int32_csr_block,
-            dtype=X.dtype,
-            meta=sp.csr_matrix((0, 0), dtype=X.dtype),
-        )
-    else:
-        adata.X = _canonical_int32_csr_block(X)
 
 
 def _main_has(repo, *path):
     """True iff the nested group/array `path` exists on the main branch."""
     try:
-        root = zarr.open_group(store=repo.readonly_session(branch="main").store, mode="r")
+        node = zarr.open_group(store=repo.readonly_session(branch="main").store, mode="r")
     except Exception:
         return False
-    node = root
     for part in path:
         if part not in node:
             return False
@@ -193,8 +132,7 @@ def _main_has(repo, *path):
 
 
 def _fresh_branch(repo, name, base="main"):
-    """Create `name` off `base`, resetting it if a prior (possibly crashed) run
-    already left the branch behind — avoids 'branch already exists' on reruns."""
+    """Create `name` off `base`, resetting it if a prior (crashed) run left it behind."""
     base_snap = repo.lookup_branch(base)
     if name in repo.list_branches():
         repo.reset_branch(name, base_snap)
@@ -216,49 +154,37 @@ def ingest(repo):
 
 
 def user1_normalize(repo):
+    """Normalize + log1p ALL cells (multi-GPU dask, streamed) into layers/norm."""
     _log("step1 user1_normalize: START")
     _fresh_branch(repo, "user1-normalize")
     s = repo.writable_session("user1-normalize")
     root = zarr.open_group(store=s.store, mode="a")
-    _log("  branch 'user1-normalize' created from main; writable session open")
 
-    # NO physical stash of raw counts: X is left untouched as the raw-count
-    # matrix. The normalized result is written to a NEW layer 'layers/norm', so
-    # nothing in X is copied or rewritten (zero data movement for the raw counts).
-    #
-    # Read through a read-only session: its store is picklable, so dask-distributed
-    # can ship the lazy-X graph to the GPU workers. A writable session refuses to
-    # pickle (uncommitted changeset state) and would raise on .compute()/.persist().
-    # X (raw counts) is already committed on main, which this branch was forked from.
-    _log("  loading lazy AnnData (read-only session, dask-backed X = raw counts)")
+    # X (raw counts on main) is left untouched; the normalized result goes to a NEW
+    # layer, so the raw counts are never copied. Read through a read-only session:
+    # its store is picklable, so dask-distributed can ship the lazy-X graph to the
+    # GPU workers (a writable session refuses to pickle uncommitted changeset state).
     adata = _load_adata(repo.readonly_session(branch="user1-normalize").store)
-    _log(f"  AnnData: X.shape={adata.X.shape} dtype={adata.X.dtype} "
-         f"chunks={adata.X.chunksize}; moving to GPU")
+    _log(f"  X.shape={adata.X.shape} chunks={adata.X.chunksize}; -> GPU + normalize")
     rsc.get.anndata_to_GPU(adata)
-    _log("  on GPU; calculate_qc_metrics")
     rsc.pp.calculate_qc_metrics(adata)
-    _log("  normalize_total")
     rsc.pp.normalize_total(adata)
-    _log("  log1p")
     rsc.pp.log1p(adata)
-    _log("  normalization done; streaming normalized X -> layers/norm")
 
-    # anndata's dask-sparse writer streams: it writes the first row-block, then
-    # appends each subsequent block. write_cupy_dask maps .get() per block so the
-    # device->host transfer is also one block at a time. Peak host RAM ~= one
-    # block, never the full CSR (this replaces the old _host_csr full-materialize).
+    # anndata's dask-sparse writer streams block-by-block (device->host one block at
+    # a time), so peak host RAM ~= one block, never the full CSR.
     layers = root.require_group("layers")
     layers.attrs["encoding-type"] = "dict"
     layers.attrs["encoding-version"] = "0.1.0"
+    _log("  streaming normalized X -> layers/norm")
     write_elem(layers, "norm", adata.X)
-    _log("  layers/norm written; committing user1 snapshot")
     snap = s.commit("user1: normalized+log1p in layers/norm; raw counts kept in X")
     repo.reset_branch("main", snap)
     print("step1 user1:", snap, flush=True)
-    _log("step1 user1_normalize: DONE")
 
 
 def user2_subset(repo):
+    """Cluster one cell type from layers/norm in-memory on a single GPU."""
     print("step2 history seen by user2:")
     for info in repo.ancestry(branch="main"):
         print("   ", info.id, info.message)
@@ -267,35 +193,27 @@ def user2_subset(repo):
     s = repo.writable_session("user2-subset")
     root = zarr.open_group(store=s.store, mode="a")
 
-    # Read via a picklable read-only session (see user1_normalize); user1 wrote the
-    # normalized matrix to layers/norm (X is still raw counts), so source X from there.
+    # Source X from layers/norm (X is still raw counts). Materialize ONLY this cell
+    # type to host as one clean CSR — a bounded working set — then run the whole
+    # subset pipeline in-memory on the GPU. This sidesteps the dask-sparse HVG path
+    # whose per-block arrays miss the mean_var_minor kernel overloads.
     adata = _load_adata(repo.readonly_session(branch="user2-subset").store,
                         x_key="layers/norm")
     mask = (adata.obs[CELL_TYPE_COL] == CELL_TYPE_VAL).to_numpy()
     idx = np.where(mask)[0]
-    adata = adata[mask].copy()
-
-    # The lazy read + boolean gather above can hand the HVG kernel int64-indexed or
-    # non-contiguous CSR blocks, which `mean_var_minor` rejects. Rebuild clean int32
-    # contiguous blocks (the same shape the dense benchmark feeds it) before GPU.
-    _normalize_csr_blocks(adata)
+    _log(f"  {CELL_TYPE_VAL}: {idx.size:,} cells; materializing subset to host")
+    sub = adata[mask]
+    adata = ad.AnnData(X=_canon_csr(sub.X.compute()),
+                       obs=sub.obs.copy(), var=sub.var.copy())
 
     rsc.get.anndata_to_GPU(adata)
     rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=N_TOP_GENES)
     hvg_mask = np.asarray(adata.var["highly_variable"])
     adata = adata[:, hvg_mask].copy()
 
-    n_cols = adata.shape[1]
-    rows_per_worker = (adata.shape[0] + 4 - 1) // 4
-    adata.X = adata.X.rechunk((rows_per_worker, n_cols)).persist()
-    adata.X.compute_chunk_sizes()
-
-    adata.X = adata.X.astype("float64")
+    adata.X = adata.X.astype("float64")  # covariance_eigh PCA is happier in float64
     rsc.pp.scale(adata, max_value=10, zero_center=False)
     rsc.pp.pca(adata, n_comps=30, svd_solver="covariance_eigh", random_state=RANDOM_SEED)
-    adata.obsm["X_pca"] = adata.obsm["X_pca"].persist()
-    adata.obsm["X_pca"].compute_chunk_sizes()
-    adata.obsm["X_pca"] = adata.obsm["X_pca"].compute()
     rsc.pp.neighbors(adata, n_neighbors=20, n_pcs=30,
                      algorithm="mg_ivfflat", random_state=RANDOM_SEED)
     rsc.tl.umap(adata, min_dist=0.45, init_pos="spectral",
@@ -308,7 +226,6 @@ def user2_subset(repo):
     write_elem(g, "leiden", np.asarray(adata.obs["leiden"].astype(str)))
     write_elem(g, "X_umap", np.asarray(adata.obsm["X_umap"]))
     write_elem(g, "highly_variable", hvg_mask)
-
     snap = s.commit(f"user2: leiden/umap/hvg for {CELL_TYPE_VAL} subset ({idx.size} cells)")
     repo.reset_branch("main", snap)
     print("step2 user2:", snap)
@@ -334,32 +251,37 @@ def main():
     rmm.reinitialize(managed_memory=True, pool_allocator=False, devices=[0, 1, 2, 3])
     cp.cuda.set_allocator(rmm_cupy_allocator)
 
-    _configure_parallelism()
+    # zarr chunk-level parallelism + codec threads (provenance for the byte-copy path).
+    zarr.config.set({"async.concurrency": ZARR_ASYNC_CONCURRENCY,
+                     "threading.max_workers": ZARR_CODEC_WORKERS})
+    from numcodecs import blosc
+    blosc.set_nthreads(BLOSC_NTHREADS)
+    # anndata's writer floods stderr with one autosharding notice per obs/var column;
+    # silence only that exact message (layout is unchanged — we don't autoshard).
+    warnings.filterwarnings("ignore", message=".*autosharding will be the default.*",
+                            category=UserWarning)
+    _log(f"parallelism: zarr async.concurrency={ZARR_ASYNC_CONCURRENCY} "
+         f"threading.max_workers={ZARR_CODEC_WORKERS} blosc.nthreads={BLOSC_NTHREADS} "
+         f"| zarr {zarr.__version__}")
 
-    # Reuse an existing repo, else create+ingest fresh. Reusing lets a rerun skip
-    # the expensive steps whose output is already committed on main (ingest, user1's
-    # normalize, user2's subset) instead of redoing them every run.
+    # Reuse an existing repo (lets a rerun skip already-committed steps), else create
+    # fresh + ingest. icechunk only creates into a clean prefix, so wipe in-process.
     abs_repo = os.path.abspath(REPO_PATH)
     storage = local_filesystem_storage(abs_repo)
     if Repository.exists(storage):
         print("repo exists, reusing:", abs_repo)
         repo = Repository.open(storage)
     else:
-        # Fresh: icechunk only creates into a *clean* prefix (root_is_clean rejects
-        # any pre-existing object), so wipe in-process — uses the script's cwd,
-        # immune to a shell `rm` run against a different working directory.
         print("creating fresh repo:", abs_repo)
         shutil.rmtree(abs_repo, ignore_errors=True)
         repo = Repository.create(storage)
         ingest(repo)
 
-    # Skip user1 if the normalized layer is already committed on main.
     if _main_has(repo, "layers", "norm"):
         print("layers/norm already on main; skipping user1_normalize")
     else:
         user1_normalize(repo)
 
-    # Skip user2 if its analysis output is already committed on main.
     if _main_has(repo, "analyses", CELL_TYPE_VAL):
         print(f"analyses/{CELL_TYPE_VAL} already on main; skipping user2_subset")
     else:
