@@ -8,6 +8,7 @@ CLAUDE*
 *0*.json
 comparisons/
 query_results/
+rapids_den*
 
 # Expression data files
 *.h5*

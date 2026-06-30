@@ -11,6 +11,11 @@ on one large dataset, where unchanged data is shared across snapshots.
           results into a scoped group (X/layers are never rewritten), pushes to main
   Step 3  open main and show the final repo + history
 
+Reruns are incremental: if REPO_PATH already holds a repo it is reused (not wiped),
+and any step whose output is already committed on main is skipped — layers/norm present
+=> skip Step 1, analyses/<cell_type> present => skip Step 2. Delete REPO_PATH to force a
+full fresh run.
+
 GPU/CUDA only — runs on the server, not the laptop. Mirrors rapids_zarr_example.py.
 """
 from __future__ import annotations
@@ -127,6 +132,76 @@ def _load_adata(store, x_key="X"):
     return ad.AnnData(X=X_dask, obs=read_elem(f["obs"]), var=read_elem(f["var"]))
 
 
+def _canonical_int32_csr_block(block):
+    """Rebuild one CSR block as canonical, C-contiguous, int32-indexed.
+
+    This store holds 13.7M cells with total nnz > 2**31, so anndata/scipy wrote
+    its CSR with **int64** indptr AND indices (see the int64 indptr in the ingest
+    log). read_elem_lazy preserves that on read, and the boolean-mask cell-type
+    gather (`adata[mask]`) can additionally leave a block's data/indices as a
+    non-contiguous view. rapids-singlecell's HVG-seurat path feeds blocks straight
+    to the compiled `mean_var_minor` kernel (_utils.py), whose nanobind overloads
+    only bind {int32,int64} + float{32,64} arrays that are C-contiguous and on one
+    device class — a non-contiguous or otherwise off-layout block matches *no*
+    overload and raises the TypeError we saw.
+
+    The working rapids_dense-csr_benchmark.py never hits this because it builds
+    blocks via `map_blocks(sp.csr_matrix)` from a dense store → already clean,
+    contiguous, int32 CSR. We reproduce that clean state here. Downcasting to int32
+    is safe for a cell-type subset: a block's nnz and the 33,538 gene indices both
+    fit well inside int32.
+    """
+    import numpy as _np
+    import scipy.sparse as sp
+    b = block if sp.isspmatrix_csr(block) else sp.csr_matrix(block)
+    return sp.csr_matrix(
+        (
+            _np.ascontiguousarray(b.data),
+            _np.ascontiguousarray(b.indices, dtype=_np.int32),
+            _np.ascontiguousarray(b.indptr, dtype=_np.int32),
+        ),
+        shape=b.shape,
+    )
+
+
+def _normalize_csr_blocks(adata):
+    """Force adata.X (dask or in-memory CSR) into clean int32 contiguous blocks."""
+    import scipy.sparse as sp
+    X = adata.X
+    if hasattr(X, "map_blocks"):  # dask array
+        adata.X = X.map_blocks(
+            _canonical_int32_csr_block,
+            dtype=X.dtype,
+            meta=sp.csr_matrix((0, 0), dtype=X.dtype),
+        )
+    else:
+        adata.X = _canonical_int32_csr_block(X)
+
+
+def _main_has(repo, *path):
+    """True iff the nested group/array `path` exists on the main branch."""
+    try:
+        root = zarr.open_group(store=repo.readonly_session(branch="main").store, mode="r")
+    except Exception:
+        return False
+    node = root
+    for part in path:
+        if part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _fresh_branch(repo, name, base="main"):
+    """Create `name` off `base`, resetting it if a prior (possibly crashed) run
+    already left the branch behind — avoids 'branch already exists' on reruns."""
+    base_snap = repo.lookup_branch(base)
+    if name in repo.list_branches():
+        repo.reset_branch(name, base_snap)
+    else:
+        repo.create_branch(name, base_snap)
+
+
 # ── steps ───────────────────────────────────────────────────────────────────--
 def ingest(repo):
     src = zarr.open_group(SOURCE_ZARR, mode="r")
@@ -142,7 +217,7 @@ def ingest(repo):
 
 def user1_normalize(repo):
     _log("step1 user1_normalize: START")
-    repo.create_branch("user1-normalize", repo.lookup_branch("main"))
+    _fresh_branch(repo, "user1-normalize")
     s = repo.writable_session("user1-normalize")
     root = zarr.open_group(store=s.store, mode="a")
     _log("  branch 'user1-normalize' created from main; writable session open")
@@ -188,7 +263,7 @@ def user2_subset(repo):
     for info in repo.ancestry(branch="main"):
         print("   ", info.id, info.message)
 
-    repo.create_branch("user2-subset", repo.lookup_branch("main"))
+    _fresh_branch(repo, "user2-subset")
     s = repo.writable_session("user2-subset")
     root = zarr.open_group(store=s.store, mode="a")
 
@@ -199,6 +274,11 @@ def user2_subset(repo):
     mask = (adata.obs[CELL_TYPE_COL] == CELL_TYPE_VAL).to_numpy()
     idx = np.where(mask)[0]
     adata = adata[mask].copy()
+
+    # The lazy read + boolean gather above can hand the HVG kernel int64-indexed or
+    # non-contiguous CSR blocks, which `mean_var_minor` rejects. Rebuild clean int32
+    # contiguous blocks (the same shape the dense benchmark feeds it) before GPU.
+    _normalize_csr_blocks(adata)
 
     rsc.get.anndata_to_GPU(adata)
     rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=N_TOP_GENES)
@@ -256,17 +336,35 @@ def main():
 
     _configure_parallelism()
 
-    # Icechunk only creates into a *clean* prefix (root_is_clean: rejects if any
-    # object exists under REPO_PATH). The demo is meant to start fresh each run, so
-    # wipe the prefix in-process — this uses the script's cwd, immune to a shell
-    # `rm` that ran against a different working directory than the script sees.
+    # Reuse an existing repo, else create+ingest fresh. Reusing lets a rerun skip
+    # the expensive steps whose output is already committed on main (ingest, user1's
+    # normalize, user2's subset) instead of redoing them every run.
     abs_repo = os.path.abspath(REPO_PATH)
-    print("repo prefix:", abs_repo)
-    shutil.rmtree(abs_repo, ignore_errors=True)
-    repo = Repository.create(local_filesystem_storage(abs_repo))
-    ingest(repo)
-    user1_normalize(repo)
-    user2_subset(repo)
+    storage = local_filesystem_storage(abs_repo)
+    if Repository.exists(storage):
+        print("repo exists, reusing:", abs_repo)
+        repo = Repository.open(storage)
+    else:
+        # Fresh: icechunk only creates into a *clean* prefix (root_is_clean rejects
+        # any pre-existing object), so wipe in-process — uses the script's cwd,
+        # immune to a shell `rm` run against a different working directory.
+        print("creating fresh repo:", abs_repo)
+        shutil.rmtree(abs_repo, ignore_errors=True)
+        repo = Repository.create(storage)
+        ingest(repo)
+
+    # Skip user1 if the normalized layer is already committed on main.
+    if _main_has(repo, "layers", "norm"):
+        print("layers/norm already on main; skipping user1_normalize")
+    else:
+        user1_normalize(repo)
+
+    # Skip user2 if its analysis output is already committed on main.
+    if _main_has(repo, "analyses", CELL_TYPE_VAL):
+        print(f"analyses/{CELL_TYPE_VAL} already on main; skipping user2_subset")
+    else:
+        user2_subset(repo)
+
     show(repo)
 
 
