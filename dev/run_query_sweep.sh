@@ -12,44 +12,31 @@
 # Example (gcs):    dev/run_query_sweep.sh gs://my-bucket/stores 1000 csr 10 sequential bench_results.jsonl
 set -euo pipefail
 
-STORE_DIR="${1:-zarr_dbs}"
-COUNT="${2:-1000}"
-FORMAT="${3:-csr}"      # csr | dense  (final format; conversion is included in the timing)
-ASYNC="${4:-10}"
-MODE="${5:-sequential}" # sequential | random
-OUT="${6:-bench_results.jsonl}"
+STORES=(
+  gs://rapid-zarr_storage/2M_csc_9.zarr
+  gs://rapid-zarr_storage/2M_csr_9.zarr
+  gs://rapid-zarr_storage/2M_dense_1x1.zarr
+  gs://rapid-zarr_storage/2M_dense_1x1_10S.zarr
+  gs://rapid-zarr_storage/2M_dense_5x5.zarr
+  gs://rapid-zarr_storage/2M_dense_5xA.zarr
+)
 
-# Build the list of stores. Remote prefixes (scheme://) are listed with gcsfs;
-# local dirs are globbed. Each line is a full store path/URL passed to --store.
-list_stores() {
-  if [[ "$STORE_DIR" == *"://"* ]]; then
-    pixi run -q python - "$STORE_DIR" <<'PY'
-import sys, fsspec
-base = sys.argv[1]
-proto = base.split("://", 1)[0]
-fs = fsspec.filesystem(proto)
-for p in fs.ls(base, detail=False):
-    if p.rstrip("/").endswith(".zarr"):
-        print(f"{proto}://{p.lstrip('/')}" if "://" not in p else p)
-PY
-  else
-    for s in "$STORE_DIR"/*.zarr; do echo "$s"; done
-  fi
-}
+COUNT="${1:-1000}"
+FORMAT="${2:-csr}"
+ASYNC="${3:-10}"
+MODE="${4:-sequential}"
+OUT="${5:-bench_results.jsonl}"
 
-mapfile -t STORES < <(list_stores)
-if [[ "${#STORES[@]}" -eq 0 ]]; then
-  echo "ERROR: no .zarr stores found under $STORE_DIR" >&2
-  exit 1
-fi
-echo ">> found ${#STORES[@]} store(s) under $STORE_DIR" >&2
 
-: > "$OUT"
+echo "[" > "$OUT"
+first=1
 for store in "${STORES[@]}"; do
-  for axis in row; do
-    echo ">> $store  axis=$axis  count=$COUNT  ASYNC=$ASYNC format=$FORMAT  mode=$MODE" >&2
-    pixi run -q zarr-bench --store "$store" --axis "$axis" --concurrency "$ASYNC" --count "$COUNT" \
-      --mode "$MODE" --format "$FORMAT" --json 2>/dev/null >> "$OUT"
-  done
+# for store in "$STORE_DIR"/*.zarr; do
+  echo ">> $store  axis=row  count=$COUNT  ASYNC=$ASYNC format=$FORMAT  mode=$MODE" >&2
+  if [[ "$first" -eq 0 ]]; then echo "," >> "$OUT"; fi
+  pixi run -q zarr-bench --store "$store" --axis row --concurrency "$ASYNC" --max-workers "$ASYNC" \
+    --count "$COUNT" --mode "$MODE" --format "$FORMAT" --json >> "$OUT"
+  first=0
 done
-echo "Wrote $(wc -l < "$OUT") results to $OUT" >&2
+echo "]" >> "$OUT"
+echo "Wrote $(grep -c '"store"' "$OUT") result(s) to $OUT" >&2
