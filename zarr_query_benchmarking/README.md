@@ -20,10 +20,11 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 | `--axis` | `row` \| `col` | (required¹) | Query rows (obs/cells) or columns (var/genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
 | `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded random indices; `celltype` = all obs rows whose `--obs-column` equals `--obs-value` (see below). |
-| `--select-mode` | `slice` \| `fancy` | `slice` | **celltype only.** How matched rows are read (both first read obs + build the mask, so they differ *only* in the X read): `slice` reads `X[start:end]` over the contiguous run(s) of matched rows (anndata's fast path — one cheap grab on a sorted store); `fancy` builds a `flatnonzero` integer index and gathers per row. Ignored for sequential/random. |
+| `--select-mode` | `auto` \| `slice` \| `fancy` | `auto` | **celltype only.** How matched rows are read (both first read obs + build the mask, so they differ *only* in the X read). `auto` picks `slice` when the cells form few long contiguous runs (sorted store — one cheap grab) and `fancy` when scattered into many short runs; `slice` reads `X[start:end]` per run (re-fetches shared chunks when scattered); `fancy` builds a `flatnonzero` index and gathers each chunk once. Ignored for sequential/random. |
 | `--obs-column` | str | (required for `celltype`) | obs column to filter on (e.g. a cell-type annotation). |
 | `--obs-value` | str | (required for `celltype`) | Value in `--obs-column` to select rows by. |
-| `--format` | `csr` \| `dense` | (required) | Final format the result is converted to (**included in the timing**). |
+| `--format` | `csr` \| `dense` | (required¹) | Final format the result is converted to (**included in the timing**; broken out as `convert_s`). |
+| `--native` | flag | off | Read at the store's **native** format — no conversion (`convert_s` ≈ 0), so you measure the layout, not the conversion tax. Overrides `--format`. Use for fair CSR-vs-dense / row-vs-col comparisons. |
 | `--concurrency` | int | zarr default (10) | `zarr` `async.concurrency` — how many chunks are *dispatched* at once (a semaphore). Pair with `--max-workers`. |
 | `--max-workers` | int | `min(32, cpu+4)` | `zarr` `threading.max_workers` — size of the pool that actually *decodes* chunks (Blosc/zstd). **The dominant stage of a dense read.** Set ≈ physical cores. |
 | `--repeats` | int | 5 | Timed repeats (reports median/min/p95). |
@@ -34,7 +35,7 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 
 ¹ `--axis` and `--count` are required for `sequential`/`random`. `--mode celltype`
 forces `--axis row` (rejects `--axis col`), **ignores `--count`**, and requires
-`--obs-column` + `--obs-value` instead.
+`--obs-column` + `--obs-value` instead. Either `--format` **or** `--native` is required.
 
 ## Selecting by cell type (`--mode celltype`)
 
@@ -70,14 +71,21 @@ stage decomposition (IO / decompress / assemble) and the dask comparison.
 ## Metrics reported
 
 - **Wall time** — median / min / p95 over `--repeats` (warm cache).
-- **I/O vs CPU split** (`io_wall_median_s` / `cpu_wall_median_s`) — every timed read runs
-  through a `TimingStore` that records each `store.get` interval. `io_wall` is the wall time
-  with **≥1 fetch in flight** (the *union* of fetch intervals — concurrency-correct, not a
-  naive sum of overlapping durations); `cpu_wall = total − io_wall` is time spent purely on
-  decompress + gather + reassembly. This is what tells you whether a query is **network/IO-bound**
-  (→ layout / chunk locality is the lever) or **CPU-bound** (→ read path / format is the lever).
-  For a perfectly clean split run `--concurrency 1` (no overlap); under high concurrency I/O and
-  CPU pipeline, so `io_wall` counts any wall time with a fetch outstanding.
+- **I/O vs CPU vs convert split** (`io_wall_median_s` / `cpu_wall_median_s` / `convert_median_s`) —
+  every timed read runs through a `TimingStore` that records each `store.get` interval, and the
+  final format conversion is timed separately. The three sum to the wall time:
+  - `io_wall` = wall time with **≥1 fetch in flight** (the *union* of fetch intervals —
+    concurrency-correct, not a naive sum of overlapping durations). This is the store-engine / network cost.
+  - `cpu_wall` = **decompress + gather** (the read-side CPU: wall with no fetch in flight, not converting).
+  - `convert_median_s` = the `.toarray()` / `.tocsr()` step (0 with `--native`). This is the
+    format-conversion tax — often the *dominant, layout-independent* term in a CSR-vs-dense
+    comparison at a common `--format`, which is why it's broken out.
+
+  Together they tell you whether a query is **network/IO-bound** (→ layout / chunk locality is the
+  lever), **read-CPU-bound** (→ read path / decompress), or **conversion-bound** (→ you're measuring
+  the format tax, not the layout — switch to `--native`). For a perfectly clean I/O split run
+  `--concurrency 1` (no overlap); under high concurrency I/O and CPU pipeline, so `io_wall` counts
+  any wall time with a fetch outstanding.
 - **Chunks fetched** — real `store.get()` calls, counted by the same `TimingStore` in the timed
   pass (deterministic, so it doesn't inflate the timing).
 - **Runs** (`n_spans`, celltype only) — number of contiguous row-runs the matched cells form: a
@@ -127,10 +135,13 @@ So for an **analysis-faithful read comparison**, query each store at its **nativ
 on **`--axis row`** — CSR store → `--format csr`, dense store → `--format dense`. The
 common-format mode answers a different question and will understate CSR's advantage.
 
-Either way, read the comparison off **`peak_rss_bytes`** and the **`io_wall`/`cpu_wall`
-split**: peak RSS is what real analysis pays in RAM and host→device (GPU) transfer, and the
-I/O-vs-CPU split shows whether the cost is the store engine (network / chunks fetched) or the
-read path (decompress + reassembly).
+Better yet, pass **`--native`**: it reads each store at its own format (no conversion), so
+`convert_s` ≈ 0 and you measure the layout instead of the conversion tax — the cleanest way to
+compare CSR vs dense (and row vs col) without one side paying a `.toarray()`/`.tocsr()` it never
+pays in real analysis. Then read the comparison off **`peak_rss_bytes`** and the
+**`io_wall`/`cpu_wall`** split: peak RSS is what real analysis pays in RAM and host→device (GPU)
+transfer, and the I/O-vs-CPU split shows whether the cost is the store engine (network / chunks
+fetched) or the read path (decompress + reassembly).
 
 ## Remote stores
 

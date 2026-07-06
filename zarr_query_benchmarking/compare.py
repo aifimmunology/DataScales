@@ -70,6 +70,7 @@ _COLUMNS = [
     ("med_s", "median_s", True, lambda v: _fmt_num(v, 3)),
     ("io_s", "io_wall_median_s", True, lambda v: _fmt_num(v, 3)),
     ("cpu_s", "cpu_wall_median_s", True, lambda v: _fmt_num(v, 3)),
+    ("conv_s", "convert_median_s", True, lambda v: _fmt_num(v, 3)),
     ("p95_s", "p95_s", True, lambda v: _fmt_num(v, 3)),
     ("commit", "git_commit", False, str),
 ]
