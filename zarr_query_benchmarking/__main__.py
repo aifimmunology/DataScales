@@ -11,6 +11,19 @@ indices), and `celltype` (all obs rows whose `--obs-column` equals
 `--obs-value`). The celltype mode forces `--axis row`, ignores `--count`, and
 reads the obs column + builds the match mask *inside* the timed region, modeling
 a real "filter by obs value, then fetch X" query.
+
+For celltype, ``--select-mode`` picks how matched rows are read (both first read obs
++ build the mask, so they differ *only* in the X read): ``slice`` (default) finds the
+contiguous ``[start, end)`` run(s) of matched rows and reads ``X[start:end]`` slices —
+anndata's contiguous fast path, which a *sorted* store turns into one cheap grab;
+``fancy`` builds a ``flatnonzero`` integer index and gathers per row (anndata's
+coordinate path). On an unsorted store the matched rows scatter into many length-1
+runs, so slice degenerates — which is exactly why sorting helps. The run count is
+reported either way as a locality metric.
+
+Each timed read runs through a ``TimingStore`` that also records store-fetch intervals,
+so every run is split into I/O (wall time with >=1 fetch in flight) vs CPU (decompress
++ gather + reassembly) to show where the time actually goes.
 """
 
 from __future__ import annotations
@@ -43,32 +56,58 @@ def open_store(path, read_only=True):
     return LocalStore(path, read_only=read_only)
 
 
-class CountingStore(WrapperStore):
-    """Wraps a store and counts chunk fetches + bytes read. Reset before a read."""
+class TimingStore(WrapperStore):
+    """Wraps a store; counts chunk fetches and records each fetch's wall interval.
+
+    Recording the ``[start, end)`` interval of every ``store.get`` (relative to the
+    last ``reset``) lets us take the *union* of those intervals — the wall time with
+    at least one fetch in flight — rather than a naive sum of overlapping durations.
+    Under ``async.concurrency`` > 1 fetches overlap, so the union is the honest,
+    concurrency-correct split of wall time into I/O vs pure-CPU. Because the timed
+    read itself runs through this store, fetch time and total time come from the
+    *same* reads (no separate pass, so cloud warm-cache can't skew the split).
+    """
 
     def __init__(self, store):
         super().__init__(store)
         self.gets = 0
-        self.bytes = 0
+        self._intervals = []
+        self._epoch = 0.0
 
     def reset(self):
         self.gets = 0
-        self.bytes = 0
+        self._intervals = []
+        self._epoch = perf_counter()
 
     async def get(self, key, prototype, byte_range=None):
+        t0 = perf_counter()
         val = await self._store.get(key, prototype, byte_range=byte_range)
+        self._intervals.append((t0 - self._epoch, perf_counter() - self._epoch))
         self.gets += 1
-        if val is not None:
-            self.bytes += len(val)
         return val
 
     async def get_partial_values(self, prototype, key_ranges):
+        t0 = perf_counter()
         vals = await self._store.get_partial_values(prototype, key_ranges)
-        for v in vals:
+        self._intervals.append((t0 - self._epoch, perf_counter() - self._epoch))
+        for _ in vals:
             self.gets += 1
-            if v is not None:
-                self.bytes += len(v)
         return vals
+
+    def io_wall_s(self) -> float:
+        """Union length of fetch intervals = wall time with >=1 fetch in flight."""
+        if not self._intervals:
+            return 0.0
+        ivs = sorted(self._intervals)
+        total = 0.0
+        cur_s, cur_e = ivs[0]
+        for s, e in ivs[1:]:
+            if s <= cur_e:
+                cur_e = max(cur_e, e)
+            else:
+                total += cur_e - cur_s
+                cur_s, cur_e = s, e
+        return total + (cur_e - cur_s)
 
 
 def open_x(store):
@@ -136,16 +175,41 @@ def read_convert(handle, axis_dim, sel, final_format):
     return sub.tocsr() if sp.issparse(sub) else sp.csr_matrix(sub)
 
 
-def _decompressed_bytes(result):
-    """Working-set size of the materialized result (decompressed, in-memory).
+def _runs_from_sorted_indices(idx):
+    """Contiguous half-open [start, end) runs from a sorted 1-D integer index array.
 
-    This is the footprint that drives RAM / host->device transfer, not the
-    compressed `bytes_read` pulled from the store: a dense block holds
-    rows*cols values, a CSR block only nnz (+ index overhead).
+    The number of runs is the selection's *locality*: a sorted store yields a few
+    long runs (cheap contiguous slice reads); an unsorted store yields many length-1
+    runs (slicing degenerates to ~per-row), which is exactly why sorting helps.
     """
-    if sp.issparse(result):
-        return int(result.data.nbytes + result.indices.nbytes + result.indptr.nbytes)
-    return int(result.nbytes)
+    if idx.size == 0:
+        return []
+    breaks = np.flatnonzero(np.diff(idx) > 1) + 1
+    starts = np.concatenate(([0], breaks))
+    ends = np.concatenate((breaks, [idx.size]))
+    return [(int(idx[s]), int(idx[e - 1]) + 1) for s, e in zip(starts, ends)]
+
+
+def read_convert_spans(handle, spans, final_format):
+    """Read contiguous row spans via slices, concatenate, and convert to final_format.
+
+    Each ``handle[s:e]`` is a contiguous slice, so sparse takes anndata's fast path
+    (`_get_contiguous_compressed_slice`: one `data[start:stop]`/`indices[start:stop]`
+    read, no per-row gather, no coordinate indexer) and dense takes a plain
+    `BasicIndexer` slice. Multiple runs are vstacked/concatenated.
+    """
+    if not spans:
+        spans = [(0, 0)]
+    parts = [handle[s:e] for s, e in spans]
+    if len(parts) == 1:
+        sub = parts[0]
+    elif sp.issparse(parts[0]):
+        sub = sp.vstack(parts, format="csr")
+    else:
+        sub = np.concatenate(parts, axis=0)
+    if final_format == "dense":
+        return sub.toarray() if sp.issparse(sub) else np.asarray(sub)
+    return sub.tocsr() if sp.issparse(sub) else sp.csr_matrix(sub)
 
 
 def _git_commit():
@@ -170,7 +234,10 @@ def run_rss_probe(args):
     if args.mode == "celltype":
         group = zarr.open_group(store=store, mode="r")
         sel = celltype_indices(group, args.obs_column, args.obs_value)
-        read_convert(handle, 0, sel, args.format)
+        if args.select_mode == "slice":
+            read_convert_spans(handle, _runs_from_sorted_indices(sel), args.format)
+        else:
+            read_convert(handle, 0, sel, args.format)
     else:
         axis_dim = 0 if args.axis == "row" else 1
         sel = select(shape[axis_dim], args.count, args.mode, args.seed)
@@ -188,6 +255,7 @@ def _measure_peak_rss(args):
         sys.executable, "-m", "zarr_query_benchmarking", "--_rss-probe",
         "--store", args.store, "--axis", args.axis,
         "--mode", args.mode, "--format", args.format, "--seed", str(args.seed),
+        "--select-mode", args.select_mode,
     ]
     if args.mode == "celltype":
         cmd += ["--obs-column", args.obs_column, "--obs-value", args.obs_value]
@@ -236,21 +304,40 @@ def run_benchmark(args):
 
     axis_dim = 0 if args.axis == "row" else 1
 
-    # Timing pass on a plain store.
-    store = open_store(args.store)
+    # One pass through a TimingStore: it counts chunk fetches AND records each
+    # store.get wall interval, so the fetch (I/O) vs CPU (decompress + gather +
+    # reassembly) split comes from the *same* reads we time — no separate untimed
+    # counting pass, and cloud warm-cache can't skew the split.
+    store = TimingStore(open_store(args.store))
     handle, is_sparse, src_format, shape, dtype = open_x(store)
     axis_len = shape[axis_dim]
 
+    n_spans = None
     if args.mode == "celltype":
-        # Validate up front (exits on a bad column / unmatched obs value), but
-        # re-read obs inside the timed query so the obs read + mask build are
-        # part of the measured "filter by obs value then fetch" cost.
+        # Validate up front (exits on a bad column / unmatched value) and capture the
+        # run count (a locality metric, reported for both read modes). The obs read +
+        # mask build happen again *inside* the timed query so "filter then fetch" is
+        # measured — slice vs fancy then differ only in how X itself is read.
         group = zarr.open_group(store=store, mode="r")
-        resolve_celltype_selection(group, args.obs_column, args.obs_value)
+        sel0 = resolve_celltype_selection(group, args.obs_column, args.obs_value)
+        n_spans = len(_runs_from_sorted_indices(sel0))
 
-        def do_query(h, g):
-            sel = celltype_indices(g, args.obs_column, args.obs_value)
-            return read_convert(h, 0, sel, args.format)
+        if args.select_mode == "slice" and n_spans and sel0.size / n_spans < 4:
+            print(
+                f"WARNING: matched cells span {n_spans} runs (avg {sel0.size / n_spans:.1f} "
+                f"rows/run) — this store is scattered for this cell type, so slice re-fetches "
+                f"shared chunks per run and will be slow. Use --select-mode fancy here.",
+                file=sys.stderr,
+            )
+
+        if args.select_mode == "slice":
+            def do_query(h, g):
+                sel = celltype_indices(g, args.obs_column, args.obs_value)
+                return read_convert_spans(h, _runs_from_sorted_indices(sel), args.format)
+        else:
+            def do_query(h, g):
+                sel = celltype_indices(g, args.obs_column, args.obs_value)
+                return read_convert(h, 0, sel, args.format)
     else:
         if args.count > axis_len:
             sys.exit(f"ERROR: count={args.count} exceeds axis length {axis_len} for axis '{args.axis}'.")
@@ -262,22 +349,21 @@ def run_benchmark(args):
 
     for _ in range(args.warmup):
         do_query(handle, group)
-    times = []
+    times, io_walls, cpu_walls = [], [], []
     result = None
+    gets = 0
     for _ in range(args.repeats):
+        store.reset()
         t0 = perf_counter()
         result = do_query(handle, group)
-        times.append(perf_counter() - t0)
-
-    # Untimed counting pass on a wrapped store (obs reads included for celltype).
-    counter = CountingStore(open_store(args.store))
-    chandle = open_x(counter)[0]
-    cgroup = zarr.open_group(store=counter, mode="r") if args.mode == "celltype" else None
-    counter.reset()
-    do_query(chandle, cgroup)
+        dt = perf_counter() - t0
+        io = store.io_wall_s()  # wall time with >=1 fetch in flight (concurrency-correct)
+        times.append(dt)
+        io_walls.append(io)
+        cpu_walls.append(max(0.0, dt - io))
+        gets = store.gets
 
     nnz_out = int(result.nnz) if sp.issparse(result) else int(np.count_nonzero(result))
-    decompressed_bytes = _decompressed_bytes(result)
     peak_rss_bytes = _measure_peak_rss(args)
     summary = {
         "store": args.store,
@@ -287,24 +373,28 @@ def run_benchmark(args):
         "axis": args.axis,
         "count": args.count,
         "mode": args.mode,
+        "select_mode": args.select_mode if args.mode == "celltype" else None,
         "obs_column": args.obs_column,
         "obs_value": args.obs_value,
+        "n_spans": n_spans,
         "selected": int(result.shape[axis_dim]),
         "final_format": args.format,
         "concurrency": concurrency,
         "max_workers": max_workers,
         "result_shape": list(result.shape),
         "result_nnz": nnz_out,
-        "chunks_fetched": counter.gets,
-        "bytes_read": counter.bytes,
-        "result_decompressed_bytes": decompressed_bytes,
+        "chunks_fetched": gets,
         "peak_rss_bytes": peak_rss_bytes,
         "warmup": args.warmup,
         "repeats": args.repeats,
         "median_s": float(np.median(times)),
         "min_s": float(np.min(times)),
         "p95_s": float(np.percentile(times, 95)),
+        "io_wall_median_s": float(np.median(io_walls)),
+        "cpu_wall_median_s": float(np.median(cpu_walls)),
         "timings_s": times,
+        "io_wall_s": io_walls,
+        "cpu_wall_s": cpu_walls,
         "versions": {p: md.version(p) for p in ("zarr", "anndata", "numpy", "scipy")},
         "git_commit": _git_commit(),
     }
@@ -316,23 +406,25 @@ def run_benchmark(args):
     print(f"Source: {src_format}  shape={tuple(shape)}  dtype={dtype}")
     if args.mode == "celltype":
         print(
-            f"Query: axis=row mode=celltype obs['{args.obs_column}']=='{args.obs_value}' "
-            f"selected={summary['selected']} -> {args.format}"
+            f"Query: axis=row mode=celltype select={args.select_mode} "
+            f"obs['{args.obs_column}']=='{args.obs_value}' "
+            f"selected={summary['selected']} runs={n_spans} -> {args.format}"
         )
     else:
         print(f"Query: axis={args.axis} count={args.count} mode={args.mode} -> {args.format}")
     print(f"Concurrency: {concurrency}  max_workers: {max_workers}  (warm cache)")
     print(f"Result: shape={tuple(result.shape)}  nnz={nnz_out}")
-    print(f"Chunks fetched: {counter.gets}   Bytes read: {counter.bytes / 1e6:.1f} MB")
+    print(f"Chunks fetched: {gets}")
     rss_str = "n/a" if peak_rss_bytes is None else f"{peak_rss_bytes / 1e6:.1f} MB"
-    print(
-        f"Decompressed result: {decompressed_bytes / 1e6:.1f} MB   "
-        f"Peak RSS: {rss_str}"
-    )
+    print(f"Peak RSS: {rss_str}")
     print(
         f"Wall time (s): median={summary['median_s']:.4f} "
         f"min={summary['min_s']:.4f} p95={summary['p95_s']:.4f}  "
         f"(warmup={args.warmup}, repeats={args.repeats})"
+    )
+    print(
+        f"  split (median): I/O(fetch in-flight)={summary['io_wall_median_s']:.4f}s  "
+        f"CPU(decompress+gather+assemble)={summary['cpu_wall_median_s']:.4f}s"
     )
 
 
@@ -348,6 +440,12 @@ def main(argv=None):
                    help="sequential = first N; random = N seeded random indices; "
                         "celltype = all obs rows whose --obs-column equals --obs-value "
                         "(forces --axis row, ignores --count). Default: sequential.")
+    p.add_argument("--select-mode", dest="select_mode", choices=["slice", "fancy"], default="slice",
+                   help="For --mode celltype only (both first read obs + build the mask, so they "
+                        "differ only in the X read): 'slice' (default) reads X[start:end] over the "
+                        "contiguous run(s) of matched rows (anndata's fast path; one cheap grab on "
+                        "a sorted store), 'fancy' builds a flatnonzero integer index and gathers per "
+                        "row (coordinate path). Ignored for sequential/random.")
     p.add_argument("--obs-column", dest="obs_column",
                    help="obs column to filter on (required for --mode celltype).")
     p.add_argument("--obs-value", dest="obs_value",

@@ -20,6 +20,7 @@ pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 | `--axis` | `row` \| `col` | (required¹) | Query rows (obs/cells) or columns (var/genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
 | `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded random indices; `celltype` = all obs rows whose `--obs-column` equals `--obs-value` (see below). |
+| `--select-mode` | `slice` \| `fancy` | `slice` | **celltype only.** How matched rows are read (both first read obs + build the mask, so they differ *only* in the X read): `slice` reads `X[start:end]` over the contiguous run(s) of matched rows (anndata's fast path — one cheap grab on a sorted store); `fancy` builds a `flatnonzero` integer index and gathers per row. Ignored for sequential/random. |
 | `--obs-column` | str | (required for `celltype`) | obs column to filter on (e.g. a cell-type annotation). |
 | `--obs-value` | str | (required for `celltype`) | Value in `--obs-column` to select rows by. |
 | `--format` | `csr` \| `dense` | (required) | Final format the result is converted to (**included in the timing**). |
@@ -69,24 +70,45 @@ stage decomposition (IO / decompress / assemble) and the dask comparison.
 ## Metrics reported
 
 - **Wall time** — median / min / p95 over `--repeats` (warm cache).
-- **Chunks fetched** — real `store.get()` calls, counted in a *separate untimed pass*
-  through a `WrapperStore` so counting never inflates the timing.
-- **Bytes read** — compressed bytes pulled from the store (≈ GCS egress for remote stores).
-- **Decompressed result bytes** (`result_decompressed_bytes`) — working-set size of the
-  materialized result (dense: `rows*cols`; CSR: `data+indices+indptr`). This — **not**
-  compressed `bytes_read` — is what drives RAM and host→device (GPU) transfer. scRNA dense
-  data Blosc-compresses extremely well, so `bytes_read` can look similar across formats while
-  this reveals the real (often ~10×) gap.
+- **I/O vs CPU split** (`io_wall_median_s` / `cpu_wall_median_s`) — every timed read runs
+  through a `TimingStore` that records each `store.get` interval. `io_wall` is the wall time
+  with **≥1 fetch in flight** (the *union* of fetch intervals — concurrency-correct, not a
+  naive sum of overlapping durations); `cpu_wall = total − io_wall` is time spent purely on
+  decompress + gather + reassembly. This is what tells you whether a query is **network/IO-bound**
+  (→ layout / chunk locality is the lever) or **CPU-bound** (→ read path / format is the lever).
+  For a perfectly clean split run `--concurrency 1` (no overlap); under high concurrency I/O and
+  CPU pipeline, so `io_wall` counts any wall time with a fetch outstanding.
+- **Chunks fetched** — real `store.get()` calls, counted by the same `TimingStore` in the timed
+  pass (deterministic, so it doesn't inflate the timing).
+- **Runs** (`n_spans`, celltype only) — number of contiguous row-runs the matched cells form: a
+  **locality metric**. A sorted store yields few long runs (slice reads are cheap); an unsorted
+  store yields many length-1 runs (slice degenerates — use `--select-mode fancy`).
 - **Peak RSS** (`peak_rss_bytes`) — peak resident memory of a single read+convert, measured
   in an *isolated subprocess* (so warmup/repeats don't contaminate the high-water mark) and
   normalized to bytes across macOS/Linux. `null` if the probe fails.
-- **Result shape / nnz**, source format, dtype, concurrency, library versions, git commit.
+- **Result shape / nnz**, source format, dtype, select mode, concurrency, versions, git commit.
 
 ## How reads work
 
 - **Dense** `X` → `zarr` array orthogonal indexing (`X[idx, :]` / `X[:, idx]`).
 - **Sparse** `X` → `anndata.io.sparse_dataset(group)` slicing (the realistic downstream
   read path), returning scipy CSR/CSC.
+
+For `--mode celltype`, `--select-mode` chooses how the matched rows are read (both first read
+obs + build the `== value` mask, so they differ **only** in the X read):
+
+- **`slice`** (default) finds the contiguous `[start, end)` run(s) of matched rows and reads
+  `X[start:end]` per run. On a **sorted** store the cell type is one run → a single contiguous
+  grab that takes anndata's fast path (`_get_contiguous_compressed_slice`: no per-row gather,
+  no coordinate indexer). This is what `datascale.reader` does.
+- **`fancy`** builds a `flatnonzero` integer index and gathers per row (anndata's coordinate
+  path — the per-row `indptr` loop + zarr `CoordinateIndexer`).
+
+The catch: `slice` reads each run independently, so when the cell type is **scattered**
+(unsorted → hundreds/thousands of runs) it re-fetches shared chunks per run and is *far slower*
+than one `fancy` gather (measured: 995 runs → 2008 chunk GETs and ~120× the wall time of the
+26-GET fancy read on the same data). So the rule is **sorted store → `slice`, unsorted store →
+`fancy`**; the `runs` metric tells you which regime you're in.
 
 Querying the *aligned* axis is cheap (CSR→rows, CSC→cols); the *cross* axis
 (CSR→cols, CSC→rows) reads most of the store and is intentionally expensive — that
@@ -105,9 +127,10 @@ So for an **analysis-faithful read comparison**, query each store at its **nativ
 on **`--axis row`** — CSR store → `--format csr`, dense store → `--format dense`. The
 common-format mode answers a different question and will understate CSR's advantage.
 
-Either way, read the comparison off **`result_decompressed_bytes`** and **`peak_rss_bytes`**,
-not just `bytes_read`: the decompressed footprint is what real analysis pays in RAM and
-PCIe transfer, and it's where the dense-vs-sparse difference actually shows up.
+Either way, read the comparison off **`peak_rss_bytes`** and the **`io_wall`/`cpu_wall`
+split**: peak RSS is what real analysis pays in RAM and host→device (GPU) transfer, and the
+I/O-vs-CPU split shows whether the cost is the store engine (network / chunks fetched) or the
+read path (decompress + reassembly).
 
 ## Remote stores
 
@@ -123,9 +146,8 @@ pixi run zarr-bench --store gs://my-bucket/health_atlas_csr.zarr \
 - **Google Cloud Storage** (`gs://`) requires `gcsfs` (a pixi dependency) and uses
   **gcloud Application Default Credentials** automatically — run
   `gcloud auth application-default login` once; no token is passed in code.
-- **`bytes_read`** is now real **GCS egress** (compressed bytes pulled over the
-  network), and **`chunks_fetched`** is the number of object GETs — both are the
-  numbers that matter for remote cost.
+- **`chunks_fetched`** is the number of object GETs and **`io_wall`** is the wall time spent
+  on them (fetch in flight) — the numbers that matter for remote cost.
 - The "warm cache" in the timing reflects gcsfs/OS caching after the warmup read,
   **not** a cold first-touch network read. For a cold-vs-warm split, run with
   `--warmup 0 --repeats 1` in a fresh process for cold, and the normal settings
@@ -174,17 +196,20 @@ pixi run python -m zarr_query_benchmarking.compare output1.json --md > table.md
 | `--md` | Emit a GitHub-flavored markdown table (numeric columns right-aligned). |
 
 Columns: `store` · `src` (source format) · `shape` · `axis` · `mode` · `out`
-(final format) · `conc` · `n` · `result` shape · `chunks` fetched · `read_MB` ·
-`rss_GB` (peak) · `med_s` · `p95_s` · `commit`, plus a trailing **`xslow`** column
-— each run's median relative to the fastest run in the table (`1.00x` = fastest).
-That last column is usually the quickest way to see how much a layout choice costs:
+(final format) · `smode` (select mode) · `conc` · `n` · `result` shape · `chunks` fetched ·
+`runs` · `rss_GB` (peak) · `med_s` · `io_s` / `cpu_s` (I/O vs CPU split) · `p95_s` · `commit`,
+plus a trailing **`xslow`** column — each run's median relative to the fastest run in the table
+(`1.00x` = fastest). That last column is usually the quickest way to see how much a layout /
+read-path choice costs:
 
 ```
-store                  src    axis  ...  read_MB  rss_GB    med_s    xslow
-5M_sparse_9.zarr       csr    row   ...     1391    10.5    2.875    1.00x
-13M_..._soundlife.zarr csr    row   ...     1523    12.0    4.111    1.43x
-5M_dense_5x11.zarr     dense  row   ...     1637    58.1  132.419   46.06x
+store           src  axis  smode  ...  chunks  runs  rss_GB  med_s   io_s   cpu_s   xslow
+sorted.zarr     csr  row   slice  ...      16     1     0.1  0.005  0.001   0.004   1.00x
+sorted.zarr     csr  row   fancy  ...      16     1     0.1  0.009  0.001   0.008   1.78x
+unsorted.zarr   csr  row   fancy  ...      26   995     0.1  0.010  0.003   0.007   1.94x
+unsorted.zarr   csr  row   slice  ...    2008   995     0.1  1.204  0.152   1.052 240.8x
 ```
 
-(Read the dense-vs-sparse gap off `read_MB`/`rss_GB` alongside `xslow`, per the
-fairness note above — `bytes_read` alone understates it.)
+Read it off `runs` + `chunks` + the `io_s`/`cpu_s` split: `slice` on a low-`runs` (sorted)
+store is the win; a high `runs` count means the cells are scattered — use `fancy` there
+(`slice` re-fetches shared chunks per run and blows up, as the last row shows).
