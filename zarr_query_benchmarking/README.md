@@ -96,31 +96,6 @@ stage decomposition (IO / decompress / assemble) and the dask comparison.
   normalized to bytes across macOS/Linux. `null` if the probe fails.
 - **Result shape / nnz**, source format, dtype, select mode, concurrency, versions, git commit.
 
-## How reads work
-
-- **Dense** `X` → `zarr` array orthogonal indexing (`X[idx, :]` / `X[:, idx]`).
-- **Sparse** `X` → `anndata.io.sparse_dataset(group)` slicing (the realistic downstream
-  read path), returning scipy CSR/CSC.
-
-For `--mode celltype`, `--select-mode` chooses how the matched rows are read (both first read
-obs + build the `== value` mask, so they differ **only** in the X read):
-
-- **`slice`** (default) finds the contiguous `[start, end)` run(s) of matched rows and reads
-  `X[start:end]` per run. On a **sorted** store the cell type is one run → a single contiguous
-  grab that takes anndata's fast path (`_get_contiguous_compressed_slice`: no per-row gather,
-  no coordinate indexer). This is what `datascale.reader` does.
-- **`fancy`** builds a `flatnonzero` integer index and gathers per row (anndata's coordinate
-  path — the per-row `indptr` loop + zarr `CoordinateIndexer`).
-
-The catch: `slice` reads each run independently, so when the cell type is **scattered**
-(unsorted → hundreds/thousands of runs) it re-fetches shared chunks per run and is *far slower*
-than one `fancy` gather (measured: 995 runs → 2008 chunk GETs and ~120× the wall time of the
-26-GET fancy read on the same data). So the rule is **sorted store → `slice`, unsorted store →
-`fancy`**; the `runs` metric tells you which regime you're in.
-
-Querying the *aligned* axis is cheap (CSR→rows, CSC→cols); the *cross* axis
-(CSR→cols, CSC→rows) reads most of the store and is intentionally expensive — that
-contrast is the point of the benchmark.
 
 ## Comparing dense vs. sparse fairly
 
