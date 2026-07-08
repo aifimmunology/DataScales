@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pixi run *)",
+      "Bash(echo \"=== exit:$? \\(empty file expected\\) ===\")",
+      "Bash(rg -n 'def read_elem' .claude/vendor/anndata/src/anndata/_io/specs/registry.py)",
+      "Bash(echo \"---methods categorical---\")",
+      "Bash(rg -n 'categorical|encoding-type|def write_dataframe|def read_dataframe' .claude/vendor/anndata/src/anndata/_io/specs/methods.py)",
+      "Bash(echo \"=== repository.py: open/create/session ===\")",
+      "Bash(rg -n 'def open|def create|def open_or_create|def writable_session|def readonly_session|def commit' /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/icechunk/src/icechunk/repository.py)",
+      "Bash(grep -vE \"^→|done \\\\\\(|\\\\[#|^\\\\s*$|Converting|Done in|Writing|Reading\")",
+      "Bash(sed -n 230,290p __TRACKED_VAR__/repository.py)",
+      "Bash(sed -n 62,120p __TRACKED_VAR__/storage.py)",
+      "Bash(sed -n '139,160p;1485,1520p' __TRACKED_VAR__/session.py)",
+      "Bash(sed -n '142,160p;1401,1445p' __TRACKED_VAR__/repository.py)",
+      "Bash(sed -n 489,540p __TRACKED_VAR__/storage.py)",
+      "Bash(rg -n 'read_indices|def read_anndata|@_REGISTRY.register_read|read_dispatched|for k in|\\\\.keys\\\\\\(\\\\\\)' __TRACKED_VAR__/_io/specs/methods.py)",
+      "WebSearch",
+      "WebFetch(domain:vitessce.io)",
+      "Bash(sysctl -n hw.ncpu)",
+      "Bash(sysctl -n hw.memsize)",
+      "Bash(awk '{print $1/1e9 \" GB\"}')",
+      "Bash(python3 -c \"print\\(100000*34000*4/1e9, 'GB decompressed'\\)\")",
+      "Bash(echo \"EXIT $?\")",
+      "Bash(python -c \"import ast,sys; ast.parse\\(open\\('icechunk_rapids_demo.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -m py_compile icechunk_rapids_demo.py)",
+      "Bash(pixi install *)",
+      "Bash(chmod +x zarr_query_benchmarking/DELETE_ME_cloud_query.sh)",
+      "Bash(rg -n 'def normalize_total' -A 30 /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/rapids-singlecell/src/rapids_singlecell/preprocessing/*.py)",
+      "Bash(rg -rn \"store_dask|\\\\.fork\\\\\\(\\\\\\)|merge_sessions|session.merge\" --glob '!src/rust-core/**' -g '*.py' -g '*.md')",
+      "Bash(ls docs/docs/icechunk-python/)",
+      "Bash(find . -iname \"*virtual*\" -path \"*docs*\")",
+      "Bash(awk '/Virtually ingesting existing Zarr stores/,/^## [^V]/' docs/docs/guides/zarr.md)",
+      "Bash(grep -rln -i virtual .claude/vendor/icechunk/src/icechunk .claude/vendor/ic)",
+      "Bash(ls /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/zarr-python/src/zarr/core/codec_pipeline.py /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/zarr-python/src/zarr/core/sync.py /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/zarr-python/src/zarr/codecs/blosc.py /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/zarr-python/src/zarr/core/config.py)",
+      "Bash(echo \"---GREP read_batch / read in codec_pipeline---\")",
+      "Bash(grep -n 'async def read\\\\|async def _read\\\\|def read\\\\b\\\\|read_batch\\\\|to_thread\\\\|concurrent\\\\|semaphore\\\\|gather\\\\|as_completed\\\\|fill_value_or_default\\\\|out\\\\[' /Users/alex.holly/Git_Repos/DataScale/.claude/vendor/zarr-python/src/zarr/core/codec_pipeline.py)"
+    ]
+  }
+}

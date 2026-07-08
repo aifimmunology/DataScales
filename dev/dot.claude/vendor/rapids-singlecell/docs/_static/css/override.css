@@ -1,0 +1,32 @@
+/* for the sphinx design cards */
+body {
+	--sd-color-shadow: dimgrey;
+}
+
+dl.citation > dt {
+	float: left;
+	margin-right: 15px;
+	font-weight: bold;
+}
+
+/* for custom small role */
+.small {
+	font-size: 40% !important;
+}
+
+.smaller,
+.pr {
+	font-size: 70% !important;
+}
+
+/* RSC colors are
+#7400ff - violet
+#76b900 - green
+#4169e1 - blue
+*/
+
+p.caption .caption-text {
+    color: #7400ff;
+    font-weight: 600;
+    text-transform: uppercase;
+}
