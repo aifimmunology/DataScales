@@ -1,4 +1,4 @@
-"""Tests for the icechunk backend (Feature A) and sort/partition + reader (Feature B)."""
+"""Tests for the icechunk backend (Feature A) and sort/partition (Feature B)."""
 from pathlib import Path
 
 import anndata as ad
@@ -7,7 +7,6 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from datascale import open_sorted
 from datascale.config import (
     AppConfig,
     ChunkConfig,
@@ -15,9 +14,12 @@ from datascale.config import (
     IOConfig,
     ValidationConfig,
 )
-from datascale.converter import ConversionError, convert_h5ad_to_zarr
+from datascale.converter import (
+    ConversionError,
+    convert_h5ad_to_zarr,
+    convert_h5ads_to_zarr,
+)
 from datascale.config import _validate_config
-from datascale.reader import QueryError
 from datascale.storage import open_input_group
 
 
@@ -52,10 +54,28 @@ def _labelled_h5ad(path: Path) -> tuple[np.ndarray, list[str], list[str]]:
     return np.arange(1, n + 1), cell_type, demographic
 
 
-def _ids(adata: ad.AnnData) -> set[int]:
+def _id_set(X) -> set[int]:
     """Recover the unique-id set from a subset's X[:,0]."""
-    col0 = adata.X[:, 0]
-    return set(int(round(v)) for v in np.asarray(col0.todense()).ravel())
+    col0 = X[:, 0]
+    dense = col0.todense() if sp.issparse(col0) else col0
+    return set(int(round(v)) for v in np.asarray(dense).ravel())
+
+
+def _self_serve_subset(g, **keys):
+    """Read rows matching ``keys`` from a sorted store using ONLY stock anndata/zarr
+    (no datascale) — proves the store is self-describing. Returns (X, obs)."""
+    from anndata.io import read_elem, sparse_dataset
+
+    ranges = read_elem(g["uns"]["datascale_sort_index"]["ranges"])
+    for k, v in keys.items():
+        ranges = ranges[ranges[k] == v]
+    spans = sorted((int(r["start"]), int(r["end"])) for _, r in ranges.iterrows())
+    rows = np.concatenate([np.arange(s, e) for s, e in spans])
+    x_ds = sparse_dataset(g["X"])
+    parts = [x_ds[s:e] for s, e in spans]
+    X = parts[0] if len(parts) == 1 else sp.vstack(parts, format="csr")
+    obs = read_elem(g["obs"]).iloc[rows]
+    return X, obs
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +115,7 @@ def test_icechunk_rejects_backed(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Feature B — sort/partition + reader
+# Feature B — sort/partition (self-serve subset reads with stock anndata/zarr)
 # ---------------------------------------------------------------------------
 
 def _sorted_cfg(backend: str = "zarr") -> AppConfig:
@@ -126,57 +146,41 @@ def test_sort_writes_valid_anndata_and_index(tmp_path: Path) -> None:
     ax = ranges[(ranges.cell_type == "A") & (ranges.demographic == "x")].iloc[0]
     assert (int(ax["start"]), int(ax["end"])) == (0, 2)
     assert np.array_equal(np.asarray(idx["obs_order"]), [1, 4, 2, 3, 0, 5])
+    # obsm is reordered consistently with the row permutation (coords col0 was 0,2,4,6,8,10).
+    assert list(adata.obsm["coords"][:, 0].astype(int)) == [2, 8, 4, 6, 0, 10]
 
 
-def test_reader_select_contiguous_block(tmp_path: Path) -> None:
+def test_sorted_store_self_serve_contiguous_block(tmp_path: Path) -> None:
+    """A whole-primary-key block spans contiguous range(s): read it with stock anndata/zarr."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted.zarr"
     convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _sorted_cfg())
 
-    store = open_sorted(str(out))
-    a = store.select(cell_type="A")           # whole A block: ids 2,3,5
-    assert _ids(a) == {2, 3, 5}
-    assert set(a.obs["cell_type"]) == {"A"}
-    assert "coords" in a.obsm and a.obsm["coords"].shape == (3, 2)
+    g = open_input_group(str(out))
+    X, obs = _self_serve_subset(g, cell_type="A")           # whole A block: ids 2,3,5
+    assert _id_set(X) == {2, 3, 5}
+    assert set(obs["cell_type"]) == {"A"}
 
-    sub = store.select(cell_type="A", demographic="x")  # sub-range: ids 2,5
-    assert _ids(sub) == {2, 5}
+    Xsub, _ = _self_serve_subset(g, cell_type="A", demographic="x")  # sub-range: ids 2,5
+    assert _id_set(Xsub) == {2, 5}
 
 
-def test_reader_select_crosscut_gathers_spans(tmp_path: Path) -> None:
+def test_sorted_store_self_serve_crosscut(tmp_path: Path) -> None:
+    """A non-leading key cuts across primary-key blocks into several non-adjacent spans;
+    gather them with stock anndata/zarr via the sort_index."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted.zarr"
     convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _sorted_cfg())
 
-    store = open_sorted(str(out))
+    g = open_input_group(str(out))
     # demographic="x" cuts across cell types A and B (non-adjacent spans): ids 2,5 (A/x) + 4 (B/x)
-    x = store.select(demographic="x")
-    assert _ids(x) == {2, 4, 5}
-
-
-def test_reader_unknown_key_and_no_match(tmp_path: Path) -> None:
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    out = tmp_path / "sorted.zarr"
-    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _sorted_cfg())
-    store = open_sorted(str(out))
-    with pytest.raises(QueryError, match="Unknown sort key"):
-        store.select(nope="A")
-    with pytest.raises(QueryError, match="No rows match"):
-        store.select(cell_type="ZZZ")
-
-
-def test_open_sorted_on_unsorted_store_errors(tmp_path: Path) -> None:
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    out = tmp_path / "plain.zarr"
-    cfg = AppConfig(io=IOConfig(overwrite=True), chunks=_chunks(), validation=ValidationConfig())
-    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), cfg)
-    with pytest.raises(QueryError, match="datascale_sort_index"):
-        open_sorted(str(out))
+    X, _ = _self_serve_subset(g, demographic="x")
+    assert _id_set(X) == {2, 4, 5}
 
 
 def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
     """Dense X supports --sort-by: rows are physically sorted and the sort_index ranges
-    line up with X[start:end] (the reader stays sparse-only, so we read X directly)."""
+    line up with X[start:end] (read directly from the dense X with stock zarr, no datascale)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted_dense.zarr"
     cfg = AppConfig(
@@ -230,9 +234,12 @@ def test_sort_through_icechunk_and_read(tmp_path: Path) -> None:
     out = tmp_path / "repo.icechunk"
     convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _sorted_cfg(backend="icechunk"))
 
-    store = open_sorted(str(out), icechunk=True, branch="main")
-    assert _ids(store.select(cell_type="A")) == {2, 3, 5}
-    assert _ids(store.select(demographic="x")) == {2, 4, 5}
+    # Read subsets from the icechunk-backed sorted store with stock anndata/zarr.
+    g = open_input_group(str(out), icechunk=True, branch="main")
+    X_a, _ = _self_serve_subset(g, cell_type="A")
+    assert _id_set(X_a) == {2, 3, 5}
+    X_x, _ = _self_serve_subset(g, demographic="x")
+    assert _id_set(X_x) == {2, 4, 5}
 
 
 # ---------------------------------------------------------------------------
@@ -331,3 +338,60 @@ def test_shard_factor_below_one_rejected() -> None:
     cfg = AppConfig(chunks=ChunkConfig(x_shard_factor=0))
     with pytest.raises(ValueError, match="x_shard_factor must be >= 1"):
         _validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Parallel (cpus>1) write correctness — guards the da.store lock choice
+# ---------------------------------------------------------------------------
+
+def _rand_h5ad(path: Path, n_obs: int, n_vars: int, seed: int) -> np.ndarray:
+    """Write a CSR h5ad with seeded ~30%-dense values; returns the dense X."""
+    rng = np.random.default_rng(seed)
+    dense = ((rng.random((n_obs, n_vars), dtype=np.float32) < 0.3)
+             * rng.random((n_obs, n_vars), dtype=np.float32)).astype(np.float32)
+    obs = pd.DataFrame({"batch": ["b"] * n_obs}, index=[f"{seed}_{i}" for i in range(n_obs)])
+    ad.AnnData(X=sp.csr_matrix(dense), obs=obs).write_h5ad(path)
+    return dense
+
+
+def _read_X(out: Path) -> np.ndarray:
+    X = ad.read_zarr(str(out)).X
+    return np.asarray(X.todense() if sp.issparse(X) else X)
+
+
+@pytest.mark.parametrize("x_storage", ["dense", "sparse-csr"])
+def test_inmem_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
+    """In-memory conversion at cpus>1 (threaded da.store) must round-trip bit-exact.
+    Rows span several row-chunks so multiple chunks are written concurrently — this is the
+    path that carries lock=False, so a lock/alignment regression would corrupt the output."""
+    src = _rand_h5ad(tmp_path / "in.h5ad", n_obs=300, n_vars=200, seed=1)
+    out = tmp_path / "out.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage=x_storage),
+        chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=200, sparse_flat_chunk=500, cpus=4),
+        validation=ValidationConfig(),
+    )
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), cfg)
+    assert np.array_equal(_read_X(out), src)
+
+
+@pytest.mark.parametrize("x_storage", ["dense", "sparse-csr"])
+def test_concat_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
+    """concat-h5ads at cpus>1 writes each file at a misaligned row offset, so the file-seam
+    chunk is read-modify-written. That path MUST keep the da.store lock (row counts here are
+    deliberately not multiples of the row chunk) — with lock=False concurrent RMW corrupts X."""
+    # 200 + 300 rows at row_chunk 64 puts the second file at a misaligned offset (200 % 64 != 0);
+    # 200 cols/chunk make the seam-chunk RMW window wide enough that lock=False corrupts
+    # reliably (verified 6/6), so this is a real guard, not a coin flip.
+    a = _rand_h5ad(tmp_path / "a.h5ad", n_obs=200, n_vars=500, seed=1)
+    b = _rand_h5ad(tmp_path / "b.h5ad", n_obs=300, n_vars=500, seed=2)
+    out = tmp_path / "out.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage=x_storage),
+        chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=500, sparse_flat_chunk=500, cpus=4),
+        validation=ValidationConfig(),
+    )
+    convert_h5ads_to_zarr(
+        [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(out), cfg
+    )
+    assert np.array_equal(_read_X(out), np.vstack([a, b]))

@@ -9,6 +9,20 @@ CLAUDE*
 comparisons/
 query_results/
 rapids_den*
+benchmarks/
+cache/
+
+# Node / npm — this is a Python project; no package.json belongs at the root
+node_modules/
+package.json
+package-lock.json
+
+# Local editor/agent config (not part of the project)
+dot.claude/
+dev/dot.claude/
+
+# Local zarr fixtures / built stores (can be multi-GB)
+zarr_dbs/
 
 # Expression data files
 *.h5*

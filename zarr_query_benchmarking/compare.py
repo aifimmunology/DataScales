@@ -2,7 +2,7 @@
 
 Reads one or more files emitted by `zarr-bench --json` — each may be a single
 run object, a JSON array of them, or JSON Lines (one object per line, as the
-`dev/run_query_sweep.sh` sweep appends) — and prints an aligned table
+`run_query_sweep.sh` sweep appends) — and prints an aligned table
 to stdout so differences between store layouts / thread counts / axes are easy
 to eyeball. A trailing `xslow` column shows each run's median relative to the
 fastest run in the table (1.00x = fastest), which is the number you usually
@@ -60,13 +60,17 @@ _COLUMNS = [
     ("axis", "axis", False, str),
     ("mode", "mode", False, str),
     ("out", "final_format", False, str),
+    ("smode", "select_mode", False, str),
     ("conc", "concurrency", True, str),
     ("n", _n, True, str),
     ("result", lambda r: _shape(r, "result_shape"), False, str),
     ("chunks", "chunks_fetched", True, str),
-    ("read_MB", lambda r: (r.get("bytes_read") or 0) / 1e6, True, lambda v: _fmt_num(v, 0)),
+    ("runs", "n_spans", True, str),
     ("rss_GB", lambda r: (r.get("peak_rss_bytes") or 0) / 1e9, True, lambda v: _fmt_num(v, 1)),
     ("med_s", "median_s", True, lambda v: _fmt_num(v, 3)),
+    ("io_s", "io_wall_median_s", True, lambda v: _fmt_num(v, 3)),
+    ("cpu_s", "cpu_wall_median_s", True, lambda v: _fmt_num(v, 3)),
+    ("conv_s", "convert_median_s", True, lambda v: _fmt_num(v, 3)),
     ("p95_s", "p95_s", True, lambda v: _fmt_num(v, 3)),
     ("commit", "git_commit", False, str),
 ]
@@ -74,6 +78,19 @@ _COLUMNS = [
 
 def _cell(run, key_or_fn):
     return key_or_fn(run) if callable(key_or_fn) else run.get(key_or_fn)
+
+
+# Map a --sort field name to the value actually used for ordering. By default we
+# sort on the raw run field, but for display-derived columns (e.g. "store" shows
+# the basename, not the full path) we must sort on the *displayed* value so that
+# identically-named stores from different runs line up. Anything not listed here
+# falls back to the raw run field via run.get(...).
+_SORT_KEYS = {col[0]: col[1] for col in _COLUMNS}
+
+
+def _sort_value(run, field):
+    extractor = _SORT_KEYS.get(field, field)
+    return _cell(run, extractor)
 
 
 def _parse(text):
@@ -173,7 +190,21 @@ def main(argv=None):
         return 1
 
     if args.sort:
-        runs.sort(key=lambda r: (r.get(args.sort) is None, r.get(args.sort)))
+        # Resolve through the column extractors so --sort store orders by the
+        # displayed basename, not the full path; tie-break on store name then
+        # file so the same store from two runs lands on adjacent rows. The
+        # primary value keeps its native type (so numeric fields like median_s
+        # sort numerically); None is pushed last via the leading flag.
+        def sort_key(r):
+            primary = _sort_value(r, args.sort)
+            return (
+                primary is None,
+                primary if primary is not None else "",
+                _store_name(r),
+                r.get("_file") or "",
+            )
+
+        runs.sort(key=sort_key)
 
     headers, rows, numeric = build_table(runs, multi_file=len(paths) > 1)
     render = render_md if args.md else render_plain

@@ -1,9 +1,8 @@
 # zarr_query_benchmarking
 
-CLI tool to benchmark **query time** against a Zarr store's `X` matrix (dense or
-sparse CSR/CSC). It times *read selection + convert to the requested final format*,
-so comparisons across layouts are fair (a `dense` query from a CSR store pays the
-densify cost; a `csr` query from a dense store pays the sparsify cost).
+CLI tool to benchmark **query time** against a Zarr store's `X` matrix (dense or sparse
+CSR/CSC). It times *read selection + convert to the requested final format*, so comparisons
+across layouts are fair (a `dense` query from a CSR store pays the densify cost, and vice versa).
 
 Run via pixi (`python` is not on PATH directly):
 
@@ -12,179 +11,81 @@ pixi run zarr-bench --store <path.zarr> --axis row --count 1000 --format csr
 pixi run zarr-bench-inspect --store <path.zarr>     # layout only, no timing
 ```
 
+Output is a text summary, or one JSON object with `--json` — the raw per-run timings (wall,
+plus an I/O / decompress / convert split) and full provenance (versions, shape, dtype, chunks,
+codec, git commit) for later comparison.
+
 ## Arguments
 
 | Flag | Values | Default | Meaning |
 |------|--------|---------|---------|
-| `--store` | path \| URL | (required) | `.zarr` store to query (reads its `X`). Local path **or** an fsspec URL — `gs://bucket/store.zarr`, `s3://…` (see [Remote stores](#remote-stores)). |
-| `--axis` | `row` \| `col` | (required¹) | Query rows (obs/cells) or columns (var/genes). |
+| `--store` | path \| URL | (required) | `.zarr` store to query. Local path or fsspec URL (`gs://…`, `s3://…`). |
+| `--axis` | `row` \| `col` | (required¹) | Query rows (cells) or columns (genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
-| `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded random indices; `celltype` = all obs rows whose `--obs-column` equals `--obs-value` (see below). |
-| `--obs-column` | str | (required for `celltype`) | obs column to filter on (e.g. a cell-type annotation). |
-| `--obs-value` | str | (required for `celltype`) | Value in `--obs-column` to select rows by. |
-| `--format` | `csr` \| `dense` | (required) | Final format the result is converted to (**included in the timing**). |
-| `--concurrency` | int | zarr default (10) | `zarr` `async.concurrency` — how many chunks are *dispatched* at once (a semaphore). Pair with `--max-workers`. |
-| `--max-workers` | int | `min(32, cpu+4)` | `zarr` `threading.max_workers` — size of the pool that actually *decodes* chunks (Blosc/zstd). **The dominant stage of a dense read.** Set ≈ physical cores. |
-| `--repeats` | int | 5 | Timed repeats (reports median/min/p95). |
-| `--warmup` | int | 1 | Warmup runs discarded before timing. |
+| `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded indices; `celltype` = all rows matching an obs value (see below). |
+| `--select-mode` | `auto` \| `slice` \| `fancy` | `auto` | **celltype only.** How matched rows are read: `slice` = per-run `X[start:end]` (best on a sorted store); `fancy` = one gathered fetch (best when scattered); `auto` picks by contiguity. |
+| `--obs-column` / `--obs-value` | str | (required for `celltype`) | obs column + value to filter rows by. |
+| `--format` | `csr` \| `dense` | (required¹) | Final format the result is converted to (**included in the timing**). |
+| `--native` | flag | off | Read at the store's native format — no conversion. Measures the layout, not the format tax. Overrides `--format`. |
+| `--concurrency` | int | 10 | zarr `async.concurrency` — chunks dispatched at once. Pair with `--max-workers`. |
+| `--max-workers` | int | `min(32, cpu+4)` | zarr `threading.max_workers` — the Blosc/zstd **decode** pool. Set ≈ physical cores. |
+| `--repeats` / `--warmup` | int | 5 / 1 | Timed repeats (median/min/p95) / warmup runs discarded. |
 | `--seed` | int | 0 | RNG seed for `--mode random`. |
-| `--json` | flag | off | Emit one JSON object (raw timings + provenance) instead of text. |
-| `--inspect` | flag | off | Print `X` layout (format/shape/chunks/codec) and exit. |
+| `--json` / `--inspect` | flag | off | Emit JSON instead of text / print layout and exit. |
 
-¹ `--axis` and `--count` are required for `sequential`/`random`. `--mode celltype`
-forces `--axis row` (rejects `--axis col`), **ignores `--count`**, and requires
-`--obs-column` + `--obs-value` instead.
+¹ `--axis` + `--count` are required for `sequential`/`random`. `celltype` forces `--axis row`,
+ignores `--count`, and needs `--obs-column` + `--obs-value`. Either `--format` or `--native` is required.
 
-## Selecting by cell type (`--mode celltype`)
+## Usage
+
+**Select by cell type** — reads `obs[<column>]`, builds the `== <value>` mask, and fetches all
+matching rows' `X` (the mask build is inside the timed region, modeling a real "filter then fetch"):
 
 ```bash
 pixi run zarr-bench --store <path.zarr> --mode celltype \
     --obs-column AIFI_L1 --obs-value Platelet --format csr
 ```
 
-Reads `obs[<obs-column>]`, builds the `== <obs-value>` mask, and selects **all**
-matching obs rows (the row count is whatever matches; `--count` is ignored). The
-obs read + mask build happen **inside the timed region**, so the wall time models
-a real "filter cells by type, then fetch their `X`" query rather than a bare slice.
-A typo in the column or obs-value name exits non-zero and prints the available
-columns / values. The JSON output adds `obs_column`, `obs_value`, and `selected`
-(number of matched rows).
-
-## Two knobs, both required for parallelism
-
-A dense read uses **two independent** zarr settings, and raising only one pins you near 1 core:
-
-- `--concurrency` (`async.concurrency`) only *dispatches* chunks — it's an `asyncio.Semaphore`,
-  it runs no CPU work.
-- `--max-workers` (`threading.max_workers`) sizes the `ThreadPoolExecutor` that runs **Blosc/zstd
-  decompression**, which is **~70% of a warm dense read** (`BloscCodec._decode_single` →
-  `asyncio.to_thread`). Decode releases the GIL, so it scales across cores.
-
-So `--concurrency 60 --max-workers 1` ≈ 1 core (decode serialized); `--concurrency 1` starves the
-pool regardless of workers. **Set both** (e.g. `--concurrency 64 --max-workers <physical cores>`).
-Measured on a 12-core box, `X[0:100000, :]` (500k×34k dense, 1k×1k chunks): `conc=60/mw=1` = 10.1 s
-@ 1.1 cores → `conc=60/mw=12` = 2.63 s @ 5.2 cores. See `thread_scaling_probe.py` for the full
-stage decomposition (IO / decompress / assemble) and the dask comparison.
-
-## Metrics reported
-
-- **Wall time** — median / min / p95 over `--repeats` (warm cache).
-- **Chunks fetched** — real `store.get()` calls, counted in a *separate untimed pass*
-  through a `WrapperStore` so counting never inflates the timing.
-- **Bytes read** — compressed bytes pulled from the store (≈ GCS egress for remote stores).
-- **Decompressed result bytes** (`result_decompressed_bytes`) — working-set size of the
-  materialized result (dense: `rows*cols`; CSR: `data+indices+indptr`). This — **not**
-  compressed `bytes_read` — is what drives RAM and host→device (GPU) transfer. scRNA dense
-  data Blosc-compresses extremely well, so `bytes_read` can look similar across formats while
-  this reveals the real (often ~10×) gap.
-- **Peak RSS** (`peak_rss_bytes`) — peak resident memory of a single read+convert, measured
-  in an *isolated subprocess* (so warmup/repeats don't contaminate the high-water mark) and
-  normalized to bytes across macOS/Linux. `null` if the probe fails.
-- **Result shape / nnz**, source format, dtype, concurrency, library versions, git commit.
-
-## How reads work
-
-- **Dense** `X` → `zarr` array orthogonal indexing (`X[idx, :]` / `X[:, idx]`).
-- **Sparse** `X` → `anndata.io.sparse_dataset(group)` slicing (the realistic downstream
-  read path), returning scipy CSR/CSC.
-
-Querying the *aligned* axis is cheap (CSR→rows, CSC→cols); the *cross* axis
-(CSR→cols, CSC→rows) reads most of the store and is intentionally expensive — that
-contrast is the point of the benchmark.
-
-## Comparing dense vs. sparse fairly
-
-`--format` is the **output** format and is *included in the timing*. A common `--format`
-across two stores answers "cost to get format X out, regardless of how it's stored" — but
-it charges the CSR store a `.toarray()` densify cost (and a dense store a sparsify cost)
-that real **rapids-singlecell + dask** analysis *never pays*: that pipeline keeps each
-store in its native on-device representation (cupyx CSR vs. dense CuPy) and reads
-row-blocks (the aligned axis).
-
-So for an **analysis-faithful read comparison**, query each store at its **native** format
-on **`--axis row`** — CSR store → `--format csr`, dense store → `--format dense`. The
-common-format mode answers a different question and will understate CSR's advantage.
-
-Either way, read the comparison off **`result_decompressed_bytes`** and **`peak_rss_bytes`**,
-not just `bytes_read`: the decompressed footprint is what real analysis pays in RAM and
-PCIe transfer, and it's where the dense-vs-sparse difference actually shows up.
-
-## Remote stores
-
-`--store` accepts an fsspec URL, not just a local path. A URL with a scheme is
-opened through zarr's `FsspecStore` (the documented, stable remote backend —
-`ObjectStore`/`obstore` is still flagged experimental):
+**Remote stores** — a URL with a scheme is opened through zarr's `FsspecStore`. `gs://` needs
+`gcsfs` (a pixi dep) and uses gcloud Application Default Credentials — run
+`gcloud auth application-default login` once; no token is passed in code.
 
 ```bash
-pixi run zarr-bench --store gs://my-bucket/health_atlas_csr.zarr \
-    --axis row --count 1000 --format csr --json
+pixi run zarr-bench --store gs://my-bucket/atlas_csr.zarr --axis row --count 1000 --format csr --json
 ```
 
-- **Google Cloud Storage** (`gs://`) requires `gcsfs` (a pixi dependency) and uses
-  **gcloud Application Default Credentials** automatically — run
-  `gcloud auth application-default login` once; no token is passed in code.
-- **`bytes_read`** is now real **GCS egress** (compressed bytes pulled over the
-  network), and **`chunks_fetched`** is the number of object GETs — both are the
-  numbers that matter for remote cost.
-- The "warm cache" in the timing reflects gcsfs/OS caching after the warmup read,
-  **not** a cold first-touch network read. For a cold-vs-warm split, run with
-  `--warmup 0 --repeats 1` in a fresh process for cold, and the normal settings
-  for warm. (Object stores can't be page-cache-dropped from userspace.)
-
-## Example: sweep row + col across many stores
-
-`dev/run_query_sweep.sh` runs both axes against every `.zarr` in a directory and
-appends one JSON line per run:
+**Sweep many stores** — `zarr_query_benchmarking/examples/run_query_sweep.sh` runs both axes over
+every `.zarr` in a directory (or `gs://` prefix) and appends one JSON line per run:
 
 ```bash
-# dev/run_query_sweep.sh [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
-dev/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench_results.jsonl
-
-# STORE_DIR may be a gs:// prefix — every *.zarr at that prefix is listed via
-# gcsfs (a bucket can't be shell-globbed) and benchmarked in turn:
-dev/run_query_sweep.sh gs://my-bucket/stores 1000 csr 32 sequential bench_results.jsonl
+# [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
+zarr_query_benchmarking/examples/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench.jsonl
 ```
 
-> Note: cross-axis sparse queries (e.g. `--axis col` on a CSR store) are slow by
-> design — keep `--count` modest when sweeping sparse stores on both axes.
-
-## Comparing runs (`compare`)
-
-`compare` reads one or more `--json` result files and prints an aligned comparison
-table, so differences between store layouts / axes / thread counts are easy to
-eyeball. It accepts a single JSON object, a JSON **array** of them (e.g. a
-hand-collected `output1.json`), or **JSON Lines** (the format
-`dev/run_query_sweep.sh` appends) — and globs are expanded.
+**Compare runs** — `compare` reads `--json` files (a single object, an array, or JSON Lines) and
+prints an aligned table, sortable, with a trailing `xslow` column (each run's median vs the fastest):
 
 ```bash
-# one file, sorted by median wall time
-pixi run python -m zarr_query_benchmarking.compare bench_results.jsonl --sort median_s
-
-# several files at once (a "file" column is added automatically)
-pixi run python -m zarr_query_benchmarking.compare 'runs/*.json' --sort store
-
-# emit a GitHub-flavored markdown table for a PR / notes
-pixi run python -m zarr_query_benchmarking.compare output1.json --md > table.md
+pixi run python -m zarr_query_benchmarking.compare bench.jsonl --sort median_s
+pixi run python -m zarr_query_benchmarking.compare 'runs/*.json' --md > table.md   # markdown
 ```
 
-| Flag | Meaning |
-|------|---------|
-| `files…` | One or more JSON / JSONL result files; shell globs are expanded. |
-| `--sort FIELD` | Sort rows ascending by any run field (e.g. `median_s`, `store`, `chunks_fetched`). |
-| `--md` | Emit a GitHub-flavored markdown table (numeric columns right-aligned). |
+## Notes
 
-Columns: `store` · `src` (source format) · `shape` · `axis` · `mode` · `out`
-(final format) · `conc` · `n` · `result` shape · `chunks` fetched · `read_MB` ·
-`rss_GB` (peak) · `med_s` · `p95_s` · `commit`, plus a trailing **`xslow`** column
-— each run's median relative to the fastest run in the table (`1.00x` = fastest).
-That last column is usually the quickest way to see how much a layout choice costs:
+**Two knobs for parallelism.** A dense read needs *both* zarr settings; raising one alone pins you
+near 1 core. `--concurrency` only *dispatches* chunks (a semaphore, no CPU); `--max-workers` sizes
+the pool that runs Blosc/zstd **decode** — the dominant cost of a warm dense read, and it scales
+across cores. Set both, e.g. `--concurrency 64 --max-workers <physical cores>`.
 
-```
-store                  src    axis  ...  read_MB  rss_GB    med_s    xslow
-5M_sparse_9.zarr       csr    row   ...     1391    10.5    2.875    1.00x
-13M_..._soundlife.zarr csr    row   ...     1523    12.0    4.111    1.43x
-5M_dense_5x11.zarr     dense  row   ...     1637    58.1  132.419   46.06x
-```
+**Fair dense-vs-sparse comparison.** `--format` is *included in the timing*, so a common `--format`
+charges the CSR store a `.toarray()` (and a dense store a `.tocsr()`) that real rapids-singlecell +
+dask analysis never pays. For an analysis-faithful read, pass **`--native`** so each store is read
+in its own layout (no conversion), then compare on peak RSS and the store-engine cost rather than
+the format tax. Query on `--axis row` (the aligned axis for CSR row-block pipelines).
 
-(Read the dense-vs-sparse gap off `read_MB`/`rss_GB` alongside `xslow`, per the
-fairness note above — `bytes_read` alone understates it.)
+**Cold vs warm.** Timed repeats are warm (OS/gcsfs cache hot after warmup). For a cold first-touch
+number, run `--warmup 0 --repeats 1` in a fresh process. Object stores can't be page-cache-dropped
+from userspace, so on `gs://` the warm number reflects client caching, not a cold network read.
+
+> Cross-axis sparse queries (e.g. `--axis col` on a CSR store) are slow by design — keep `--count`
+> modest when sweeping sparse stores on both axes.

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,12 @@ version = "0.1.0"
 description = "Configurable AnnData to Zarr converter with strong validation"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "DataScale" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 dependencies = [
-  "anndata>=0.10.0",
-  "zarr>=2.18.0",
+  "anndata>=0.11.0",
+  "zarr>=3.0.0",
   "numpy>=1.24.0",
   "scipy>=1.10.0",
   "PyYAML>=6.0",
@@ -48,8 +50,6 @@ dev = { features = ["dev"], solve-group = "default" }
 #   pixi run zarr-bench --store zarr_dbs/health_atlas_csr_1000.zarr --axis obs --count 1000
 zarr-bench = "python -m zarr_query_benchmarking"
 zarr-bench-inspect = "python -m zarr_query_benchmarking --inspect"
-# Tests live in the dev environment: pixi run -e dev test-zarr-bench
-test-zarr-bench = "python -m pytest tests/test_zarr_query_benchmarking.py -q"
 
 [tasks]
 kernel = "python -m ipykernel install --user --name <kernelname> --display-name 'Python (<kernelname>)'"

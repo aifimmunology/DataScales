@@ -9,7 +9,6 @@ from .converter import (
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
 )
-from .validation import ValidationError
 
 _CONVERTERS = {
     "convert-h5ad": convert_h5ad_to_zarr,
@@ -98,9 +97,10 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="OBS_COLUMN",
         help="Sort + partition rows by these obs column(s), primary key first "
              "(e.g. --sort-by AIFI_L1 batch_id). Each distinct key tuple becomes a "
-             "contiguous row range queryable via datascale.open_sorted. Requires eager "
-             "(non-backed) load and sparse-csr or dense storage (datascale.open_sorted "
-             "reads back sparse-csr only; dense ranges are read directly from X[start:end]).",
+             "contiguous row range recorded in uns/datascale_sort_index, so subsets can be "
+             "read with stock anndata/zarr by slicing X[start:end] over the matching range(s) "
+             "— no datascale dependency required. Requires eager (non-backed) load and "
+             "sparse-csr or dense storage.",
     )
     _add_common_args(h5ad_required, h5ad_optional)
 
