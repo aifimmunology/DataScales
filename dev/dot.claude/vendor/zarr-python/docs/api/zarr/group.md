@@ -1,2 +1,0 @@
-::: zarr.Group
-::: zarr.AsyncGroup

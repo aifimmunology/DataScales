@@ -1,3 +1,0 @@
-## Utils
-
-::: zarr.testing.utils

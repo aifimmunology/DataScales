@@ -2,7 +2,7 @@
 
 Reads one or more files emitted by `zarr-bench --json` — each may be a single
 run object, a JSON array of them, or JSON Lines (one object per line, as the
-`dev/run_query_sweep.sh` sweep appends) — and prints an aligned table
+`run_query_sweep.sh` sweep appends) — and prints an aligned table
 to stdout so differences between store layouts / thread counts / axes are easy
 to eyeball. A trailing `xslow` column shows each run's median relative to the
 fastest run in the table (1.00x = fastest), which is the number you usually

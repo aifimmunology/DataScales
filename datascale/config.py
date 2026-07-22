@@ -57,11 +57,11 @@ class GroupingConfig:
     """Sort + partition X by one or more obs columns (Feature B).
 
     When enabled, rows are physically sorted by ``sort_by`` (primary key first), so each
-    distinct key tuple is a contiguous row range — enabling fast subset reads via the
-    importable reader (``datascale.open_sorted``). All obs-aligned arrays are reordered
-    consistently so the store stays a valid AnnData. convert-h5ad only, with sparse-csr or
-    dense X (the ``open_sorted`` reader currently reads back sparse-csr only; dense sorted
-    ranges are read directly from ``X[start:end]``).
+    distinct key tuple is a contiguous row range recorded in ``uns/datascale_sort_index``.
+    Subsets can then be read with stock anndata/zarr by slicing ``X[start:end]`` over the
+    matching range(s) — no datascale dependency required. All obs-aligned arrays are
+    reordered consistently so the store stays a valid AnnData. convert-h5ad only, with
+    sparse-csr or dense X.
     """
     enabled: bool = False
     sort_by: tuple[str, ...] = ()  # obs column names, primary sort key first

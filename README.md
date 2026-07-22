@@ -1,16 +1,22 @@
-# DataScales
+# DataScale
 
-A configurable converter for single-cell gene expression data to Zarr stores, focused on non-spatial single-cell AnnData.
+A configurable converter for h5 data(currently only single cell) to Zarr stores, non-spatial single-cell AnnData.
+
+> **This README covers the DataScale conversion tool.** The repo also ships a separate,
+> CLI-only **[zarr query benchmark tool](zarr_query_benchmarking/README.md)** — used to time any
+> query type (row/column, sequential/random/cell-type) against a Zarr store's `X` so you can
+> compare setups (dense vs CSR/CSC, chunking, sharding). See its own README; everything below is
+> about conversion.
 
 ## Scope
 
 - Converts `.h5ad` and 10x Genomics Cell Ranger `.h5` files to Zarr v3
 - Rejects spatial AnnData inputs during validation
 - Supports sparse (CSR/CSC) and dense output storage formats with configurable chunking and optional sharding for dense X (`--x-shard-factor`)
-- Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it
+- Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it (slower)
 - Optional 'backed' HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
 - Optional Icechunk storage backend (`--icechunk`) — writes the store through a transactional, versioned repository instead of a plain zarr directory
-- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous row range for fast subset reads via `datascale.open_sorted`
+- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous row range (recorded under `uns/datascale_sort_index`) for fast subset reads with stock anndata/zarr by slicing `X[start:end]`
 - Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
@@ -20,20 +26,6 @@ Requires Python 3.10+. Run commands in repository directory after cloning.
 **pixi (recommended)** — handles all dependencies automatically:
 ```bash
 pixi install
-```
-
-**pip** — with a virtual environment:
-```bash
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -e .
-```
-
-**From source** — for contributors:
-```bash
-git clone https://github.com/yourname/DataScale.git
-cd DataScale
-pip install -e .
 ```
 
 ## Commands
@@ -78,9 +70,9 @@ Requirements (strict; conversion errors otherwise):
 - `adata.X` in each file must be CSR or CSC (CSC is auto-converted to CSR).
 - All `X` matrices must share the same dtype.
 
+# Argument passing
 
 ## Config (TOML or YAML)
-
 See `example_config.toml` for a full reference. Key options:
 
 ```toml
@@ -113,9 +105,9 @@ min_vars = 1
 
 # Sort + partition X by obs columns (convert-h5ad, sparse-csr or dense, eager only). When
 # enabled, rows are physically sorted by sort_by (primary key first) so each distinct key tuple
-# is a contiguous row range, recorded under uns/datascale_sort_index. sparse-csr stores are
-# queryable via datascale.open_sorted(...).select(...); for dense stores the reader is not yet
-# wired up, so read ranges directly from X[start:end] using the recorded sort_index.
+# is a contiguous row range, recorded under uns/datascale_sort_index. To read a subset, look up
+# the matching range(s) in the sort_index and slice X[start:end] with stock anndata/zarr — the
+# store is self-describing and needs no datascale dependency to query.
 [grouping]
 enabled = false
 sort_by = ["AIFI_L1", "batch_id"]
@@ -141,7 +133,7 @@ All commands share the same optional flags:
 | `--x-shard-factor` | Optional | Pack dense X chunks into shards of `(x_row_chunk, x_col_chunk)` × factor. `1` (default) = no sharding. Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only) |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
 | `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Commits to the `main` branch. Local storage; eager input only (not `--backed`). All subcommands |
-| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous, queryable row range. Requires eager load + `sparse-csr` or `dense` (`datascale.open_sorted` reads back `sparse-csr` only; dense ranges are read directly from `X[start:end]`) |
+| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous row range recorded in `uns/datascale_sort_index`, readable with stock anndata/zarr via `X[start:end]` (no datascale dependency). Requires eager load + `sparse-csr` or `dense` |
 
 ```bash
 pixi run datascale convert-h5ad --help
@@ -154,3 +146,7 @@ pixi run datascale concat-h5ads --help
 ```bash
 pixi run -e dev pytest tests/ -v
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).

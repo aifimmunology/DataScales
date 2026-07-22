@@ -7,7 +7,6 @@ from .converter import (
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
 )
-from .reader import QueryError, SortedStore, open_sorted
 from .validation import ValidationError, validate_single_cell_anndata
 
 # Exportable Library API
@@ -17,9 +16,6 @@ __all__ = [
     "load_config",
     "ConversionError",
     "ValidationError",
-    "QueryError",
-    "open_sorted",
-    "SortedStore",
     "convert_h5ad_to_zarr",
     "convert_h5ads_to_zarr",
     "convert_10x_h5_to_zarr",

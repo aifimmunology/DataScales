@@ -5853,10 +5853,10 @@ packages:
 - pypi: ./
   name: datascale
   version: 0.1.0
-  sha256: f5f76f8f9223a12cd857d0f0736a7a94c0395ff23f107aa65c0c622770003f7f
+  sha256: b309be84f95382313990133e5a66494191866e396602dbb9dc3463a22a0ec654
   requires_dist:
-  - anndata>=0.10.0
-  - zarr>=2.18.0
+  - anndata>=0.11.0
+  - zarr>=3.0.0
   - numpy>=1.24.0
   - scipy>=1.10.0
   - pyyaml>=6.0

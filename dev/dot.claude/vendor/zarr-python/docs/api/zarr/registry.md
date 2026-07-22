@@ -1,5 +1,0 @@
----
-title: registry
----
-
-::: zarr.registry

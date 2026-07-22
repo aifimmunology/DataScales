@@ -258,7 +258,15 @@ def _write_sparse_as_dense_dask(
 
     dask_dense = _build_tiled_dense_dask(matrix, block_row, block_col)
     with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
-        da.store(dask_dense, zarr_arr, scheduler="threads", num_workers=cfg.chunks.cpus)
+        # lock=False: this single-file path tiles from row 0 with block == the shard shape
+        # (_dense_shards), so every da.store task writes one whole, disjoint shard — no shared
+        # chunk, so no write lock is needed. dask's default lock=True serializes the
+        # compress+write and pins the threaded path to ~1 core (measured ~6.5x slower on the
+        # unsharded dense path). NOTE: do NOT copy lock=False to the concat/_append_* paths —
+        # those write at a misaligned row/nnz offset and read-modify-write the seam chunk, so
+        # they must keep the lock or concurrent writes corrupt data.
+        da.store(dask_dense, zarr_arr, scheduler="threads",
+                 num_workers=cfg.chunks.cpus, lock=False)
 
 
 def _write_dense_streaming(
@@ -297,6 +305,7 @@ def _write_dense_streaming(
             arr, zarr_arr,
             scheduler="synchronous" if backed else "threads",
             num_workers=1 if backed else cfg.chunks.cpus,
+            lock=False,  # single-file, block==shard tiled from 0 -> disjoint whole-shard writes (see _write_sparse_as_dense_dask)
         )
 
 
