@@ -12,14 +12,13 @@ indices), and `celltype` (all obs rows whose `--obs-column` equals
 reads the obs column + builds the match mask *inside* the timed region, modeling
 a real "filter by obs value, then fetch X" query.
 
-For celltype, ``--select-mode`` picks how matched rows are read (both first read obs
-+ build the mask, so they differ *only* in the X read): ``slice`` (default) finds the
-contiguous ``[start, end)`` run(s) of matched rows and reads ``X[start:end]`` slices —
-anndata's contiguous fast path, which a *sorted* store turns into one cheap grab;
-``fancy`` builds a ``flatnonzero`` integer index and gathers per row (anndata's
-coordinate path). On an unsorted store the matched rows scatter into many length-1
-runs, so slice degenerates — which is exactly why sorting helps. The run count is
-reported either way as a locality metric.
+For celltype, the matched rows are read by finding their contiguous ``[start, end)``
+run(s) and reading ``X[start:end]`` slices — anndata's contiguous fast path
+(``_get_contiguous_compressed_slice``), which a *sorted* store turns into one cheap grab.
+The obs read + mask build happen inside the timed region too, modeling "filter by obs
+value, then fetch X". On an unsorted store the matched rows scatter into many short runs,
+so the per-run slice reads re-fetch shared chunks and degrade — which is exactly why
+sorting helps. The run count is reported as a locality metric (with a warning when high).
 
 Each timed read runs through a ``TimingStore`` that also records store-fetch intervals,
 so every run is split into I/O (wall time with >=1 fetch in flight) vs CPU (decompress
@@ -206,26 +205,20 @@ def _runs_from_sorted_indices(idx):
     return [(int(idx[s]), int(idx[e - 1]) + 1) for s, e in zip(starts, ends)]
 
 
-_AUTO_MIN_AVG_RUN = 4  # avg rows/run >= this => contiguous (slice); below => scattered (fancy)
+_SCATTER_WARN_AVG_RUN = 4  # warn below this avg rows/run: matched cells are scattered, so the
+                           # per-run slice reads re-fetch shared chunks and the query degrades
 
 
-def _resolve_select_mode(select_mode, sel):
-    """Resolve `auto` to `slice` (contiguous/sorted) or `fancy` (scattered).
+def _run_stats(sel):
+    """Return ``(spans, n_runs, avg_run_len)`` for a sorted 1-D index array.
 
-    Returns ``(resolved_mode, n_runs, avg_run_len)``. `auto` picks `slice` when the matched
-    rows form few long runs (a sorted store — slice visits each chunk once) and `fancy` when
-    they scatter into many short runs (slice would re-fetch shared chunks once *per run*, so a
-    single combined gather that visits each chunk once is faster). A forced mode is returned
-    unchanged.
+    ``avg_run_len`` is the selection's locality: a sorted store yields a few long runs (cheap
+    contiguous slices); an unsorted store yields many short runs (slice re-fetches shared
+    chunks per run), which is why a low value earns a warning.
     """
     spans = _runs_from_sorted_indices(sel)
     n = len(spans)
-    avg = sel.size / n if n else 0.0
-    if select_mode == "auto":
-        resolved = "slice" if avg >= _AUTO_MIN_AVG_RUN else "fancy"
-    else:
-        resolved = select_mode
-    return resolved, n, avg
+    return spans, n, (sel.size / n if n else 0.0)
 
 
 def _read_spans(handle, spans):
@@ -273,11 +266,7 @@ def run_rss_probe(args):
     if args.mode == "celltype":
         group = zarr.open_group(store=store, mode="r")
         sel = celltype_indices(group, args.obs_column, args.obs_value)
-        resolved, _, _ = _resolve_select_mode(args.select_mode, sel)
-        if resolved == "slice":
-            read_convert_spans(handle, _runs_from_sorted_indices(sel), final_format)
-        else:
-            read_convert(handle, 0, sel, final_format)
+        read_convert_spans(handle, _runs_from_sorted_indices(sel), final_format)
     else:
         axis_dim = 0 if args.axis == "row" else 1
         sel = select(shape[axis_dim], args.count, args.mode, args.seed)
@@ -295,7 +284,6 @@ def _measure_peak_rss(args):
         sys.executable, "-m", "zarr_query_benchmarking", "--_rss-probe",
         "--store", args.store, "--axis", args.axis,
         "--mode", args.mode, "--seed", str(args.seed),
-        "--select-mode", args.select_mode,
     ]
     cmd += ["--native"] if args.native else ["--format", args.format]
     if args.mode == "celltype":
@@ -354,33 +342,27 @@ def run_benchmark(args):
     axis_len = shape[axis_dim]
 
     final_format = "native" if args.native else args.format
-    n_spans = resolved_mode = avg_run = None
+    n_spans = avg_run = None
     if args.mode == "celltype":
-        # Validate up front (exits on a bad column / unmatched value) and resolve the read
-        # mode from the run structure. 'auto' -> slice when the cells are contiguous (few long
-        # runs, e.g. a sorted store), fancy when scattered (many short runs). The obs read +
-        # mask build happen again *inside* the timed read so "filter then fetch" is measured —
-        # the modes differ only in how X itself is read.
+        # Validate up front (exits on a bad column / unmatched value) and measure the run
+        # structure as a locality metric. The obs read + mask build happen again *inside* the
+        # timed read so "filter then fetch" is measured; X is read by slicing each contiguous
+        # run of matched rows (anndata's contiguous fast path).
         group = zarr.open_group(store=store, mode="r")
         sel0 = resolve_celltype_selection(group, args.obs_column, args.obs_value)
-        resolved_mode, n_spans, avg_run = _resolve_select_mode(args.select_mode, sel0)
+        _, n_spans, avg_run = _run_stats(sel0)
 
-        if args.select_mode == "slice" and avg_run < _AUTO_MIN_AVG_RUN:
+        if avg_run < _SCATTER_WARN_AVG_RUN:
             print(
                 f"WARNING: matched cells span {n_spans} runs (avg {avg_run:.1f} rows/run) — "
-                f"scattered for this cell type, so slice re-fetches shared chunks per run and "
-                f"will be slow. Use --select-mode fancy (or auto) here.",
+                f"scattered for this cell type, so the per-run slice reads re-fetch shared "
+                f"chunks and will be slow. Sort the store by this column for a fast query.",
                 file=sys.stderr,
             )
 
-        if resolved_mode == "slice":
-            def do_read(h, g):
-                sel = celltype_indices(g, args.obs_column, args.obs_value)
-                return _read_spans(h, _runs_from_sorted_indices(sel))
-        else:
-            def do_read(h, g):
-                sel = celltype_indices(g, args.obs_column, args.obs_value)
-                return _read_sel(h, 0, sel)
+        def do_read(h, g):
+            sel = celltype_indices(g, args.obs_column, args.obs_value)
+            return _read_spans(h, _runs_from_sorted_indices(sel))
     else:
         if args.count > axis_len:
             sys.exit(f"ERROR: count={args.count} exceeds axis length {axis_len} for axis '{args.axis}'.")
@@ -422,8 +404,6 @@ def run_benchmark(args):
         "axis": args.axis,
         "count": args.count,
         "mode": args.mode,
-        "select_mode": resolved_mode,
-        "select_mode_requested": args.select_mode if args.mode == "celltype" else None,
         "obs_column": args.obs_column,
         "obs_value": args.obs_value,
         "n_spans": n_spans,
@@ -458,10 +438,8 @@ def run_benchmark(args):
     print(f"Store: {summary['store']}")
     print(f"Source: {src_format}  shape={tuple(shape)}  dtype={dtype}")
     if args.mode == "celltype":
-        sm_str = (args.select_mode if args.select_mode == resolved_mode
-                  else f"{args.select_mode}->{resolved_mode}")
         print(
-            f"Query: axis=row mode=celltype select={sm_str} "
+            f"Query: axis=row mode=celltype "
             f"obs['{args.obs_column}']=='{args.obs_value}' "
             f"selected={summary['selected']} runs={n_spans} (avg {avg_run:.1f} rows/run) "
             f"-> {final_format}"
@@ -497,13 +475,6 @@ def main(argv=None):
                    help="sequential = first N; random = N seeded random indices; "
                         "celltype = all obs rows whose --obs-column equals --obs-value "
                         "(forces --axis row, ignores --count). Default: sequential.")
-    p.add_argument("--select-mode", dest="select_mode", choices=["auto", "slice", "fancy"], default="auto",
-                   help="For --mode celltype only (both first read obs + build the mask, so they "
-                        "differ only in the X read). 'auto' (default) inspects the matched rows: slice "
-                        "if they form few long contiguous runs (a sorted store — one cheap grab), fancy "
-                        "if scattered into many short runs (one combined gather that visits each chunk "
-                        "once, vs slice re-fetching shared chunks per run). 'slice'/'fancy' force it. "
-                        "Ignored for sequential/random.")
     p.add_argument("--obs-column", dest="obs_column",
                    help="obs column to filter on (required for --mode celltype).")
     p.add_argument("--obs-value", dest="obs_value",

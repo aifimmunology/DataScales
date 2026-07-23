@@ -593,35 +593,18 @@ def _compute_sort(adata: ad.AnnData, sort_by: tuple[str, ...]):
     return perm, ranges
 
 
-def _write_sort_index(store: zarr.Group, perm, ranges_df) -> None:
-    """Write the dedicated sort index under ``uns/datascale_sort_index``.
-
-    Parented under ``uns`` (rather than a top-level group) so the store stays openable by
-    stock ``anndata.read_zarr`` — that reader passes every root key to ``AnnData(**…)``, so a
-    non-standard top-level group would break it, while ``uns`` round-trips arbitrary nested
-    data. The group holds the ``ranges`` table (one row per key tuple, with start/end) and the
-    ``obs_order`` reverse permutation; the sort keys are the ranges columns minus start/end.
-    """
-    from anndata._io.specs import write_elem
-    import numpy as np
-
-    write_elem(
-        store["uns"], "datascale_sort_index",
-        {"ranges": ranges_df, "obs_order": np.asarray(perm)},
-    )
-
-
 def _maybe_sort_adata(
     adata: ad.AnnData, cfg: AppConfig, warnings: list[str]
-) -> tuple[ad.AnnData, tuple[str, ...], Any, Any]:
+) -> ad.AnnData:
     """If grouping is enabled, reorder all obs-aligned arrays by the sort keys.
 
-    Returns ``(adata, sort_by, perm, ranges_df)``; ``perm``/``ranges_df`` are None when
-    grouping is off. Reordering uses anndata fancy indexing so obs/obsm/obsp/layers/raw
-    all share one permutation and the store stays a valid AnnData.
+    Reordering uses anndata fancy indexing so obs/obsm/obsp/layers/raw all share one
+    permutation and the store stays a valid AnnData. No datascale-specific index is written:
+    the result is a plain, physically sorted AnnData, so each distinct key tuple is a
+    contiguous row block that a downstream reader derives from the sorted obs column(s).
     """
     if not cfg.grouping.enabled:
-        return adata, (), None, None
+        return adata
 
     sort_by = cfg.grouping.sort_by
     if cfg.io.x_storage not in ("sparse-csr", "dense"):
@@ -640,15 +623,10 @@ def _maybe_sort_adata(
         adata = adata[perm].copy()  # reorders X/obs/obsm/obsp/layers/raw consistently
     warnings.append(
         f"Rows sorted by {list(sort_by)} into {len(ranges_df)} contiguous groups; "
-        "obs/obsm/obsp/layers/raw reordered to match (see sort_index group)."
+        "obs/obsm/obsp/layers/raw reordered to match. Store is a plain sorted AnnData "
+        "(no datascale index); derive ranges from the sorted obs column(s) if needed."
     )
-    if cfg.io.x_storage == "dense":
-        warnings.append(
-            "Sorted store has dense X: the sort_index makes contiguous row ranges "
-            "queryable, but datascale.open_sorted().select() reads X via sparse_dataset "
-            "and does not yet support dense X — read dense ranges directly from X[start:end]."
-        )
-    return adata, sort_by, perm, ranges_df
+    return adata
 
 
 def _write_adata_to_zarr(
@@ -667,13 +645,11 @@ def _write_adata_to_zarr(
     warnings = list(load_warnings)
 
     if allow_grouping:
-        adata, sort_by, perm, ranges_df = _maybe_sort_adata(adata, cfg, warnings)
-    else:
-        if cfg.grouping.enabled:
-            raise ConversionError(
-                "grouping (sort_by) is only supported by convert-h5ad for now."
-            )
-        sort_by, perm, ranges_df = (), None, None
+        adata = _maybe_sort_adata(adata, cfg, warnings)
+    elif cfg.grouping.enabled:
+        raise ConversionError(
+            "grouping (sort_by) is only supported by convert-h5ad for now."
+        )
 
     x_for_write: Any | None = None
     is_csr = sp.isspmatrix_csr(adata.X) or (
@@ -710,9 +686,6 @@ def _write_adata_to_zarr(
         output_path, cfg, commit_message=f"datascale convert-h5ad → {output_path.name}",
     )
     _write_csr_adata_direct(adata, store, cfg, x_override=x_for_write)
-    if perm is not None:
-        with _stage(f"Writing sort_index ({len(ranges_df)} groups)"):
-            _write_sort_index(store, perm, ranges_df)
     finalize()
     print(
         f"Done in {time.perf_counter() - t0:.1f}s",
@@ -1002,7 +975,12 @@ def convert_h5ads_to_zarr(
 
     Requirements:
       - All inputs must share the same `var` (gene names + order, strict match).
-      - All inputs must share the same `obs` columns (strict schema match).
+      - obs columns: by default all inputs must share an identical obs schema
+        (same names + order). If ``cfg.concat.obs_columns`` is set, each input must
+        instead merely *contain* those columns; obs is projected to exactly those
+        (in that order) and all other columns are dropped before concatenation. A
+        selected column that is categorical must have the same categories in every
+        input, else it would degrade to a string array on concat — a hard error.
       - Only X, obs, var are written. layers/raw/uns/obsm/etc. are ignored.
 
     Sparse output uses CSR; dense output is supported. CSC output is not supported
@@ -1053,13 +1031,61 @@ def convert_h5ads_to_zarr(
                     f"{inputs[0].name}, got {a.n_vars} (names+order must be identical)."
                 )
 
-        ref_obs_cols = list(adatas[0].obs.columns)
-        for i, a in enumerate(adatas[1:], start=1):
-            if list(a.obs.columns) != ref_obs_cols:
-                raise ConversionError(
-                    f"obs schema mismatch in {inputs[i]}: expected columns "
-                    f"{ref_obs_cols}, got {list(a.obs.columns)}."
-                )
+        obs_columns = list(cfg.concat.obs_columns)
+        if obs_columns:
+            # Explicit selection: every input must contain the named columns; obs is then
+            # projected down to exactly these (in this order) at concat time — all other
+            # columns are dropped. Lets files with differing *extra* columns be joined.
+            for i, a in enumerate(adatas):
+                missing = [c for c in obs_columns if c not in a.obs.columns]
+                if missing:
+                    raise ConversionError(
+                        f"obs columns not found in {inputs[i].name}: {missing}. "
+                        f"Requested via obs_columns; available: {list(a.obs.columns)}."
+                    )
+                dropped = [c for c in a.obs.columns if c not in obs_columns]
+                if dropped:
+                    all_warnings.append(
+                        f"[{inputs[i].name}] dropping {len(dropped)} obs column(s) not in "
+                        f"obs_columns: {dropped}."
+                    )
+            # Categorical columns must line up across inputs. If they don't (mixed
+            # categorical/non-categorical, or differing category *sets*), pandas coerces the
+            # column to a string (object) array on concat — dropping the compact categorical
+            # `codes` encoding and making per-cell-type access far slower. Fail loudly instead.
+            for c in obs_columns:
+                is_cat = [isinstance(a.obs[c].dtype, pd.CategoricalDtype) for a in adatas]
+                if not any(is_cat):
+                    continue
+                if not all(is_cat):
+                    have = [inputs[i].name for i, v in enumerate(is_cat) if v]
+                    lack = [inputs[i].name for i, v in enumerate(is_cat) if not v]
+                    raise ConversionError(
+                        f"obs column '{c}' is categorical in {have} but not in {lack}; "
+                        f"concatenating would coerce it to a string array (dropping the "
+                        f"categorical encoding). Make '{c}' categorical in all inputs, or "
+                        f"drop it from obs_columns."
+                    )
+                cat0 = set(adatas[0].obs[c].cat.categories)
+                bad = [inputs[i].name for i, a in enumerate(adatas)
+                       if set(a.obs[c].cat.categories) != cat0]
+                if bad:
+                    raise ConversionError(
+                        f"obs column '{c}' has mismatched categorical categories across "
+                        f"inputs ({bad} differ from {inputs[0].name}); concatenating would "
+                        f"coerce it to a string array (dropping the categorical encoding). "
+                        f"Reconcile the categories (union them) across inputs, or drop "
+                        f"'{c}' from obs_columns."
+                    )
+        else:
+            # Default: strict identical obs schema (names + order) against file 0.
+            ref_obs_cols = list(adatas[0].obs.columns)
+            for i, a in enumerate(adatas[1:], start=1):
+                if list(a.obs.columns) != ref_obs_cols:
+                    raise ConversionError(
+                        f"obs schema mismatch in {inputs[i]}: expected columns "
+                        f"{ref_obs_cols}, got {list(a.obs.columns)}."
+                    )
 
         for i, a in enumerate(adatas):
             vr = validate_single_cell_anndata(a, cfg.validation)
@@ -1085,7 +1111,20 @@ def convert_h5ads_to_zarr(
         n_obs_total = sum(n_obs_each)
 
         # ── Concat obs (small; pandas) ────────────────────────────────────────
-        obs_concat = pd.concat([a.obs for a in adatas], axis=0)
+        if obs_columns:
+            # Project each obs to the selected columns (fixes output order), then concat.
+            # (Categorical mismatches already errored out above; any coercion left here is
+            # numeric, e.g. int+float -> float — harmless, but worth a heads-up.)
+            obs_concat = pd.concat([a.obs[obs_columns] for a in adatas], axis=0)
+            for c in obs_columns:
+                in_dtypes = {str(a.obs[c].dtype) for a in adatas}
+                out_dtype = str(obs_concat[c].dtype)
+                if in_dtypes != {out_dtype}:
+                    all_warnings.append(
+                        f"obs column '{c}' coerced on concat: {sorted(in_dtypes)} -> {out_dtype}."
+                    )
+        else:
+            obs_concat = pd.concat([a.obs for a in adatas], axis=0)
 
         print(
             f"Concatenating {len(inputs)} h5ads → {output_path} "

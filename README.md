@@ -16,7 +16,7 @@ A configurable converter for h5 data(currently only single cell) to Zarr stores,
 - Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it (slower)
 - Optional 'backed' HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
 - Optional Icechunk storage backend (`--icechunk`) — writes the store through a transactional, versioned repository instead of a plain zarr directory
-- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous row range (recorded under `uns/datascale_sort_index`) for fast subset reads with stock anndata/zarr by slicing `X[start:end]`
+- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous block for fast subset reads; the output is a plain sorted AnnData (no datascale-specific metadata), so you derive the range from the sorted obs column and slice `X[start:end]` with stock anndata/zarr
 - Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
@@ -66,7 +66,12 @@ pixi run datascale concat-h5ads \
 Requirements (strict; conversion errors otherwise):
 
 - All inputs must share the **same `var`** — identical gene names *and* order.
-- All inputs must share the **same `obs` schema** — identical column names.
+- **`obs` columns** — by default all inputs must share an identical `obs` schema
+  (same column names). Pass `--obs-columns COL...` to instead keep only those
+  columns: each input must *contain* them, `obs` is projected to exactly those (in
+  the given order) and all other columns are dropped. Lets files with differing
+  *extra* obs columns be joined; a coercion warning is emitted if a kept column has
+  mixed dtypes across files (e.g. categoricals with differing categories → string).
 - `adata.X` in each file must be CSR or CSC (CSC is auto-converted to CSR).
 - All `X` matrices must share the same dtype.
 
@@ -105,9 +110,9 @@ min_vars = 1
 
 # Sort + partition X by obs columns (convert-h5ad, sparse-csr or dense, eager only). When
 # enabled, rows are physically sorted by sort_by (primary key first) so each distinct key tuple
-# is a contiguous row range, recorded under uns/datascale_sort_index. To read a subset, look up
-# the matching range(s) in the sort_index and slice X[start:end] with stock anndata/zarr — the
-# store is self-describing and needs no datascale dependency to query.
+# is a contiguous block. The output is a plain sorted AnnData with no datascale-specific
+# metadata: to read a subset, derive the contiguous range from the (now sorted) obs column and
+# slice X[start:end] with stock anndata/zarr — no datascale dependency to query.
 [grouping]
 enabled = false
 sort_by = ["AIFI_L1", "batch_id"]
@@ -133,7 +138,8 @@ All commands share the same optional flags:
 | `--x-shard-factor` | Optional | Pack dense X chunks into shards of `(x_row_chunk, x_col_chunk)` × factor. `1` (default) = no sharding. Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only) |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
 | `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Commits to the `main` branch. Local storage; eager input only (not `--backed`). All subcommands |
-| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Each distinct key tuple becomes a contiguous row range recorded in `uns/datascale_sort_index`, readable with stock anndata/zarr via `X[start:end]` (no datascale dependency). Requires eager load + `sparse-csr` or `dense` |
+| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Physically sorts rows so each distinct key tuple is a contiguous block; output is a plain sorted AnnData (no datascale index) — derive ranges from the sorted obs column and slice `X[start:end]` with stock anndata/zarr. Requires eager load + `sparse-csr` or `dense` |
+| `--obs-columns` | Optional (`concat-h5ads`) | obs columns to keep and join on (e.g. `--obs-columns cell_type donor`). Omitted = require an identical obs schema across all inputs. When given, each input must contain these columns; `obs` is projected to exactly these (in this order) and all other columns are dropped |
 
 ```bash
 pixi run datascale convert-h5ad --help

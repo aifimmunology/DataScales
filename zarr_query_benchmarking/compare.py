@@ -60,7 +60,6 @@ _COLUMNS = [
     ("axis", "axis", False, str),
     ("mode", "mode", False, str),
     ("out", "final_format", False, str),
-    ("smode", "select_mode", False, str),
     ("conc", "concurrency", True, str),
     ("n", _n, True, str),
     ("result", lambda r: _shape(r, "result_shape"), False, str),

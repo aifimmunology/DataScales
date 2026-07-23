@@ -23,7 +23,6 @@ codec, git commit) for later comparison.
 | `--axis` | `row` \| `col` | (required¹) | Query rows (cells) or columns (genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
 | `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded indices; `celltype` = all rows matching an obs value (see below). |
-| `--select-mode` | `auto` \| `slice` \| `fancy` | `auto` | **celltype only.** How matched rows are read: `slice` = per-run `X[start:end]` (best on a sorted store); `fancy` = one gathered fetch (best when scattered); `auto` picks by contiguity. |
 | `--obs-column` / `--obs-value` | str | (required for `celltype`) | obs column + value to filter rows by. |
 | `--format` | `csr` \| `dense` | (required¹) | Final format the result is converted to (**included in the timing**). |
 | `--native` | flag | off | Read at the store's native format — no conversion. Measures the layout, not the format tax. Overrides `--format`. |
@@ -39,12 +38,17 @@ ignores `--count`, and needs `--obs-column` + `--obs-value`. Either `--format` o
 ## Usage
 
 **Select by cell type** — reads `obs[<column>]`, builds the `== <value>` mask, and fetches all
-matching rows' `X` (the mask build is inside the timed region, modeling a real "filter then fetch"):
+matching rows' `X` by slicing each contiguous run of matched rows (`X[start:end]`, anndata's fast
+path; the mask build is inside the timed region, modeling a real "filter then fetch"):
 
 ```bash
 pixi run zarr-bench --store <path.zarr> --mode celltype \
     --obs-column AIFI_L1 --obs-value Platelet --format csr
 ```
+
+The `runs` metric reports locality: a store **sorted** by that column yields a few long runs (one
+cheap grab per run); an unsorted store scatters into many short runs, so the per-run slices
+re-fetch shared chunks and the query degrades — a warning fires when that happens.
 
 **Remote stores** — a URL with a scheme is opened through zarr's `FsspecStore`. `gs://` needs
 `gcsfs` (a pixi dep) and uses gcloud Application Default Credentials — run
