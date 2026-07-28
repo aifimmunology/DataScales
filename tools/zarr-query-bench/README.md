@@ -1,4 +1,4 @@
-# zarr_query_benchmarking
+# zarr-query-bench
 
 CLI tool to benchmark **query time** against a Zarr store's `X` matrix (dense or sparse
 CSR/CSC). It times *read selection + convert to the requested final format*, so comparisons
@@ -23,7 +23,6 @@ codec, git commit) for later comparison.
 | `--axis` | `row` \| `col` | (required¹) | Query rows (cells) or columns (genes). |
 | `--count` | int | (required¹) | Number of rows/columns to select. |
 | `--mode` | `sequential` \| `random` \| `celltype` | `sequential` | `sequential` = first N; `random` = N seeded indices; `celltype` = all rows matching an obs value (see below). |
-| `--select-mode` | `auto` \| `slice` \| `fancy` | `auto` | **celltype only.** How matched rows are read: `slice` = per-run `X[start:end]` (best on a sorted store); `fancy` = one gathered fetch (best when scattered); `auto` picks by contiguity. |
 | `--obs-column` / `--obs-value` | str | (required for `celltype`) | obs column + value to filter rows by. |
 | `--format` | `csr` \| `dense` | (required¹) | Final format the result is converted to (**included in the timing**). |
 | `--native` | flag | off | Read at the store's native format — no conversion. Measures the layout, not the format tax. Overrides `--format`. |
@@ -39,12 +38,17 @@ ignores `--count`, and needs `--obs-column` + `--obs-value`. Either `--format` o
 ## Usage
 
 **Select by cell type** — reads `obs[<column>]`, builds the `== <value>` mask, and fetches all
-matching rows' `X` (the mask build is inside the timed region, modeling a real "filter then fetch"):
+matching rows' `X` by slicing each contiguous run of matched rows (`X[start:end]`, anndata's fast
+path; the mask build is inside the timed region, modeling a real "filter then fetch"):
 
 ```bash
 pixi run zarr-bench --store <path.zarr> --mode celltype \
     --obs-column AIFI_L1 --obs-value Platelet --format csr
 ```
+
+The `runs` metric reports locality: a store **sorted** by that column yields a few long runs (one
+cheap grab per run); an unsorted store scatters into many short runs, so the per-run slices
+re-fetch shared chunks and the query degrades — a warning fires when that happens.
 
 **Remote stores** — a URL with a scheme is opened through zarr's `FsspecStore`. `gs://` needs
 `gcsfs` (a pixi dep) and uses gcloud Application Default Credentials — run
@@ -54,20 +58,20 @@ pixi run zarr-bench --store <path.zarr> --mode celltype \
 pixi run zarr-bench --store gs://my-bucket/atlas_csr.zarr --axis row --count 1000 --format csr --json
 ```
 
-**Sweep many stores** — `zarr_query_benchmarking/examples/run_query_sweep.sh` runs both axes over
+**Sweep many stores** — `zarr_query_bench/examples/run_query_sweep.sh` runs both axes over
 every `.zarr` in a directory (or `gs://` prefix) and appends one JSON line per run:
 
 ```bash
 # [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
-zarr_query_benchmarking/examples/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench.jsonl
+zarr_query_bench/examples/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench.jsonl
 ```
 
 **Compare runs** — `compare` reads `--json` files (a single object, an array, or JSON Lines) and
 prints an aligned table, sortable, with a trailing `xslow` column (each run's median vs the fastest):
 
 ```bash
-pixi run python -m zarr_query_benchmarking.compare bench.jsonl --sort median_s
-pixi run python -m zarr_query_benchmarking.compare 'runs/*.json' --md > table.md   # markdown
+pixi run python -m zarr_query_bench.compare bench.jsonl --sort median_s
+pixi run python -m zarr_query_bench.compare 'runs/*.json' --md > table.md   # markdown
 ```
 
 ## Notes

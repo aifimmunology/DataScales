@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "convert-to-zarr"
+version = "0.1.0"
+description = "Configurable AnnData to Zarr converter with strong validation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
+dependencies = [
+  "anndata>=0.11.0",
+  "zarr>=3.0.0",
+  "numpy>=1.24.0",
+  "scipy>=1.10.0",
+  "PyYAML>=6.0",
+  "scanpy>=1.9.0",
+  "dask[array]>=2023.1.0",
+  "icechunk>=2.0.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+convert-to-zarr = "convert_to_zarr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["convert_to_zarr*"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64", "win-64"]
+
+[tool.pixi.pypi-dependencies]
+convert-to-zarr = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.dependencies]
+scanpy = ">=1.12.1,<2"
+dask = ">=2026.3.0,<2027"

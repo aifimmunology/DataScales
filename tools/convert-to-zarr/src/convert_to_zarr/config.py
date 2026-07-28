@@ -57,14 +57,27 @@ class GroupingConfig:
     """Sort + partition X by one or more obs columns (Feature B).
 
     When enabled, rows are physically sorted by ``sort_by`` (primary key first), so each
-    distinct key tuple is a contiguous row range recorded in ``uns/datascale_sort_index``.
-    Subsets can then be read with stock anndata/zarr by slicing ``X[start:end]`` over the
-    matching range(s) — no datascale dependency required. All obs-aligned arrays are
-    reordered consistently so the store stays a valid AnnData. convert-h5ad only, with
-    sparse-csr or dense X.
+    distinct key tuple becomes a contiguous row block. No convert-to-zarr-specific index is
+    written — the result is a plain sorted AnnData; a downstream reader derives the ranges
+    from the (now sorted) obs column(s) and slices ``X[start:end]`` with stock anndata/zarr,
+    no convert-to-zarr dependency. All obs-aligned arrays are reordered consistently so the store
+    stays a valid AnnData. convert-h5ad only, with sparse-csr or dense X.
     """
     enabled: bool = False
     sort_by: tuple[str, ...] = ()  # obs column names, primary sort key first
+
+
+@dataclass(frozen=True)
+class ConcatConfig:
+    """obs-column policy for concat-h5ads (multi-file concat).
+
+    ``obs_columns`` empty (default) → strict: every input must have an *identical*
+    obs schema (same column names, same order). Non-empty → validate that every
+    input contains those columns, then project each input's obs down to exactly
+    those columns (in the given order) before concatenating; all other columns are
+    dropped. concat-h5ads only.
+    """
+    obs_columns: tuple[str, ...] = ()  # obs columns to keep+join on; () = strict all-match
 
 
 @dataclass(frozen=True)
@@ -73,6 +86,7 @@ class AppConfig:
     chunks: ChunkConfig = ChunkConfig()
     validation: ValidationConfig = ValidationConfig()
     grouping: GroupingConfig = GroupingConfig()
+    concat: ConcatConfig = ConcatConfig()
 
 
 def _normalize_x_storage(value: str) -> XStorageMode:
@@ -107,11 +121,17 @@ def _validate_config(config: AppConfig) -> AppConfig:
     grouping = replace(config.grouping, sort_by=tuple(sort_by))
     if grouping.enabled and not grouping.sort_by:
         raise ValueError("grouping.enabled is true but grouping.sort_by is empty.")
+    # obs_columns may arrive from TOML/YAML as a list (or a bare string for one column);
+    # freeze to a tuple. Empty tuple keeps the default strict all-match behavior.
+    obs_columns = config.concat.obs_columns
+    if isinstance(obs_columns, str):
+        obs_columns = (obs_columns,)
+    concat = replace(config.concat, obs_columns=tuple(obs_columns))
     if config.chunks.x_shard_factor < 1:
         raise ValueError(
             f"chunks.x_shard_factor must be >= 1 (1 = no sharding); got {config.chunks.x_shard_factor}."
         )
-    return replace(config, io=io, grouping=grouping)
+    return replace(config, io=io, grouping=grouping, concat=concat)
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
@@ -155,7 +175,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
 
     data = _read_config_file(path)
 
-    known_sections = {"io", "chunks", "validation", "grouping"}
+    known_sections = {"io", "chunks", "validation", "grouping", "concat"}
     unknown_sections = set(data.keys()) - known_sections
     if unknown_sections:
         bad = ", ".join(sorted(unknown_sections))
@@ -168,9 +188,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
     chunks_patch = data.get("chunks", {})
     validation_patch = data.get("validation", {})
     grouping_patch = data.get("grouping", {})
+    concat_patch = data.get("concat", {})
 
-    if not all(isinstance(p, dict) for p in (io_patch, chunks_patch, validation_patch, grouping_patch)):
-        raise ValueError("Config sections [io], [chunks], [validation], [grouping] must be maps/objects.")
+    if not all(isinstance(p, dict) for p in (io_patch, chunks_patch, validation_patch, grouping_patch, concat_patch)):
+        raise ValueError("Config sections [io], [chunks], [validation], [grouping], [concat] must be maps/objects.")
 
     config = replace(
         config,
@@ -178,6 +199,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         chunks=_merge_dataclass(config.chunks, chunks_patch),
         validation=_merge_dataclass(config.validation, validation_patch),
         grouping=_merge_dataclass(config.grouping, grouping_patch),
+        concat=_merge_dataclass(config.concat, concat_patch),
     )
 
     return _validate_config(config)
@@ -196,10 +218,12 @@ def apply_cli_overrides(
     backed: bool | None = None,
     backend: str | None = None,
     sort_by: list[str] | None = None,
+    obs_columns: list[str] | None = None,
 ) -> AppConfig:
     io_cfg = config.io
     chunk_cfg = config.chunks
     grouping_cfg = config.grouping
+    concat_cfg = config.concat
 
     if overwrite is not None:
         io_cfg = replace(io_cfg, overwrite=overwrite)
@@ -223,7 +247,9 @@ def apply_cli_overrides(
         chunk_cfg = replace(chunk_cfg, cpus=cpus)
     if sort_by is not None:
         grouping_cfg = replace(grouping_cfg, enabled=True, sort_by=tuple(sort_by))
+    if obs_columns is not None:
+        concat_cfg = replace(concat_cfg, obs_columns=tuple(obs_columns))
 
     return _validate_config(
-        replace(config, io=io_cfg, chunks=chunk_cfg, grouping=grouping_cfg)
+        replace(config, io=io_cfg, chunks=chunk_cfg, grouping=grouping_cfg, concat=concat_cfg)
     )

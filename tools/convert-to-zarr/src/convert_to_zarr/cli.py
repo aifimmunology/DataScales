@@ -76,7 +76,7 @@ def _add_common_args(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="datascale")
+    parser = argparse.ArgumentParser(prog="convert-to-zarr")
     #dest is what field to grab froms args object. EG args.command will be the below subparser name
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -96,11 +96,12 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="OBS_COLUMN",
         help="Sort + partition rows by these obs column(s), primary key first "
-             "(e.g. --sort-by AIFI_L1 batch_id). Each distinct key tuple becomes a "
-             "contiguous row range recorded in uns/datascale_sort_index, so subsets can be "
-             "read with stock anndata/zarr by slicing X[start:end] over the matching range(s) "
-             "— no datascale dependency required. Requires eager (non-backed) load and "
-             "sparse-csr or dense storage.",
+             "(e.g. --sort-by AIFI_L1 batch_id). Physically sorts rows so each distinct key "
+             "tuple is a contiguous block; the output is a plain sorted AnnData (no convert-to-zarr "
+             "index) — derive ranges from the sorted obs column(s) and slice X[start:end] with "
+             "stock anndata/zarr. Eager load handles sparse-csr or dense; with --backed the "
+             "sort is streamed (memory-bounded) for sparse-csr only, and layers/raw/obsp must "
+             "be absent.",
     )
     _add_common_args(h5ad_required, h5ad_optional)
 
@@ -126,6 +127,13 @@ def _build_parser() -> argparse.ArgumentParser:
     concat_optional.add_argument(
         "--backed", action="store_true",
         help="Stream X from disk without loading into RAM. Recommended for large files.",
+    )
+    concat_optional.add_argument(
+        "--obs-columns", nargs="+", metavar="COL",
+        help="obs columns to keep and join on (e.g. --obs-columns cell_type donor). "
+             "Default (omitted): require an identical obs schema across all inputs. "
+             "When given: each input must contain these columns; obs is projected to "
+             "exactly these (in this order) and all other columns are dropped.",
     )
     _add_common_args(concat_required, concat_optional)
 
@@ -155,6 +163,7 @@ def run(argv: list[str] | None = None) -> int:
             backed=True if getattr(args, "backed", False) else None,
             backend="icechunk" if getattr(args, "icechunk", False) else None,
             sort_by=getattr(args, "sort_by", None),
+            obs_columns=getattr(args, "obs_columns", None),
         )
 
         if args.command == "concat-h5ads":
@@ -175,6 +184,8 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Storage backend: {config.io.backend}")
     if config.grouping.enabled:
         print(f"Sorted by: {list(config.grouping.sort_by)}")
+    if args.command == "concat-h5ads" and config.concat.obs_columns:
+        print(f"obs columns kept: {list(config.concat.obs_columns)}")
     print(f"Backed load: {config.io.backed}")
     print(f"CPUs: {config.chunks.cpus}")
 

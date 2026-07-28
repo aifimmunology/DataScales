@@ -28,9 +28,17 @@ min_vars = 1
 
 # Sort + partition X by obs columns (convert-h5ad, sparse-csr or dense, eager only). When
 # enabled, rows are physically sorted by sort_by (primary key first) so each distinct key tuple
-# is a contiguous row range, recorded under uns/datascale_sort_index. Read a subset by looking
-# up the matching range(s) and slicing X[start:end] with stock anndata/zarr — no datascale
-# dependency needed to query the store.
+# is a contiguous block. Output is a plain sorted AnnData with no convert-to-zarr-specific metadata:
+# read a subset by deriving the contiguous range from the (now sorted) obs column and slicing
+# X[start:end] with stock anndata/zarr — no convert-to-zarr dependency needed to query the store.
 [grouping]
 enabled = false
 sort_by = ["AIFI_L1", "batch_id"]
+
+# obs-column policy for concat-h5ads. Empty (default) requires an identical obs schema across
+# all inputs. A non-empty list keeps only those obs columns (each input must contain them; obs
+# is projected to exactly these, others dropped). A kept categorical column must have identical
+# categories across inputs, else it's a hard error (concat would degrade it to a slow string
+# array). concat-h5ads only.
+[concat]
+obs_columns = []

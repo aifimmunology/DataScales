@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sweep query time (row + col) across every .zarr store in a directory and append
 # one JSON object per (store, axis) run to a JSON Lines file that
-# `python -m zarr_query_benchmarking.compare` can read directly.
+# `python -m zarr_query_bench.compare` can read directly.
 #
 # STORE_DIR may be a local directory OR a remote fsspec prefix (e.g.
 # gs://bucket/prefix). A local dir is shell-globbed for *.zarr; a scheme:// prefix
@@ -9,8 +9,8 @@
 # Remote reads use zarr's FsspecStore and gcloud Application Default Credentials.
 #
 # Usage:  run_query_sweep.sh [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
-# Local:  zarr_query_benchmarking/examples/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench_results.jsonl
-# GCS:    zarr_query_benchmarking/examples/run_query_sweep.sh gs://my-bucket/stores 1000 csr 32 sequential bench_results.jsonl
+# Local:  zarr_query_bench/examples/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench_results.jsonl
+# GCS:    zarr_query_bench/examples/run_query_sweep.sh gs://my-bucket/stores 1000 csr 32 sequential bench_results.jsonl
 set -euo pipefail
 
 STORE_DIR="${1:-zarr_dbs}"

@@ -7,20 +7,21 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from datascale.config import (
+from convert_to_zarr.config import (
     AppConfig,
     ChunkConfig,
+    ConcatConfig,
     GroupingConfig,
     IOConfig,
     ValidationConfig,
 )
-from datascale.converter import (
+from convert_to_zarr.converter import (
     ConversionError,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
 )
-from datascale.config import _validate_config
-from datascale.storage import open_input_group
+from convert_to_zarr.config import _validate_config
+from convert_to_zarr.storage import open_input_group
 
 
 # ---------------------------------------------------------------------------
@@ -62,20 +63,28 @@ def _id_set(X) -> set[int]:
 
 
 def _self_serve_subset(g, **keys):
-    """Read rows matching ``keys`` from a sorted store using ONLY stock anndata/zarr
-    (no datascale) — proves the store is self-describing. Returns (X, obs)."""
+    """Read rows matching ``keys`` from a sorted store using ONLY stock anndata/zarr — no
+    convert_to_zarr, no convert_to_zarr index. Because the store is physically sorted by the keys, the
+    matching rows form contiguous span(s); we find them by masking the (sorted) obs column(s)
+    and splitting the matched row indices into contiguous runs. Returns (X, obs)."""
     from anndata.io import read_elem, sparse_dataset
 
-    ranges = read_elem(g["uns"]["datascale_sort_index"]["ranges"])
+    obs = read_elem(g["obs"])
+    mask = np.ones(len(obs), dtype=bool)
     for k, v in keys.items():
-        ranges = ranges[ranges[k] == v]
-    spans = sorted((int(r["start"]), int(r["end"])) for _, r in ranges.iterrows())
-    rows = np.concatenate([np.arange(s, e) for s, e in spans])
+        mask &= obs[k].to_numpy() == v
+    rows = np.flatnonzero(mask)
+    if rows.size == 0:
+        spans = []
+    else:
+        cut = np.flatnonzero(np.diff(rows) > 1)          # boundaries between contiguous runs
+        starts = np.concatenate([rows[:1], rows[cut + 1]])
+        ends = np.concatenate([rows[cut], rows[-1:]]) + 1
+        spans = list(zip(starts.tolist(), ends.tolist()))
     x_ds = sparse_dataset(g["X"])
     parts = [x_ds[s:e] for s, e in spans]
     X = parts[0] if len(parts) == 1 else sp.vstack(parts, format="csr")
-    obs = read_elem(g["obs"]).iloc[rows]
-    return X, obs
+    return X, obs.iloc[rows]
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +136,7 @@ def _sorted_cfg(backend: str = "zarr") -> AppConfig:
     )
 
 
-def test_sort_writes_valid_anndata_and_index(tmp_path: Path) -> None:
+def test_sort_writes_valid_anndata_no_index(tmp_path: Path) -> None:
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted.zarr"
     convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _sorted_cfg())
@@ -138,16 +147,11 @@ def test_sort_writes_valid_anndata_and_index(tmp_path: Path) -> None:
     assert ct == sorted(ct)  # primary key non-decreasing
     # Permutation = original ids order after sort: A/x(2,5), A/y(3), B/x(4), B/y(1,6)
     assert list(np.asarray(adata.X[:, 0].todense()).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
-
-    # Index lives under uns/datascale_sort_index and round-trips with anndata.
-    idx = adata.uns["datascale_sort_index"]
-    ranges = idx["ranges"]
-    assert set(ranges.columns) >= {"cell_type", "demographic", "start", "end"}
-    ax = ranges[(ranges.cell_type == "A") & (ranges.demographic == "x")].iloc[0]
-    assert (int(ax["start"]), int(ax["end"])) == (0, 2)
-    assert np.array_equal(np.asarray(idx["obs_order"]), [1, 4, 2, 3, 0, 5])
     # obsm is reordered consistently with the row permutation (coords col0 was 0,2,4,6,8,10).
     assert list(adata.obsm["coords"][:, 0].astype(int)) == [2, 8, 4, 6, 0, 10]
+
+    # NO convert_to_zarr-specific index is written — the store is a plain sorted AnnData.
+    assert "convert_to_zarr_sort_index" not in adata.uns
 
 
 def test_sorted_store_self_serve_contiguous_block(tmp_path: Path) -> None:
@@ -167,7 +171,7 @@ def test_sorted_store_self_serve_contiguous_block(tmp_path: Path) -> None:
 
 def test_sorted_store_self_serve_crosscut(tmp_path: Path) -> None:
     """A non-leading key cuts across primary-key blocks into several non-adjacent spans;
-    gather them with stock anndata/zarr via the sort_index."""
+    gather them with stock anndata/zarr by masking the sorted obs column."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted.zarr"
     convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out), _sorted_cfg())
@@ -179,8 +183,9 @@ def test_sorted_store_self_serve_crosscut(tmp_path: Path) -> None:
 
 
 def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
-    """Dense X supports --sort-by: rows are physically sorted and the sort_index ranges
-    line up with X[start:end] (read directly from the dense X with stock zarr, no datascale)."""
+    """Dense X supports --sort-by: rows are physically sorted so each key tuple is a
+    contiguous run derivable from the sorted obs and read directly via X[start:end]
+    (stock zarr, no convert_to_zarr, no index)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted_dense.zarr"
     cfg = AppConfig(
@@ -202,15 +207,17 @@ def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
     assert ct == sorted(ct)
     assert list(np.asarray(adata.X[:, 0]).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
 
-    # Each sort_index range is a contiguous block whose obs rows share the key tuple,
-    # readable directly from the dense X with a single slice.
-    ranges = read_elem(g["uns"]["datascale_sort_index"]["ranges"])
+    # Each contiguous run of equal (cell_type, demographic) in the sorted obs is a block,
+    # derivable from obs alone and readable directly from the dense X with a single slice.
     obs_full = read_elem(g["obs"])
-    for _, row in ranges.iterrows():
-        s, e = int(row["start"]), int(row["end"])
-        block = g["X"][s:e]
-        assert block.shape == (e - s, adata.n_vars)
-        assert (obs_full["cell_type"].to_numpy()[s:e] == row["cell_type"]).all()
+    keys = list(zip(obs_full["cell_type"].astype(str), obs_full["demographic"].astype(str)))
+    s = 0
+    for i in range(1, len(keys) + 1):
+        if i == len(keys) or keys[i] != keys[s]:
+            block = g["X"][s:i]
+            assert block.shape == (i - s, adata.n_vars)
+            assert (obs_full["cell_type"].to_numpy()[s:i] == keys[s][0]).all()
+            s = i
 
 
 def test_sort_rejects_sparse_csc(tmp_path: Path) -> None:
@@ -222,6 +229,55 @@ def test_sort_rejects_sparse_csc(tmp_path: Path) -> None:
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
     )
     with pytest.raises(ConversionError, match="requires x_storage='sparse-csr' or 'dense'"):
+        convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(tmp_path / "o.zarr"), cfg)
+
+
+def _backed_sorted_cfg() -> AppConfig:
+    return AppConfig(
+        io=IOConfig(overwrite=True, backed=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
+    )
+
+
+def test_sort_backed_streamed_matches_eager(tmp_path: Path) -> None:
+    """--backed --sort-by (streamed bucketing, Option C) yields the SAME sorted sparse-csr
+    store as the eager path — same row order, X values, and reordered obsm — without ever
+    materialising X in full."""
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    out_backed = tmp_path / "backed.zarr"
+    out_eager = tmp_path / "eager.zarr"
+
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out_eager), _sorted_cfg())
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out_backed), _backed_sorted_cfg())
+
+    a_backed = ad.read_zarr(str(out_backed))
+    a_eager = ad.read_zarr(str(out_eager))
+    # A/x(2,5), A/y(3), B/x(4), B/y(1,6): the same permutation the eager test asserts.
+    assert list(np.asarray(a_backed.X[:, 0].todense()).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
+    assert np.array_equal(np.asarray(a_backed.X.todense()), np.asarray(a_eager.X.todense()))
+    assert list(a_backed.obs["cell_type"]) == list(a_eager.obs["cell_type"])
+    assert np.array_equal(a_backed.obsm["coords"], a_eager.obsm["coords"])
+    assert "convert_to_zarr_sort_index" not in a_backed.uns
+
+    # Self-serve subset reads (stock anndata/zarr) work on the backed-sorted store too.
+    g = open_input_group(str(out_backed))
+    assert _id_set(_self_serve_subset(g, cell_type="A")[0]) == {2, 3, 5}
+    assert _id_set(_self_serve_subset(g, demographic="x")[0]) == {2, 4, 5}
+
+
+def test_sort_backed_rejects_dense(tmp_path: Path) -> None:
+    """Backed streamed sort is sparse-csr only; dense + --backed + --sort-by is rejected
+    (dense sort still works eagerly)."""
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, backed=True, x_storage="dense"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
+    )
+    with pytest.raises(ConversionError, match="sparse-csr"):
         convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(tmp_path / "o.zarr"), cfg)
 
 
@@ -395,3 +451,130 @@ def test_concat_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None
         [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(out), cfg
     )
     assert np.array_equal(_read_X(out), np.vstack([a, b]))
+
+
+# ---------------------------------------------------------------------------
+# concat obs-column selection (ConcatConfig.obs_columns)
+# ---------------------------------------------------------------------------
+
+def _obs_cols_h5ad(path: Path, n: int, cats: list[str], extra: str) -> None:
+    """CSR h5ad whose obs has a categorical `cell_type` (categories=`cats`), a shared
+    `donor`, and one file-unique `extra` column. Two files may carry the SAME or DIFFERENT
+    category sets — the latter is what the categorical-mismatch guard rejects."""
+    dense = np.arange(n * 2, dtype=np.float32).reshape(n, 2)
+    obs = pd.DataFrame(
+        {
+            "cell_type": pd.Categorical([cats[i % len(cats)] for i in range(n)], categories=cats),
+            "donor": [f"d{i % 2}" for i in range(n)],
+            extra: np.arange(n),
+        },
+        index=[f"{extra}_{i}" for i in range(n)],
+    )
+    ad.AnnData(X=sp.csr_matrix(dense), obs=obs).write_h5ad(path)
+
+
+def _plain_obs_h5ad(path: Path, n: int, extra: str, score: np.ndarray) -> None:
+    """CSR h5ad with non-categorical obs: string `cell_type`/`donor`, a numeric `score`
+    (dtype set by the caller, to exercise int+float coercion) and a file-unique `extra`."""
+    dense = np.arange(n * 2, dtype=np.float32).reshape(n, 2)
+    obs = pd.DataFrame(
+        {
+            "cell_type": [f"ct{i % 2}" for i in range(n)],
+            "donor": [f"d{i % 2}" for i in range(n)],
+            "score": score,
+            extra: np.arange(n),
+        },
+        index=[f"{extra}_{i}" for i in range(n)],
+    )
+    ad.AnnData(X=sp.csr_matrix(dense), obs=obs).write_h5ad(path)
+
+
+def test_concat_obs_columns_projects_and_warns(tmp_path: Path) -> None:
+    """obs_columns projects obs to exactly the named cols (in order), drops the rest (warns),
+    and warns on a harmless numeric coercion (int+float -> float)."""
+    _plain_obs_h5ad(tmp_path / "a.h5ad", 6, "qc_a", np.arange(6, dtype="int64"))
+    _plain_obs_h5ad(tmp_path / "b.h5ad", 4, "qc_b", np.arange(4, dtype="float64"))
+    out = tmp_path / "out.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        concat=ConcatConfig(obs_columns=("cell_type", "donor", "score")),
+    )
+    warns = convert_h5ads_to_zarr(
+        [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(out), cfg
+    )
+    res = ad.read_zarr(str(out))
+    assert list(res.obs.columns) == ["cell_type", "donor", "score"]  # projected + ordered
+    assert res.n_obs == 10
+    assert any("qc_a" in w for w in warns) and any("qc_b" in w for w in warns)  # extras dropped
+    assert any("score" in w and "coerced" in w for w in warns)  # int + float -> float
+
+
+def test_concat_obs_columns_missing_raises(tmp_path: Path) -> None:
+    """A requested obs column absent from any input is a hard error."""
+    _obs_cols_h5ad(tmp_path / "a.h5ad", 6, ["Tcell", "Bcell"], "qc_a")
+    _obs_cols_h5ad(tmp_path / "b.h5ad", 4, ["Tcell", "Bcell"], "qc_b")
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        concat=ConcatConfig(obs_columns=("cell_type", "qc_a")),  # qc_a exists only in a.h5ad
+    )
+    with pytest.raises(ConversionError, match="obs columns not found"):
+        convert_h5ads_to_zarr(
+            [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(tmp_path / "o.zarr"), cfg
+        )
+
+
+def test_concat_obs_columns_categorical_mismatch_raises(tmp_path: Path) -> None:
+    """A selected categorical column with differing category sets across inputs is a hard
+    error — concat would degrade it to a (slow) string array, so we refuse."""
+    _obs_cols_h5ad(tmp_path / "a.h5ad", 6, ["Tcell", "Bcell"], "qc_a")
+    _obs_cols_h5ad(tmp_path / "b.h5ad", 4, ["Bcell", "NK"], "qc_b")  # different category set
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        concat=ConcatConfig(obs_columns=("cell_type", "donor")),
+    )
+    with pytest.raises(ConversionError, match="mismatched categorical categories"):
+        convert_h5ads_to_zarr(
+            [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(tmp_path / "o.zarr"), cfg
+        )
+
+
+def test_concat_obs_columns_categorical_match_ok(tmp_path: Path) -> None:
+    """A selected categorical column with IDENTICAL category sets concatenates fine and
+    stays categorical (codes+categories) in the output."""
+    _obs_cols_h5ad(tmp_path / "a.h5ad", 6, ["Tcell", "Bcell", "NK"], "qc_a")
+    _obs_cols_h5ad(tmp_path / "b.h5ad", 4, ["Tcell", "Bcell", "NK"], "qc_b")  # same categories
+    out = tmp_path / "out.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        concat=ConcatConfig(obs_columns=("cell_type", "donor")),
+    )
+    convert_h5ads_to_zarr(
+        [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(out), cfg
+    )
+    res = ad.read_zarr(str(out))
+    assert list(res.obs.columns) == ["cell_type", "donor"]
+    assert res.n_obs == 10
+    assert isinstance(res.obs["cell_type"].dtype, pd.CategoricalDtype)  # categorical preserved
+
+
+def test_concat_default_strict_rejects_mismatched_obs(tmp_path: Path) -> None:
+    """With no obs_columns, differing obs schemas still abort (unchanged default)."""
+    _obs_cols_h5ad(tmp_path / "a.h5ad", 6, ["Tcell", "Bcell"], "qc_a")
+    _obs_cols_h5ad(tmp_path / "b.h5ad", 4, ["Tcell", "Bcell"], "qc_b")  # different extra col name
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+    )
+    with pytest.raises(ConversionError, match="obs schema mismatch"):
+        convert_h5ads_to_zarr(
+            [str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], str(tmp_path / "o.zarr"), cfg
+        )
