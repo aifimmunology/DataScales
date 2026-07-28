@@ -629,6 +629,167 @@ def _maybe_sort_adata(
     return adata
 
 
+def _write_sorted_backed(
+    adata: ad.AnnData,
+    output_path: Path,
+    cfg: AppConfig,
+    warnings: list[str],
+) -> list[str]:
+    """Streamed, memory-bounded sort for --backed input (Option C: bucket + concat).
+
+    The eager sort (:func:`_maybe_sort_adata`) does ``adata[perm].copy()`` — a full in-memory
+    reorder that transiently holds ~2x X. For a backed load X stays on the h5py handle, so we
+    keep it there: one *sequential* pass over X buckets each source row into a temporary
+    per-group CSR zarr store (contiguous append — no random scatter, no read-modify-write of
+    output chunks), then the groups are concatenated in sorted order into the final store via
+    the existing concat writer. Peak RAM is one row-batch of X, not the whole matrix.
+
+    Scope (raises otherwise): sparse-csr X only; the backed input's X must be CSR on disk; and
+    layers / raw / obsp must be absent (those are obs-aligned and would need their own reorder).
+    obs/obsm are reordered in memory (backed mode already loads them); var/varm/varp/uns are not
+    obs-aligned and are written as-is. Dense or CSC sort still works eagerly (omit --backed).
+    """
+    import shutil
+    import tempfile
+
+    import numpy as np
+    from anndata._io.specs import write_elem  # private API — see anndata skill
+    from anndata.io import sparse_dataset
+
+    sort_by = cfg.grouping.sort_by
+    if cfg.io.x_storage != "sparse-csr":
+        raise ConversionError(
+            f"--backed --sort-by supports x_storage='sparse-csr' only (got '{cfg.io.x_storage}'). "
+            "Omit --backed to sort dense/CSC eagerly."
+        )
+    if adata.layers or adata.raw is not None or len(adata.obsp) > 0:
+        raise ConversionError(
+            "--backed --sort-by does not reorder layers/raw/obsp yet (they are obs-aligned and "
+            "would need their own streamed reorder). Omit --backed to sort eagerly, or drop them."
+        )
+    x = adata.X
+    if sp.issparse(x) or getattr(x, "format", None) != "csr":
+        got = "in-memory " + type(x).__name__ if sp.issparse(x) else (getattr(x, "format", None) or type(x).__name__)
+        raise ConversionError(
+            f"--backed --sort-by requires the backed input's X to be CSR on disk; got {got}. "
+            "Omit --backed to sort eagerly."
+        )
+
+    n_obs, n_vars = adata.shape
+    x_dtype = x.dtype
+    indices_dtype = np.int32  # matches the rest of the converter (fits unless > 2^31 cols)
+
+    # Permutation + contiguous group ranges — obs-only, so backed-safe (obs is in memory).
+    perm, ranges = _compute_sort(adata, sort_by)
+    n_groups = len(ranges)
+    starts = ranges["start"].to_numpy()
+    ends = ranges["end"].to_numpy()
+
+    # For each SOURCE row, the group (in sorted-group order) it routes to. perm[start:end] lists
+    # a group's source rows in output order, which for a stable lexsort is ascending source order.
+    group_of_source = np.empty(n_obs, dtype=np.int64)
+    group_rows = []  # source-row ids per group, ascending (== stable within-group order)
+    for gi in range(n_groups):
+        rows = perm[starts[gi]:ends[gi]]
+        group_of_source[rows] = gi
+        group_rows.append(rows)
+
+    # Per-group nnz + full indptr, precomputed from the (small) source indptr — no data pass
+    # needed for structure, only for the data/indices values.
+    row_nnz = np.diff(_get_indptr(x)).astype(np.int64)
+    n_rows_each = [int(r.size) for r in group_rows]
+    indptr_each = [
+        np.concatenate([[0], np.cumsum(row_nnz[r])]).astype(np.int64) for r in group_rows
+    ]
+    nnz_each = [int(ip[-1]) for ip in indptr_each]
+
+    validation_result = validate_single_cell_anndata(adata, cfg.validation)
+    ad.settings.zarr_write_format = 3
+    print(
+        f"Converting (backed, streamed sort) → {output_path} "
+        f"(n_obs={n_obs}, n_vars={n_vars}, sparse-csr, {n_groups} groups, backend={cfg.io.backend})",
+        flush=True, file=sys.stderr,
+    )
+    t0 = time.perf_counter()
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="datascale_sort_", dir=str(output_path.parent)))
+    try:
+        # ── Create temp per-group CSR stores (indptr known upfront; data filled by the pass) ──
+        temp_groups = []
+        for gi in range(n_groups):
+            tg = zarr.open_group(str(tmp_root / f"g{gi}"), mode="w")
+            tg.attrs["encoding-type"] = "csr_matrix"
+            tg.attrs["encoding-version"] = "0.1.0"
+            tg.attrs["shape"] = [n_rows_each[gi], n_vars]
+            flat = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_each[gi]))
+            tg.require_array("data", shape=(nnz_each[gi],), dtype=x_dtype, chunks=(flat,), overwrite=True)
+            tg.require_array("indices", shape=(nnz_each[gi],), dtype=indices_dtype, chunks=(flat,), overwrite=True)
+            ip = tg.require_array(
+                "indptr", shape=(n_rows_each[gi] + 1,), dtype=np.int64,
+                chunks=(n_rows_each[gi] + 1,), overwrite=True,
+            )
+            for name in ("data", "indices", "indptr"):
+                tg[name].attrs["encoding-type"] = "array"
+                tg[name].attrs["encoding-version"] = "0.2.0"
+            ip[:] = indptr_each[gi]
+            temp_groups.append(tg)
+
+        # ── Single sequential pass over X: bucket each row-batch into its groups ──
+        # Batch to ~256 MB of nnz like the other streaming writers.
+        nnz_total = int(row_nnz.sum())
+        bpm = max(1, nnz_total // max(1, n_obs)) * (np.dtype(x_dtype).itemsize + np.dtype(indices_dtype).itemsize)
+        batch_size = max(1_000, min(200_000, (256 * 1024 * 1024) // max(1, bpm)))
+        cursors = [0] * n_groups  # nnz write cursor per group
+        with _stage(f"Bucketing {n_obs} rows into {n_groups} groups (backed, streamed)"):
+            for b0 in range(0, n_obs, batch_size):
+                b1 = min(b0 + batch_size, n_obs)
+                batch = x[b0:b1]  # backed CSR slice -> in-memory scipy CSR (one batch bounds RAM)
+                if not sp.isspmatrix_csr(batch):
+                    batch = batch.tocsr()
+                g_batch = group_of_source[b0:b1]
+                for gi in np.unique(g_batch):
+                    gi = int(gi)
+                    sub = batch[g_batch == gi]  # this group's rows, in source (== output) order
+                    m = sub.nnz
+                    if m == 0:
+                        continue
+                    c = cursors[gi]
+                    temp_groups[gi]["data"][c:c + m] = sub.data
+                    temp_groups[gi]["indices"][c:c + m] = sub.indices.astype(indices_dtype, copy=False)
+                    cursors[gi] = c + m
+
+        # ── Concat the groups (in sorted order) into the final store ──
+        store, finalize = open_output_store(
+            output_path, cfg, commit_message=f"datascale convert-h5ad (sorted) → {output_path.name}",
+        )
+        store.attrs["encoding-type"] = "anndata"
+        store.attrs["encoding-version"] = "0.1.0"
+        with _stage("Writing metadata (sorted obs/obsm; var/varm/varp/uns as-is)"):
+            write_elem(store, "obs", adata.obs.iloc[perm])
+            write_elem(store, "var", adata.var)
+            write_elem(store, "uns", dict(adata.uns))
+            write_elem(store, "obsm", {k: (v.iloc[perm] if hasattr(v, "iloc") else v[perm])
+                                       for k, v in adata.obsm.items()})
+            write_elem(store, "varm", dict(adata.varm))
+            write_elem(store, "obsp", {})   # empty (non-empty obsp is rejected above)
+            write_elem(store, "varp", dict(adata.varp))
+
+        temp_mats = [sparse_dataset(tg) for tg in temp_groups]
+        with _stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, sparse-csr, concat {n_groups} groups)"):
+            _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
+        finalize()
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    print(f"Done in {time.perf_counter() - t0:.1f}s", flush=True, file=sys.stderr)
+    warnings.append(
+        f"Rows sorted by {list(sort_by)} into {n_groups} contiguous groups via backed streamed "
+        "bucketing (X never fully materialised); obs/obsm reordered to match. Store is a plain "
+        "sorted AnnData (no datascale index)."
+    )
+    return [*warnings, *validation_result.warnings]
+
+
 def _write_adata_to_zarr(
     adata: ad.AnnData,
     output_path: Path,
@@ -645,6 +806,9 @@ def _write_adata_to_zarr(
     warnings = list(load_warnings)
 
     if allow_grouping:
+        if cfg.grouping.enabled and cfg.io.backed:
+            # Backed input: sort X without ever materialising it (streamed bucket + concat).
+            return _write_sorted_backed(adata, output_path, cfg, warnings)
         adata = _maybe_sort_adata(adata, cfg, warnings)
     elif cfg.grouping.enabled:
         raise ConversionError(

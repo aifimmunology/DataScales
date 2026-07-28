@@ -232,6 +232,55 @@ def test_sort_rejects_sparse_csc(tmp_path: Path) -> None:
         convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(tmp_path / "o.zarr"), cfg)
 
 
+def _backed_sorted_cfg() -> AppConfig:
+    return AppConfig(
+        io=IOConfig(overwrite=True, backed=True, x_storage="sparse-csr"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
+    )
+
+
+def test_sort_backed_streamed_matches_eager(tmp_path: Path) -> None:
+    """--backed --sort-by (streamed bucketing, Option C) yields the SAME sorted sparse-csr
+    store as the eager path — same row order, X values, and reordered obsm — without ever
+    materialising X in full."""
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    out_backed = tmp_path / "backed.zarr"
+    out_eager = tmp_path / "eager.zarr"
+
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out_eager), _sorted_cfg())
+    convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(out_backed), _backed_sorted_cfg())
+
+    a_backed = ad.read_zarr(str(out_backed))
+    a_eager = ad.read_zarr(str(out_eager))
+    # A/x(2,5), A/y(3), B/x(4), B/y(1,6): the same permutation the eager test asserts.
+    assert list(np.asarray(a_backed.X[:, 0].todense()).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
+    assert np.array_equal(np.asarray(a_backed.X.todense()), np.asarray(a_eager.X.todense()))
+    assert list(a_backed.obs["cell_type"]) == list(a_eager.obs["cell_type"])
+    assert np.array_equal(a_backed.obsm["coords"], a_eager.obsm["coords"])
+    assert "datascale_sort_index" not in a_backed.uns
+
+    # Self-serve subset reads (stock anndata/zarr) work on the backed-sorted store too.
+    g = open_input_group(str(out_backed))
+    assert _id_set(_self_serve_subset(g, cell_type="A")[0]) == {2, 3, 5}
+    assert _id_set(_self_serve_subset(g, demographic="x")[0]) == {2, 4, 5}
+
+
+def test_sort_backed_rejects_dense(tmp_path: Path) -> None:
+    """Backed streamed sort is sparse-csr only; dense + --backed + --sort-by is rejected
+    (dense sort still works eagerly)."""
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, backed=True, x_storage="dense"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
+    )
+    with pytest.raises(ConversionError, match="sparse-csr"):
+        convert_h5ad_to_zarr(str(tmp_path / "in.h5ad"), str(tmp_path / "o.zarr"), cfg)
+
+
 # ---------------------------------------------------------------------------
 # Features compose: sorted store written through icechunk
 # ---------------------------------------------------------------------------

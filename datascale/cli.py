@@ -99,8 +99,9 @@ def _build_parser() -> argparse.ArgumentParser:
              "(e.g. --sort-by AIFI_L1 batch_id). Physically sorts rows so each distinct key "
              "tuple is a contiguous block; the output is a plain sorted AnnData (no datascale "
              "index) — derive ranges from the sorted obs column(s) and slice X[start:end] with "
-             "stock anndata/zarr. Requires eager (non-backed) load and sparse-csr or dense "
-             "storage.",
+             "stock anndata/zarr. Eager load handles sparse-csr or dense; with --backed the "
+             "sort is streamed (memory-bounded) for sparse-csr only, and layers/raw/obsp must "
+             "be absent.",
     )
     _add_common_args(h5ad_required, h5ad_optional)
 
