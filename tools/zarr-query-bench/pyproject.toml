@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zarr-query-bench"
+version = "0.1.0"
+description = "Query-time benchmark for a Zarr store's X (dense or CSR/CSC)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
+dependencies = [
+  "anndata>=0.11.0",
+  "zarr>=3.0.0",
+  "numpy>=1.24.0",
+  "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["zarr_query_benchmarking*"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64", "win-64"]
+
+[tool.pixi.pypi-dependencies]
+zarr-query-bench = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+# Run the benchmark CLI; pass flags after the task name, e.g.
+#   pixi run zarr-bench --store <store>.zarr --axis row --count 1000 --format csr
+[tool.pixi.tasks]
+zarr-bench = "python -m zarr_query_benchmarking"
+zarr-bench-inspect = "python -m zarr_query_benchmarking --inspect"
