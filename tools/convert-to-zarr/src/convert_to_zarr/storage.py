@@ -81,7 +81,7 @@ def open_output_store(
         root = zarr.open_group(store=session.store, mode="w")
 
         def finalize() -> None:
-            msg = commit_message or f"datascale convert → {output_path.name}"
+            msg = commit_message or f"convert-to-zarr convert → {output_path.name}"
             snapshot_id = session.commit(msg)
             print(
                 f"  icechunk commit {snapshot_id} on branch 'main'",

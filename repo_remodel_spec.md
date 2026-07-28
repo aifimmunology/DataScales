@@ -40,12 +40,12 @@ working in this repo — it *becomes* the hub) while giving each tool its own pa
 | Role | Package/module (kept for now) | Tool folder / brand |
 |------|-------------------------------|---------------------|
 | umbrella / hub repo | `datascales-project` | repo root |
-| convert tool | `datascale` (import + CLI unchanged) | `tools/convert-to-zarr` |
-| query benchmark | `zarr_query_benchmarking` (`python -m …`) | `tools/zarr-query-bench` |
+| convert tool | `convert_to_zarr` (import) · `convert-to-zarr` (dist/CLI) | `tools/convert-to-zarr` |
+| query benchmark | `zarr_query_bench` (`python -m …`) | `tools/zarr-query-bench` |
 | merge/sort (deferred) | new (carved from `converter.py`) | `tools/<merge-sort>` — not started |
 
-Importable package/module names are intentionally **kept as-is** for now (relative imports,
-zero test churn); the `datascale → convert-to-zarr` / module renames are a later user pass.
+Package/module identifiers **renamed**: `datascale → convert_to_zarr` (dist/CLI `convert-to-zarr`)
+and `zarr_query_benchmarking → zarr_query_bench`.
 Env model: **one pixi env per tool** (each `tools/*` has its own `pyproject.toml`); the root is a
 hub env for the project folders/notebooks.
 

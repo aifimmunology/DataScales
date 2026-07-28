@@ -22,7 +22,7 @@ dev = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["zarr_query_benchmarking*"]
+include = ["zarr_query_bench*"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -38,5 +38,5 @@ dev = { features = ["dev"], solve-group = "default" }
 # Run the benchmark CLI; pass flags after the task name, e.g.
 #   pixi run zarr-bench --store <store>.zarr --axis row --count 1000 --format csr
 [tool.pixi.tasks]
-zarr-bench = "python -m zarr_query_benchmarking"
-zarr-bench-inspect = "python -m zarr_query_benchmarking --inspect"
+zarr-bench = "python -m zarr_query_bench"
+zarr-bench-inspect = "python -m zarr_query_bench --inspect"

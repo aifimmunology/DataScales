@@ -281,7 +281,7 @@ def _measure_peak_rss(args):
     Returns None on any failure — the memory probe must never break the run.
     """
     cmd = [
-        sys.executable, "-m", "zarr_query_benchmarking", "--_rss-probe",
+        sys.executable, "-m", "zarr_query_bench", "--_rss-probe",
         "--store", args.store, "--axis", args.axis,
         "--mode", args.mode, "--seed", str(args.seed),
     ]

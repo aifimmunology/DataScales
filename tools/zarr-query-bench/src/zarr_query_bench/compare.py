@@ -9,9 +9,9 @@ fastest run in the table (1.00x = fastest), which is the number you usually
 care about when comparing inputs.
 
 Usage:
-    python -m zarr_query_benchmarking.compare output1.json
-    python -m zarr_query_benchmarking.compare run_*.json --sort median_s
-    python -m zarr_query_benchmarking.compare a.json b.json --md > table.md
+    python -m zarr_query_bench.compare output1.json
+    python -m zarr_query_bench.compare run_*.json --sort median_s
+    python -m zarr_query_bench.compare a.json b.json --md > table.md
 
 This is read-only and stdlib-only; it never touches a store.
 """

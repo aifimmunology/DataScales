@@ -57,10 +57,10 @@ class GroupingConfig:
     """Sort + partition X by one or more obs columns (Feature B).
 
     When enabled, rows are physically sorted by ``sort_by`` (primary key first), so each
-    distinct key tuple becomes a contiguous row block. No datascale-specific index is
+    distinct key tuple becomes a contiguous row block. No convert-to-zarr-specific index is
     written — the result is a plain sorted AnnData; a downstream reader derives the ranges
     from the (now sorted) obs column(s) and slices ``X[start:end]`` with stock anndata/zarr,
-    no datascale dependency. All obs-aligned arrays are reordered consistently so the store
+    no convert-to-zarr dependency. All obs-aligned arrays are reordered consistently so the store
     stays a valid AnnData. convert-h5ad only, with sparse-csr or dense X.
     """
     enabled: bool = False

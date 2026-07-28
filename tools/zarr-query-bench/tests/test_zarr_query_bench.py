@@ -1,4 +1,4 @@
-"""Minimal regression tests for the zarr_query_benchmarking CLI tool.
+"""Minimal regression tests for the zarr_query_bench CLI tool.
 
 Covers the pieces that would silently produce WRONG benchmark numbers if a future
 refactor broke them — not exhaustive coverage of the CLI surface:
@@ -21,8 +21,8 @@ import pytest
 import scipy.sparse as sp
 import anndata as ad
 
-import zarr_query_benchmarking.__main__ as qbench
-from zarr_query_benchmarking.__main__ import (
+import zarr_query_bench.__main__ as qbench
+from zarr_query_bench.__main__ import (
     TimingStore,
     _read_spans,
     _run_stats,

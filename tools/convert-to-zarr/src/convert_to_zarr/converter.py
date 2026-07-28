@@ -599,7 +599,7 @@ def _maybe_sort_adata(
     """If grouping is enabled, reorder all obs-aligned arrays by the sort keys.
 
     Reordering uses anndata fancy indexing so obs/obsm/obsp/layers/raw all share one
-    permutation and the store stays a valid AnnData. No datascale-specific index is written:
+    permutation and the store stays a valid AnnData. No convert-to-zarr-specific index is written:
     the result is a plain, physically sorted AnnData, so each distinct key tuple is a
     contiguous row block that a downstream reader derives from the sorted obs column(s).
     """
@@ -624,7 +624,7 @@ def _maybe_sort_adata(
     warnings.append(
         f"Rows sorted by {list(sort_by)} into {len(ranges_df)} contiguous groups; "
         "obs/obsm/obsp/layers/raw reordered to match. Store is a plain sorted AnnData "
-        "(no datascale index); derive ranges from the sorted obs column(s) if needed."
+        "(no convert-to-zarr index); derive ranges from the sorted obs column(s) if needed."
     )
     return adata
 
@@ -712,7 +712,7 @@ def _write_sorted_backed(
     )
     t0 = time.perf_counter()
 
-    tmp_root = Path(tempfile.mkdtemp(prefix="datascale_sort_", dir=str(output_path.parent)))
+    tmp_root = Path(tempfile.mkdtemp(prefix="convert-to-zarr_sort_", dir=str(output_path.parent)))
     try:
         # ── Create temp per-group CSR stores (indptr known upfront; data filled by the pass) ──
         temp_groups = []
@@ -760,7 +760,7 @@ def _write_sorted_backed(
 
         # ── Concat the groups (in sorted order) into the final store ──
         store, finalize = open_output_store(
-            output_path, cfg, commit_message=f"datascale convert-h5ad (sorted) → {output_path.name}",
+            output_path, cfg, commit_message=f"convert-to-zarr convert-h5ad (sorted) → {output_path.name}",
         )
         store.attrs["encoding-type"] = "anndata"
         store.attrs["encoding-version"] = "0.1.0"
@@ -785,7 +785,7 @@ def _write_sorted_backed(
     warnings.append(
         f"Rows sorted by {list(sort_by)} into {n_groups} contiguous groups via backed streamed "
         "bucketing (X never fully materialised); obs/obsm reordered to match. Store is a plain "
-        "sorted AnnData (no datascale index)."
+        "sorted AnnData (no convert-to-zarr index)."
     )
     return [*warnings, *validation_result.warnings]
 
@@ -847,7 +847,7 @@ def _write_adata_to_zarr(
     )
     t0 = time.perf_counter()
     store, finalize = open_output_store(
-        output_path, cfg, commit_message=f"datascale convert-h5ad → {output_path.name}",
+        output_path, cfg, commit_message=f"convert-to-zarr convert-h5ad → {output_path.name}",
     )
     _write_csr_adata_direct(adata, store, cfg, x_override=x_for_write)
     finalize()
@@ -1299,7 +1299,7 @@ def convert_h5ads_to_zarr(
 
         # ── Open store + write metadata ───────────────────────────────────────
         store, finalize = open_output_store(
-            output_path, cfg, commit_message=f"datascale concat-h5ads → {output_path.name}",
+            output_path, cfg, commit_message=f"convert-to-zarr concat-h5ads → {output_path.name}",
         )
         store.attrs["encoding-type"] = "anndata"
         store.attrs["encoding-version"] = "0.1.0"

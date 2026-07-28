@@ -28,9 +28,9 @@ min_vars = 1
 
 # Sort + partition X by obs columns (convert-h5ad, sparse-csr or dense, eager only). When
 # enabled, rows are physically sorted by sort_by (primary key first) so each distinct key tuple
-# is a contiguous block. Output is a plain sorted AnnData with no datascale-specific metadata:
+# is a contiguous block. Output is a plain sorted AnnData with no convert-to-zarr-specific metadata:
 # read a subset by deriving the contiguous range from the (now sorted) obs column and slicing
-# X[start:end] with stock anndata/zarr — no datascale dependency needed to query the store.
+# X[start:end] with stock anndata/zarr — no convert-to-zarr dependency needed to query the store.
 [grouping]
 enabled = false
 sort_by = ["AIFI_L1", "batch_id"]

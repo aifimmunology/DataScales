@@ -8,8 +8,6 @@ A configurable converter for h5 data(currently only single cell) to Zarr stores,
 > compare setups (dense vs CSR/CSC, chunking, sharding). See its own README; everything below is
 > about conversion.
 
-> The CLI entrypoint is currently `datascale` (package rename to `convert-to-zarr` pending).
-
 ## Scope
 
 - Converts `.h5ad` and 10x Genomics Cell Ranger `.h5` files to Zarr v3
@@ -18,7 +16,7 @@ A configurable converter for h5 data(currently only single cell) to Zarr stores,
 - Input expected to be CSR-formatted AnnData (`adata.X` in CSR) or it is converted to it (slower)
 - Optional 'backed' HDF5 loading (`--backed`) streams X from disk without loading it into RAM — useful for large files or memory-constrained environments
 - Optional Icechunk storage backend (`--icechunk`) — writes the store through a transactional, versioned repository instead of a plain zarr directory
-- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous block for fast subset reads; the output is a plain sorted AnnData (no datascale-specific metadata), so you derive the range from the sorted obs column and slice `X[start:end]` with stock anndata/zarr
+- Optional sort + partition of rows by obs column(s) (`--sort-by`) — physically groups each key tuple into a contiguous block for fast subset reads; the output is a plain sorted AnnData (no convert-to-zarr-specific metadata), so you derive the range from the sorted obs column and slice `X[start:end]` with stock anndata/zarr
 - Config via TOML or YAML with CLI overrides; all options can also be passed as CLI flags
 
 ## Install
@@ -36,7 +34,7 @@ pixi install
 ### Convert `.h5ad` to Zarr
 
 ```bash
-pixi run datascale convert-h5ad \
+pixi run convert-to-zarr convert-h5ad \
   --input path/to/input.h5ad \
   --output path/to/output.zarr \
   --config example_config.toml
@@ -45,7 +43,7 @@ pixi run datascale convert-h5ad \
 ### Convert 10x Cell Ranger `.h5` to Zarr
 
 ```bash
-pixi run datascale convert-10x-h5 \
+pixi run convert-to-zarr convert-10x-h5 \
   --input path/to/filtered_feature_bc_matrix.h5 \
   --output path/to/output.zarr \
   --config example_config.toml
@@ -59,7 +57,7 @@ its slice of the output — the full concatenated matrix is never materialised i
 memory.
 
 ```bash
-pixi run datascale concat-h5ads \
+pixi run convert-to-zarr concat-h5ads \
   --inputs path/to/sample_A.h5ad path/to/sample_B.h5ad path/to/sample_C.h5ad \
   --output path/to/combined.zarr \
   --backed \
@@ -113,9 +111,9 @@ min_vars = 1
 
 # Sort + partition X by obs columns (convert-h5ad, sparse-csr or dense, eager only). When
 # enabled, rows are physically sorted by sort_by (primary key first) so each distinct key tuple
-# is a contiguous block. The output is a plain sorted AnnData with no datascale-specific
+# is a contiguous block. The output is a plain sorted AnnData with no convert-to-zarr-specific
 # metadata: to read a subset, derive the contiguous range from the (now sorted) obs column and
-# slice X[start:end] with stock anndata/zarr — no datascale dependency to query.
+# slice X[start:end] with stock anndata/zarr — no convert-to-zarr dependency to query.
 [grouping]
 enabled = false
 sort_by = ["AIFI_L1", "batch_id"]
@@ -141,13 +139,13 @@ All commands share the same optional flags:
 | `--x-shard-factor` | Optional | Pack dense X chunks into shards of `(x_row_chunk, x_col_chunk)` × factor. `1` (default) = no sharding. Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only) |
 | `--consolidate-metadata` | Optional | False by default - Write consolidated zarr metadata. useful for remote stores |
 | `--icechunk` | Optional | Write the output through an Icechunk repository (transactional, versioned) instead of a plain zarr directory. Commits to the `main` branch. Local storage; eager input only (not `--backed`). All subcommands |
-| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Physically sorts rows so each distinct key tuple is a contiguous block; output is a plain sorted AnnData (no datascale index) — derive ranges from the sorted obs column and slice `X[start:end]` with stock anndata/zarr. Requires eager load + `sparse-csr` or `dense` |
+| `--sort-by` | Optional (`convert-h5ad`) | Sort + partition rows by these obs column(s), primary key first (e.g. `--sort-by AIFI_L1 batch_id`). Physically sorts rows so each distinct key tuple is a contiguous block; output is a plain sorted AnnData (no convert-to-zarr index) — derive ranges from the sorted obs column and slice `X[start:end]` with stock anndata/zarr. Requires eager load + `sparse-csr` or `dense` |
 | `--obs-columns` | Optional (`concat-h5ads`) | obs columns to keep and join on (e.g. `--obs-columns cell_type donor`). Omitted = require an identical obs schema across all inputs. When given, each input must contain these columns; `obs` is projected to exactly these (in this order) and all other columns are dropped |
 
 ```bash
-pixi run datascale convert-h5ad --help
-pixi run datascale convert-10x-h5 --help
-pixi run datascale concat-h5ads --help
+pixi run convert-to-zarr convert-h5ad --help
+pixi run convert-to-zarr convert-10x-h5 --help
+pixi run convert-to-zarr concat-h5ads --help
 ```
 
 ## Development
