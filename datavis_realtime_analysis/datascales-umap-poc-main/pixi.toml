@@ -1,0 +1,11 @@
+[workspace]
+authors = ["Alex Holly <alex.holly@alleninstitute.org>"]
+channels = ["conda-forge"]
+name = "datascales-umap-poc-main"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+bun = ">=1.3.11,<2"
