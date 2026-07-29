@@ -3,7 +3,7 @@ overwrite = false
 consolidate_metadata = false
 # x_storage: "sparse-csr" (default), "sparse-csc" (force CSC), "dense" (force dense)
 x_storage = "sparse-csr"
-backed = false
+backed = true
 # backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
 # one commit per conversion). icechunk requires eager input (not backed) for now.
 backend = "zarr"
