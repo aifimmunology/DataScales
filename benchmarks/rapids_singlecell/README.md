@@ -1,68 +1,148 @@
 # rapids-singlecell — GPU pipeline benchmark
 
-Per-step **wall-clock + peak host RSS + peak GPU VRAM** for an out-of-core, multi-GPU
-single-cell pipeline that reads a Zarr store lazily through Dask-CUDA. GPU/CUDA-only —
-run on the GPU node's pixi env, not the local CPU env.
+This directory is **two things**:
 
-## Steps
+1. **Findings** — what we measured when running the standard single-cell pipeline
+   (preprocess → HVG → PCA → neighbors → UMAP → Leiden) three ways: stock in-memory
+   Scanpy, Scanpy streamed out-of-core from Zarr via Dask, and **rapids-singlecell on a
+   multi-GPU dask-cuda cluster** reading the same Zarr store. The bulk of this README is
+   those results.
+2. **The tool** — [`rapids_benchmark.py`](rapids_benchmark.py), the configurable
+   per-step benchmark that produced the RAPIDS numbers, plus [`sweep_gpu_zarr.sh`](sweep_gpu_zarr.sh)
+   for GPU-count / read-config sweeps.
 
-`load_zarr` → `h2d_transfer` → `preprocessing` (qc + normalize + log1p) → `hvg` →
-`scaling` → `pca` → `harmony` (if `--batch-key`) → `neighbors` → `umap` → `leiden` →
-`write_h5ad` (if `--h5ad-out`).
+**Headline (5M-cell PBMC, 4× GPU):** the RAPIDS pipeline runs the full analysis in
+**~20 min vs ~3h49m** for baseline Scanpy (**11.6×**) while holding peak host RAM to
+**~50 GB vs ~295 GB** (**~6× lower**). Per-step, the win concentrates exactly where it
+matters — UMAP **32.7×**, PCA **21.7×**, neighbors **19.7×**.
 
-## Run
+---
 
-Defaults live in the `Config` dataclass in [`rapids_benchmark.py`](rapids_benchmark.py);
-**every field has a matching `--flag`**, so a sweep is a shell loop — no source edits.
+## The benchmark tool (brief)
+
+[`rapids_benchmark.py`](rapids_benchmark.py) times **wall-clock + peak host RSS
+(process tree) + peak GPU VRAM (NVML, device-wide)** for each stage of an out-of-core,
+multi-GPU pipeline that reads a Zarr store lazily through Dask-CUDA:
+
+```
+load_zarr → h2d_transfer → preprocessing (qc+normalize+log1p) → hvg → scaling
+          → pca → harmony (if --batch-key) → neighbors → umap → leiden → write_h5ad
+```
+
+Every field of the `Config` dataclass has a matching `--flag`, so a sweep is a shell loop —
+no source edits. GPU/CUDA-only; run it on the GPU node's pixi env (`--help` works anywhere).
 
 ```bash
-# 4-GPU baseline (capacity preset: tcp + managed memory)
+# 4-GPU run, capacity preset (tcp + managed memory)
 pixi run python rapids_benchmark.py \
-    --data-path /path/to/2M_50M.zarr --gpus 0,1,2,3 \
-    --results-json results/2M_4gpu.json --label 2M_4gpu
-
-# scaling sweep: same store, vary GPU count
-for g in "0" "0,1" "0,1,2,3"; do
-  pixi run python rapids_benchmark.py --data-path /path/to/2M_50M.zarr \
-      --gpus "$g" --results-json "results/2M_${g//,/-}.json" --label "2M_${g//,/-}gpu"
-done
+    --data-path /path/to/5M.zarr --gpus 0,1,2,3 \
+    --results-json results/5M_4gpu.json --label 5M_4gpu
 ```
 
-**Canned single-vs-multi-GPU × zarr-config grid:** [`sweep_gpu_zarr.sh`](sweep_gpu_zarr.sh)
-runs `{gpus} × {zarr concurrency 4,16} × {max-workers 4,8}` (neighbors algo derived:
-multi→`mg_ivfflat`, single→`ivfflat`), one isolated subprocess per config, and aggregates
-every per-run JSON into `results/sweep_summary.{csv}` + a printed comparison table. Sets
-`threads_per_worker = 64 / n_gpus` to fill the 64-core box while keeping total host threads
-equal across the GPU-count variable. Edit the grid/DATA at the top; env-var overrides:
+Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM),
+`--preset capacity|speed`, `--zarr-concurrency`/`--zarr-max-workers` (applied on *every*
+worker), `--chunk-rows`, and the pipeline params (`--n-top-genes`, `--n-comps`,
+`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). Each run writes
+`results/*.json` with full provenance (library versions, CUDA/driver, GPU model, dataset
+shape/nnz, resolved thread budget). See the module docstring and `--help` for the rest.
 
-```bash
-DRY_RUN=1 bash sweep_gpu_zarr.sh                       # preview the planned commands
-bash sweep_gpu_zarr.sh                                 # run the full grid
-DATA=/home/workspace/zarrs/other.zarr bash sweep_gpu_zarr.sh
-```
+---
 
-## Key knobs
+## Findings
 
-| Knob | Flag | Note |
-|------|------|------|
-| GPUs | `--gpus 0,1,2,3` | physical ids; single-sourced to cluster + NVML + client RMM |
-| Cluster preset | `--preset capacity\|speed` | `capacity`=tcp+managed, `speed`=ucx+rmm-pool |
-| Hard overrides | `--protocol`, `--rmm-mode`, `--rmm-pool-size`, `--threads-per-worker`, `--enable-cudf-spill/--no-enable-cudf-spill` | beat the preset |
-| Zarr read | `--zarr-concurrency`, `--zarr-max-workers` | **applied on every worker** (see below) |
-| Layout | `--chunk-rows` | row block; multiple of the store's row chunk |
-| Pipeline | `--n-top-genes`, `--n-comps`, `--n-neighbors`, `--neighbors-algorithm`, `--leiden-resolution`, `--umap-min-dist`, `--pca-float64/--no-pca-float64`, `--batch-key` | `--batch-key ""` skips harmony |
+### What was compared
 
+Three implementations of the **same** pipeline, on the **same** Zarr stores:
 
-## Output
+| Series | What | Device |
+|--------|------|--------|
+| **Base Scanpy** | stock scanpy, `X` read fully into memory from `.h5ad` | CPU |
+| **Scanpy Zarr/Dask** | stock scanpy, `X` streamed out-of-core from Zarr via Dask | CPU |
+| **RAPIDS Zarr/Dask** | rapids-singlecell on a 4-GPU `dask-cuda` cluster, same Zarr streamed to device | GPU |
 
-- `results/*.json` — raw provenance (versions, CUDA/driver, GPU model, dataset shape/nnz)
-  + per-step numbers. `--results-txt` appends a human-readable table.
-- `figures/` — plots embedded below.
+Baseline Scanpy is the "what everyone does today" reference. Speedups below are **vs Base
+Scanpy** unless noted. All figures are the **5M-cell PBMC** run; cross-dataset totals are
+in the table at the end. Caches were warm for repeat steps and cold on first touch (page
+cache can't be dropped without root) — reported, not hidden.
 
-## Results
+### Per-step speedup — where the time goes
 
-_Pending: per-step timings across dataset sizes + figures._
+![Per-step speedup vs baseline Scanpy for the Scanpy Zarr/Dask (CPU) and RAPIDS Zarr/Dask (GPU) pipelines, with baseline wall time overlaid](figures/Rapids_PerStep_Speedup.png)
 
-| dataset | GPUs | total wall | peak host | peak GPU | notes |
-|---------|------|-----------|-----------|----------|-------|
-| _TODO_  |      |           |           |          |       |
+Bars are speedup vs baseline for each pipeline; the **blue line is the baseline wall time**
+per step (right axis). Two things stand out:
+
+- **Baseline cost is wildly concentrated.** UMAP alone is ~8.7 ks (2.4 h), then Leiden
+  ~2.1 ks and neighbors ~1.3 ks. These are precisely the steps you re-run while tuning
+  resolution / min-dist / n-neighbors — so their cost dominates real iterative work.
+- **Only the GPU cracks the expensive steps.** Scanpy Zarr/Dask (orange) helps I/O-ish
+  steps (load 35×, PCA 12×) but is ~1× on UMAP and Leiden — those are CPU-compute-bound, so
+  streaming the data doesn't help. RAPIDS (green) is tallest exactly where the baseline is
+  most expensive: **32.7× on UMAP**, the single biggest lever.
+
+### Heavy hitters — the four steps worth accelerating
+
+![RAPIDS speedup vs baseline Scanpy for the four most re-run steps: pca 21.7x, neighbors 19.7x, umap 32.7x, leiden 7.8x](figures/Key_step_speedups.png)
+
+Zooming into the four steps that dominate an interactive session — **PCA, neighbors, UMAP,
+Leiden** — RAPIDS vs baseline Scanpy:
+
+| Step | Baseline → RAPIDS | Speedup |
+|------|-------------------|--------:|
+| PCA | 264 s → 12 s | **21.7×** |
+| neighbors | 1274 s → 65 s | **19.7×** |
+| UMAP | 8737 s → 267 s | **32.7×** |
+| Leiden | 2090 s → 269 s | **7.8×** |
+
+UMAP goes from a coffee-break-plus-lunch (2.4 h) to **~4.5 min**. Leiden shows the smallest
+multiple (7.8×) but still turns 35 min into ~4.5 min.
+
+### Memory — Dask streaming is what makes it fit
+
+![Peak host RAM per step for Base Scanpy, Scanpy Zarr/Dask, and RAPIDS Zarr/Dask, with dashed lines marking the RAM ceilings of the available compute tiers](figures/Memory_usage.png)
+
+Peak host RAM per step; dashed lines mark the RAM ceilings of the three compute tiers
+available to us. The story is **the Zarr/Dask streaming path — not the GPU — collapses
+memory**:
+
+- Base Scanpy spikes to **~295 GB** at HVG (and >200 GB through load/preprocess/scaling),
+  clearing only the *top* tier. You'd have to provision the biggest box just to open the data.
+- Both streamed pipelines stay flat and low: **Scanpy Zarr/Dask ~53 GB**, **RAPIDS
+  Zarr/Dask ~50 GB** peak host — each **~6× lower** than baseline and comfortably under the
+  *smallest* tier. RAPIDS additionally holds **~48 GB VRAM** across the 4 GPUs.
+
+So the two axes are independent: **Dask streaming buys the memory ceiling** (run it on a
+small machine at all), **the GPU buys the wall-clock**.
+
+### Totals across datasets
+
+Full-pipeline wall time and peak memory. RAPIDS = 4× GPU. Speedup is vs Base Scanpy where a
+baseline exists, else vs Scanpy Zarr/Dask (†).
+
+| Dataset (~cells) | Pipeline | Total wall | Peak host | Peak VRAM | Speedup |
+|------------------|----------|-----------:|----------:|----------:|--------:|
+| **5M PBMC** | Base Scanpy | 3 h 49 m | 295 GB | — | 1× |
+| | Scanpy Zarr/Dask | 3 h 08 m | 53 GB | — | 1.2× |
+| | **RAPIDS Zarr/Dask** | **19.8 min** | **50 GB** | 48 GB | **11.6×** |
+| **2M Soundlife Misc** | Base Scanpy | 1 h 37 m | 214 GB | — | 1× |
+| | Scanpy Zarr/Dask | 56.3 min | 42 GB | — | 1.7× |
+| | **RAPIDS Zarr/Dask** | **6.8 min** | 56 GB | 38 GB | **14.2×** |
+| **13M Soundlife Single-Cell** | Base Scanpy | — *(didn't fit)* | — | — | — |
+| | Scanpy Zarr/Dask | 10 h 01 m | 147 GB | — | 1× † |
+| | **RAPIDS Zarr/Dask** | **1 h 26 m** | 92 GB | 52 GB | **7.0×** † |
+
+At 13M cells, in-memory baseline Scanpy no longer fits — the streamed pipelines are the only
+options, and RAPIDS turns a **10-hour** CPU run into **~1.4 h**.
+
+---
+
+## Multi-GPU scaling comparison *(coming soon)*
+
+The numbers above fix RAPIDS at **4 GPUs**. A GPU-count scaling study — **1 → 2 → 4 GPUs**
+on an identical store, holding chunk shape, codec, preset, and total host-decode threads
+constant so we isolate GPU count alone — is running via
+[`sweep_gpu_zarr.sh`](sweep_gpu_zarr.sh) (which also sweeps `--zarr-concurrency` ×
+`--zarr-max-workers` and derives the neighbors algorithm from GPU count:
+`mg_ivfflat` multi-GPU vs `ivfflat` single). Results, a per-step scaling curve, and notes on
+where scaling breaks down (small steps dominated by cluster/comm overhead; UMAP's
+scaling ceiling) will land here.
