@@ -32,6 +32,7 @@ PY="${PY:-pixi run python}"                 # runner python; override if not usi
 GPU_SETUPS=("0" "0,1,2,3")                  # single vs multi (add "0,1" for a midpoint)
 CONCURRENCY=(4 16)
 MAX_WORKERS=(4 8)
+PRESET=("capacity","speed")
 
 # held constant across every run (isolate the swept variables)
 TOTAL_THREADS=64                            # machine cores; threads/worker = TOTAL/n_gpus
@@ -57,26 +58,28 @@ for gpus in "${GPU_SETUPS[@]}"; do
   gtag="${gpus//,/-}"
   for c in "${CONCURRENCY[@]}"; do
     for w in "${MAX_WORKERS[@]}"; do
-      i=$((i+1))
-      label="${DATA_TAG}_g${gtag}_c${c}_w${w}"
-      args=(--data-path "$DATA" --gpus "$gpus"
-        --zarr-concurrency "$c" --zarr-max-workers "$w"
-        --neighbors-algorithm "$algo" --threads-per-worker "$tpw"
-        --chunk-rows "$CHUNK_ROWS" --preset "$PRESET" --batch-key ""
-        --label "$label" --results-json "$OUTDIR/$label.json" --results-txt "$TXT")
-      # $PY may be "pixi run python" (multiple words) — split it, then the script + args
-      read -r -a py_words <<< "$PY"
-      full=("${py_words[@]}" "$BENCH" "${args[@]}")
-      echo
-      echo "############################################################################"
-      echo "# [$i] $label  (gpus=$gpus n_gpus=$n_gpus threads/worker=$tpw algo=$algo c=$c w=$w)"
-      echo "############################################################################"
-      if [[ "$DRY_RUN" == "1" ]]; then
-        printf '  %q' "${full[@]}"; echo
-      else
-        # don't let one bad config abort the whole sweep
-        "${full[@]}" || echo "# -> FAILED ($label), continuing"
-      fi
+      for p in "${PRESET[@]}"; do
+          i=$((i+1))
+          label="${DATA_TAG}_g${gtag}_c${c}_w${w}"
+          args=(--data-path "$DATA" --gpus "$gpus"
+            --zarr-concurrency "$c" --zarr-max-workers "$w"
+            --neighbors-algorithm "$algo" --threads-per-worker "$tpw"
+            --chunk-rows "$CHUNK_ROWS" --preset "$PRESET" --batch-key ""
+            --label "$label" --results-json "$OUTDIR/$label.json" --results-txt "$TXT")
+          # $PY may be "pixi run python" (multiple words) — split it, then the script + args
+          read -r -a py_words <<< "$PY"
+          full=("${py_words[@]}" "$BENCH" "${args[@]}")
+          echo
+          echo "############################################################################"
+          echo "# [$i] $label  (gpus=$gpus n_gpus=$n_gpus threads/worker=$tpw algo=$algo c=$c w=$w)"
+          echo "############################################################################"
+          if [[ "$DRY_RUN" == "1" ]]; then
+            printf '  %q' "${full[@]}"; echo
+          else
+            # don't let one bad config abort the whole sweep
+            "${full[@]}" || echo "# -> FAILED ($label), continuing"
+          fi
+      done
     done
   done
 done

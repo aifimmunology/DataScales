@@ -60,19 +60,23 @@ export default function Umap() {
   }, [level])
 
   // ---- lasso drawing (screen space) -> selection (world space) ----
-  const relPos = (e: React.PointerEvent<SVGSVGElement>): [number, number] => {
+  // Handlers live on a <div> overlay, not the <svg>: an empty svg defaults to
+  // pointer-events:visiblePainted, so the initial pointerdown (before any polygon
+  // is painted) falls through to the deck canvas and the lasso never starts. A div
+  // captures over its whole box unconditionally.
+  const relPos = (e: React.PointerEvent<HTMLDivElement>): [number, number] => {
     const r = e.currentTarget.getBoundingClientRect()
     return [e.clientX - r.left, e.clientY - r.top]
   }
 
-  const onPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     draggingRef.current = true
     pathRef.current = [relPos(e)]
     setLassoScreen(pathRef.current.slice())
     e.currentTarget.setPointerCapture(e.pointerId)
   }
 
-  const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!draggingRef.current) return
     pathRef.current.push(relPos(e))
     setLassoScreen(pathRef.current.slice())
@@ -89,7 +93,10 @@ export default function Umap() {
     // Unproject the drawn polygon to UMAP coords via the live viewport
     // (respects current pan/zoom), then point-in-polygon over the cells.
     const vp = deckRef.current?.deck?.getViewports?.()[0]
-    if (!vp) return
+    if (!vp) {
+      console.warn('[lasso] no deck viewport available — selection skipped')
+      return
+    }
     const world = screen.map(([x, y]) => {
       const u = vp.unproject([x, y])
       return [u[0], u[1]] as [number, number]
@@ -138,7 +145,11 @@ export default function Umap() {
       }
       return [base[0], base[1], base[2], 200]
     },
-    updateTriggers: { getFillColor: [level, selVersion] },
+    // `cat` MUST be here: it loads async, and deck.gl only re-runs getFillColor when
+    // a trigger changes. Without it, colors stay at the default until some *other*
+    // trigger fires (e.g. a lasso bumping selVersion) — which is exactly the bug where
+    // color-by looked dead until you selected a subset.
+    updateTriggers: { getFillColor: [level, selVersion, cat] },
     pickable: false,
   })
 
@@ -165,23 +176,27 @@ export default function Umap() {
         style={{ width: '100%', height: '100%' }}
       />
 
-      {/* Lasso overlay — captures pointer events only while selecting. */}
+      {/* Lasso overlay — a div captures the pointer (reliable full-box hit-testing);
+          the inner svg only draws the polygon (pointer-events:none so it never
+          intercepts). Present only while selecting. */}
       {selecting && (
-        <svg
+        <div
           style={{ position: 'absolute', inset: 0, zIndex: 10, cursor: 'crosshair' }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
         >
-          {lassoScreen.length > 1 && (
-            <polygon
-              points={lassoScreen.map(p => `${p[0]},${p[1]}`).join(' ')}
-              fill="rgba(255, 240, 30, 0.12)"
-              stroke="rgba(255, 240, 30, 0.9)"
-              strokeWidth={1.5}
-            />
-          )}
-        </svg>
+          <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+            {lassoScreen.length > 1 && (
+              <polygon
+                points={lassoScreen.map(p => `${p[0]},${p[1]}`).join(' ')}
+                fill="rgba(255, 240, 30, 0.12)"
+                stroke="rgba(255, 240, 30, 0.9)"
+                strokeWidth={1.5}
+              />
+            )}
+          </svg>
+        </div>
       )}
 
       <SelectionControls
