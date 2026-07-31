@@ -1,61 +1,30 @@
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "datascale"
+name = "datascales-project"
 version = "0.1.0"
-description = "Configurable AnnData to Zarr converter with strong validation"
+description = "DataScale project hub — installable tools/ plus per-cohort project folders"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "DataScale" }]
-dependencies = [
-  "anndata>=0.10.0",
-  "zarr>=2.18.0",
-  "numpy>=1.24.0",
-  "scipy>=1.10.0",
-  "PyYAML>=6.0",
-  "scanpy>=1.9.0",
-  "dask[array]>=2023.1.0",
-  "icechunk>=2.0.6",
-]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 
-[project.optional-dependencies]
-dev = [
-  "pytest>=8.0",
-]
-
-[project.scripts]
-datascale = "datascale.cli:main"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["datascale*"]
-
+# The hub is not itself a Python package — each tool under tools/ is its own installable
+# package with its own pixi environment. This env serves the project folders (notebooks,
+# analyses) that read/write stores.
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64", "win-64"]
 
-[tool.pixi.pypi-dependencies]
-datascale = { path = ".", editable = true }
-
 [tool.pixi.environments]
 default = { solve-group = "default" }
-dev = { features = ["dev"], solve-group = "default" }
-
-[tool.pixi.tasks]
-# Run the zarr query benchmark CLI; pass flags after the task name, e.g.
-#   pixi run zarr-bench --store zarr_dbs/health_atlas_csr_1000.zarr --axis obs --count 1000
-zarr-bench = "python -m zarr_query_benchmarking"
-zarr-bench-inspect = "python -m zarr_query_benchmarking --inspect"
-# Tests live in the dev environment: pixi run -e dev test-zarr-bench
-test-zarr-bench = "python -m pytest tests/test_zarr_query_benchmarking.py -q"
-
-[tasks]
-kernel = "python -m ipykernel install --user --name <kernelname> --display-name 'Python (<kernelname>)'"
 
 [tool.pixi.dependencies]
 scanpy = ">=1.12.1,<2"
 dask = ">=2026.3.0,<2027"
 notebook = ">=7.5.6,<8"
 gcsfs = ">=2026.3.0"
+anndata = ">=0.11"
+zarr = ">=3.0"
+
+[tool.pixi.tasks]
+kernel = "python -m ipykernel install --user --name datascales --display-name 'Python (datascales)'"
