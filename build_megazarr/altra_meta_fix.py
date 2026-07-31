@@ -4,11 +4,11 @@ import scanpy as sc
 import hisepy as hp
 
 # Grab data from HISE
-meta_path = hp.reader.cache_files(['cf5fdfaa-b643-4379-a908-e125e5a58dfe'])
-metadata = pd.read_csv(meta_path)
+meta_path = hp.reader.cache_files(['242128d8-4449-4b03-a00c-d9729a511437'])
+metadata = pd.read_csv(meta_path[0])
 
 altra_path = hp.reader.cache_files(['7e90bfe0-03b0-438d-b654-cdfbff994bd6'])
-adata = sc.read_h5ad(altra_path) 
+adata = sc.read_h5ad(altra_path[0]) 
 
 # Swap PB to KT and remove trailing numbers to get KIT ID
 adata.obs["sample.sampleKitGuid"] = (
@@ -32,4 +32,4 @@ adata.obs = (
     .set_index(adata.obs.index.name or "")
 )
 
-adata.write("altra_with_meta.h5ad")
+# adata.write("altra_with_meta.h5ad")
