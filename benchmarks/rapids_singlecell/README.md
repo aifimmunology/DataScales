@@ -136,13 +136,29 @@ options, and RAPIDS turns a **10-hour** CPU run into **~1.4 h**.
 
 ---
 
-## Multi-GPU scaling comparison *(coming soon)*
+## Multi-GPU scaling: 1 vs 4 GPUs
 
-The numbers above fix RAPIDS at **4 GPUs**. A GPU-count scaling study — **1 → 2 → 4 GPUs**
-on an identical store, holding chunk shape, codec, preset, and total host-decode threads
-constant so we isolate GPU count alone — is running via
-[`sweep_gpu_zarr.sh`](sweep_gpu_zarr.sh) (which also sweeps `--zarr-concurrency` ×
-`--zarr-max-workers` and derives the neighbors algorithm from GPU count:
-`mg_ivfflat` multi-GPU vs `ivfflat` single). Results, a per-step scaling curve, and notes on
-where scaling breaks down (small steps dominated by cluster/comm overhead; UMAP's
-scaling ceiling) will land here.
+Full sweep in [`results/multi-gpu.csv`](results/multi-gpu.csv): the same 5M sorted store run
+at **1 GPU** (`ivfflat`) and **4 GPUs** (`mg_ivfflat`), each across a `--zarr-concurrency` ×
+`--zarr-max-workers` grid (chunk shape, codec, and preset held constant so GPU count is the
+variable). Values below are the **median** over each GPU count's grid.
+
+**4 GPUs cut total wall ~1.3×, not ~4×** — median full-pipeline **~17.7 min (1 GPU) →
+~13.3 min (4 GPU)**. It falls well short of linear because the two dominant steps don't scale:
+
+| Step (median) | 1 GPU | 4 GPU | Scaling |
+|---|---:|---:|---:|
+| preprocessing | 138 s | 46 s | ~3× |
+| HVG | 259 s | 104 s | ~2.5× |
+| neighbors | 104 s | 60 s | ~1.7× |
+| UMAP | 319 s | 327 s | ~1× (flat) |
+| Leiden | 230 s | 230 s | ~1× (flat) |
+| **total** | **1065 s** | **795 s** | **~1.3×** |
+
+UMAP + Leiden are ~70% of the 4-GPU wall and are effectively single-GPU-bound, so extra GPUs
+only speed up the parallel front half (preprocess / HVG / neighbors). Within each GPU count the
+read-config sweep mostly moves preprocessing/HVG: `--zarr-max-workers 1` starves host decode
+(preprocessing ~80 s vs ~44 s at 4 GPU) while `w4`–`w16` are all near-optimal — decode threads,
+not fetch concurrency, are the lever. Cost of the extra GPUs is host RAM: ~50–60 GB peak
+(4 GPU, 16 workers) vs ~18–40 GB single-GPU, and ~48 GB VRAM spread over 4 devices vs ~15 GB
+on one.

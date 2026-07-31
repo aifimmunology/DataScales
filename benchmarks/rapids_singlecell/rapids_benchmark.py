@@ -36,7 +36,7 @@ you can script a sweep of near-identical runs without editing source:
 
     # speed preset (ucx + rmm pool) with a hard protocol override
     pixi run python rapids_benchmark.py --gpus 0,1,2,3 --preset speed \
-        --protocol tcp --rmm-pool-size 70%
+        --protocol tcp --rmm-pool-size 0.7
 
 Key correctness notes (see CLAUDE.md):
   * ZARR CONFIG REACHES THE WORKERS. `zarr.config` is a *runtime* (donfig) setting,
@@ -92,7 +92,7 @@ class Config:
     preset: str = "capacity"           # "capacity" (tcp+managed) | "speed" (ucx+rmm pool)
     protocol: str | None = None        # hard override of preset transport ("tcp"|"ucx")
     rmm_mode: str | None = None        # hard override: "managed" | "pool" | "none"
-    rmm_pool_size: str = "80%"         # per-worker pool (only when rmm mode == pool)
+    rmm_pool_size: float = 0.8         # per-worker pool as fraction of device mem (pool mode only)
     threads_per_worker: int = 1        # dask-cuda worker threadpool (GPU-safe default=1)
     enable_cudf_spill: bool = True     # spill cuDF (obs/var) from VRAM to host under pressure
 
