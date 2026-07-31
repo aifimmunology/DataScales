@@ -223,3 +223,11 @@ __marimo__/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+*.h5ad
+*.zarr/
+*.icechunk/
+*.parquet
+.ipynb_checkpoints/
+__pycache__/
+*.egg-info/
+.pixi/
