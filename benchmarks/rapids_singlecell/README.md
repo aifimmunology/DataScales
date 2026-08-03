@@ -26,7 +26,7 @@ multi-GPU pipeline that reads a Zarr store lazily through Dask-CUDA:
 
 ```
 load_zarr → h2d_transfer → preprocessing (qc+normalize+log1p) → hvg → scaling
-          → pca → harmony (if --batch-key) → neighbors → umap → leiden → write_h5ad
+          → pca → harmony (if --batch-key) → neighbors → umap → leiden → write_results
 ```
 
 Every field of the `Config` dataclass has a matching `--flag`, so a sweep is a shell loop —
@@ -35,16 +35,18 @@ no source edits. GPU/CUDA-only; run it on the GPU node's pixi env (`--help` work
 ```bash
 # 4-GPU run, capacity preset (tcp + managed memory)
 pixi run python rapids_benchmark.py \
-    --data-path /path/to/5M.zarr --gpus 0,1,2,3 \
-    --results-json results/5M_4gpu.json --label 5M_4gpu
+    --data-path /path/to/5M.zarr --gpus 0,1,2,3 --label 5M_4gpu
 ```
 
 Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM),
 `--preset capacity|speed`, `--zarr-concurrency`/`--zarr-max-workers` (applied on *every*
 worker), `--chunk-rows`, and the pipeline params (`--n-top-genes`, `--n-comps`,
-`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). Each run writes
-`results/*.json` with full provenance (library versions, CUDA/driver, GPU model, dataset
-shape/nnz, resolved thread budget). See the module docstring and `--help` for the rest.
+`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). By default the
+final step writes the UMAP embedding (`obsm/X_umap`) and leiden labels (`obs/leiden`) back
+**into the input store** as an anndata-readable layer — no h5ad, no X rematerialization;
+`--results-store` retargets it, `--no-write-results` skips it. Each run also appends a
+per-step summary to `results/Run_results.txt` headed by the date, store, GPUs, and any cfg
+options left off their defaults. See the module docstring and `--help` for the rest.
 
 ---
 

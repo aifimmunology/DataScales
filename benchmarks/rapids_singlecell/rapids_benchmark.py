@@ -16,7 +16,9 @@ Steps measured:
   8. neighbors      neighbors
   9. umap           umap
  10. leiden         leiden
- 11. write_h5ad     (only if --h5ad-out set) materialize HVG X to host CSR + write
+ 11. write_results  (default on) append the UMAP embedding (obsm/X_umap) + leiden
+                    labels (obs/leiden) onto the zarr store — anndata-readable, and
+                    crucially no X rematerialization; skip with --no-write-results
 
 Everything that was hardcoded is now a knob: GPUs, zarr read concurrency/threads,
 dask-cuda threads/protocol/RMM, chunk size, data path, and the pipeline params.
@@ -26,13 +28,12 @@ you can script a sweep of near-identical runs without editing source:
     # 4-GPU baseline, capacity preset (tcp + managed memory)
     pixi run python rapids_benchmark.py \
         --data-path /home/workspace/temp/2M_50M.zarr --gpus 0,1,2,3 \
-        --results-json results/2M_4gpu.json --label 2M_4gpu
+        --label 2M_4gpu
 
     # same store, single GPU, smaller chunk, more zarr read threads per worker
     pixi run python rapids_benchmark.py \
         --data-path /home/workspace/temp/2M_50M.zarr --gpus 0 \
-        --chunk-rows 12000 --zarr-max-workers 8 \
-        --results-json results/2M_1gpu.json --label 2M_1gpu
+        --chunk-rows 12000 --zarr-max-workers 8 --label 2M_1gpu
 
     # speed preset (ucx + rmm pool) with a hard protocol override
     pixi run python rapids_benchmark.py --gpus 0,1,2,3 --preset speed \
@@ -61,15 +62,11 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import os
-import platform
-import subprocess
-import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 
 # Pin host BLAS/OpenMP threads so N worker processes don't each spawn N BLAS
@@ -103,7 +100,12 @@ class Config:
     # -- data / layout --
     data_path: str = "/home/workspace/temp/2M_50M_pbmc.zarr"
     chunk_rows: int = 24_000           # row block for read (multiple of the store's row chunk)
-    h5ad_out: str = ""                 # if set, write the processed HVG AnnData here
+
+    # -- result write-back (UMAP embedding + leiden labels onto the zarr, no h5ad) --
+    write_results: bool = True         # append obsm/X_umap + obs/leiden to the store as a final step
+    results_store: str = ""            # target store; "" -> write back into data_path (a layer on the input)
+    umap_key: str = "X_umap"           # obsm key for the embedding (anndata default)
+    leiden_key: str = "leiden"         # obs column for the labels (anndata default)
 
     # -- pipeline params --
     n_top_genes: int = 2000
@@ -120,8 +122,7 @@ class Config:
     # -- sampling / output --
     sample_interval_s: float = 0.02    # memory poll interval (GPU changes fast)
     results_txt: str = "results/Run_results.txt"  # human-readable append log ("" to skip)
-    results_json: str = ""             # raw provenance + per-step JSON ("" to skip)
-    label: str = ""                    # free tag stored in provenance/header
+    label: str = ""                    # free tag shown in the run header/log
 
     @property
     def gpu_ids(self) -> list[int]:
@@ -145,7 +146,7 @@ def parse_config(argv=None) -> Config:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    bool_fields = {"pca_float64", "enable_cudf_spill"}
+    bool_fields = {"pca_float64", "enable_cudf_spill", "write_results"}
     for f in fields(Config):
         flag = "--" + f.name.replace("_", "-")
         default = getattr(base, f.name)
@@ -331,112 +332,79 @@ def _set_zarr_config(concurrency: int, max_workers: int) -> None:
     })
 
 
-# ── provenance ────────────────────────────────────────────────────────────────
-def _pkg_versions() -> dict:
-    import importlib.metadata as md
-    pkgs = ("rapids-singlecell", "cupy", "cudf", "cuml", "dask", "distributed",
-            "dask-cuda", "rmm", "zarr", "anndata", "numcodecs", "scipy", "numpy", "pynvml")
-    out = {}
-    for pkg in pkgs:
-        try:
-            out[pkg] = md.version(pkg)
-        except Exception:
-            out[pkg] = "MISSING"
-    return out
-
-
-def _describe_store(path: str) -> dict:
-    """Cheap metadata read: shape / dtype / nnz of X (sparse or dense)."""
-    import zarr
-    info: dict = {"path": path}
-    try:
-        f = zarr.open(path, mode="r")
-        X = f["X"]
-        enc = dict(getattr(X, "attrs", {})).get("encoding-type", "array")
-        info["encoding_type"] = enc
-        if "csr_matrix" in enc or "csc_matrix" in enc:
-            info["shape"] = list(X.attrs["shape"])
-            info["dtype"] = str(X["data"].dtype)
-            info["nnz"] = int(X["indptr"][-1])
-        else:
-            info["shape"] = list(X.shape)
-            info["dtype"] = str(X.dtype)
-            info["nnz"] = None
-    except Exception as e:
-        info["error"] = f"{type(e).__name__}: {e}"
-    return info
-
-
-def _gpu_provenance(physical_ids: list[int]) -> dict:
-    out: dict = {"physical_ids": physical_ids}
-    if not _NVML_OK:
-        return out
-    import pynvml
-    try:
-        drv = pynvml.nvmlSystemGetDriverVersion()
-        out["driver_version"] = drv.decode() if isinstance(drv, bytes) else drv
-    except Exception:
-        pass
-    names = []
-    for h in _GPU_HANDLES:
-        try:
-            n = pynvml.nvmlDeviceGetName(h)
-            names.append(n.decode() if isinstance(n, bytes) else n)
-        except Exception:
-            names.append("unknown")
-    out["gpu_names"] = names
-    return out
+# ── run header (date + the knobs the user actually set) ─────────────────────────
+def _changed_cfg(cfg: Config) -> dict:
+    """Config fields the user actually overrode (value != dataclass default). The store,
+    GPUs, and label are surfaced on their own line, so drop them from this diff."""
+    base = Config()
+    shown = {"data_path", "gpus", "label"}
+    return {f.name: getattr(cfg, f.name) for f in fields(cfg)
+            if f.name not in shown and getattr(cfg, f.name) != getattr(base, f.name)}
 
 
 def provenance(cfg: Config) -> dict:
-    try:
-        git = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], text=True,
-            stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        git = "unknown"
-    ids = cfg.gpu_ids
-    protocol, rmm_mode = cfg.resolve_cluster()
-    thread_budget = len(ids) * cfg.threads_per_worker * cfg.zarr_max_workers
+    """Just what identifies/parameterises this run: timestamp + the user's inputs (store,
+    GPUs, and any cfg field left off its default). No auto-collected env facts."""
     return {
         "label": cfg.label,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "host": platform.node(),
-        "platform": platform.platform(),
-        "cpu_count": os.cpu_count(),
-        "git": git,
-        "config": asdict(cfg),
-        "resolved": {"protocol": protocol, "rmm_mode": rmm_mode,
-                     "host_decode_thread_budget": thread_budget},
-        "env_threads": {v: os.environ.get(v, "unset") for v in
-                        ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")},
-        "versions": _pkg_versions(),
-        "gpu": _gpu_provenance(ids),
-        "dataset": _describe_store(cfg.data_path),
+        "data_path": cfg.data_path,
+        "gpus": cfg.gpu_ids,
+        "changed": _changed_cfg(cfg),
     }
 
 
-# ── optional h5ad writer ──────────────────────────────────────────────────────
-def _write_h5ad(adata, path: str) -> None:
-    """Materialize the dask X to a single host CSR (block-by-block, never gathering
-    the full matrix onto one GPU), move the rest of adata to host, write one h5ad.
-    Peak host RAM ≈ one full HVG CSR; peak VRAM ≈ one block above what is resident."""
-    import scipy.sparse as sp
-    import rapids_singlecell as rsc
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    X = adata.X
-    if hasattr(X, "numblocks"):
-        parts = []
-        for bi in range(X.numblocks[0]):
-            ck = X.blocks[bi, 0].compute()
-            if hasattr(ck, "get"):  # cupyx CSR -> scipy CSR
-                ck = ck.get()
-            parts.append(ck)
-        adata.X = sp.vstack(parts, format="csr")
-        del parts
-    rsc.get.anndata_to_CPU(adata)
-    adata.write_h5ad(path, compression="gzip")
-    print(f"  h5ad written: {path}")
+def _format_header(prov: dict) -> str:
+    """The run header shared by stdout and the Run_results.txt append log."""
+    changed = prov["changed"]
+    changed_str = ", ".join(f"{k}={v}" for k, v in changed.items()) if changed else "(defaults)"
+    return (
+        f"Rapids-Singlecell Benchmark  —  {prov['timestamp']}  —  label: {prov['label'] or '-'}\n"
+        f"store: {prov['data_path']}  —  GPUs: {prov['gpus']}\n"
+        f"changed cfg: {changed_str}"
+    )
+
+
+# ── result write-back (UMAP + leiden -> zarr, anndata-readable) ─────────────────
+def _write_results(adata, cfg: Config) -> None:
+    """Writing the UMAP and Leiden clustering results.
+
+    Target defaults to `data_path` (add a layer onto the input store); `--results-store`
+    points it elsewhere. `write_elem` overwrites existing keys, so re-runs are idempotent."""
+    import numpy as np
+    import zarr
+    from anndata.io import write_elem
+
+    store = cfg.results_store or cfg.data_path
+
+    umap = adata.obsm[cfg.umap_key]
+    if hasattr(umap, "get"):            # cupy -> host (rsc already gathers; belt-and-braces)
+        umap = umap.get()
+    umap = np.asarray(umap)
+    leiden = adata.obs[cfg.leiden_key].values
+         
+    #Check if consolidated. Important when reclosing the store
+    was_consolidated = (
+        zarr.open_group(store, mode="r").metadata.consolidated_metadata is not None
+    )
+    root = zarr.open_group(store, mode="r+", use_consolidated=False)
+
+    obsm = root["obsm"] if "obsm" in root else root.create_group("obsm")
+    obsm.attrs["encoding-type"] = "dict"
+    obsm.attrs["encoding-version"] = "0.1.0"
+    write_elem(obsm, cfg.umap_key, umap)
+
+    obs = root["obs"]
+    write_elem(obs, cfg.leiden_key, leiden)
+    order = list(obs.attrs.get("column-order", []))
+    if cfg.leiden_key not in order:
+        obs.attrs["column-order"] = order + [cfg.leiden_key]
+
+    if was_consolidated:
+        zarr.consolidate_metadata(store)
+
+    print(f"  results -> {store}: obsm/{cfg.umap_key} + obs/{cfg.leiden_key}"
+          + ("  (metadata re-consolidated)" if was_consolidated else ""))
 
 
 # ── the pipeline ──────────────────────────────────────────────────────────────
@@ -515,9 +483,9 @@ def run_pipeline(cfg: Config) -> None:
         rsc.tl.leiden(adata, resolution=cfg.leiden_resolution,
                       n_iterations=cfg.leiden_iterations, random_state=cfg.random_seed)
 
-    if cfg.h5ad_out:
-        with step("write_h5ad"):
-            _write_h5ad(adata, cfg.h5ad_out)
+    if cfg.write_results:
+        with step("write_results"):
+            _write_results(adata, cfg)
 
 
 # ── report ────────────────────────────────────────────────────────────────────
@@ -539,33 +507,10 @@ def report(cfg: Config, prov: dict) -> None:
 
     if cfg.results_txt:
         os.makedirs(os.path.dirname(cfg.results_txt) or ".", exist_ok=True)
-        r = prov["resolved"]
-        header = (
-            f"Rapids-Singlecell Benchmark  —  {prov['timestamp']}  —  label: {cfg.label or '-'}\n"
-            f"input: {cfg.data_path}  —  GPUs: {cfg.gpu_ids}  —  chunk_rows: {cfg.chunk_rows}\n"
-            f"preset: {cfg.preset} -> {r['protocol']}/{r['rmm_mode']}  —  "
-            f"threads/worker: {cfg.threads_per_worker}  —  zarr concx/threads: "
-            f"{cfg.zarr_concurrency}/{cfg.zarr_max_workers}  —  host decode budget: "
-            f"{r['host_decode_thread_budget']}"
-        )
+        header = _format_header(prov)
         with open(cfg.results_txt, "a") as fh:
             fh.write(header + "\n" + "=" * 80 + "\n" + summary + "\n\n")
         print(f"Summary appended to: {cfg.results_txt}")
-
-    if cfg.results_json:
-        os.makedirs(os.path.dirname(cfg.results_json) or ".", exist_ok=True)
-        payload = {
-            "provenance": prov,
-            "results": [
-                {"step": s, "wall_s": w, "peak_host_mb": h, "peak_gpu_mb": g}
-                for s, w, h, g in RESULTS
-            ],
-            "totals": {"wall_s": total_wall, "peak_host_mb": overall_host,
-                       "peak_gpu_mb": overall_gpu},
-        }
-        with open(cfg.results_json, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        print(f"Raw results -> {cfg.results_json}")
 
 
 # ── entrypoint ────────────────────────────────────────────────────────────────
@@ -594,12 +539,7 @@ def main(cfg: Config) -> None:
 
         prov = provenance(cfg)
         print()
-        print(f"Rapids-Singlecell Benchmark  —  {prov['timestamp']}  —  label: {cfg.label or '-'}")
-        print(f"input: {cfg.data_path}  —  GPUs: {physical_ids}  "
-              f"({protocol}/{rmm_mode}, {cfg.threads_per_worker} thr/worker)")
-        print(f"host decode thread budget = {len(physical_ids)} gpus x "
-              f"{cfg.threads_per_worker} thr/worker x {cfg.zarr_max_workers} zarr = "
-              f"{prov['resolved']['host_decode_thread_budget']}")
+        print(_format_header(prov))
         print("=" * 80)
 
         run_pipeline(cfg)
