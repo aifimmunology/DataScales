@@ -721,9 +721,8 @@ def _write_sorted_backed(
             tg.attrs["encoding-type"] = "csr_matrix"
             tg.attrs["encoding-version"] = "0.1.0"
             tg.attrs["shape"] = [n_rows_each[gi], n_vars]
-            flat = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_each[gi]))
-            tg.require_array("data", shape=(nnz_each[gi],), dtype=x_dtype, chunks=(flat,), overwrite=True)
-            tg.require_array("indices", shape=(nnz_each[gi],), dtype=indices_dtype, chunks=(flat,), overwrite=True)
+            tg.require_array("data", shape=(nnz_each[gi],), dtype=x_dtype, chunks="auto", overwrite=True)
+            tg.require_array("indices", shape=(nnz_each[gi],), dtype=indices_dtype, chunks="auto", overwrite=True)
             ip = tg.require_array(
                 "indptr", shape=(n_rows_each[gi] + 1,), dtype=np.int64,
                 chunks=(n_rows_each[gi] + 1,), overwrite=True,
