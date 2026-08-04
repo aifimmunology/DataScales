@@ -116,7 +116,7 @@ class Config:
     leiden_iterations: int = 100
     umap_min_dist: float = 0.45
     pca_float64: bool = True           # cast X to float64 before scale for stable std
-    batch_key: str = "pool_id"         # obs column for harmony; "" disables the harmony step
+    batch_key: str = ""         # obs column for harmony; "" disables the harmony step
     random_seed: int = 5671
 
     # -- sampling / output --

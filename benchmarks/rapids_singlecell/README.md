@@ -118,8 +118,8 @@ small machine at all), **the GPU buys the wall-clock**.
 
 ### Totals across datasets
 
-Full-pipeline wall time and peak memory. RAPIDS = 4× GPU. Speedup is vs Base Scanpy where a
-baseline exists, else vs Scanpy Zarr/Dask (†).
+Full-pipeline wall time and peak memory. RAPIDS = 4× GPU unless noted. Speedup is vs Base
+Scanpy where a baseline exists, else vs Scanpy Zarr/Dask (†).
 
 | Dataset (~cells) | Pipeline | Total wall | Peak host | Peak VRAM | Speedup |
 |------------------|----------|-----------:|----------:|----------:|--------:|
@@ -132,13 +132,40 @@ baseline exists, else vs Scanpy Zarr/Dask (†).
 | **13M Soundlife Single-Cell** | Base Scanpy | — *(didn't fit)* | — | — | — |
 | | Scanpy Zarr/Dask | 10 h 01 m | 147 GB | — | 1× † |
 | | **RAPIDS Zarr/Dask** | **1 h 26 m** | 92 GB | 52 GB | **7.0×** † |
+| **~30M megazarr (~80 GB instance)** | **RAPIDS Zarr/Dask, 1× GPU** | **~46 min** | 46 GB | ~80 GB | — ‡ |
+
+† *vs Scanpy Zarr/Dask (no in-memory baseline).*  ‡ *Single 80 GB GPU, RMM managed memory —
+no CPU baseline (doesn't fit) and no 4-GPU run yet.*
 
 At 13M cells, in-memory baseline Scanpy no longer fits — the streamed pipelines are the only
 options, and RAPIDS turns a **10-hour** CPU run into **~1.4 h**.
 
+At **~30M cells / ~80 GB on a single GPU** the run is **VRAM-bound**: neighbors alone peaks the
+whole 80 GB card. It still finishes in **~46 min** (~43–46 min across store variants), with
+neighbors + UMAP + Leiden ≈ **55% of the wall** — and those are the steps that scale worst with
+cell count (neighbors and UMAP ~**10×** slower from 5M→30M, Leiden ~6×, vs ~4× for
+preprocess/HVG).
+
+### RMM allocator: managed vs pool (single GPU)
+
+On the 5M store (1 GPU, everything else held constant) the RMM mode is a **~1.4× total-wall
+lever**, and it lands almost entirely on the two graph steps:
+
+| Step (5M, 1 GPU) | managed | pool | Speedup |
+|---|---:|---:|---:|
+| neighbors | 38 s | 14 s | **2.7×** |
+| Leiden | 105 s | 19 s | **5.6×** |
+| **total** | **479 s** | **337 s** | **1.4×** |
+
+preprocessing, HVG, and UMAP barely move. Managed memory oversubscribes VRAM to host, so the
+kNN-graph and community-detection steps thrash across PCIe (silent perf killer #9); a resident
+pool removes it. The cost is headroom — pool pins ~the whole card (~74–81 GB VRAM) vs ~16 GB for
+managed — which is exactly why the **~30M store above must use managed to fit at all**, trading
+that 1.4× back for the ability to run on one GPU.
+
 ---
 
-## Multi-GPU scaling: 1 vs 4 GPUs
+## Multi-GPU scaling: 1 vs 4 GPUs on HISE
 
 Full sweep in [`results/multi-gpu.csv`](results/multi-gpu.csv): the same 5M sorted store run
 at **1 GPU** (`ivfflat`) and **4 GPUs** (`mg_ivfflat`), each across a `--zarr-concurrency` ×
