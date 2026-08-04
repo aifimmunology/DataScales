@@ -974,25 +974,23 @@ def _append_dense_region(
         )
 
 
-def _append_sparse_csr_region(
-    data_arr: Any,
-    indices_arr: Any,
+def _csr_dask_parts(
     matrix: Any,
     indptr_full: Any,
-    nnz_offset: int,
     n_rows: int,
     nnz_total: int,
     data_dtype: Any,
     indices_dtype: Any,
-    cfg: AppConfig,
-) -> None:
-    """Stream one CSR matrix's data + indices into existing zarr arrays at nnz_offset."""
+) -> tuple[list[Any], list[Any]]:
+    """Build (data_parts, indices_parts) dask arrays for ONE CSR matrix, batched by ~256 MB.
+
+    Returns lazy parts rather than writing them, so callers can concatenate parts across many
+    matrices and issue a SINGLE ``da.store`` — see :func:`_write_concatenated_csr` for why that
+    matters.
+    """
     import numpy as np
     import dask
     import dask.array as da
-    from dask.diagnostics import ProgressBar
-
-    backed = not sp.issparse(matrix)
 
     _TARGET_BATCH_BYTES = 256 * 1024 * 1024
     avg_nnz = max(1, nnz_total // max(1, n_rows))
@@ -1014,22 +1012,7 @@ def _append_sparse_csr_region(
             dask.delayed(lambda b: np.asarray(b.indices, dtype=indices_dtype))(batch),
             shape=(bnnz,), dtype=indices_dtype,
         ))
-
-    if not data_parts:
-        return
-
-    data_dask = da.concatenate(data_parts)
-    indices_dask = da.concatenate(indices_parts)
-    region = (slice(nnz_offset, nnz_offset + nnz_total),)
-    scheduler = "synchronous" if backed else "threads"
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
-        da.store(
-            [data_dask, indices_dask],
-            [data_arr, indices_arr],
-            regions=[region, region],
-            scheduler=scheduler,
-            num_workers=1 if backed else cfg.chunks.cpus,
-        )
+    return data_parts, indices_parts
 
 
 def _write_concatenated_csr(
@@ -1086,16 +1069,46 @@ def _write_concatenated_csr(
         nnz_offset += nnz_i
     indptr_arr[:] = full_indptr
 
-    # Stream each matrix's data + indices to its nnz region.
-    nnz_offset = 0
+    # ── ONE da.store across ALL matrices, rechunked to the output chunk grid ──
+    # This used to be one `da.store` per matrix, writing into an arbitrary nnz region. Two costs
+    # made that pathological once the matrix count got large (e.g. `--sort-by` on high-cardinality
+    # keys, which buckets one matrix per distinct key tuple):
+    #   1. Every `da.store` is wrapped in `ProgressBar(dt=1.0)`, whose teardown joins a timer
+    #      thread sleeping `dt` — ~1 s of fixed cost per matrix regardless of payload. Measured
+    #      slope was 1.02 s/matrix, so 10^5 groups meant tens of hours of pure overhead.
+    #   2. A per-matrix nnz region is never chunk-aligned, so zarr read-modify-wrote a whole
+    #      `flat_chunk` (data + indices) for every matrix — amplification ~= flat_chunk/mean nnz.
+    # Concatenating the lazy parts and rechunking to `flat_chunk` fixes both: one ProgressBar for
+    # the whole write, and each output chunk written exactly once.
+    import dask.array as da
+    from dask.diagnostics import ProgressBar
+
+    all_data, all_indices = [], []
+    backed_any = False
     for matrix, ip, n_obs_i, nnz_i in zip(matrices, indptrs, n_obs_each, nnz_each):
-        if nnz_i > 0:
-            _append_sparse_csr_region(
-                data_arr, indices_arr, matrix, ip,
-                nnz_offset, n_obs_i, nnz_i,
-                data_dtype, indices_dtype, cfg,
-            )
-        nnz_offset += nnz_i
+        if nnz_i == 0:
+            continue
+        if not sp.issparse(matrix):
+            backed_any = True  # backed _CSRDataset: h5py/zarr handle, not thread-safe
+        d_parts, i_parts = _csr_dask_parts(
+            matrix, ip, n_obs_i, nnz_i, data_dtype, indices_dtype
+        )
+        all_data.extend(d_parts)
+        all_indices.extend(i_parts)
+
+    if not all_data:
+        return
+
+    data_dask = da.concatenate(all_data).rechunk((flat_chunk,))
+    indices_dask = da.concatenate(all_indices).rechunk((flat_chunk,))
+    scheduler = "synchronous" if backed_any else "threads"
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+        da.store(
+            [data_dask, indices_dask],
+            [data_arr, indices_arr],
+            scheduler=scheduler,
+            num_workers=1 if backed_any else cfg.chunks.cpus,
+        )
 
 
 def _write_concatenated_dense(

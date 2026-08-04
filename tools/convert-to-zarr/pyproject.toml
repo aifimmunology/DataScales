@@ -11,7 +11,9 @@ requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 dependencies = [
-  "anndata>=0.11.0",
+  # <0.13: 0.13 adds a None key to .layers aliasing .X, which breaks the layers write path
+  # (and makes len(layers) disagree with bool(layers)). Pin to the validated 0.12.x line.
+  "anndata>=0.12.10,<0.13",
   "zarr>=3.0.0",
   "numpy>=1.24.0",
   "scipy>=1.10.0",
@@ -45,3 +47,4 @@ dev = { features = ["dev"], solve-group = "default" }
 [tool.pixi.dependencies]
 scanpy = ">=1.12.1,<2"
 dask = ">=2026.3.0,<2027"
+anndata = ">=0.12.10,<0.13"
