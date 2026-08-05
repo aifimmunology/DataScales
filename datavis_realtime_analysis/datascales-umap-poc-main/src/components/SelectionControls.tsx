@@ -37,11 +37,9 @@ export default function SelectionControls({
   )
 }
 
+// Positioned by the top-left stack wrapper in Umap.tsx (kept in normal flow so the
+// View picker stacks beneath it).
 const panelStyle: React.CSSProperties = {
-  position: 'absolute',
-  top: 12,
-  left: 12,
-  zIndex: 20, // above the lasso svg overlay so the buttons stay clickable
   display: 'flex',
   flexDirection: 'column',
   gap: 8,

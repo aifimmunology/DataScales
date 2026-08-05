@@ -27,11 +27,8 @@ export default function GroupPicker({ groups, active, onChange }: Props) {
   )
 }
 
+// Positioned by the top-left stack wrapper in Umap.tsx, beneath the selection tool.
 const panelStyle: React.CSSProperties = {
-  position: 'absolute',
-  top: 12,
-  left: 12,
-  zIndex: 20, // above the lasso svg overlay
   background: 'rgba(20, 20, 20, 0.85)',
   border: '1px solid #333',
   borderRadius: 6,

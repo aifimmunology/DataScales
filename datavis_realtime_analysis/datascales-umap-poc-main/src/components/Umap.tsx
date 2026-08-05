@@ -226,14 +226,17 @@ export default function Umap() {
         </div>
       )}
 
-      <SelectionControls
-        selecting={selecting}
-        onToggle={toggleSelecting}
-        count={selection?.indices.length ?? 0}
-        onDownload={downloadCurrent}
-        onClear={clearSelection}
-      />
-      <GroupPicker groups={groups} active={group} onChange={setGroup} />
+      {/* Top-left stack: selection tool on top, View picker beneath it. */}
+      <div style={topLeftStack}>
+        <SelectionControls
+          selecting={selecting}
+          onToggle={toggleSelecting}
+          count={selection?.indices.length ?? 0}
+          onDownload={downloadCurrent}
+          onClear={clearSelection}
+        />
+        <GroupPicker groups={groups} active={group} onChange={setGroup} />
+      </div>
       <Legend level={level} onLevelChange={setLevel} categories={cat?.categories ?? null} />
     </>
   )
@@ -260,6 +263,19 @@ function fitView(pts: Point[]): { target: [number, number, number]; zoom: number
   const vw = window.innerWidth || 800, vh = window.innerHeight || 600
   const zoom = Math.log2(Math.min(vw / extentX, vh / extentY) * 0.9)
   return { target: [cx, cy, 0], zoom: Math.max(-2, Math.min(zoom, 10)) }
+}
+
+// Top-left overlay column: selection controls, then the View picker below them.
+// zIndex 20 keeps it above the lasso svg overlay (zIndex 10).
+const topLeftStack: React.CSSProperties = {
+  position: 'absolute',
+  top: 12,
+  left: 12,
+  zIndex: 20,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 8,
+  alignItems: 'flex-start',
 }
 
 const overlayStyle: React.CSSProperties = {
