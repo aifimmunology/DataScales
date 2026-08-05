@@ -1,14 +1,18 @@
 """Re-run the RAPIDS single-cell UMAP pipeline on cells selected in the datavis app.
 
-Script form of rapids_user_notebook/rapids_GPU_sc_analysis.ipynb, with one change:
-the AnnData is built from only the barcodes listed in the datavis selection file.
+Script form of rapids_user_notebook/rapids_GPU_sc_analysis.ipynb, with two changes:
+the AnnData is built from only the barcodes in the datavis selection file, and the
+result is written as a small self-contained "view" store (VIEW_STORE) rather than an
+.h5ad. The view holds just obsm/X_umap (the new coords) + obs (AIFI_L* labels and
+barcodes) for the selected cells and NO X — exactly what the datavis viewer reads, by
+row position. Open it in the app with DATA_DIR=<VIEW_STORE>.
 Run on the HISE/GPU node:  pixi run python rerun_umap_on_selection.py
 """
 
 # ── Variables ────────────────────────────────────────────────────────────────
 data_pth       = "/home/workspace/temp/expression.zarr"  # CSR zarr store (raw counts)
-SELECTION_FILE = "selection.json"                         # barcodes from the datavis app
-output_h5ad    = "./selection_analysis.h5ad"
+SELECTION_FILE = "./datascales-umap-poc-main/data/3M_subset_bcell_selection.json"  # barcodes from the datavis app
+VIEW_STORE     = data_pth + "/umap_views/bcell_selection"  # mini view store to write (obsm/X_umap + obs, no X); point the datavis app's DATA_DIR here
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
 BATCH_KEY      = []   # obs columns to harmony-integrate on; [] = skip harmony
@@ -74,7 +78,6 @@ if raw_counts:
 
 # ── Highly variable genes ────────────────────────────────────────────────────
 rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=2000)
-adata_full = adata                                  # full genes → written to output
 adata = adata[:, adata.var["highly_variable"].to_numpy()].copy()
 
 n_rows, n_cols = adata.shape
@@ -103,12 +106,11 @@ rsc.tl.umap(adata, min_dist=0.45, init_pos="spectral", n_components=2,
 rsc.tl.leiden(adata, resolution=1.1, n_iterations=100, random_state=RANDOM_SEED)
 print("clusters:", len(adata.obs["leiden"].cat.categories))
 
-# ── Write (full genes + new embeddings; small subset → safe to gather) ───────
-adata_full.obs  = adata.obs
-adata_full.obsm = adata.obsm
-adata_full.obsp = adata.obsp
-adata_full.uns  = adata.uns
-adata_full.X = adata_full.X.compute()
-rsc.get.anndata_to_CPU(adata_full)
-adata_full.write_h5ad(output_h5ad)
-print("wrote", output_h5ad)
+
+umap = adata.obsm["X_umap"]
+if hasattr(umap, "get"):                            # cupy → host
+    umap = umap.get()
+ad.settings.zarr_write_format = 3                   # zarrita (the viewer) reads v3 only
+view = ad.AnnData(obs=adata.obs.copy(), obsm={"X_umap": np.asarray(umap, dtype=np.float32)})
+view.write_zarr(VIEW_STORE)
+print(f"wrote view store: {VIEW_STORE}  ({view.n_obs} cells)")
