@@ -8,42 +8,35 @@ BENCH="$HERE/rapids_benchmark.py"
 OUTDIR="${OUTDIR:-$HERE/results}"
 
 DATASETS=(
-  "/home/workspace/zarrs/datasetA.zarr"
-  "/home/workspace/zarrs/datasetB.zarr"
+  #"/mnt/5M_sparse_sorted_9.zarr"
+  "/mnt/subset3M_megazarr_v1.0.zarr"
 )
 
-RMM=(managed pool)
-CHUNK_ROWS=(6000 24000 48000)
-POOL_SIZES=(50% 90%)
+RMM=(managed) #pool)
+CHUNK_ROWS=(48000)
 
-THREAD_SPLITS=(1:12 3:4 6:2 12:1)
-ZARR_CONCURRENCY=32
-
+THREAD_SPLITS=(12:12) #12:12)
+ZARR_CONCURRENCY=12
 
 
 #------------RUN LOOP
 for data in "${DATASETS[@]}"; do
   dtag="$(basename "$data" .zarr)"
   for rmm in "${RMM[@]}"; do
-    if [[ "$rmm" == "pool" ]]; then szlist=("${POOL_SIZES[@]}"); else szlist=("-"); fi
     for ck in "${CHUNK_ROWS[@]}"; do
-      for psz in "${szlist[@]}"; do
         for split in "${THREAD_SPLITS[@]}"; do
           tpw="${split%%:*}"; zmw="${split##*:}"   # threads_per_worker : zarr_max_workers
           label="${dtag}_g0_${rmm}_ck${ck}"
-          extra=()
-          if [[ "$psz" != "-" ]]; then extra=(--rmm-pool-size "$psz"); label="${label}_p${psz%\%}"; fi
           label="${label}_t${tpw}x${zmw}"
           args=(--data-path "$data" --gpus 0 --protocol tcp --rmm-mode "$rmm"
                 --chunk-rows "$ck" --neighbors-algorithm ivfflat --batch-key ""
                 --threads-per-worker "$tpw" --zarr-max-workers "$zmw"
                 --zarr-concurrency "$ZARR_CONCURRENCY"
-                --label "$label" --results-json "$OUTDIR/$label.json" "${extra[@]}")
+                --label "$label")
           echo "== $label =="
           pixi run python "$BENCH" "${args[@]}" \
             || echo "# -> FAILED ($label), continuing"
         done
-      done
     done
   done
 done
@@ -84,3 +77,4 @@ with open(csv_path, "w", newline="") as fh:
     w.writeheader(); w.writerows(rows)
 print(f"wrote {csv_path}  ({len(rows)} runs)")
 PY
+
