@@ -26,7 +26,7 @@ multi-GPU pipeline that reads a Zarr store lazily through Dask-CUDA:
 
 ```
 load_zarr → h2d_transfer → preprocessing (qc+normalize+log1p) → hvg → scaling
-          → pca → harmony (if --batch-key) → neighbors → umap → leiden → write_h5ad
+          → pca → harmony (if --batch-key) → neighbors → umap → leiden → write_results
 ```
 
 Every field of the `Config` dataclass has a matching `--flag`, so a sweep is a shell loop —
@@ -35,16 +35,18 @@ no source edits. GPU/CUDA-only; run it on the GPU node's pixi env (`--help` work
 ```bash
 # 4-GPU run, capacity preset (tcp + managed memory)
 pixi run python rapids_benchmark.py \
-    --data-path /path/to/5M.zarr --gpus 0,1,2,3 \
-    --results-json results/5M_4gpu.json --label 5M_4gpu
+    --data-path /path/to/5M.zarr --gpus 0,1,2,3 --label 5M_4gpu
 ```
 
 Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM),
 `--preset capacity|speed`, `--zarr-concurrency`/`--zarr-max-workers` (applied on *every*
 worker), `--chunk-rows`, and the pipeline params (`--n-top-genes`, `--n-comps`,
-`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). Each run writes
-`results/*.json` with full provenance (library versions, CUDA/driver, GPU model, dataset
-shape/nnz, resolved thread budget). See the module docstring and `--help` for the rest.
+`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). By default the
+final step writes the UMAP embedding (`obsm/X_umap`) and leiden labels (`obs/leiden`) back
+**into the input store** as an anndata-readable layer — no h5ad, no X rematerialization;
+`--results-store` retargets it, `--no-write-results` skips it. Each run also appends a
+per-step summary to `results/Run_results.txt` headed by the date, store, GPUs, and any cfg
+options left off their defaults. See the module docstring and `--help` for the rest.
 
 ---
 
@@ -116,8 +118,8 @@ small machine at all), **the GPU buys the wall-clock**.
 
 ### Totals across datasets
 
-Full-pipeline wall time and peak memory. RAPIDS = 4× GPU. Speedup is vs Base Scanpy where a
-baseline exists, else vs Scanpy Zarr/Dask (†).
+Full-pipeline wall time and peak memory. RAPIDS = 4× GPU unless noted. Speedup is vs Base
+Scanpy where a baseline exists, else vs Scanpy Zarr/Dask (†).
 
 | Dataset (~cells) | Pipeline | Total wall | Peak host | Peak VRAM | Speedup |
 |------------------|----------|-----------:|----------:|----------:|--------:|
@@ -130,19 +132,62 @@ baseline exists, else vs Scanpy Zarr/Dask (†).
 | **13M Soundlife Single-Cell** | Base Scanpy | — *(didn't fit)* | — | — | — |
 | | Scanpy Zarr/Dask | 10 h 01 m | 147 GB | — | 1× † |
 | | **RAPIDS Zarr/Dask** | **1 h 26 m** | 92 GB | 52 GB | **7.0×** † |
+| **~30M megazarr (~80 GB instance)** | **RAPIDS Zarr/Dask, 1× GPU** | **~46 min** | 46 GB | ~80 GB | — ‡ |
+
+† *vs Scanpy Zarr/Dask (no in-memory baseline).*  ‡ *Single 80 GB GPU, RMM managed memory —
+no CPU baseline (doesn't fit) and no 4-GPU run yet.*
 
 At 13M cells, in-memory baseline Scanpy no longer fits — the streamed pipelines are the only
 options, and RAPIDS turns a **10-hour** CPU run into **~1.4 h**.
 
+At **~30M cells / ~80 GB on a single GPU** the run is **VRAM-bound**: neighbors alone peaks the
+whole 80 GB card. It still finishes in **~46 min** (~43–46 min across store variants), with
+neighbors + UMAP + Leiden ≈ **55% of the wall** — and those are the steps that scale worst with
+cell count (neighbors and UMAP ~**10×** slower from 5M→30M, Leiden ~6×, vs ~4× for
+preprocess/HVG).
+
+### RMM allocator: managed vs pool (single GPU)
+
+On the 5M store (1 GPU, everything else held constant) the RMM mode is a **~1.4× total-wall
+lever**, and it lands almost entirely on the two graph steps:
+
+| Step (5M, 1 GPU) | managed | pool | Speedup |
+|---|---:|---:|---:|
+| neighbors | 38 s | 14 s | **2.7×** |
+| Leiden | 105 s | 19 s | **5.6×** |
+| **total** | **479 s** | **337 s** | **1.4×** |
+
+preprocessing, HVG, and UMAP barely move. Managed memory oversubscribes VRAM to host, so the
+kNN-graph and community-detection steps thrash across PCIe (silent perf killer #9); a resident
+pool removes it. The cost is headroom — pool pins ~the whole card (~74–81 GB VRAM) vs ~16 GB for
+managed — which is exactly why the **~30M store above must use managed to fit at all**, trading
+that 1.4× back for the ability to run on one GPU.
+
 ---
 
-## Multi-GPU scaling comparison *(coming soon)*
+## Multi-GPU scaling: 1 vs 4 GPUs on HISE
 
-The numbers above fix RAPIDS at **4 GPUs**. A GPU-count scaling study — **1 → 2 → 4 GPUs**
-on an identical store, holding chunk shape, codec, preset, and total host-decode threads
-constant so we isolate GPU count alone — is running via
-[`sweep_gpu_zarr.sh`](sweep_gpu_zarr.sh) (which also sweeps `--zarr-concurrency` ×
-`--zarr-max-workers` and derives the neighbors algorithm from GPU count:
-`mg_ivfflat` multi-GPU vs `ivfflat` single). Results, a per-step scaling curve, and notes on
-where scaling breaks down (small steps dominated by cluster/comm overhead; UMAP's
-scaling ceiling) will land here.
+Full sweep in [`results/multi-gpu.csv`](results/multi-gpu.csv): the same 5M sorted store run
+at **1 GPU** (`ivfflat`) and **4 GPUs** (`mg_ivfflat`), each across a `--zarr-concurrency` ×
+`--zarr-max-workers` grid (chunk shape, codec, and preset held constant so GPU count is the
+variable). Values below are the **median** over each GPU count's grid.
+
+**4 GPUs cut total wall ~1.3×, not ~4×** — median full-pipeline **~17.7 min (1 GPU) →
+~13.3 min (4 GPU)**. It falls well short of linear because the two dominant steps don't scale:
+
+| Step (median) | 1 GPU | 4 GPU | Scaling |
+|---|---:|---:|---:|
+| preprocessing | 138 s | 46 s | ~3× |
+| HVG | 259 s | 104 s | ~2.5× |
+| neighbors | 104 s | 60 s | ~1.7× |
+| UMAP | 319 s | 327 s | ~1× (flat) |
+| Leiden | 230 s | 230 s | ~1× (flat) |
+| **total** | **1065 s** | **795 s** | **~1.3×** |
+
+UMAP + Leiden are ~70% of the 4-GPU wall and are effectively single-GPU-bound, so extra GPUs
+only speed up the parallel front half (preprocess / HVG / neighbors). Within each GPU count the
+read-config sweep mostly moves preprocessing/HVG: `--zarr-max-workers 1` starves host decode
+(preprocessing ~80 s vs ~44 s at 4 GPU) while `w4`–`w16` are all near-optimal — decode threads,
+not fetch concurrency, are the lever. Cost of the extra GPUs is host RAM: ~50–60 GB peak
+(4 GPU, 16 workers) vs ~18–40 GB single-GPU, and ~48 GB VRAM spread over 4 devices vs ~15 GB
+on one.

@@ -7,13 +7,13 @@ name = "convert-to-zarr"
 version = "0.1.0"
 description = "Configurable AnnData to Zarr converter with strong validation"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = "MIT"
 authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 dependencies = [
-  "anndata>=0.11.0",
+  "anndata>=0.11.0,<0.13",
   "zarr>=3.0.0",
-  "numpy>=1.24.0",
+  "numpy>=1.24.0,<2.5",
   "scipy>=1.10.0",
   "PyYAML>=6.0",
   "scanpy>=1.9.0",
@@ -43,5 +43,8 @@ default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.dependencies]
+python = ">=3.10,<3.13"
+anndata = ">=0.11,<0.13"  # 0.13 injects a phantom None layer key that breaks the layer writer
+numpy = "<2.5"
 scanpy = ">=1.12.1,<2"
 dask = ">=2026.3.0,<2027"
