@@ -34,6 +34,7 @@ def main():
     from dask.distributed import Client
 
     import json
+    import time
     import numpy as np
     import zarr
     import anndata as ad
@@ -63,6 +64,9 @@ def main():
     # ── Managed memory (client process) ──────────────────────────────────────────
     rmm.reinitialize(managed_memory=True, pool_allocator=False)
     cp.cuda.set_allocator(rmm_cupy_allocator)
+
+    # Wall clock: cluster/CUDA setup is done; time load → pipeline → write only.
+    t0 = time.perf_counter()
 
     # ── Load ONLY the selected cells ─────────────────────────────────────────────
     f = zarr.open(data_pth, mode="r")
@@ -126,6 +130,7 @@ def main():
     view = ad.AnnData(obs=adata.obs.copy(), obsm={"X_umap": np.asarray(umap, dtype=np.float32)})
     view.write_zarr(VIEW_STORE)
     print(f"wrote view store: {VIEW_STORE}  ({view.n_obs} cells)")
+    print(f"wall (load → pipeline → write): {time.perf_counter() - t0:.2f}s")
 
 
 if __name__ == "__main__":
