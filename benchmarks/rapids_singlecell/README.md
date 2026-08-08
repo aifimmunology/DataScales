@@ -41,7 +41,11 @@ pixi run python rapids_benchmark.py \
 Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM),
 `--preset capacity|speed`, `--zarr-concurrency`/`--zarr-max-workers` (applied on *every*
 worker), `--chunk-rows`, and the pipeline params (`--n-top-genes`, `--n-comps`,
-`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). By default the
+`--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). Add
+`--subset-column COL --subset-value VAL` to run the whole pipeline on just the cells matching
+one metadata value — a contiguous `X[start:end]` slice on a store sorted by that column (needs
+`--no-write-results` or `--results-store`, since a subset has fewer rows than the input store).
+By default the
 final step writes the UMAP embedding (`obsm/X_umap`) and leiden labels (`obs/leiden`) back
 **into the input store** as an anndata-readable layer — no h5ad, no X rematerialization;
 `--results-store` retargets it, `--no-write-results` skips it. Each run also appends a

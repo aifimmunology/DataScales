@@ -39,6 +39,13 @@ you can script a sweep of near-identical runs without editing source:
     pixi run python rapids_benchmark.py --gpus 0,1,2,3 --preset speed \
         --protocol tcp --rmm-pool-size 0.7
 
+    # subset: run the whole pipeline on just one cell type (store sorted by that column,
+    # so the match is a contiguous X[start:end] slice). Needs --no-write-results (or
+    # --results-store) since a subset has fewer rows than the input store.
+    pixi run python rapids_benchmark.py --gpus 0 \
+        --data-path /path/to/sorted.zarr \
+        --subset-column cell_type --subset-value "T cell" --no-write-results
+
 Key correctness notes (see CLAUDE.md):
   * ZARR CONFIG REACHES THE WORKERS. `zarr.config` is a *runtime* (donfig) setting,
     not an env var, so setting it in the client process does NOT propagate to the
@@ -100,6 +107,10 @@ class Config:
     # -- data / layout --
     data_path: str = "/home/workspace/temp/2M_50M_pbmc.zarr"
     chunk_rows: int = 24_000           # row block for read (multiple of the store's row chunk)
+
+    # -- optional obs subset (run the whole pipeline on cells matching one metadata value) --
+    subset_column: str = ""   # obs column to filter on; "" = no subset (run on the whole store)
+    subset_value: str = ""    # value in subset_column to keep (string compare, categorical-safe)
 
     # -- result write-back (UMAP embedding + leiden labels onto the zarr, no h5ad) --
     write_results: bool = True         # append obsm/X_umap + obs/leiden to the store as a final step
@@ -407,6 +418,43 @@ def _write_results(adata, cfg: Config) -> None:
           + ("  (metadata re-consolidated)" if was_consolidated else ""))
 
 
+# ── optional obs subset (filter by one metadata value, by SLICING) ──────────────
+def _subset_rows(X_dask, obs, cfg: Config):
+    """Subset the lazy X + obs to rows where obs[subset_column] == subset_value, by SLICING.
+
+    On a store sorted by subset_column the matched rows are one contiguous block, so this is
+    a single X[start:end]: dask reads only the chunks that span it, decodes them, and trims to
+    the rows — the common 'filter then fetch' access, same path as zarr-query-bench celltype
+    mode. If the value spans a few runs (store sorted by a different key) each run is sliced and
+    the slices concatenated lazily — still slicing, never a scattered per-row gather. The slice
+    keeps known chunk sizes, so no compute_chunk_sizes() is needed before the pipeline.
+    """
+    import numpy as np
+    import dask.array as da
+
+    if cfg.subset_column not in obs.columns:
+        raise KeyError(f"subset column '{cfg.subset_column}' not in obs. "
+                       f"Available: {', '.join(map(str, obs.columns))}")
+    idx = np.flatnonzero((obs[cfg.subset_column] == cfg.subset_value).to_numpy())
+    if idx.size == 0:
+        uniq = obs[cfg.subset_column].unique()
+        raise ValueError(f"no rows match obs['{cfg.subset_column}']=='{cfg.subset_value}'. "
+                         f"Available: {', '.join(map(str, uniq[:50]))}")
+
+    # contiguous [start,end) runs of matched rows (== 1 run on a store sorted by this column)
+    breaks = np.flatnonzero(np.diff(idx) > 1) + 1
+    starts, ends = np.concatenate(([0], breaks)), np.concatenate((breaks, [idx.size]))
+    spans = [(int(idx[s]), int(idx[e - 1]) + 1) for s, e in zip(starts, ends)]
+
+    parts = [X_dask[s:e] for s, e in spans]     # each a contiguous slice, known chunks
+    X_dask = parts[0] if len(parts) == 1 else da.concatenate(parts, axis=0)
+    obs = obs.iloc[idx].copy()
+    kind = "1 span (contiguous)" if len(spans) == 1 else \
+        f"{len(spans)} spans (store not sorted by this column)"
+    print(f"  subset: obs['{cfg.subset_column}']=='{cfg.subset_value}' -> {idx.size} rows, {kind}")
+    return X_dask, obs
+
+
 # ── the pipeline ──────────────────────────────────────────────────────────────
 def run_pipeline(cfg: Config) -> None:
     import numpy as np
@@ -430,9 +478,12 @@ def run_pipeline(cfg: Config) -> None:
         X_dask = read_dask(X, (cfg.chunk_rows, shape[1]))
         if np.issubdtype(X_dask.dtype, np.integer):
             X_dask = X_dask.astype(np.float32)
+        obs = ad.io.read_elem(f["obs"])
+        if cfg.subset_column:
+            X_dask, obs = _subset_rows(X_dask, obs, cfg)  # lazy: slices the sorted span, no X read yet
         adata = ad.AnnData(
             X=X_dask,                       # (chunk_rows, all genes) blocks; align to zarr row chunk
-            obs=ad.io.read_elem(f["obs"]),
+            obs=obs,
             var=ad.io.read_elem(f["var"]),
         )
 
@@ -517,6 +568,15 @@ def report(cfg: Config, prov: dict) -> None:
 def main(cfg: Config) -> None:
     global _SAMPLE_INTERVAL
     _SAMPLE_INTERVAL = cfg.sample_interval_s
+
+    # A subset produces k<N result rows; writing them back into the full input store would
+    # misalign it (obs/leiden length k vs the store's other obs columns length N — silent
+    # corruption). Force a separate target, or skip the write.
+    if cfg.subset_column and cfg.write_results and not cfg.results_store:
+        raise SystemExit(
+            "subset + write-results into the input store would corrupt it (row-count mismatch). "
+            "Re-run with --no-write-results, or --results-store PATH to write a separate store."
+        )
 
     import dask
     from dask.distributed import Client
