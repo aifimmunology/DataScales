@@ -43,14 +43,14 @@ Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM
 worker), `--chunk-rows`, and the pipeline params (`--n-top-genes`, `--n-comps`,
 `--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to skip harmony). Add
 `--subset-column COL --subset-value VAL` to run the whole pipeline on just the cells matching
-one metadata value — a contiguous `X[start:end]` slice on a store sorted by that column (needs
-`--no-write-results` or `--results-store`, since a subset has fewer rows than the input store).
-By default the
-final step writes the UMAP embedding (`obsm/X_umap`) and leiden labels (`obs/leiden`) back
-**into the input store** as an anndata-readable layer — no h5ad, no X rematerialization;
-`--results-store` retargets it, `--no-write-results` skips it. Each run also appends a
-per-step summary to `results/Run_results.txt` headed by the date, store, GPUs, and any cfg
-options left off their defaults. See the module docstring and `--help` for the rest.
+one metadata value — a contiguous `X[start:end]` slice on a store sorted by that column.
+By default the final step persists the UMAP embedding (`obsm/X_umap`) and leiden labels
+(`obs/leiden`), anndata-readable, no h5ad and no X rematerialization: a **full run** appends
+them onto the input store's root; a **subset run** writes a self-contained no-X store under
+`data_path/subsets/<name>` (`--subset-dir-name`, default a slug of the column/value).
+`--no-write-results` skips it. Each run also appends a per-step summary to
+`results/Run_results.txt` headed by the date, store, GPUs, and any cfg options left off their
+defaults. See the module docstring and `--help` for the rest.
 
 ---
 

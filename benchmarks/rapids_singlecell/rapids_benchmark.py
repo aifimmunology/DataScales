@@ -16,9 +16,11 @@ Steps measured:
   8. neighbors      neighbors
   9. umap           umap
  10. leiden         leiden
- 11. write_results  (default on) append the UMAP embedding (obsm/X_umap) + leiden
-                    labels (obs/leiden) onto the zarr store — anndata-readable, and
-                    crucially no X rematerialization; skip with --no-write-results
+ 11. write_results  (default on) persist the UMAP embedding (obsm/X_umap) + leiden
+                    labels (obs/leiden), anndata-readable, no X rematerialization. Full
+                    run: appended onto the master root. Subset run: a self-contained no-X
+                    store under data_path/subsets/<name> (--subset-dir-name). Skip with
+                    --no-write-results.
 
 Everything that was hardcoded is now a knob: GPUs, zarr read concurrency/threads,
 dask-cuda threads/protocol/RMM, chunk size, data path, and the pipeline params.
@@ -40,11 +42,11 @@ you can script a sweep of near-identical runs without editing source:
         --protocol tcp --rmm-pool-size 0.7
 
     # subset: run the whole pipeline on just one cell type (store sorted by that column,
-    # so the match is a contiguous X[start:end] slice). Needs --no-write-results (or
-    # --results-store) since a subset has fewer rows than the input store.
+    # so the match is a contiguous X[start:end] slice). Results land in a no-X store under
+    # data_path/subsets/<name> (name defaults to a slug of the column/value; override below).
     pixi run python rapids_benchmark.py --gpus 0 \
         --data-path /path/to/sorted.zarr \
-        --subset-column cell_type --subset-value "T cell" --no-write-results
+        --subset-column cell_type --subset-value "T cell" --subset-dir-name tcell
 
 Key correctness notes (see CLAUDE.md):
   * ZARR CONFIG REACHES THE WORKERS. `zarr.config` is a *runtime* (donfig) setting,
@@ -112,9 +114,9 @@ class Config:
     subset_column: str = ""   # obs column to filter on; "" = no subset (run on the whole store)
     subset_value: str = ""    # value in subset_column to keep (string compare, categorical-safe)
 
-    # -- result write-back (UMAP embedding + leiden labels onto the zarr, no h5ad) --
-    write_results: bool = True         # append obsm/X_umap + obs/leiden to the store as a final step
-    results_store: str = ""            # target store; "" -> write back into data_path (a layer on the input)
+    # -- result write-back (UMAP embedding + leiden labels, no h5ad) --
+    write_results: bool = True         # final step (full run: onto master root; subset: a data_path/subsets/ store)
+    subset_dir_name: str = ""          # subset only: dir name under data_path/subsets/; "" -> slug of column_value
     umap_key: str = "X_umap"           # obsm key for the embedding (anndata default)
     leiden_key: str = "leiden"         # obs column for the labels (anndata default)
 
@@ -378,15 +380,16 @@ def _format_header(prov: dict) -> str:
 
 # ── result write-back (UMAP + leiden -> zarr, anndata-readable) ─────────────────
 def _write_results(adata, cfg: Config) -> None:
-    """Writing the UMAP and Leiden clustering results.
+    """Full-run write-back: append the UMAP + Leiden results onto the master root.
 
-    Target defaults to `data_path` (add a layer onto the input store); `--results-store`
-    points it elsewhere. `write_elem` overwrites existing keys, so re-runs are idempotent."""
+    Adds obsm/X_umap + obs/leiden in place on `data_path` (n_obs matches, so it stays a valid
+    anndata layer). `write_elem` overwrites existing keys, so re-runs are idempotent. Subset runs
+    go through `_write_subset` instead (k<N rows would break the master's row alignment)."""
     import numpy as np
     import zarr
     from anndata.io import write_elem
 
-    store = cfg.results_store or cfg.data_path
+    store = cfg.data_path
 
     umap = adata.obsm[cfg.umap_key]
     if hasattr(umap, "get"):            # cupy -> host (rsc already gathers; belt-and-braces)
@@ -416,6 +419,42 @@ def _write_results(adata, cfg: Config) -> None:
 
     print(f"  results -> {store}: obsm/{cfg.umap_key} + obs/{cfg.leiden_key}"
           + ("  (metadata re-consolidated)" if was_consolidated else ""))
+
+
+def _default_subset_name(cfg: Config) -> str:
+    """Dir name for the subset store when --subset-dir-name is omitted: '<column>_<value>'
+    with filesystem-unfriendly characters collapsed to '_'."""
+    import re
+    raw = f"{cfg.subset_column}_{cfg.subset_value}"
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", raw).strip("_") or "subset"
+
+
+def _write_subset(adata, cfg: Config) -> None:
+    """Subset write-back: a self-contained no-X 'subset' AnnData at data_path/subsets/<name>
+    (name defaults to a slug of the column/value).
+
+    Holds obs (index = barcodes, incl. leiden) + obsm/X_umap — NO X. n_obs = k, so it never
+    clashes with the master's N-row arrays, and it references the master rows by barcode (the obs
+    index), which survives a later re-sort of the master. `subsets/` is a bare path prefix (no
+    zarr.json), so it never becomes a root member of the master and stays invisible to
+    ad.read_zarr(master) in every consolidation state; the subset itself opens standalone."""
+    import os
+    import numpy as np
+    import anndata as ad
+
+    umap = adata.obsm[cfg.umap_key]
+    if hasattr(umap, "get"):            # cupy -> host
+        umap = umap.get()
+    umap = np.asarray(umap, dtype=np.float32)
+
+    name = cfg.subset_dir_name or _default_subset_name(cfg)
+    subset_path = os.path.join(cfg.data_path, "subsets", name)
+
+    ad.settings.zarr_write_format = 3   # v3 so anndata/zarrita readers round-trip it
+    subset = ad.AnnData(obs=adata.obs.copy(), obsm={cfg.umap_key: umap})
+    subset.write_zarr(subset_path)      # write_zarr sets all encoding attrs; no X written
+    print(f"  subset -> {subset_path}: obs (incl {cfg.leiden_key}) + obsm/{cfg.umap_key}, "
+          f"{subset.n_obs} cells, no X")
 
 
 # ── optional obs subset (filter by one metadata value, by SLICING) ──────────────
@@ -536,7 +575,8 @@ def run_pipeline(cfg: Config) -> None:
 
     if cfg.write_results:
         with step("write_results"):
-            _write_results(adata, cfg)
+            # subset run -> a no-X store under data_path/subsets/; full run -> onto the master root
+            (_write_subset if cfg.subset_column else _write_results)(adata, cfg)
 
 
 # ── report ────────────────────────────────────────────────────────────────────
@@ -568,15 +608,6 @@ def report(cfg: Config, prov: dict) -> None:
 def main(cfg: Config) -> None:
     global _SAMPLE_INTERVAL
     _SAMPLE_INTERVAL = cfg.sample_interval_s
-
-    # A subset produces k<N result rows; writing them back into the full input store would
-    # misalign it (obs/leiden length k vs the store's other obs columns length N — silent
-    # corruption). Force a separate target, or skip the write.
-    if cfg.subset_column and cfg.write_results and not cfg.results_store:
-        raise SystemExit(
-            "subset + write-results into the input store would corrupt it (row-count mismatch). "
-            "Re-run with --no-write-results, or --results-store PATH to write a separate store."
-        )
 
     import dask
     from dask.distributed import Client
