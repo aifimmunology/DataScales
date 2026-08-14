@@ -167,7 +167,9 @@ export default function Umap() {
         // highlight selected in yellow; dim the rest to make it pop
         return selection.mask[d.index] ? [255, 240, 30, 255] : [base[0], base[1], base[2], 40]
       }
-      return [base[0], base[1], base[2], 200]
+      // Low alpha so millions of overlapping points read as density instead of
+      // saturating into one solid blob (this store is ~2.7M cells).
+      return [base[0], base[1], base[2], 90]
     },
     // `cat` MUST be here: it loads async, and deck.gl only re-runs getFillColor when
     // a trigger changes. Without it, colors stay at the default until some *other*
