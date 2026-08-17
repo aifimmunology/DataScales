@@ -94,20 +94,20 @@ class Config:
     the CLI (field `foo_bar` -> `--foo-bar`)."""
 
     # -- GPUs / dask-cuda cluster --
-    gpus: str = "0,1,2,3"              # physical device ids (drives cluster+NVML+client RMM)
+    gpus: str = "0"              # physical device ids IE "0,1,2,3"
     preset: str = "capacity"           # "capacity" (tcp+managed) | "speed" (ucx+rmm pool)
     protocol: str | None = None        # hard override of preset transport ("tcp"|"ucx")
     rmm_mode: str | None = None        # hard override: "managed" | "pool" | "none"
     rmm_pool_size: float = 0.8         # per-worker pool as fraction of device mem (pool mode only)
-    threads_per_worker: int = 1        # dask-cuda worker threadpool (GPU-safe default=1)
+    threads_per_worker: int = 12        # dask-cuda worker threadpool (GPU-safe default=1)
     enable_cudf_spill: bool = True     # spill cuDF (obs/var) from VRAM to host under pressure
 
     # -- zarr read path (applied on EVERY worker + client) --
-    zarr_concurrency: int = 4          # async.concurrency (dispatch semaphore)
-    zarr_max_workers: int = 4          # threading.max_workers (decode threadpool)
+    zarr_concurrency: int = 12          # async.concurrency (dispatch semaphore)
+    zarr_max_workers: int = 12          # threading.max_workers (decode threadpool)
 
     # -- data / layout --
-    data_path: str = "/home/workspace/temp/2M_50M_pbmc.zarr"
+    data_path: str = "/mnt/external_megazarr_v1.0.zarr"
     chunk_rows: int = 24_000           # row block for read (multiple of the store's row chunk)
 
     # -- optional obs subset (run the whole pipeline on cells matching one metadata value) --
@@ -124,11 +124,11 @@ class Config:
     n_top_genes: int = 2000
     n_comps: int = 30                  # PCA comps (also n_pcs for neighbors)
     n_neighbors: int = 20
-    neighbors_algorithm: str = "mg_ivfflat"  # brute|ivfflat|ivfpq|mg_ivfflat|mg_ivfpq
+    neighbors_algorithm: str = "ivfflat"  # brute|ivfflat|ivfpq|mg_ivfflat|mg_ivfpq
     leiden_resolution: float = 1.1
     leiden_iterations: int = 100
     umap_min_dist: float = 0.45
-    pca_float64: bool = True           # cast X to float64 before scale for stable std
+    pca_float64: bool = False           # cast X to float64 before scale for stable std
     batch_key: str = ""         # obs column for harmony; "" disables the harmony step
     random_seed: int = 5671
 
@@ -493,6 +493,33 @@ def _subset_rows(X_dask, obs, cfg: Config):
     print(f"  subset: obs['{cfg.subset_column}']=='{cfg.subset_value}' -> {idx.size} rows, {kind}")
     return X_dask, obs
 
+# ── harmony managed-memory workaround ───────────────────────────────────────────
+def _patch_harmony_empty_joint_arrays() -> None:
+    """Work around a rapids-singlecell bug (0.16.1, still in upstream main): with a
+    single batch key, harmony passes zero-size int32 placeholders (joint_codes /
+    marginal_joint_offsets / marginal_joint_indices) to the C++ clustering_loop.
+    A zero-size cupy array owns no allocation, so its DLPack device is always plain
+    'cuda' — but under RMM managed memory (our capacity preset's client allocator)
+    every other argument is 'cuda_managed', no nanobind overload matches, and the
+    call raises TypeError. Substitute zero-size VIEWS of `cats` (same int32 dtype,
+    shares the managed allocation, so it reports 'cuda_managed'); the kernel never
+    reads them when use_joint_scatter=False. Harmless under non-managed allocators.
+    Drop this once fixed upstream (scverse/rapids-singlecell)."""
+    from rapids_singlecell.preprocessing import _harmony
+
+    real = _harmony._hc_cl.clustering_loop
+    if getattr(real, "_joint_patch", False):
+        return
+
+    def _fixed(Z_norm, **kw):
+        for k in ("joint_codes", "marginal_joint_offsets", "marginal_joint_indices"):
+            if kw.get(k) is not None and kw[k].size == 0:
+                kw[k] = kw["cats"][:0]
+        return real(Z_norm, **kw)
+
+    _fixed._joint_patch = True
+    _harmony._hc_cl.clustering_loop = _fixed
+
 
 # ── the pipeline ──────────────────────────────────────────────────────────────
 def run_pipeline(cfg: Config) -> None:
@@ -557,6 +584,7 @@ def run_pipeline(cfg: Config) -> None:
 
     if cfg.batch_key:
         with step("harmony"):
+            _patch_harmony_empty_joint_arrays()
             adata.obs[cfg.batch_key] = adata.obs[cfg.batch_key].astype("category")
             rsc.pp.harmony_integrate(adata, key=cfg.batch_key, basis="X_pca",
                                      adjusted_basis="X_pca_harmony")
