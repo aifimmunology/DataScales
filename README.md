@@ -1,4 +1,4 @@
-# DataScale — Project
+# DataScales — Project
 
 Tools and experiments for fast, memory-bounded storage, access, and analysis of large
 single-cell (and future multimodal) genomic data on Zarr — with Icechunk versioning,
