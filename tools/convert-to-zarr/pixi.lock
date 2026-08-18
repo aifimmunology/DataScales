@@ -4060,9 +4060,9 @@ packages:
 - pypi: ./
   name: convert-to-zarr
   version: 0.1.0
-  sha256: 4dc3c93d80a44acb2a9ca421e1b1412c10b94a82454ccd4075c5bd7a00050d3e
+  sha256: cdf10cc0b1c728a83b24ef59d597cfde4d4eefaf95418570a016cf88321a16fa
   requires_dist:
-  - anndata>=0.11.0,<0.13
+  - anndata>=0.12.10,<0.13
   - zarr>=3.0.0
   - numpy>=1.24.0,<2.5
   - scipy>=1.10.0
