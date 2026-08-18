@@ -16,9 +16,11 @@ Steps measured:
   8. neighbors      neighbors
   9. umap           umap
  10. leiden         leiden
- 11. write_results  (default on) append the UMAP embedding (obsm/X_umap) + leiden
-                    labels (obs/leiden) onto the zarr store — anndata-readable, and
-                    crucially no X rematerialization; skip with --no-write-results
+ 11. write_results  (default on) persist the UMAP embedding (obsm/X_umap) + leiden
+                    labels (obs/leiden), anndata-readable, no X rematerialization. Full
+                    run: appended onto the master root. Subset run: a self-contained no-X
+                    store under data_path/subsets/<name> (--subset-dir-name). Skip with
+                    --no-write-results.
 
 Everything that was hardcoded is now a knob: GPUs, zarr read concurrency/threads,
 dask-cuda threads/protocol/RMM, chunk size, data path, and the pipeline params.
@@ -38,6 +40,13 @@ you can script a sweep of near-identical runs without editing source:
     # speed preset (ucx + rmm pool) with a hard protocol override
     pixi run python rapids_benchmark.py --gpus 0,1,2,3 --preset speed \
         --protocol tcp --rmm-pool-size 0.7
+
+    # subset: run the whole pipeline on just one cell type (store sorted by that column,
+    # so the match is a contiguous X[start:end] slice). Results land in a no-X store under
+    # data_path/subsets/<name> (name defaults to a slug of the column/value; override below).
+    pixi run python rapids_benchmark.py --gpus 0 \
+        --data-path /path/to/sorted.zarr \
+        --subset-column cell_type --subset-value "T cell" --subset-dir-name tcell
 
 Key correctness notes (see CLAUDE.md):
   * ZARR CONFIG REACHES THE WORKERS. `zarr.config` is a *runtime* (donfig) setting,
@@ -85,25 +94,29 @@ class Config:
     the CLI (field `foo_bar` -> `--foo-bar`)."""
 
     # -- GPUs / dask-cuda cluster --
-    gpus: str = "0,1,2,3"              # physical device ids (drives cluster+NVML+client RMM)
+    gpus: str = "0"              # physical device ids IE "0,1,2,3"
     preset: str = "capacity"           # "capacity" (tcp+managed) | "speed" (ucx+rmm pool)
     protocol: str | None = None        # hard override of preset transport ("tcp"|"ucx")
     rmm_mode: str | None = None        # hard override: "managed" | "pool" | "none"
     rmm_pool_size: float = 0.8         # per-worker pool as fraction of device mem (pool mode only)
-    threads_per_worker: int = 1        # dask-cuda worker threadpool (GPU-safe default=1)
+    threads_per_worker: int = 12        # dask-cuda worker threadpool (GPU-safe default=1)
     enable_cudf_spill: bool = True     # spill cuDF (obs/var) from VRAM to host under pressure
 
     # -- zarr read path (applied on EVERY worker + client) --
-    zarr_concurrency: int = 4          # async.concurrency (dispatch semaphore)
-    zarr_max_workers: int = 4          # threading.max_workers (decode threadpool)
+    zarr_concurrency: int = 12          # async.concurrency (dispatch semaphore)
+    zarr_max_workers: int = 12          # threading.max_workers (decode threadpool)
 
     # -- data / layout --
-    data_path: str = "/home/workspace/temp/2M_50M_pbmc.zarr"
+    data_path: str = "/mnt/external_megazarr_v1.0.zarr"
     chunk_rows: int = 24_000           # row block for read (multiple of the store's row chunk)
 
-    # -- result write-back (UMAP embedding + leiden labels onto the zarr, no h5ad) --
-    write_results: bool = True         # append obsm/X_umap + obs/leiden to the store as a final step
-    results_store: str = ""            # target store; "" -> write back into data_path (a layer on the input)
+    # -- optional obs subset (run the whole pipeline on cells matching one metadata value) --
+    subset_column: str = ""   # obs column to filter on; "" = no subset (run on the whole store)
+    subset_value: str = ""    # value in subset_column to keep (string compare, categorical-safe)
+
+    # -- result write-back (UMAP embedding + leiden labels, no h5ad) --
+    write_results: bool = True         # final step (full run: onto master root; subset: a data_path/subsets/ store)
+    subset_dir_name: str = ""          # subset only: dir name under data_path/subsets/; "" -> slug of column_value
     umap_key: str = "X_umap"           # obsm key for the embedding (anndata default)
     leiden_key: str = "leiden"         # obs column for the labels (anndata default)
 
@@ -111,11 +124,11 @@ class Config:
     n_top_genes: int = 2000
     n_comps: int = 30                  # PCA comps (also n_pcs for neighbors)
     n_neighbors: int = 20
-    neighbors_algorithm: str = "mg_ivfflat"  # brute|ivfflat|ivfpq|mg_ivfflat|mg_ivfpq
+    neighbors_algorithm: str = "ivfflat"  # brute|ivfflat|ivfpq|mg_ivfflat|mg_ivfpq
     leiden_resolution: float = 1.1
     leiden_iterations: int = 100
     umap_min_dist: float = 0.45
-    pca_float64: bool = True           # cast X to float64 before scale for stable std
+    pca_float64: bool = False           # cast X to float64 before scale for stable std
     batch_key: str = ""         # obs column for harmony; "" disables the harmony step
     random_seed: int = 5671
 
@@ -367,15 +380,16 @@ def _format_header(prov: dict) -> str:
 
 # ── result write-back (UMAP + leiden -> zarr, anndata-readable) ─────────────────
 def _write_results(adata, cfg: Config) -> None:
-    """Writing the UMAP and Leiden clustering results.
+    """Full-run write-back: append the UMAP + Leiden results onto the master root.
 
-    Target defaults to `data_path` (add a layer onto the input store); `--results-store`
-    points it elsewhere. `write_elem` overwrites existing keys, so re-runs are idempotent."""
+    Adds obsm/X_umap + obs/leiden in place on `data_path` (n_obs matches, so it stays a valid
+    anndata layer). `write_elem` overwrites existing keys, so re-runs are idempotent. Subset runs
+    go through `_write_subset` instead (k<N rows would break the master's row alignment)."""
     import numpy as np
     import zarr
     from anndata.io import write_elem
 
-    store = cfg.results_store or cfg.data_path
+    store = cfg.data_path
 
     umap = adata.obsm[cfg.umap_key]
     if hasattr(umap, "get"):            # cupy -> host (rsc already gathers; belt-and-braces)
@@ -407,6 +421,106 @@ def _write_results(adata, cfg: Config) -> None:
           + ("  (metadata re-consolidated)" if was_consolidated else ""))
 
 
+def _default_subset_name(cfg: Config) -> str:
+    """Dir name for the subset store when --subset-dir-name is omitted: '<column>_<value>'
+    with filesystem-unfriendly characters collapsed to '_'."""
+    import re
+    raw = f"{cfg.subset_column}_{cfg.subset_value}"
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", raw).strip("_") or "subset"
+
+
+def _write_subset(adata, cfg: Config) -> None:
+    """Subset write-back: a self-contained no-X 'subset' AnnData at data_path/subsets/<name>
+    (name defaults to a slug of the column/value).
+
+    Holds obs (index = barcodes, incl. leiden) + obsm/X_umap — NO X. n_obs = k, so it never
+    clashes with the master's N-row arrays, and it references the master rows by barcode (the obs
+    index), which survives a later re-sort of the master. `subsets/` is a bare path prefix (no
+    zarr.json), so it never becomes a root member of the master and stays invisible to
+    ad.read_zarr(master) in every consolidation state; the subset itself opens standalone."""
+    import os
+    import numpy as np
+    import anndata as ad
+
+    umap = adata.obsm[cfg.umap_key]
+    if hasattr(umap, "get"):            # cupy -> host
+        umap = umap.get()
+    umap = np.asarray(umap, dtype=np.float32)
+
+    name = cfg.subset_dir_name or _default_subset_name(cfg)
+    subset_path = os.path.join(cfg.data_path, "subsets", name)
+
+    ad.settings.zarr_write_format = 3   # v3 so anndata/zarrita readers round-trip it
+    subset = ad.AnnData(obs=adata.obs.copy(), obsm={cfg.umap_key: umap})
+    subset.write_zarr(subset_path)      # write_zarr sets all encoding attrs; no X written
+    print(f"  subset -> {subset_path}: obs (incl {cfg.leiden_key}) + obsm/{cfg.umap_key}, "
+          f"{subset.n_obs} cells, no X")
+
+
+# ── optional obs subset (filter by one metadata value, by SLICING) ──────────────
+def _subset_rows(X_dask, obs, cfg: Config):
+    """Subset the lazy X + obs to rows where obs[subset_column] == subset_value, by SLICING.
+
+    On a store sorted by subset_column the matched rows are one contiguous block, so this is
+    a single X[start:end]: dask reads only the chunks that span it, decodes them, and trims to
+    the rows — the common 'filter then fetch' access, same path as zarr-query-bench celltype
+    mode. If the value spans a few runs (store sorted by a different key) each run is sliced and
+    the slices concatenated lazily — still slicing, never a scattered per-row gather. The slice
+    keeps known chunk sizes, so no compute_chunk_sizes() is needed before the pipeline.
+    """
+    import numpy as np
+    import dask.array as da
+
+    if cfg.subset_column not in obs.columns:
+        raise KeyError(f"subset column '{cfg.subset_column}' not in obs. "
+                       f"Available: {', '.join(map(str, obs.columns))}")
+    idx = np.flatnonzero((obs[cfg.subset_column] == cfg.subset_value).to_numpy())
+    if idx.size == 0:
+        uniq = obs[cfg.subset_column].unique()
+        raise ValueError(f"no rows match obs['{cfg.subset_column}']=='{cfg.subset_value}'. "
+                         f"Available: {', '.join(map(str, uniq[:50]))}")
+
+    # contiguous [start,end) runs of matched rows (== 1 run on a store sorted by this column)
+    breaks = np.flatnonzero(np.diff(idx) > 1) + 1
+    starts, ends = np.concatenate(([0], breaks)), np.concatenate((breaks, [idx.size]))
+    spans = [(int(idx[s]), int(idx[e - 1]) + 1) for s, e in zip(starts, ends)]
+
+    parts = [X_dask[s:e] for s, e in spans]     # each a contiguous slice, known chunks
+    X_dask = parts[0] if len(parts) == 1 else da.concatenate(parts, axis=0)
+    obs = obs.iloc[idx].copy()
+    kind = "1 span (contiguous)" if len(spans) == 1 else \
+        f"{len(spans)} spans (store not sorted by this column)"
+    print(f"  subset: obs['{cfg.subset_column}']=='{cfg.subset_value}' -> {idx.size} rows, {kind}")
+    return X_dask, obs
+
+# ── harmony managed-memory workaround ───────────────────────────────────────────
+def _patch_harmony_empty_joint_arrays() -> None:
+    """Work around a rapids-singlecell bug (0.16.1, still in upstream main): with a
+    single batch key, harmony passes zero-size int32 placeholders (joint_codes /
+    marginal_joint_offsets / marginal_joint_indices) to the C++ clustering_loop.
+    A zero-size cupy array owns no allocation, so its DLPack device is always plain
+    'cuda' — but under RMM managed memory (our capacity preset's client allocator)
+    every other argument is 'cuda_managed', no nanobind overload matches, and the
+    call raises TypeError. Substitute zero-size VIEWS of `cats` (same int32 dtype,
+    shares the managed allocation, so it reports 'cuda_managed'); the kernel never
+    reads them when use_joint_scatter=False. Harmless under non-managed allocators.
+    Drop this once fixed upstream (scverse/rapids-singlecell)."""
+    from rapids_singlecell.preprocessing import _harmony
+
+    real = _harmony._hc_cl.clustering_loop
+    if getattr(real, "_joint_patch", False):
+        return
+
+    def _fixed(Z_norm, **kw):
+        for k in ("joint_codes", "marginal_joint_offsets", "marginal_joint_indices"):
+            if kw.get(k) is not None and kw[k].size == 0:
+                kw[k] = kw["cats"][:0]
+        return real(Z_norm, **kw)
+
+    _fixed._joint_patch = True
+    _harmony._hc_cl.clustering_loop = _fixed
+
+
 # ── the pipeline ──────────────────────────────────────────────────────────────
 def run_pipeline(cfg: Config) -> None:
     import numpy as np
@@ -430,9 +544,12 @@ def run_pipeline(cfg: Config) -> None:
         X_dask = read_dask(X, (cfg.chunk_rows, shape[1]))
         if np.issubdtype(X_dask.dtype, np.integer):
             X_dask = X_dask.astype(np.float32)
+        obs = ad.io.read_elem(f["obs"])
+        if cfg.subset_column:
+            X_dask, obs = _subset_rows(X_dask, obs, cfg)  # lazy: slices the sorted span, no X read yet
         adata = ad.AnnData(
             X=X_dask,                       # (chunk_rows, all genes) blocks; align to zarr row chunk
-            obs=ad.io.read_elem(f["obs"]),
+            obs=obs,
             var=ad.io.read_elem(f["var"]),
         )
 
@@ -467,6 +584,7 @@ def run_pipeline(cfg: Config) -> None:
 
     if cfg.batch_key:
         with step("harmony"):
+            _patch_harmony_empty_joint_arrays()
             adata.obs[cfg.batch_key] = adata.obs[cfg.batch_key].astype("category")
             rsc.pp.harmony_integrate(adata, key=cfg.batch_key, basis="X_pca",
                                      adjusted_basis="X_pca_harmony")
@@ -485,7 +603,8 @@ def run_pipeline(cfg: Config) -> None:
 
     if cfg.write_results:
         with step("write_results"):
-            _write_results(adata, cfg)
+            # subset run -> a no-X store under data_path/subsets/; full run -> onto the master root
+            (_write_subset if cfg.subset_column else _write_results)(adata, cfg)
 
 
 # ── report ────────────────────────────────────────────────────────────────────
