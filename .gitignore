@@ -236,3 +236,6 @@ __marimo__/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Keep raw benchmark-run JSONs in the findings dirs (overrides *0*.json above)
+!benchmarking_results/**/*.json

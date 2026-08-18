@@ -1,0 +1,15 @@
+file                                store                        src    shape           axis  mode        out  conc       n  result        chunks  read_MB  rss_GB    med_s    p95_s  commit    xslow
+----------------------------------  ---------------------------  -----  --------------  ----  ----------  ---  ----  ------  ------------  ------  -------  ------  -------  -------  -------  ------
+500_000_row_csr_56_sequential.json  5M_sparse_9.zarr             csr    5477370x31915   row   sequential  csr    56  500000  500000x31915     181     1391    11.4    2.366    2.415  7b1cdca   1.00x
+IP_500k_row_csr_56_seq.json         5M_sparse_9.zarr             csr    5477370x31915   row   sequential  csr    56  500000  500000x31915     181     1391    11.5    2.388    2.435  7b1cdca   1.01x
+IP_500k_row_csr_56_seq.json         5M_sparse_50.zarr            csr    5477370x31915   row   sequential  csr    56  500000  500000x31915      35     1457    11.9    3.083    3.198  7b1cdca   1.30x
+500_000_row_csr_56_sequential.json  5M_sparse_50.zarr            csr    5477370x31915   row   sequential  csr    56  500000  500000x31915      35     1457    12.0    3.173    3.617  7b1cdca   1.34x
+500_000_row_csr_56_sequential.json  13M_50M_pbmc_soundlife.zarr  csr    13789548x33538  row   sequential  csr    56  500000  500000x33538      37     1523    12.6    3.296    3.318  7b1cdca   1.39x
+500_000_row_csr_56_sequential.json  5M_sparse_csc_15.zarr        csc    5477370x31915   row   sequential  csr    56  500000  500000x31915    1163    28237   128.6  120.736  121.124  7b1cdca  51.02x
+IP_500k_row_csr_56_seq.json         5M_sparse_csc_15.zarr        csc    5477370x31915   row   sequential  csr    56  500000  500000x31915    1163    28237   128.5  122.823  124.566  7b1cdca  51.90x
+IP_500k_row_csr_56_seq.json         5M_dense_5xA.zarr            dense  5477370x31915   row   sequential  csr    56  500000  500000x31915     100     1642    59.3  124.627  125.611  7b1cdca  52.66x
+IP_500k_row_csr_56_seq.json         5M_dense_5x11.zarr           dense  5477370x31915   row   sequential  csr    56  500000  500000x31915     300     1637    58.7  124.952  125.373  7b1cdca  52.80x
+500_000_row_csr_56_sequential.json  5M_dense_5xA.zarr            dense  5477370x31915   row   sequential  csr    56  500000  500000x31915     100     1642    59.2  125.109  125.353  7b1cdca  52.87x
+500_000_row_csr_56_sequential.json  5M_dense_5x11.zarr           dense  5477370x31915   row   sequential  csr    56  500000  500000x31915     300     1637    58.6  125.962  127.590  7b1cdca  53.23x
+500_000_row_csr_56_sequential.json  5M_dense_5x5.zarr            dense  5477370x31915   row   sequential  csr    56  500000  500000x31915     700     1632    58.3  127.097  128.237  7b1cdca  53.71x
+IP_500k_row_csr_56_seq.json         5M_dense_5x5.zarr            dense  5477370x31915   row   sequential  csr    56  500000  500000x31915     700     1632    58.2  127.189  127.432  7b1cdca  53.75x
