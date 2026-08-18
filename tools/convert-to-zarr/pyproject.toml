@@ -11,7 +11,7 @@ requires-python = ">=3.10,<3.13"
 license = "MIT"
 authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 dependencies = [
-  "anndata>=0.11.0,<0.13",
+  "anndata>=0.12.10,<0.13",
   "zarr>=3.0.0",
   "numpy>=1.24.0,<2.5",
   "scipy>=1.10.0",
@@ -44,7 +44,7 @@ dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.dependencies]
 python = ">=3.10,<3.13"
-anndata = ">=0.11,<0.13"  # 0.13 injects a phantom None layer key that breaks the layer writer
+anndata = ">=0.12.10,<0.13"  # 0.13 injects a phantom None layer key that breaks the layer writer; 0.12.10 is the validated floor
 numpy = "<2.5"
 scanpy = ">=1.12.1,<2"
 dask = ">=2026.3.0,<2027"

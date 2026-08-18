@@ -4,6 +4,10 @@ CLI tool to benchmark **query time** against a Zarr store's `X` matrix (dense or
 CSR/CSC). It times *read selection + convert to the requested final format*, so comparisons
 across layouts are fair (a `dense` query from a CSR store pays the densify cost, and vice versa).
 
+> Findings produced with this tool (dense vs sparse, row vs column axis, sorted vs unsorted,
+> read threading) live in
+> [`benchmarking_results/zarr_layouts/`](../../benchmarking_results/zarr_layouts/README.md).
+
 Run via pixi (`python` is not on PATH directly):
 
 ```bash
@@ -58,13 +62,16 @@ re-fetch shared chunks and the query degrades — a warning fires when that happ
 pixi run zarr-bench --store gs://my-bucket/atlas_csr.zarr --axis row --count 1000 --format csr --json
 ```
 
-**Sweep many stores** — `zarr_query_bench/examples/run_query_sweep.sh` runs both axes over
+**Sweep many stores** — `./run_query_sweep.sh` runs both axes over
 every `.zarr` in a directory (or `gs://` prefix) and appends one JSON line per run:
 
 ```bash
 # [STORE_DIR] [COUNT] [FORMAT] [THREAD_CONCURRENCY] [MODE] [OUT]
-zarr_query_bench/examples/run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench.jsonl
+./run_query_sweep.sh zarr_dbs 1000 csr 32 sequential bench.jsonl
 ```
+
+For an explicit few-stores × few-parameters matrix instead (edit the CONFIG block, run),
+use `./sweep_stores.sh`.
 
 **Compare runs** — `compare` reads `--json` files (a single object, an array, or JSON Lines) and
 prints an aligned table, sortable, with a trailing `xslow` column (each run's median vs the fastest):

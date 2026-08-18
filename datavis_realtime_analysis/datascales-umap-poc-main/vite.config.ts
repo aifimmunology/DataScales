@@ -46,6 +46,22 @@ function serveDataDir(dir?: string): PluginOption {
         },
       })
       server.middlewares.use(serve)
+
+      // A missing Zarr resource MUST 404 — not fall through to Vite's SPA
+      // index.html. A missing chunk is normal (an all-fill-value column, e.g. a
+      // single-category obs like AIFI_L1 on a pure-lineage subset, writes no
+      // chunk file); zarrita treats a 404 as "read the fill value", but a 200
+      // index.html gets zstd-decoded as chunk bytes and throws. This runs only
+      // for requests express.static didn't already serve.
+      server.middlewares.use((req, res, next) => {
+        const p = (req.url ?? '').split('?')[0]
+        if (/\/(zarr|groups)\.json$/.test(p) || /\/c\/[0-9/]+$/.test(p)) {
+          res.statusCode = 404
+          res.end()
+          return
+        }
+        next()
+      })
     },
   }
 }

@@ -148,6 +148,30 @@ pixi run convert-to-zarr convert-10x-h5 --help
 pixi run convert-to-zarr concat-h5ads --help
 ```
 
+## Benchmarking
+
+[`benchmarking/convert_bench.py`](benchmarking/convert_bench.py) benchmarks **h5ad → zarr
+conversion** (wall time + peak RSS + output size) with this tool against the alternatives,
+each at its tuned best-effort: eager `anndata.write_zarr` (serial), a naive serial h5py→zarr
+copy, an eager Icechunk write (one commit), `convert-to-zarr --backed --cpus N` (the
+process-parallel streaming path this row is meant to prove out), and optional virtualizarr
+byte-range references. Each method runs in its **own subprocess** so peak RSS is isolated.
+
+Run it from this directory (uses this tool's pixi env):
+
+```bash
+# all core methods, 64-way parallel where supported
+pixi run python benchmarking/convert_bench.py \
+    --input data/synthetic_2M_34k.h5ad --workers 64 --json results_2M.json
+
+# a subset of methods
+pixi run python benchmarking/convert_bench.py \
+    --input data/synthetic_500k.h5ad --methods h5py datascale --workers 8
+```
+
+Output is a table (and `--json` raw per-method numbers). See the module docstring for
+method notes, cache-warmth caveats, and the remaining flags (`--outdir`, …).
+
 ## Development
 
 ```bash
