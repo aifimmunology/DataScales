@@ -49,12 +49,12 @@ stays bounded. Use the 500k file to exercise the eager rows on a small box.
 Usage
 -----
     # tuned run across the core methods, 64-way parallel where supported
-    pixi run python benchmarks/convert_bench.py \
+    pixi run python benchmarking/convert_bench.py \
         --input data/synthetic_2M_34k.h5ad --workers 64 \
         --outdir /scratch/convbench --json results_2M.json
 
     # single method / fewer workers
-    pixi run python benchmarks/convert_bench.py \
+    pixi run python benchmarking/convert_bench.py \
         --input data/synthetic_2M_34k.h5ad --methods h5py datascale --workers 8
 
 Notes
@@ -185,8 +185,8 @@ def convert_icechunk(inp: Path, out: Path, workers: int) -> None:
 
 def convert_datascale(inp: Path, out: Path, workers: int) -> None:
     # Tuned: backed streaming + process parallelism (bounded RAM per worker).
-    from datascale.config import load_config, apply_cli_overrides
-    from datascale.converter import convert_h5ad_to_zarr
+    from convert_to_zarr.config import load_config, apply_cli_overrides
+    from convert_to_zarr.converter import convert_h5ad_to_zarr
 
     cfg = load_config(None)  # defaults: sparse-csr, zarr backend
     # Always backed so this row is ALWAYS the streaming/bounded CSR->CSR path
