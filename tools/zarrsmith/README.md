@@ -76,6 +76,24 @@ Requirements (strict; conversion errors otherwise):
 - `adata.X` in each file must be CSR or CSC (CSC is auto-converted to CSR).
 - All `X` matrices must share the same dtype.
 
+## Store ops (existing zarr stores)
+
+```bash
+# add a log-normalized expression layer (layers/gexp) for gene queries — csc, dense, or csr
+pixi run zarrsmith add-expr --store path/to/store.zarr --format csc --chunk-elems 1000000
+
+# rewrite a matrix with new chunking into a new store (everything else copied as-is)
+pixi run zarrsmith rechunk --store in.zarr --output out.zarr --array X --x-row-chunk 2048 --x-col-chunk 512
+
+# physically sort by obs column(s) into a new store (streamed, memory-bounded, CSR X)
+pixi run zarrsmith sort --store in.zarr --output sorted.zarr --by AIFI_L1 batch_id
+
+# append the cells of another zarr store, in place (strict var/obs/dtype match)
+pixi run zarrsmith append --store store.zarr --cells new_cells.zarr [--drop-obsp] [--refresh-expr]
+```
+
+`add-expr` and `append` mutate the store in place (one commit with `--icechunk`); `rechunk` and `sort` always write a new store. Appending refuses to silently invalidate things: obsp graphs need `--drop-obsp`, an existing gexp layer needs `--refresh-expr` (re-derived after the append), and a previously sorted store should be re-sorted. See [zarrsmith-buildspec.md](zarrsmith-buildspec.md) for design details.
+
 # Argument passing
 
 ## Config (TOML or YAML)

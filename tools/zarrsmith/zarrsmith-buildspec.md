@@ -17,10 +17,13 @@ AnnData zarr stores. One streaming/parallel engine, one config/storage/encoding 
 ## Status
 
 - [x] Phase 0 — restructure (rename + converter.py split, tests green, zero behavior change)
-- [ ] Phase 1 — add-expr
-- [ ] Phase 2 — rechunk
-- [ ] Phase 3 — sort (standalone, zarr input)
-- [ ] Phase 4 — append
+- [x] Phase 1 — add-expr (ops/expr.py; csc/dense via disk-backed column-band buckets, csr streamed)
+- [x] Phase 2 — rechunk (ops/rechunk.py; threaded tile copy, non-target elements copied as-is)
+- [x] Phase 3 — sort (ops/sort.py sort_store; shares _stream_sorted_store with --backed convert)
+- [x] Phase 4 — append (ops/append.py; in-place resize, --drop-obsp / --refresh-expr escapes)
+
+Still open from the invariants list: peak-RSS assertions in tests, `--verify` flag,
+parallel band finalize in add-expr.
 
 ## Module map
 

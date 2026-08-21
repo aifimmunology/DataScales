@@ -101,6 +101,46 @@ def open_output_store(
     return root, finalize
 
 
+def open_store_rw(
+    store_path: Path, cfg: AppConfig, *, commit_message: str | None = None
+) -> tuple[zarr.Group, Callable[[], None]]:
+    """Open an existing store for in-place update; finalize() commits/re-consolidates."""
+    if cfg.io.backend == "icechunk":
+        import icechunk
+
+        repo = icechunk.Repository.open(_icechunk_storage(store_path, cfg))
+        session = repo.writable_session("main")
+        root = zarr.open_group(store=session.store, mode="r+")
+
+        def finalize() -> None:
+            msg = commit_message or f"zarrsmith update → {store_path.name}"
+            snapshot_id = session.commit(msg)
+            print(
+                f"  icechunk commit {snapshot_id} on branch 'main'",
+                flush=True, file=sys.stderr,
+            )
+
+        return root, finalize
+
+    if not store_path.exists():
+        raise StorageError(f"Store does not exist: {store_path}")
+    root = zarr.open_group(str(store_path), mode="r+")
+
+    import json
+
+    meta_file = store_path / "zarr.json"
+    had_consolidated = (
+        meta_file.exists()
+        and json.loads(meta_file.read_text()).get("consolidated_metadata") is not None
+    )
+
+    def finalize() -> None:
+        if had_consolidated or cfg.io.consolidate_metadata:
+            zarr.consolidate_metadata(str(store_path))
+
+    return root, finalize
+
+
 def open_input_group(
     path: str, *, icechunk: bool = False, branch: str = "main"
 ) -> zarr.Group:

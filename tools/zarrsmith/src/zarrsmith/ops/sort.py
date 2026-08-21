@@ -17,7 +17,7 @@ from ..validation import validate_single_cell_anndata
 from ..writers import _write_concatenated_csr
 
 
-def _compute_sort(adata: ad.AnnData, sort_by: tuple[str, ...]):
+def _compute_sort(obs, sort_by: tuple[str, ...]):
     """Compute the row permutation + contiguous range table for sorting by ``sort_by``.
 
     Returns ``(perm, ranges_df)`` where ``perm`` is the int64 permutation (original row
@@ -28,7 +28,6 @@ def _compute_sort(adata: ad.AnnData, sort_by: tuple[str, ...]):
     import numpy as np
     import pandas as pd
 
-    obs = adata.obs
     missing = [c for c in sort_by if c not in obs.columns]
     if missing:
         raise ConversionError(
@@ -83,7 +82,7 @@ def _maybe_sort_adata(
             "--backed yet. Omit --backed to sort."
         )
 
-    perm, ranges_df = _compute_sort(adata, sort_by)
+    perm, ranges_df = _compute_sort(adata.obs, sort_by)
     with _stage(f"Sorting {adata.n_obs} cells by {list(sort_by)} ({len(ranges_df)} groups)"):
         adata = adata[perm].copy()  # reorders X/obs/obsm/obsp/layers/raw consistently
     warnings.append(
@@ -114,13 +113,6 @@ def _write_sorted_backed(
     obs/obsm are reordered in memory (backed mode already loads them); var/varm/varp/uns are not
     obs-aligned and are written as-is. Dense or CSC sort still works eagerly (omit --backed).
     """
-    import shutil
-    import tempfile
-
-    import numpy as np
-    from anndata._io.specs import write_elem  # private API — see anndata skill
-    from anndata.io import sparse_dataset
-
     sort_by = cfg.grouping.sort_by
     if cfg.io.x_storage != "sparse-csr":
         raise ConversionError(
@@ -140,12 +132,31 @@ def _write_sorted_backed(
             "Omit --backed to sort eagerly."
         )
 
-    n_obs, n_vars = adata.shape
+    validation_result = validate_single_cell_anndata(adata, cfg.validation)
+    return _stream_sorted_store(
+        x, adata.obs, adata.var, dict(adata.uns), dict(adata.obsm), dict(adata.varm),
+        dict(adata.varp), output_path, cfg, warnings, list(validation_result.warnings),
+    )
+
+
+def _stream_sorted_store(
+    x, obs, var, uns, obsm, varm, varp,
+    output_path: Path, cfg: AppConfig, warnings: list[str], extra_warnings: list[str],
+) -> list[str]:
+    """Bucket rows into temp per-group CSR stores, then concat them in sorted order."""
+    import shutil
+    import tempfile
+
+    import numpy as np
+    from anndata._io.specs import write_elem  # private API — see anndata skill
+    from anndata.io import sparse_dataset
+
+    sort_by = cfg.grouping.sort_by
+    n_obs, n_vars = x.shape
     x_dtype = x.dtype
     indices_dtype = np.int32  # matches the rest of the writers (fits unless > 2^31 cols)
 
-    # Permutation + contiguous group ranges — obs-only, so backed-safe (obs is in memory).
-    perm, ranges = _compute_sort(adata, sort_by)
+    perm, ranges = _compute_sort(obs, sort_by)
     n_groups = len(ranges)
     starts = ranges["start"].to_numpy()
     ends = ranges["end"].to_numpy()
@@ -168,10 +179,9 @@ def _write_sorted_backed(
     ]
     nnz_each = [int(ip[-1]) for ip in indptr_each]
 
-    validation_result = validate_single_cell_anndata(adata, cfg.validation)
     ad.settings.zarr_write_format = 3
     print(
-        f"Converting (backed, streamed sort) → {output_path} "
+        f"Sorting (streamed) → {output_path} "
         f"(n_obs={n_obs}, n_vars={n_vars}, sparse-csr, {n_groups} groups, backend={cfg.io.backend})",
         flush=True, file=sys.stderr,
     )
@@ -229,14 +239,14 @@ def _write_sorted_backed(
         store.attrs["encoding-type"] = "anndata"
         store.attrs["encoding-version"] = "0.1.0"
         with _stage("Writing metadata (sorted obs/obsm; var/varm/varp/uns as-is)"):
-            write_elem(store, "obs", adata.obs.iloc[perm])
-            write_elem(store, "var", adata.var)
-            write_elem(store, "uns", dict(adata.uns))
+            write_elem(store, "obs", obs.iloc[perm])
+            write_elem(store, "var", var)
+            write_elem(store, "uns", dict(uns))
             write_elem(store, "obsm", {k: (v.iloc[perm] if hasattr(v, "iloc") else v[perm])
-                                       for k, v in adata.obsm.items()})
-            write_elem(store, "varm", dict(adata.varm))
-            write_elem(store, "obsp", {})   # empty (non-empty obsp is rejected above)
-            write_elem(store, "varp", dict(adata.varp))
+                                       for k, v in obsm.items()})
+            write_elem(store, "varm", dict(varm))
+            write_elem(store, "obsp", {})   # empty (non-empty obsp is rejected by callers)
+            write_elem(store, "varp", dict(varp))
 
         temp_mats = [sparse_dataset(tg) for tg in temp_groups]
         with _stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, sparse-csr, concat {n_groups} groups)"):
@@ -251,4 +261,40 @@ def _write_sorted_backed(
         "bucketing (X never fully materialised); obs/obsm reordered to match. Store is a plain "
         "sorted AnnData (no tool index)."
     )
-    return [*warnings, *validation_result.warnings]
+    return [*warnings, *extra_warnings]
+
+
+def sort_store(input_store: str, output_zarr: str, cfg: AppConfig) -> list[str]:
+    """Physically sort an existing zarr store by obs column(s) into a new store."""
+    from anndata.io import read_elem, sparse_dataset
+
+    from ..config import _resolve_backend_cfg
+    from ..storage import open_input_group
+
+    cfg = _resolve_backend_cfg(cfg)
+    if not cfg.grouping.sort_by:
+        raise ConversionError("sort requires --by OBS_COLUMN [OBS_COLUMN ...].")
+    if cfg.io.x_storage != "sparse-csr":
+        raise ConversionError(
+            f"sort supports x_storage='sparse-csr' only (got '{cfg.io.x_storage}')."
+        )
+
+    src = open_input_group(input_store)
+    if src["X"].attrs.get("encoding-type") != "csr_matrix":
+        raise ConversionError(
+            f"sort requires CSR X; got encoding {src['X'].attrs.get('encoding-type')!r}."
+        )
+    for key in ("layers", "raw", "obsp"):
+        if key in src and len(list(src[key])) > 0:
+            raise ConversionError(
+                f"sort does not reorder {key} yet; drop it or sort at convert time."
+            )
+
+    def _read(key):
+        return read_elem(src[key]) if key in src else {}
+
+    x = sparse_dataset(src["X"])
+    return _stream_sorted_store(
+        x, read_elem(src["obs"]), read_elem(src["var"]), _read("uns"), _read("obsm"),
+        _read("varm"), _read("varp"), Path(output_zarr), cfg, [], [],
+    )

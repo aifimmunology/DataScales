@@ -61,6 +61,18 @@ def _run_parallel(worker, jobs, cpus):
             fut.result()
 
 
+def _run_parallel_threads(worker, jobs, cpus):
+    """Threaded variant for zarr→zarr copies (blosc codecs release the GIL)."""
+    if cpus <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            worker(*job)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=cpus) as ex:
+        for fut in [ex.submit(worker, *job) for job in jobs]:
+            fut.result()
+
+
 @contextmanager
 def _stage(label: str):
     """Print a labelled progress line with elapsed time. Flushes immediately."""
