@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from ..config import AppConfig
-from ..engine import _stage
+from ..engine import _stage, configure_runtime
 from ..errors import ConversionError
 from ..layout import _x_compressors
 from ..storage import open_store_rw
@@ -28,6 +28,7 @@ def add_expr_layer(
     if fmt not in ("csc", "dense", "csr"):
         raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
 
+    configure_runtime(cfg.chunks.cpus)
     store_path = Path(store)
     root, finalize = open_store_rw(
         store_path, cfg, commit_message=f"zarrsmith add-expr {fmt} → layers/{layer}"
@@ -41,6 +42,8 @@ def add_expr_layer(
         )
 
     n_obs, n_vars = (int(v) for v in x.attrs["shape"])
+    if max(n_obs, n_vars) > 2**31 - 1:
+        raise ConversionError("add-expr supports up to 2^31-1 cells/genes.")
     data_arr, idx_arr = x["data"], x["indices"]
     indptr = np.asarray(x["indptr"][:], dtype=np.int64)
     nnz = int(indptr[-1])
@@ -57,31 +60,23 @@ def add_expr_layer(
     bytes_per_row = max(1, nnz // max(1, n_obs)) * 12
     row_step = max(1_000, min(200_000, _BAND_BYTES // bytes_per_row))
 
-    factors = np.zeros(n_obs, dtype=np.float64)
-    with _stage(f"Computing scale factors (n_obs={n_obs}, nnz={nnz})"):
-        for b0 in range(0, n_obs, row_step):
-            b1 = min(b0 + row_step, n_obs)
-            seg = np.asarray(data_arr[int(indptr[b0]):int(indptr[b1])], dtype=np.float64)
-            if seg.size == 0:
-                continue
-            cs = np.concatenate(([0.0], np.cumsum(seg)))
-            sums = cs[indptr[b0 + 1:b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
-            nz = sums > 0
-            factors[b0:b1][nz] = target_sum / sums[nz]
-
+    # factors are row-local, so they fuse into the transform: one pass over X data
     def _band(b0: int, b1: int):
         s0, s1 = int(indptr[b0]), int(indptr[b1])
-        vals = np.log1p(
-            np.asarray(data_arr[s0:s1], dtype=np.float64)
-            * np.repeat(factors[b0:b1], row_nnz[b0:b1])
-        ).astype(np.float32)
+        seg = np.asarray(data_arr[s0:s1], dtype=np.float64)
+        cs = np.concatenate(([0.0], np.cumsum(seg)))
+        sums = cs[indptr[b0 + 1:b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
+        factors = np.zeros(b1 - b0)
+        nz = sums > 0
+        factors[nz] = target_sum / sums[nz]
+        vals = np.log1p(seg * np.repeat(factors, row_nnz[b0:b1])).astype(np.float32)
         return s0, s1, vals
 
     indptr_dtype = np.int64 if nnz > np.iinfo(np.int32).max else np.int32
 
     if fmt == "csr":
         g = _sparse_layer(layers, layer, "csr_matrix", (n_obs, n_vars), nnz,
-                          idx_arr.dtype, indptr_dtype, chunk_elems)
+                          idx_arr.dtype, indptr_dtype, chunk_elems, target_sum)
         g["indptr"][:] = indptr.astype(indptr_dtype)
         with _stage(f"Writing layers/{layer} (csr, nnz={nnz})"):
             for b0 in range(0, n_obs, row_step):
@@ -107,10 +102,12 @@ def add_expr_layer(
         band_cols = max(k, (_BAND_BYTES // (4 * n_obs)) // k * k)
         edges = list(range(0, n_vars, band_cols)) + [n_vars]
     else:
-        max_band_nnz = _BAND_BYTES // 12
+        # 20 B/entry: 12 B bucket (i32+i32+f32) + 8 B argsort index in the write phase
+        max_band_nnz = _BAND_BYTES // 20
         edges = [0]
         while edges[-1] < n_vars:
-            nxt = int(np.searchsorted(csc_indptr, csc_indptr[edges[-1]] + max_band_nnz))
+            target = csc_indptr[edges[-1]] + max_band_nnz
+            nxt = int(np.searchsorted(csc_indptr, target, side="right")) - 1
             edges.append(min(max(nxt, edges[-1] + 1), n_vars))
     n_bands = len(edges) - 1
     band_nnz = [int(csc_indptr[edges[i + 1]] - csc_indptr[edges[i]]) for i in range(n_bands)]
@@ -121,8 +118,8 @@ def add_expr_layer(
         for i, m in enumerate(band_nnz):
             m = max(1, m)
             buckets.append({
-                "rows": np.memmap(tmp_root / f"r{i}", dtype=np.int64, mode="w+", shape=(m,)),
-                "cols": np.memmap(tmp_root / f"c{i}", dtype=np.int64, mode="w+", shape=(m,)),
+                "rows": np.memmap(tmp_root / f"r{i}", dtype=np.int32, mode="w+", shape=(m,)),
+                "cols": np.memmap(tmp_root / f"c{i}", dtype=np.int32, mode="w+", shape=(m,)),
                 "vals": np.memmap(tmp_root / f"v{i}", dtype=np.float32, mode="w+", shape=(m,)),
             })
         edges_arr = np.asarray(edges[1:], dtype=np.int64)
@@ -132,8 +129,8 @@ def add_expr_layer(
             for b0 in range(0, n_obs, row_step):
                 b1 = min(b0 + row_step, n_obs)
                 s0, s1, vals = _band(b0, b1)
-                cols = np.asarray(idx_arr[s0:s1], dtype=np.int64)
-                rows = np.repeat(np.arange(b0, b1, dtype=np.int64), row_nnz[b0:b1])
+                cols = np.asarray(idx_arr[s0:s1], dtype=np.int32)
+                rows = np.repeat(np.arange(b0, b1, dtype=np.int32), row_nnz[b0:b1])
                 band_ids = np.searchsorted(edges_arr, cols, side="right")
                 order = np.argsort(band_ids, kind="stable")
                 bounds = np.searchsorted(band_ids[order], np.arange(n_bands + 1))
@@ -149,9 +146,9 @@ def add_expr_layer(
                     cursors[bi] = c + hi - lo
 
         if fmt == "csc":
-            indices_dtype = np.int64 if n_obs > np.iinfo(np.int32).max else np.int32
+            indices_dtype = np.int32
             g = _sparse_layer(layers, layer, "csc_matrix", (n_obs, n_vars), nnz,
-                              indices_dtype, indptr_dtype, chunk_elems)
+                              indices_dtype, indptr_dtype, chunk_elems, target_sum)
             g["indptr"][:] = csc_indptr.astype(indptr_dtype)
             with _stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
                 for bi in range(n_bands):
@@ -169,7 +166,8 @@ def add_expr_layer(
                 layer, shape=(n_obs, n_vars), dtype=np.float32,
                 chunks=(n_obs, k), compressors=_x_compressors(), overwrite=True,
             )
-            arr.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
+            arr.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0",
+                              "zarrsmith_target_sum": float(target_sum)})
             with _stage(f"Writing layers/{layer} (dense, {n_bands} column bands)"):
                 for bi in range(n_bands):
                     c0, c1 = edges[bi], edges[bi + 1]
@@ -188,11 +186,13 @@ def add_expr_layer(
     return []
 
 
-def _sparse_layer(layers, name, enc, shape, nnz, indices_dtype, indptr_dtype, chunk_elems):
+def _sparse_layer(layers, name, enc, shape, nnz, indices_dtype, indptr_dtype,
+                  chunk_elems, target_sum):
     import numpy as np
 
     g = layers.require_group(name)
-    g.attrs.update({"encoding-type": enc, "encoding-version": "0.1.0", "shape": list(shape)})
+    g.attrs.update({"encoding-type": enc, "encoding-version": "0.1.0", "shape": list(shape),
+                    "zarrsmith_target_sum": float(target_sum)})
     n_major = shape[0] if enc == "csr_matrix" else shape[1]
     flat = min(chunk_elems, max(1, nnz))
     g.require_array("data", shape=(nnz,), dtype=np.float32, chunks=(flat,),

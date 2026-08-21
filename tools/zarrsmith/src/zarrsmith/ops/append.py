@@ -6,7 +6,7 @@ from pathlib import Path
 import zarr
 
 from ..config import AppConfig
-from ..engine import _stage
+from ..engine import _run_parallel_threads, _stage, configure_runtime
 from ..errors import ConversionError
 from ..storage import open_input_group, open_store_rw
 from .expr import add_expr_layer
@@ -28,6 +28,7 @@ def append_cells(
     from anndata._io.specs import write_elem
     from anndata.io import read_elem
 
+    configure_runtime(cfg.chunks.cpus)
     src = open_input_group(cells)
     store_path = Path(store)
     root, finalize = open_store_rw(
@@ -114,7 +115,7 @@ def append_cells(
                 del root["obsp"][k]
             warnings.append(f"dropped obsp graphs {obsp_keys} (invalidated by appended cells).")
         _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
-                       indptr_t, indptr_s, n_t, n_s, n_vars, warnings)
+                       indptr_t, indptr_s, n_t, n_s, n_vars, warnings, cfg)
     except ConversionError:
         raise
     except Exception as e:
@@ -130,15 +131,21 @@ def append_cells(
     finalize()
 
     if gexp_params is not None:
-        fmt, chunk_elems = gexp_params
+        fmt, chunk_elems, target_sum = gexp_params
         cfg_ow = replace(cfg, io=replace(cfg.io, overwrite=True))
-        add_expr_layer(store, cfg_ow, fmt=fmt, chunk_elems=chunk_elems)
+        if target_sum is None:
+            warnings.append(
+                "layers/gexp has no recorded target_sum (pre-zarrsmith layer); "
+                "re-deriving at the default 1e4."
+            )
+            target_sum = 1e4
+        add_expr_layer(store, cfg_ow, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum)
         warnings.append(f"layers/gexp re-derived ({fmt}) over the appended matrix.")
     return warnings
 
 
 def _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
-                   indptr_t, indptr_s, n_t, n_s, n_vars, warnings):
+                   indptr_t, indptr_s, n_t, n_s, n_vars, warnings, cfg):
     import numpy as np
     import pandas as pd
     from anndata._io.specs import write_elem
@@ -151,10 +158,18 @@ def _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
         for name in ("data", "indices"):
             dst_a, src_a = x_t[name], x_s[name]
             dst_a.resize((nnz_new,))
-            seg = max(1, _SEG_BYTES // max(1, dst_a.dtype.itemsize))
-            for s0 in range(0, nnz_s, seg):
-                s1 = min(s0 + seg, nnz_s)
-                dst_a[nnz_t + s0:nnz_t + s1] = src_a[s0:s1]
+            # after the seam, cut on dst chunk multiples: disjoint whole-chunk
+            # writes, so segments can run threaded with no RMW
+            chunk0 = dst_a.chunks[0]
+            step = max(chunk0, (_SEG_BYTES // max(1, chunk0 * dst_a.dtype.itemsize)) * chunk0)
+            cuts = [0]
+            seam = (-nnz_t) % chunk0
+            if 0 < seam < nnz_s:
+                cuts.append(seam)
+            while cuts[-1] < nnz_s:
+                cuts.append(min(nnz_s, cuts[-1] + step))
+            jobs = [(src_a, dst_a, cuts[i], cuts[i + 1], nnz_t) for i in range(len(cuts) - 1)]
+            _run_parallel_threads(_copy_shifted, jobs, cfg.chunks.cpus)
         indptr_dtype = np.int64 if nnz_new > np.iinfo(np.int32).max else x_t["indptr"].dtype
         del x_t["indptr"]
         ip = x_t.require_array(
@@ -177,11 +192,16 @@ def _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
             a[n_t:n_new] = src_obsm[k][:]
 
 
-def _introspect_gexp(node) -> tuple[str, int]:
+def _copy_shifted(src, dst, s0, s1, off):
+    dst[off + s0:off + s1] = src[s0:s1]
+
+
+def _introspect_gexp(node) -> tuple[str, int, float | None]:
+    target_sum = node.attrs.get("zarrsmith_target_sum")
     if isinstance(node, zarr.Array):
-        return "dense", node.chunks[0] * node.chunks[1]
+        return "dense", node.chunks[0] * node.chunks[1], target_sum
     enc = node.attrs.get("encoding-type")
     fmt = {"csr_matrix": "csr", "csc_matrix": "csc"}.get(enc)
     if fmt is None:
         raise ConversionError(f"cannot refresh layers/gexp: unsupported encoding {enc!r}.")
-    return fmt, int(node["data"].chunks[0])
+    return fmt, int(node["data"].chunks[0]), target_sum

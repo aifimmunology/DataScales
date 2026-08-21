@@ -544,8 +544,10 @@ def _write_concatenated_csr(
     for matrix, ip, n_obs_i, nnz_i in zip(matrices, indptrs, n_obs_each, nnz_each):
         if nnz_i == 0:
             continue
-        if not sp.issparse(matrix):
-            backed_any = True  # backed _CSRDataset: h5py/zarr handle, not thread-safe
+        if not sp.issparse(matrix) and not isinstance(
+            getattr(matrix, "group", None), zarr.Group
+        ):
+            backed_any = True  # h5py-backed: not thread-safe (zarr-backed temps are)
         d_parts, i_parts = _csr_dask_parts(
             matrix, ip, n_obs_i, nnz_i, data_dtype, indices_dtype
         )

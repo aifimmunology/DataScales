@@ -9,7 +9,7 @@ import scipy.sparse as sp
 import zarr
 
 from ..config import AppConfig
-from ..engine import _stage
+from ..engine import _stage, configure_runtime
 from ..errors import ConversionError
 from ..sources import _get_indptr
 from ..storage import open_output_store
@@ -151,6 +151,14 @@ def _stream_sorted_store(
     from anndata._io.specs import write_elem  # private API — see anndata skill
     from anndata.io import sparse_dataset
 
+    # fail fast before the expensive bucketing pass (mirrors the concat path)
+    if cfg.io.backend != "icechunk" and output_path.exists() and not cfg.io.overwrite:
+        raise ConversionError(
+            f"Output path already exists: {output_path}. "
+            "Use overwrite=true in config or --overwrite flag."
+        )
+    configure_runtime(cfg.chunks.cpus)
+
     sort_by = cfg.grouping.sort_by
     n_obs, n_vars = x.shape
     x_dtype = x.dtype
@@ -220,10 +228,16 @@ def _stream_sorted_store(
                 batch = x[b0:b1]  # backed CSR slice -> in-memory scipy CSR (one batch bounds RAM)
                 if not sp.isspmatrix_csr(batch):
                     batch = batch.tocsr()
+                # one stable argsort per batch instead of a boolean mask per group —
+                # O(rows·log) not O(rows·groups) at high-cardinality keys
                 g_batch = group_of_source[b0:b1]
-                for gi in np.unique(g_batch):
-                    gi = int(gi)
-                    sub = batch[g_batch == gi]  # this group's rows, in source (== output) order
+                order = np.argsort(g_batch, kind="stable")
+                sorted_g = g_batch[order]
+                starts = np.flatnonzero(np.concatenate(([True], sorted_g[1:] != sorted_g[:-1])))
+                ends = np.concatenate((starts[1:], [sorted_g.size]))
+                for lo, hi in zip(starts, ends):
+                    gi = int(sorted_g[lo])
+                    sub = batch[order[lo:hi]]  # stable ties keep source (== output) order
                     m = sub.nnz
                     if m == 0:
                         continue

@@ -258,10 +258,10 @@ def apply_cli_overrides(
 def _resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
     """Validate + adapt config for the chosen storage backend.
 
-    The icechunk backend writes through an in-process session; the backed-input writers
-    fan out to worker processes that reopen the store by filesystem path, which an
-    IcechunkStore can't provide — so backed + icechunk is rejected for now. To keep the
-    single-session write thread-safe we also force a single worker for icechunk.
+    Icechunk supports multi-threaded writes against one shared session (single commit),
+    so in-process threaded paths keep cpus. Only the backed-input writers are rejected:
+    they fan out to worker processes that reopen the store by filesystem path, which an
+    icechunk session can't provide (Session.fork() is the future path).
     """
     import sys
 
@@ -273,19 +273,10 @@ def _resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
             f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored.",
             flush=True, file=sys.stderr,
         )
-    if cfg.io.backend != "icechunk":
-        return cfg
-    if cfg.io.backed:
+    if cfg.io.backend == "icechunk" and cfg.io.backed:
         raise ConversionError(
             "backend='icechunk' does not support --backed input yet (backed writers use "
             "worker processes that reopen the store by path; the icechunk session is "
             "in-process only). Convert eagerly (omit --backed), or use backend='zarr'."
         )
-    if cfg.chunks.cpus > 1:
-        print(
-            f"→ icechunk backend: forcing cpus=1 (was {cfg.chunks.cpus}; single-session "
-            "writes are not parallelised yet).",
-            flush=True, file=sys.stderr,
-        )
-        cfg = replace(cfg, chunks=replace(cfg.chunks, cpus=1))
     return cfg

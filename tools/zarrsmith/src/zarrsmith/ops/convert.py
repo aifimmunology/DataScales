@@ -9,6 +9,7 @@ import anndata as ad
 import scipy.sparse as sp
 
 from ..config import AppConfig, _resolve_backend_cfg
+from ..engine import configure_runtime
 from ..errors import ConversionError
 from ..sources import _close_backed_if_needed, _load_h5ad_for_conversion
 from ..storage import open_output_store
@@ -30,6 +31,7 @@ def _write_adata_to_zarr(
     a warning. When ``allow_grouping`` and grouping is enabled, rows are sorted first.
     """
     cfg = _resolve_backend_cfg(cfg)
+    configure_runtime(cfg.chunks.cpus)
     warnings = list(load_warnings)
 
     if allow_grouping:

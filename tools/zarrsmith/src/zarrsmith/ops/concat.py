@@ -8,7 +8,7 @@ from typing import Any
 import anndata as ad
 
 from ..config import AppConfig, _resolve_backend_cfg
-from ..engine import _stage
+from ..engine import _stage, configure_runtime
 from ..errors import ConversionError
 from ..sources import _close_backed_if_needed, _ensure_csr, _load_h5ad_for_conversion
 from ..storage import open_output_store
@@ -47,6 +47,7 @@ def convert_h5ads_to_zarr(
         )
 
     cfg = _resolve_backend_cfg(cfg)
+    configure_runtime(cfg.chunks.cpus)
     if cfg.grouping.enabled:
         raise ConversionError("grouping (sort_by) is only supported by convert for now.")
 

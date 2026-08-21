@@ -5,12 +5,12 @@ from pathlib import Path
 import zarr
 
 from ..config import AppConfig, _resolve_backend_cfg
-from ..engine import _run_parallel_threads, _stage
+from ..engine import _run_parallel_threads, _stage, configure_runtime
 from ..errors import ConversionError
 from ..layout import _dense_shards
 from ..storage import open_input_group, open_output_store
 
-_SMALL_ELEMS = ("obs", "var", "uns", "obsm", "varm", "obsp", "varp")
+_SMALL_ELEMS = ("obs", "var", "uns", "varm", "varp")
 _SEG_BYTES = 256 * 1024 * 1024
 
 
@@ -23,11 +23,17 @@ def rechunk_store(
     from anndata.io import read_elem
 
     cfg = _resolve_backend_cfg(cfg)
+    configure_runtime(cfg.chunks.cpus)
     src = open_input_group(input_store)
-    try:
-        target = src[array]
-    except KeyError:
-        raise ConversionError(f"array '{array}' not found in {input_store}.")
+
+    # validate the target before touching (or overwriting) the output
+    matrix_keys = ["X"]
+    if "layers" in src:
+        matrix_keys += [f"layers/{k}" for k in src["layers"]]
+    if "raw" in src and "X" in src["raw"]:
+        matrix_keys.append("raw/X")
+    if array not in matrix_keys:
+        raise ConversionError(f"array '{array}' is not a matrix element ({matrix_keys}).")
 
     ad.settings.zarr_write_format = 3
     output_path = Path(output_zarr)
@@ -40,6 +46,20 @@ def rechunk_store(
         for key in _SMALL_ELEMS:
             if key in src:
                 write_elem(dst, key, read_elem(src[key]))
+        # obsm/obsp scale with n_obs — stream arrays and sparse groups, chunks preserved
+        for key in ("obsm", "obsp"):
+            if key not in src:
+                continue
+            g = dst.require_group(key)
+            g.attrs.update(dict(src[key].attrs))
+            for child in src[key]:
+                node = src[key][child]
+                if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in (
+                    "csr_matrix", "csc_matrix",
+                ):
+                    _copy_matrix(node, dst, f"{key}/{child}", cfg, rechunk=False)
+                else:
+                    write_elem(g, child, read_elem(node))
         if "raw" in src:
             raw = dst.require_group("raw")
             raw.attrs.update(dict(src["raw"].attrs))
@@ -47,15 +67,9 @@ def rechunk_store(
                 if key in src["raw"]:
                     write_elem(raw, key, read_elem(src["raw"][key]))
 
-    matrix_keys = ["X"]
     if "layers" in src:
         layers = dst.require_group("layers")
         layers.attrs.update(dict(src["layers"].attrs))
-        matrix_keys += [f"layers/{k}" for k in src["layers"]]
-    if "raw" in src and "X" in src["raw"]:
-        matrix_keys.append("raw/X")
-    if array not in matrix_keys:
-        raise ConversionError(f"array '{array}' is not a matrix element ({matrix_keys}).")
 
     for key in matrix_keys:
         rechunked = key == array
@@ -92,7 +106,10 @@ def _copy_matrix(node, dst_root, key, cfg: AppConfig, *, rechunk: bool) -> None:
             for r0 in range(0, n_rows, block_row)
             for c0 in range(0, n_cols, block_col)
         ]
-        _run_parallel_threads(_copy_block, jobs, cfg.chunks.cpus)
+        # cap in-flight blocks: peak RSS ~ workers x block, budgeted at ~2 GiB
+        block_bytes = block_row * block_col * node.dtype.itemsize
+        workers = max(1, min(cfg.chunks.cpus, (2 << 30) // max(1, block_bytes)))
+        _run_parallel_threads(_copy_block, jobs, workers)
         return
 
     enc = node.attrs.get("encoding-type")

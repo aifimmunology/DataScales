@@ -26,15 +26,20 @@ Still open from the invariants list: peak-RSS assertions in tests, `--verify` fl
 
 ## Review backlog (multi-agent review, hotfixes landed separately)
 
-Efficiency: sort's concat is forced single-threaded for zarr-backed temps (backed_any
-misclassification in _write_concatenated_csr); icechunk cpus=1 clamp too broad for
-in-process threaded paths; zarr concurrency knobs + BLAS/Blosc pinning never set;
-add-expr — fuse the factor pass into the transform, int32 bucket memmaps, snap csc band
-edges to chunk multiples (bounds memory + enables parallel finalize); append — chunk-align
-copy segments, thread them, incremental csr gexp refresh; rechunk — stream obsp/obsm
-copies, validate --array before touching the output, align tiles to both grids, cap
-cpus×block RAM; sort bucketing degrades at high-cardinality keys (per-group masks +
-tail-chunk RMW).
+Efficiency (landed): sort concat threads for zarr-backed temps; icechunk cpus clamp
+dropped (threads share one session — icechunk's documented pattern; commit stays single;
+Session.fork() is the future path for the process-pool backed writers); configure_runtime
+sets zarr async.concurrency/max_workers + pins BLAS, small pools in process workers;
+add-expr factor pass fused into the transform (single data pass), int32 buckets, band
+sizing accounts for the 20 B/entry write phase; append segments chunk-aligned + threaded,
+target_sum persisted on the layer and honored by --refresh-expr; rechunk validates
+--array before touching the output, streams obsm/obsp, caps workers×block RAM; sort
+fail-fast on existing output, argsort-run bucketing (no per-group masks).
+
+Efficiency (still open): incremental csr gexp refresh on append; rechunk tile alignment
+to both grids (source chunks straddling output tiles are re-decoded); buffered temp-group
+appends in sort (tail-chunk RMW remains at high-cardinality keys); icechunk Session.fork()
+for the backed process-pool writers.
 
 Hygiene: one batch-bytes constant + helper (currently 6 copies), one make-sparse-group
 helper (currently 5 hand-rolled), ZarrsmithError root + unified CLI dispatch, merge the

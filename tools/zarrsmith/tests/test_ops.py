@@ -255,13 +255,23 @@ def test_append_refresh_expr(tmp_path):
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
     sb = _store(tmp_path, b, "b.zarr")
-    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
+    # non-default target_sum must survive the refresh (persisted on the layer)
+    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32, target_sum=1e6)
     with pytest.raises(ConversionError, match="stale"):
         append_cells(str(sa), str(sb), _cfg())
     append_cells(str(sa), str(sb), _cfg(), refresh_expr=True)
     got = ad.read_zarr(str(sa))
     np.testing.assert_allclose(
         got.layers["gexp"].toarray(),
-        _expected_gexp(sp.vstack([a.X, b.X])),
+        _expected_gexp(sp.vstack([a.X, b.X]), target_sum=1e6),
         rtol=1e-5,
     )
+
+
+def test_sort_store_output_exists(tmp_path):
+    out = _store(tmp_path, _adata())
+    out2 = tmp_path / "sorted.zarr"
+    out2.mkdir()
+    cfg = replace(_cfg(), grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)))
+    with pytest.raises(ConversionError, match="already exists"):
+        sort_store(str(out), str(out2), cfg)

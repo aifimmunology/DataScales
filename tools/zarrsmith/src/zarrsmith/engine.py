@@ -22,6 +22,8 @@ def _copy_sparse_segment(out_root, data_path, indices_path, src_file, src_group,
     import zarr
     from zarr.storage import LocalStore
 
+    # pools multiply across the process pool — keep each worker's zarr pools small
+    zarr.config.set({"async.concurrency": 8, "threading.max_workers": 2})
     with h5py.File(src_file, "r") as f:
         g = f[src_group]
         data = g["data"][s0:s1]
@@ -40,6 +42,7 @@ def _densify_band_segment(out_root, data_path, src_file, src_group, r0, r1,
     from anndata.io import sparse_dataset
     from zarr.storage import LocalStore
 
+    zarr.config.set({"async.concurrency": 8, "threading.max_workers": 2})
     with h5py.File(src_file, "r") as f:
         band = sparse_dataset(f[src_group])[r0:r1]
     arr = zarr.open_group(store=LocalStore(str(out_root)), mode="r+")[data_path]
@@ -59,6 +62,24 @@ def _run_parallel(worker, jobs, cpus):
     with ProcessPoolExecutor(max_workers=cpus) as ex:
         for fut in [ex.submit(worker, *job) for job in jobs]:
             fut.result()
+
+
+_configured = False
+
+
+def configure_runtime(cpus: int) -> None:
+    """Pin BLAS threads and size zarr's dispatch/decode pools, once per process."""
+    global _configured
+    if _configured:
+        return
+    _configured = True
+    import os
+    import zarr
+
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+    workers = max(cpus, os.cpu_count() or 1)
+    zarr.config.set({"async.concurrency": 64, "threading.max_workers": workers})
 
 
 def _run_parallel_threads(worker, jobs, cpus):
