@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from .config import apply_cli_overrides, load_config
-from .converter import (
+from .ops import (
     convert_10x_h5_to_zarr,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,

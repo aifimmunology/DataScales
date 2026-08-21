@@ -15,7 +15,7 @@ from zarrsmith.config import (
     IOConfig,
     ValidationConfig,
 )
-from zarrsmith.converter import (
+from zarrsmith import (
     ConversionError,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,

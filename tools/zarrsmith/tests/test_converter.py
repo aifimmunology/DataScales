@@ -8,7 +8,7 @@ import scipy.sparse as sp
 import zarr
 
 from zarrsmith.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
-from zarrsmith.converter import (
+from zarrsmith import (
     ConversionError,
     convert_10x_h5_to_zarr,
     convert_h5ad_to_zarr,
@@ -139,7 +139,7 @@ def test_h5ad_eager_csc_x_converts_to_csr_with_warning(tmp_path: Path) -> None:
 def test_h5ad_backed_flag_uses_backed_read(tmp_path: Path) -> None:
     """--backed causes backed="r" load; omitting it causes eager load."""
     _make_h5ad(tmp_path / "input.h5ad")
-    with patch("zarrsmith.converter.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
+    with patch("zarrsmith.sources.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
         convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csr"))
     assert mocked.call_args_list[0].kwargs.get("backed") == "r"
 
@@ -147,7 +147,7 @@ def test_h5ad_backed_flag_uses_backed_read(tmp_path: Path) -> None:
 def test_h5ad_eager_does_not_use_backed_read(tmp_path: Path) -> None:
     """Default (backed=False) uses eager load."""
     _make_h5ad(tmp_path / "input.h5ad")
-    with patch("zarrsmith.converter.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
+    with patch("zarrsmith.sources.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
         convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csr"))
     assert "backed" not in mocked.call_args_list[0].kwargs
 
