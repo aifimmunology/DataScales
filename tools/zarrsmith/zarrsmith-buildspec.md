@@ -22,8 +22,32 @@ AnnData zarr stores. One streaming/parallel engine, one config/storage/encoding 
 - [x] Phase 3 — sort (ops/sort.py sort_store; shares _stream_sorted_store with --backed convert)
 - [x] Phase 4 — append (ops/append.py; in-place resize, --drop-obsp / --refresh-expr escapes)
 
-Still open from the invariants list: peak-RSS assertions in tests, `--verify` flag,
-parallel band finalize in add-expr.
+Still open from the invariants list: peak-RSS assertions in tests, `--verify` flag.
+
+## Review backlog (multi-agent review, hotfixes landed separately)
+
+Efficiency: sort's concat is forced single-threaded for zarr-backed temps (backed_any
+misclassification in _write_concatenated_csr); icechunk cpus=1 clamp too broad for
+in-process threaded paths; zarr concurrency knobs + BLAS/Blosc pinning never set;
+add-expr — fuse the factor pass into the transform, int32 bucket memmaps, snap csc band
+edges to chunk multiples (bounds memory + enables parallel finalize); append — chunk-align
+copy segments, thread them, incremental csr gexp refresh; rechunk — stream obsp/obsm
+copies, validate --array before touching the output, align tiles to both grids, cap
+cpus×block RAM; sort bucketing degrades at high-cardinality keys (per-group masks +
+tail-chunk RMW).
+
+Hygiene: one batch-bytes constant + helper (currently 6 copies), one make-sparse-group
+helper (currently 5 hand-rolled), ZarrsmithError root + unified CLI dispatch, merge the
+two parallel runners, drop GCS config scaffolding + dead importlib import, scanpy →
+optional extra, persist add-expr params (target_sum) in layer attrs for --refresh-expr,
+icechunk-input support (or clear refusal) for store ops, sort fail-fast on existing
+output, temp+atomic-swap for rechunk/sort or amend the claim above, --version/inspect,
+README fixes (--cpus/--backed row, 64 MB cap claim, "Planned ops", example_config
+backed=true drift), stale convert-to-zarr strings (storage.py:84 commit message).
+
+Tests: multi-band add-expr (monkeypatch _BAND_BYTES), remaining append guards,
+int32→int64 promotion via patchable constant, icechunk paths for all new ops,
+rechunk of layers/raw/sharded arrays, memory-bound assertions.
 
 ## Module map
 
