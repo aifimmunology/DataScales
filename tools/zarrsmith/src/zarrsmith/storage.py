@@ -124,7 +124,9 @@ def open_store_rw(
 
     if not store_path.exists():
         raise StorageError(f"Store does not exist: {store_path}")
-    root = zarr.open_group(str(store_path), mode="r+")
+    # use_consolidated=False: anndata's write_elem refuses to edit a group opened
+    # through consolidated metadata; finalize() re-consolidates below.
+    root = zarr.open_group(str(store_path), mode="r+", use_consolidated=False)
 
     import json
 

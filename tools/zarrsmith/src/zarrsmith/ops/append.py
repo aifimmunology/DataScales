@@ -36,6 +36,8 @@ def append_cells(
     warnings: list[str] = []
 
     for g, label in ((root, "store"), (src, "cells")):
+        if "X" not in g:
+            raise ConversionError(f"no X in {label} store — not an AnnData zarr store?")
         if g["X"].attrs.get("encoding-type") != "csr_matrix":
             raise ConversionError(
                 f"append requires CSR X in {label}; got {g['X'].attrs.get('encoding-type')!r}."
@@ -53,15 +55,12 @@ def append_cells(
             )
         gexp_params = _introspect_gexp(root["layers"]["gexp"])
 
+    # validation only here — the deletion happens with the other mutations below
     obsp_keys = list(root["obsp"]) if "obsp" in root else []
-    if obsp_keys:
-        if not drop_obsp:
-            raise ConversionError(
-                f"store has obsp graphs {obsp_keys} invalidated by new cells; pass --drop-obsp."
-            )
-        for k in obsp_keys:
-            del root["obsp"][k]
-        warnings.append(f"dropped obsp graphs {obsp_keys} (invalidated by appended cells).")
+    if obsp_keys and not drop_obsp:
+        raise ConversionError(
+            f"store has obsp graphs {obsp_keys} invalidated by new cells; pass --drop-obsp."
+        )
 
     var_t, var_s = read_elem(root["var"]), read_elem(src["var"])
     if len(var_t) != len(var_s) or not (var_t.index == var_s.index).all():
@@ -73,13 +72,15 @@ def append_cells(
             f"obs schema mismatch: store {list(obs_t.columns)} vs cells {list(obs_s.columns)}."
         )
     for c in obs_t.columns:
-        t_cat = isinstance(obs_t[c].dtype, pd.CategoricalDtype)
-        s_cat = isinstance(obs_s[c].dtype, pd.CategoricalDtype)
-        if t_cat != s_cat or (
-            t_cat and set(obs_t[c].cat.categories) != set(obs_s[c].cat.categories)
-        ):
+        is_cat = isinstance(obs_t[c].dtype, pd.CategoricalDtype) or isinstance(
+            obs_s[c].dtype, pd.CategoricalDtype
+        )
+        # dtype equality covers categories, order (for ordered), and the ordered flag —
+        # anything less degrades the column to a string array on concat
+        if is_cat and obs_t[c].dtype != obs_s[c].dtype:
             raise ConversionError(
-                f"obs column '{c}' categorical mismatch; reconcile categories before append."
+                f"obs column '{c}' categorical dtype mismatch "
+                f"({obs_t[c].dtype} vs {obs_s[c].dtype}); reconcile before append."
             )
 
     x_t, x_s = root["X"], src["X"]
@@ -104,8 +105,47 @@ def append_cells(
 
     indptr_t = np.asarray(x_t["indptr"][:], dtype=np.int64)
     indptr_s = np.asarray(x_s["indptr"][:], dtype=np.int64)
+
+    # mutations start here; order keeps the store readable as its old self until
+    # indptr/shape flip (plain zarr has no rollback — icechunk discards on failure)
+    try:
+        if obsp_keys:
+            for k in obsp_keys:
+                del root["obsp"][k]
+            warnings.append(f"dropped obsp graphs {obsp_keys} (invalidated by appended cells).")
+        _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
+                       indptr_t, indptr_s, n_t, n_s, n_vars, warnings)
+    except ConversionError:
+        raise
+    except Exception as e:
+        raise ConversionError(
+            f"append failed mid-mutation; {store_path} may be inconsistent "
+            f"(plain zarr cannot roll back — icechunk discards uncommitted changes): {e}"
+        ) from e
+
+    warnings.append(
+        "appended cells break any sorted-store contiguity; re-run `zarrsmith sort` if the "
+        "store was sorted."
+    )
+    finalize()
+
+    if gexp_params is not None:
+        fmt, chunk_elems = gexp_params
+        cfg_ow = replace(cfg, io=replace(cfg.io, overwrite=True))
+        add_expr_layer(store, cfg_ow, fmt=fmt, chunk_elems=chunk_elems)
+        warnings.append(f"layers/gexp re-derived ({fmt}) over the appended matrix.")
+    return warnings
+
+
+def _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
+                   indptr_t, indptr_s, n_t, n_s, n_vars, warnings):
+    import numpy as np
+    import pandas as pd
+    from anndata._io.specs import write_elem
+
     nnz_t, nnz_s = int(indptr_t[-1]), int(indptr_s[-1])
     nnz_new = nnz_t + nnz_s
+    n_new = n_t + n_s
 
     with _stage(f"Appending X ({n_s} cells, nnz={nnz_s})"):
         for name in ("data", "indices"):
@@ -134,20 +174,7 @@ def append_cells(
         for k in obsm_keys:
             a = root["obsm"][k]
             a.resize((n_new,) + a.shape[1:])
-            a[n_t:n_new] = src["obsm"][k][:]
-
-    warnings.append(
-        "appended cells break any sorted-store contiguity; re-run `zarrsmith sort` if the "
-        "store was sorted."
-    )
-    finalize()
-
-    if gexp_params is not None:
-        fmt, chunk_elems = gexp_params
-        cfg_ow = replace(cfg, io=replace(cfg.io, overwrite=True))
-        add_expr_layer(store, cfg_ow, fmt=fmt, chunk_elems=chunk_elems)
-        warnings.append(f"layers/gexp re-derived ({fmt}) over the appended matrix.")
-    return warnings
+            a[n_t:n_new] = src_obsm[k][:]
 
 
 def _introspect_gexp(node) -> tuple[str, int]:

@@ -32,6 +32,8 @@ def add_expr_layer(
     root, finalize = open_store_rw(
         store_path, cfg, commit_message=f"zarrsmith add-expr {fmt} → layers/{layer}"
     )
+    if "X" not in root:
+        raise ConversionError(f"no X in {store} — not an AnnData zarr store?")
     x = root["X"]
     if x.attrs.get("encoding-type") != "csr_matrix":
         raise ConversionError(
@@ -62,9 +64,8 @@ def add_expr_layer(
             seg = np.asarray(data_arr[int(indptr[b0]):int(indptr[b1])], dtype=np.float64)
             if seg.size == 0:
                 continue
-            offsets = np.minimum((indptr[b0:b1] - indptr[b0]), seg.size - 1)
-            sums = np.add.reduceat(seg, offsets)
-            sums[row_nnz[b0:b1] == 0] = 0.0
+            cs = np.concatenate(([0.0], np.cumsum(seg)))
+            sums = cs[indptr[b0 + 1:b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
             nz = sums > 0
             factors[b0:b1][nz] = target_sum / sums[nz]
 

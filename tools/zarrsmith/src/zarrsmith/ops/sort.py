@@ -280,6 +280,8 @@ def sort_store(input_store: str, output_zarr: str, cfg: AppConfig) -> list[str]:
         )
 
     src = open_input_group(input_store)
+    if "X" not in src:
+        raise ConversionError(f"no X in {input_store} — not an AnnData zarr store?")
     if src["X"].attrs.get("encoding-type") != "csr_matrix":
         raise ConversionError(
             f"sort requires CSR X; got encoding {src['X'].attrs.get('encoding-type')!r}."

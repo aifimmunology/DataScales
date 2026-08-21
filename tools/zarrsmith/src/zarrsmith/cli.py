@@ -155,6 +155,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="normalize_total target before log1p (default: 1e4)")
     addexpr.add_argument("--overwrite", action="store_true", help="Replace the layer if it exists")
     addexpr.add_argument("--icechunk", action="store_true", help="Store is an Icechunk repository")
+    addexpr.add_argument("--config", help="Path to YAML/TOML config file")
 
     rechunk = subparsers.add_parser(
         "rechunk", help="Rewrite a matrix with new chunking into a new store"
@@ -173,6 +174,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rechunk.add_argument("--overwrite", action="store_true")
     rechunk.add_argument("--consolidate-metadata", action="store_true")
     rechunk.add_argument("--icechunk", action="store_true", help="Write output through Icechunk")
+    rechunk.add_argument("--config", help="Path to YAML/TOML config file")
 
     sort = subparsers.add_parser(
         "sort", help="Physically sort an existing store by obs column(s) into a new store"
@@ -185,6 +187,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sort.add_argument("--overwrite", action="store_true")
     sort.add_argument("--consolidate-metadata", action="store_true")
     sort.add_argument("--icechunk", action="store_true", help="Write output through Icechunk")
+    sort.add_argument("--config", help="Path to YAML/TOML config file")
 
     append = subparsers.add_parser(
         "append", help="Append the cells of another zarr store onto this one, in place"
@@ -196,6 +199,7 @@ def _build_parser() -> argparse.ArgumentParser:
     append.add_argument("--refresh-expr", action="store_true",
                         help="Re-derive layers/gexp after the append instead of refusing")
     append.add_argument("--icechunk", action="store_true", help="Store is an Icechunk repository")
+    append.add_argument("--config", help="Path to YAML/TOML config file")
 
     return parser
 
@@ -236,6 +240,9 @@ def run(argv: list[str] | None = None) -> int:
     if args.command in ("add-expr", "rechunk", "sort", "append"):
         try:
             warnings, target = _run_store_op(args)
+        except KeyError as exc:
+            print(f"ERROR: store is missing element {exc}", file=sys.stderr)
+            return 1
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

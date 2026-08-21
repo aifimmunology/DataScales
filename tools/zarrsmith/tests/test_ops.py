@@ -186,6 +186,71 @@ def test_append_guards(tmp_path):
     assert ad.read_zarr(str(sa2)).n_obs == 30
 
 
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
+def test_add_expr_empty_rows_and_genes(tmp_path, fmt):
+    # zero-count cells at band boundaries (incl. the last row) once truncated the
+    # previous row's sum; an all-zero gene exercises empty csc columns
+    x = np.zeros((10, 5), dtype=np.float32)
+    x[1:9, [0, 1, 3, 4]] = np.arange(1, 33, dtype=np.float32).reshape(8, 4)
+    adata = ad.AnnData(
+        X=sp.csr_matrix(x),
+        obs=pd.DataFrame({"cell_type": pd.Categorical(["a"] * 10)},
+                         index=[f"c{i}" for i in range(10)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+    )
+    out = _store(tmp_path, adata)
+    add_expr_layer(str(out), _cfg(), fmt=fmt, chunk_elems=16)
+    got = ad.read_zarr(str(out))
+    vals = got.layers["gexp"]
+    vals = np.asarray(vals) if fmt == "dense" else vals.toarray()
+    np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
+    assert not vals[0].any() and not vals[-1].any() and not vals[:, 2].any()
+
+
+def test_ops_on_consolidated_store(tmp_path):
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    sa = _store(tmp_path, a, "a.zarr", cfg=_cfg(consolidate_metadata=True))
+    sb = _store(tmp_path, b, "b.zarr")
+    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
+    append_cells(str(sa), str(sb), _cfg(), refresh_expr=True)
+    got = ad.read_zarr(str(sa))  # reads via the re-consolidated metadata
+    assert got.n_obs == 42 and "gexp" in got.layers
+
+
+def test_append_failed_validation_mutates_nothing(tmp_path):
+    a = _adata(n=20, seed=0)
+    a.obsp["conn"] = sp.eye(20, format="csr")
+    sa = _store(tmp_path, a, "a.zarr")
+    sb_bad = _store(tmp_path, _adata(n=10, v=5, seed=1), "bad.zarr")
+    with pytest.raises(ConversionError, match="var mismatch"):
+        append_cells(str(sa), str(sb_bad), _cfg(), drop_obsp=True)
+    got = ad.read_zarr(str(sa))
+    assert got.n_obs == 20 and "conn" in got.obsp
+
+
+def test_append_categorical_order_mismatch(tmp_path):
+    a, b = _adata(n=20, seed=0), _adata(n=10, seed=1)
+    b.obs["cell_type"] = pd.Categorical(
+        b.obs["cell_type"], categories=["a", "b", "c"], ordered=True
+    )
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    with pytest.raises(ConversionError, match="categorical dtype mismatch"):
+        append_cells(str(sa), str(sb), _cfg())
+
+
+def test_cli_store_ops(tmp_path):
+    from zarrsmith.cli import run
+
+    out = _store(tmp_path, _adata())
+    cfg_file = tmp_path / "cfg.toml"
+    cfg_file.write_text("[chunks]\nsparse_flat_chunk = 32\n")
+    assert run(["add-expr", "--store", str(out), "--chunk-elems", "32",
+                "--config", str(cfg_file)]) == 0
+    assert "gexp" in ad.read_zarr(str(out)).layers
+    assert run(["add-expr", "--store", str(tmp_path / "missing.zarr")]) == 1
+
+
 def test_append_refresh_expr(tmp_path):
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
