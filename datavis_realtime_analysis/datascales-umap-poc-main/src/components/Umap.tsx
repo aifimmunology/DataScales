@@ -4,20 +4,26 @@ import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
 import Legend from './Legend'
 import GroupPicker from './GroupPicker'
+import GenePicker from './GenePicker'
+import RunsPanel from './RunsPanel'
 import SelectionControls from './SelectionControls'
 import {
   loadUmapCoords,
   loadCategorical,
   loadBarcodes,
   loadGroups,
+  loadGeneNames,
+  loadGeneExpression,
   colorForCode,
-  STORE_ID,
+  getStoreId,
   type Point,
   type Categorical,
   type Level,
   type Group,
+  type GeneExpression,
 } from '../lib/zarrData'
 import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
+import { submitSelection } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
 
@@ -33,6 +39,15 @@ export default function Umap() {
   const [groups, setGroups] = useState<Group[]>([])
   const [group, setGroup] = useState<string>('') // active group path ('' = store root)
   const [viewState, setViewState] = useState<any>({ target: [0, 0, 0], zoom: 3 })
+
+  // gene expression color-by
+  const [genes, setGenes] = useState<string[]>([])
+  const [gene, setGene] = useState<string | null>(null)
+  const [exprData, setExprData] = useState<GeneExpression | null>(null)
+  const [exprError, setExprError] = useState<string | null>(null)
+
+  // submitted-runs refresh counter (bumped on each submit)
+  const [submitCount, setSubmitCount] = useState(0)
 
   // selection state
   const [selecting, setSelecting] = useState(false)
@@ -81,6 +96,34 @@ export default function Umap() {
       .then(setCat)
       .catch(err => console.error(`Failed to load ${level}:`, err))
   }, [level, group])
+
+  // Gene list is per-group; switching groups clears the active gene.
+  useEffect(() => {
+    setGene(null)
+    loadGeneNames(group)
+      .then(setGenes)
+      .catch(() => setGenes([]))
+  }, [group])
+
+  useEffect(() => {
+    setExprData(null)
+    setExprError(null)
+    const idx = gene ? genes.indexOf(gene) : -1
+    if (idx < 0) return
+    let stale = false
+    loadGeneExpression(idx, group)
+      .then(d => {
+        if (!stale) setExprData(d)
+      })
+      .catch(err => {
+        if (stale) return
+        console.error(`Failed to load expression for ${gene}:`, err)
+        setExprError(err instanceof Error ? err.message : String(err))
+      })
+    return () => {
+      stale = true
+    }
+  }, [gene, genes, group])
 
   // ---- lasso drawing (screen space) -> selection (world space) ----
   // Handlers live on a <div> overlay, not the <svg>: an empty svg defaults to
@@ -143,16 +186,30 @@ export default function Umap() {
     setSelVersion(v => v + 1)
   }
 
-  const downloadCurrent = () => {
+  const selectionPayload = async (sel: Sel) => ({
+    store: await getStoreId(),
+    group, // which embedding this selection's row indices refer to
+    lasso_world: sel.world.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)] as [number, number]),
+    indices: sel.indices,
+  })
+
+  const downloadCurrent = async () => {
     if (!selection) return
     const artifact: SelectionArtifact = {
-      store: STORE_ID,
-      group, // which embedding this selection's row indices refer to
-      lasso_world: selection.world.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]),
-      indices: selection.indices,
+      ...(await selectionPayload(selection)),
       barcodes: selection.indices.map(i => barcodes[i] ?? ''),
     }
     downloadSelection(artifact)
+  }
+
+  const submitCurrent = async () => {
+    if (!selection) return
+    try {
+      await submitSelection(await selectionPayload(selection))
+      setSubmitCount(c => c + 1)
+    } catch (err) {
+      console.error('Submit failed:', err)
+    }
   }
 
   const layer = new ScatterplotLayer<Point>({
@@ -162,7 +219,12 @@ export default function Umap() {
     getRadius: 0.5,
     radiusUnits: 'pixels',
     getFillColor: d => {
-      const base = cat ? colorForCode(cat.codes[d.index]) : [130, 70, 255]
+      const i = d.index * 3
+      const base: readonly number[] = exprData
+        ? [exprData.colors[i], exprData.colors[i + 1], exprData.colors[i + 2]]
+        : cat
+          ? colorForCode(cat.codes[d.index])
+          : [130, 70, 255]
       if (selection) {
         // highlight selected in yellow; dim the rest to make it pop
         return selection.mask[d.index] ? [255, 240, 30, 255] : [base[0], base[1], base[2], 40]
@@ -175,7 +237,7 @@ export default function Umap() {
     // a trigger changes. Without it, colors stay at the default until some *other*
     // trigger fires (e.g. a lasso bumping selVersion) — which is exactly the bug where
     // color-by looked dead until you selected a subset.
-    updateTriggers: { getFillColor: [level, selVersion, cat] },
+    updateTriggers: { getFillColor: [level, selVersion, cat, exprData] },
     pickable: false,
   })
 
@@ -235,11 +297,17 @@ export default function Umap() {
           onToggle={toggleSelecting}
           count={selection?.indices.length ?? 0}
           onDownload={downloadCurrent}
+          onSubmit={submitCurrent}
           onClear={clearSelection}
         />
         <GroupPicker groups={groups} active={group} onChange={setGroup} />
+        <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} onChange={setGene} />
       </div>
-      <Legend level={level} onLevelChange={setLevel} categories={cat?.categories ?? null} />
+      <RunsPanel refresh={submitCount} />
+      {/* legend tracks the actual coloring mode, not the picked gene */}
+      {!exprData && (
+        <Legend level={level} onLevelChange={setLevel} categories={cat?.categories ?? null} />
+      )}
     </>
   )
 }

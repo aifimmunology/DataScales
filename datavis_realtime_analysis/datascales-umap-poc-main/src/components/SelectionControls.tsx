@@ -1,17 +1,21 @@
+import { panel, control } from '../lib/styles'
+
 type Props = {
   selecting: boolean
   onToggle: () => void
   count: number
   onDownload: () => void
+  onSubmit: () => void
   onClear: () => void
 }
 
-// Top-left overlay: toggle lasso mode, then download / clear the selection.
+// Top-left overlay: toggle lasso mode, then download / submit / clear the selection.
 export default function SelectionControls({
   selecting,
   onToggle,
   count,
   onDownload,
+  onSubmit,
   onClear,
 }: Props) {
   return (
@@ -28,6 +32,9 @@ export default function SelectionControls({
           <button onClick={onDownload} style={btnStyle}>
             ⬇ Download selection.json
           </button>
+          <button onClick={onSubmit} style={btnStyle}>
+            🚀 Submit to GPU
+          </button>
           <button onClick={onClear} style={{ ...btnStyle, color: '#f88', borderColor: '#622' }}>
             Clear
           </button>
@@ -37,26 +44,16 @@ export default function SelectionControls({
   )
 }
 
-// Positioned by the top-left stack wrapper in Umap.tsx (kept in normal flow so the
-// View picker stacks beneath it).
 const panelStyle: React.CSSProperties = {
+  ...panel,
   display: 'flex',
   flexDirection: 'column',
   gap: 8,
-  background: 'rgba(20, 20, 20, 0.85)',
-  border: '1px solid #333',
-  borderRadius: 6,
-  padding: '10px 12px',
-  fontFamily: 'system-ui, sans-serif',
 }
 
 const btnStyle: React.CSSProperties = {
-  background: '#1c1c1c',
-  color: '#ddd',
-  border: '1px solid #444',
-  borderRadius: 4,
+  ...control,
   padding: '6px 10px',
-  fontSize: 13,
   cursor: 'pointer',
   textAlign: 'left',
 }

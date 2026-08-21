@@ -1,3 +1,7 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# re-include what the repo-root .gitignore blanket-ignores (package.json, lib/)
+!package.json
+!src/lib/

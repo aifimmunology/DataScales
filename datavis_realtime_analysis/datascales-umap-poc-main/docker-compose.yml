@@ -1,0 +1,21 @@
+services:
+  frontend:
+    build: .
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: ${DATA_DIR}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+    volumes:
+      - ~/.config/gcloud:/root/.config/gcloud:ro
+      # local store instead of GCS: uncomment and run with DATA_DIR=/data
+      # - ./data/soundlife-other-tiny.zarr:/data:ro

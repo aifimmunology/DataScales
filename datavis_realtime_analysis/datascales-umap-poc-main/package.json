@@ -1,0 +1,33 @@
+{
+  "name": "datascales-umap-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@deck.gl/core": "^9.2.2",
+    "@deck.gl/layers": "^9.2.2",
+    "@deck.gl/react": "^9.2.2",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.0.1",
+    "@mui/material": "^9.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zarrita": "^0.7.3"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.0",
+    "concurrently": "^10.0.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.0.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n vite,api -c blue,green \"vite\" \"uvicorn server.main:app --reload\"",
+    "dev:frontend": "vite",
+    "dev:api": "uvicorn server.main:app --reload",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  }
+}

@@ -12,17 +12,12 @@ COPY src ./src
 RUN bun run build
 
 # Stage 2: Production
-FROM oven/bun:1-alpine
+FROM nginx:alpine
 
-WORKDIR /app
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/dist /usr/share/nginx/html
 
-COPY --from=builder /app/dist ./dist
-
-RUN bun add serve
-
-CMD ["bunx", "serve", "dist", "-p", "3000"]
-
-EXPOSE 3000
+EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD bun -e "fetch('http://localhost:3000').then(r => process.exit(r.ok ? 0 : 1))"
+  CMD wget -q --spider http://localhost:80 || exit 1

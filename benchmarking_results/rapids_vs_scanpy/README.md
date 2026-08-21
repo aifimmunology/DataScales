@@ -93,16 +93,24 @@ Scanpy where a baseline exists, else vs Scanpy Zarr/Dask (†).
 | **5M PBMC** | Base Scanpy | 3 h 49 m | 295 GB | — | 1× |
 | | Scanpy Zarr/Dask | 3 h 08 m | 53 GB | — | 1.2× |
 | | **RAPIDS Zarr/Dask** | **19.8 min** | **50 GB** | 48 GB | **11.6×** |
+| | **RAPIDS, 1× A100 80 GB** | **8.5 min** | 16 GB | 16 GB | **26.8×** |
 | **2M Soundlife Misc** | Base Scanpy | 1 h 37 m | 214 GB | — | 1× |
 | | Scanpy Zarr/Dask | 56.3 min | 42 GB | — | 1.7× |
 | | **RAPIDS Zarr/Dask** | **6.8 min** | 56 GB | 38 GB | **14.2×** |
+| | **RAPIDS, 1× A100 80 GB** | **2.1 min** | 10 GB | 9 GB | **46×** |
 | **13M Soundlife Single-Cell** | Base Scanpy | — *(didn't fit)* | — | — | — |
 | | Scanpy Zarr/Dask | 10 h 01 m | 147 GB | — | 1× † |
 | | **RAPIDS Zarr/Dask** | **1 h 26 m** | 92 GB | 52 GB | **7.0×** † |
+| | **RAPIDS, 1× A100 80 GB** | **23.7 min** | 39 GB | 38 GB | **25.3×** † |
 | **~30M megazarr (~80 GB instance)** | **RAPIDS Zarr/Dask, 1× GPU** | **~46 min** | 46 GB | ~80 GB | — ‡ |
 
 † *vs Scanpy Zarr/Dask (no in-memory baseline).*  ‡ *Single 80 GB GPU, RMM managed memory —
 no CPU baseline (doesn't fit) and no 4-GPU run yet.*
+
+The single-A100 rows (raw per-step numbers in [`results/a100-80gb.csv`](results/a100-80gb.csv))
+beat the 4-GPU HISE runs 2.3–3.6× on every dataset: the gain lands on UMAP and Leiden — the
+single-GPU-bound graph steps that dominate the wall — while peak VRAM stays well under the
+card (neighbors-set: 9 → 16 → 38 GB from 2M → 13M).
 
 At 13M cells, in-memory baseline Scanpy no longer fits — the streamed pipelines are the only
 options, and RAPIDS turns a **10-hour** CPU run into **~1.4 h**.

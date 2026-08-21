@@ -1,4 +1,5 @@
-import { LEVELS, type Level, colorForCode, type RGB } from '../lib/zarrData'
+import { LEVELS, type Level, colorForCode } from '../lib/zarrData'
+import { panel, control, label, rgb } from '../lib/styles'
 
 type Props = {
   level: Level
@@ -6,19 +7,15 @@ type Props = {
   categories: string[] | null
 }
 
-const rgb = (c: RGB) => `rgb(${c[0]}, ${c[1]}, ${c[2]})`
-
 // Top-right overlay: pick which AIFI level colors the UMAP + show the key.
 export default function Legend({ level, onLevelChange, categories }: Props) {
   return (
     <div style={panelStyle}>
-      <label style={{ display: 'block', fontSize: 11, color: '#888', marginBottom: 4 }}>
-        Color by
-      </label>
+      <label style={label}>Color by</label>
       <select
         value={level}
         onChange={e => onLevelChange(e.target.value as Level)}
-        style={selectStyle}
+        style={control}
       >
         {LEVELS.map(l => (
           <option key={l} value={l}>
@@ -44,27 +41,13 @@ export default function Legend({ level, onLevelChange, categories }: Props) {
 }
 
 const panelStyle: React.CSSProperties = {
+  ...panel,
   position: 'absolute',
   top: 12,
   right: 12,
   zIndex: 20, // above the lasso svg overlay
-  background: 'rgba(20, 20, 20, 0.85)',
-  border: '1px solid #333',
-  borderRadius: 6,
-  padding: '10px 12px',
-  color: '#ddd',
-  fontFamily: 'system-ui, sans-serif',
   maxHeight: 'calc(100vh - 24px)',
   overflowY: 'auto',
-}
-
-const selectStyle: React.CSSProperties = {
-  background: '#1c1c1c',
-  color: '#ddd',
-  border: '1px solid #444',
-  borderRadius: 4,
-  padding: '4px 6px',
-  fontSize: 13,
 }
 
 const swatchStyle: React.CSSProperties = {
