@@ -76,7 +76,7 @@ def _add_common_args(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="convert-to-zarr")
+    parser = argparse.ArgumentParser(prog="zarrsmith")
     #dest is what field to grab froms args object. EG args.command will be the below subparser name
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -1,4 +1,4 @@
-"""DataScale: AnnData conversion tools."""
+"""zarrsmith: build and rework AnnData zarr stores."""
 
 from .config import AppConfig, GroupingConfig, load_config
 from .converter import (
