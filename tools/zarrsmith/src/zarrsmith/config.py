@@ -40,7 +40,7 @@ class ChunkConfig:
     sparse_flat_chunk: int = 1_000_000
     cpus: int = 1  # workers for parallel matrix chunk writes; threads in-memory, processes when backed; raise on HPC
     # Pack dense X inner chunks into shards of (x_row_chunk, x_col_chunk) * factor.
-    # 1 = no sharding. Dense X only (sparse output ignores it). See converter._dense_shards.
+    # 1 = no sharding. Dense X only (sparse output ignores it). See layout._dense_shards.
     x_shard_factor: int = 1
 
 

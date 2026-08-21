@@ -433,7 +433,7 @@ def test_inmem_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
 
 @pytest.mark.parametrize("x_storage", ["dense", "sparse-csr"])
 def test_concat_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
-    """concat-h5ads at cpus>1 writes each file at a misaligned row offset, so the file-seam
+    """concat at cpus>1 writes each file at a misaligned row offset, so the file-seam
     chunk is read-modify-written. That path MUST keep the da.store lock (row counts here are
     deliberately not multiples of the row chunk) — with lock=False concurrent RMW corrupts X."""
     # 200 + 300 rows at row_chunk 64 puts the second file at a misaligned offset (200 % 64 != 0);

@@ -11,9 +11,9 @@ from .ops import (
 )
 
 _CONVERTERS = {
-    "convert-h5ad": convert_h5ad_to_zarr,
-    "convert-10x-h5": convert_10x_h5_to_zarr,
-    "concat-h5ads": convert_h5ads_to_zarr,
+    "convert": convert_h5ad_to_zarr,
+    "convert-10x": convert_10x_h5_to_zarr,
+    "concat": convert_h5ads_to_zarr,
 }
 
 
@@ -81,7 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     h5ad = subparsers.add_parser(
-        "convert-h5ad", help="Convert non-spatial single-cell .h5ad to zarr"
+        "convert", help="Convert non-spatial single-cell .h5ad to zarr"
     )
     h5ad_required = h5ad.add_argument_group("required arguments")
     h5ad_required.add_argument("--input", required=True, help="Path to input .h5ad file")
@@ -97,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="OBS_COLUMN",
         help="Sort + partition rows by these obs column(s), primary key first "
              "(e.g. --sort-by AIFI_L1 batch_id). Physically sorts rows so each distinct key "
-             "tuple is a contiguous block; the output is a plain sorted AnnData (no convert-to-zarr "
+             "tuple is a contiguous block; the output is a plain sorted AnnData (no tool "
              "index) — derive ranges from the sorted obs column(s) and slice X[start:end] with "
              "stock anndata/zarr. Eager load handles sparse-csr or dense; with --backed the "
              "sort is streamed (memory-bounded) for sparse-csr only, and layers/raw/obsp must "
@@ -106,7 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_args(h5ad_required, h5ad_optional)
 
     h5 = subparsers.add_parser(
-        "convert-10x-h5", help="Convert 10x Genomics Cell Ranger HDF5 (.h5) to zarr"
+        "convert-10x", help="Convert 10x Genomics Cell Ranger HDF5 (.h5) to zarr"
     )
     h5_required = h5.add_argument_group("required arguments")
     h5_required.add_argument("--input", required=True, help="Path to 10x Cell Ranger .h5 file")
@@ -114,7 +114,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_args(h5_required, h5_optional)
 
     concat = subparsers.add_parser(
-        "concat-h5ads",
+        "concat",
         help="Concatenate multiple .h5ad files along obs (rows) into one zarr. "
              "Requires identical var (genes) and obs schema across files.",
     )
@@ -166,7 +166,7 @@ def run(argv: list[str] | None = None) -> int:
             obs_columns=getattr(args, "obs_columns", None),
         )
 
-        if args.command == "concat-h5ads":
+        if args.command == "concat":
             warnings = converter(args.inputs, args.output, config)
             input_label = ", ".join(args.inputs)
         else:
@@ -184,7 +184,7 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Storage backend: {config.io.backend}")
     if config.grouping.enabled:
         print(f"Sorted by: {list(config.grouping.sort_by)}")
-    if args.command == "concat-h5ads" and config.concat.obs_columns:
+    if args.command == "concat" and config.concat.obs_columns:
         print(f"obs columns kept: {list(config.concat.obs_columns)}")
     print(f"Backed load: {config.io.backed}")
     print(f"CPUs: {config.chunks.cpus}")
