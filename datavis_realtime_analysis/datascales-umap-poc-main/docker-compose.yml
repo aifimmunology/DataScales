@@ -14,6 +14,7 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: ${DATA_DIR}
+      RAPIDS_DIR: ${RAPIDS_DIR:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
     volumes:
       - ~/.config/gcloud:/root/.config/gcloud:ro

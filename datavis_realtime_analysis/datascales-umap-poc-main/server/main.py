@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
 DATA_DIR = os.environ.get("DATA_DIR", "")
+RAPIDS_DIR = os.environ.get("RAPIDS_DIR", "") or DATA_DIR
 SIMULATE_SCRIPT = Path(__file__).parent / "simulate_gpu.sh"
 MAX_JOBS = 50
 
@@ -53,7 +54,8 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"store": DATA_DIR}
+    # store: what the app reads (gene vis); rapids_store: what submissions reference
+    return {"store": DATA_DIR, "rapids_store": RAPIDS_DIR}
 
 
 # Missing objects must 404 (zarrita reads a 404 as "chunk is all fill-value").

@@ -29,7 +29,9 @@ Download and install Docker Desktop for your platform from https://docs.docker.c
 - a local path, e.g. `./data/soundlife-other-tiny.zarr`
 - a private GCS store, e.g. `gs://my-bucket/path/store.zarr` — read with your Google credentials (see [Docker deployment](#docker-deployment-gcs))
 
-In the app: lasso a cell selection, then download it as `selection.json` (with barcodes) or submit it — `POST /api/submit` sends store/group/lasso/indices, logs the payload, and runs a fake 10s GPU job (`server/simulate_gpu.sh`); submitted runs show running/done/failed status in a panel. A gene dropdown colors the UMAP by that gene's expression (dense `X` stores with column-friendly chunking only — the app refuses layouts where one gene read would stream the matrix).
+Optionally set `RAPIDS_DIR` to a second store (e.g. the CSR store RAPIDS consumes): the app reads everything it displays from `DATA_DIR`, and selection exports/submissions record `RAPIDS_DIR` as their `store`. Unset, one store serves both roles.
+
+In the app: lasso a cell selection, then download it as `selection.json` (with barcodes) or submit it — `POST /api/submit` sends store/group/lasso/indices, logs the payload, and runs a fake 10s GPU job (`server/simulate_gpu.sh`); submitted runs show running/done/failed status in a panel. A gene dropdown colors the UMAP by that gene's expression, resolved in order: `layers/gexp` (csc or dense, the `zarrsmith add-expr` setup) → dense `X` → CSC `X`. CSR-only stores are refused with a pointer at `zarrsmith add-expr`; dense reads are refused when the chunk layout would stream the matrix for one gene.
 
 ---
 
