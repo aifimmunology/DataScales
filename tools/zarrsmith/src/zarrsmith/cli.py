@@ -195,9 +195,11 @@ def _build_parser() -> argparse.ArgumentParser:
     append.add_argument("--store", required=True, help="Store to extend (CSR X)")
     append.add_argument("--cells", required=True, help="Zarr store with the cells to append")
     append.add_argument("--drop-obsp", action="store_true",
-                        help="Drop obsp graphs (invalidated by new cells) instead of refusing")
+                        help="Pre-approve dropping obsp graphs (invalidated by new cells)")
     append.add_argument("--refresh-expr", action="store_true",
-                        help="Re-derive layers/gexp after the append instead of refusing")
+                        help="Pre-approve re-deriving layers/gexp after the append")
+    append.add_argument("--yes", action="store_true",
+                        help="Approve the printed loss plan non-interactively")
     append.add_argument("--icechunk", action="store_true", help="Store is an Icechunk repository")
     append.add_argument("--config", help="Path to YAML/TOML config file")
 
@@ -229,7 +231,7 @@ def _run_store_op(args) -> tuple[list[str], str]:
         return sort_store(args.store, args.output, config), args.output
     return append_cells(
         args.store, args.cells, config,
-        drop_obsp=args.drop_obsp, refresh_expr=args.refresh_expr,
+        drop_obsp=args.drop_obsp, refresh_expr=args.refresh_expr, assume_yes=args.yes,
     ), args.store
 
 

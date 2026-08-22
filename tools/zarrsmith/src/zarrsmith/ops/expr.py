@@ -186,6 +186,20 @@ def add_expr_layer(
     return []
 
 
+def _introspect_gexp(node) -> tuple[str, int, float | None]:
+    """Recover (fmt, chunk_elems, target_sum) from an existing gexp layer."""
+    import zarr
+
+    target_sum = node.attrs.get("zarrsmith_target_sum")
+    if isinstance(node, zarr.Array):
+        return "dense", node.chunks[0] * node.chunks[1], target_sum
+    enc = node.attrs.get("encoding-type")
+    fmt = {"csr_matrix": "csr", "csc_matrix": "csc"}.get(enc)
+    if fmt is None:
+        raise ConversionError(f"cannot re-derive layers/gexp: unsupported encoding {enc!r}.")
+    return fmt, int(node["data"].chunks[0]), target_sum
+
+
 def _sparse_layer(layers, name, enc, shape, nnz, indices_dtype, indptr_dtype,
                   chunk_elems, target_sum):
     import numpy as np

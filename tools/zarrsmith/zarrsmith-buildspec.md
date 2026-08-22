@@ -41,18 +41,23 @@ to both grids (source chunks straddling output tiles are re-decoded); buffered t
 appends in sort (tail-chunk RMW remains at high-cardinality keys); icechunk Session.fork()
 for the backed process-pool writers.
 
-Hygiene: one batch-bytes constant + helper (currently 6 copies), one make-sparse-group
-helper (currently 5 hand-rolled), ZarrsmithError root + unified CLI dispatch, merge the
-two parallel runners, drop GCS config scaffolding + dead importlib import, scanpy →
-optional extra, persist add-expr params (target_sum) in layer attrs for --refresh-expr,
-icechunk-input support (or clear refusal) for store ops, sort fail-fast on existing
-output, temp+atomic-swap for rechunk/sort or amend the claim above, --version/inspect,
-README fixes (--cpus/--backed row, 64 MB cap claim, "Planned ops", example_config
-backed=true drift), stale convert-to-zarr strings (storage.py:84 commit message).
+Workflow (landed): sort auto-re-derives a lone gexp layer on the sorted output
+(introspected fmt/chunks/target_sum); icechunk inputs auto-detected by open_input_group
+(repo/ + snapshots/, no zarr.json) — rechunk/sort/append --cells read icechunk repos with
+no extra flags; append presents a loss plan (obsp drop, gexp re-derive, cells-store
+extras left behind) and requires a flag, --yes, or an interactive confirmation.
+Vendored libs re-synced to the locked versions (zarr 3.3.0, anndata 0.12.19,
+dask 2026.7.1, icechunk 2.1.2, rapids-singlecell 0.16.1); key APIs re-verified.
 
-Tests: multi-band add-expr (monkeypatch _BAND_BYTES), remaining append guards,
-int32→int64 promotion via patchable constant, icechunk paths for all new ops,
-rechunk of layers/raw/sharded arrays, memory-bound assertions.
+Hygiene (still open): one batch-bytes constant + helper (currently 6 copies), one
+make-sparse-group helper (currently 5 hand-rolled), ZarrsmithError root + unified CLI
+dispatch, merge the two parallel runners, drop GCS config scaffolding + dead importlib
+import, scanpy → optional extra, temp+atomic-swap for rechunk/sort or amend the claim
+above, --version/inspect, README fixes (--cpus/--backed row, 64 MB cap claim,
+"Planned ops", example_config backed=true drift).
+
+Tests (still open): remaining append guards, int32→int64 promotion via patchable
+constant, rechunk of layers/raw/sharded arrays, memory-bound assertions.
 
 ## Module map
 

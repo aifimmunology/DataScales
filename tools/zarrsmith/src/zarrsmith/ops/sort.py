@@ -284,6 +284,7 @@ def sort_store(input_store: str, output_zarr: str, cfg: AppConfig) -> list[str]:
 
     from ..config import _resolve_backend_cfg
     from ..storage import open_input_group
+    from .expr import _introspect_gexp, add_expr_layer
 
     cfg = _resolve_backend_cfg(cfg)
     if not cfg.grouping.sort_by:
@@ -300,7 +301,16 @@ def sort_store(input_store: str, output_zarr: str, cfg: AppConfig) -> list[str]:
         raise ConversionError(
             f"sort requires CSR X; got encoding {src['X'].attrs.get('encoding-type')!r}."
         )
-    for key in ("layers", "raw", "obsp"):
+    # a lone gexp layer is re-derived on the sorted output; anything else is refused
+    gexp_params = None
+    layer_keys = list(src["layers"]) if "layers" in src else []
+    if layer_keys == ["gexp"]:
+        gexp_params = _introspect_gexp(src["layers"]["gexp"])
+    elif layer_keys:
+        raise ConversionError(
+            f"sort does not reorder layers {layer_keys}; only a gexp layer is re-derived."
+        )
+    for key in ("raw", "obsp"):
         if key in src and len(list(src[key])) > 0:
             raise ConversionError(
                 f"sort does not reorder {key} yet; drop it or sort at convert time."
@@ -310,7 +320,15 @@ def sort_store(input_store: str, output_zarr: str, cfg: AppConfig) -> list[str]:
         return read_elem(src[key]) if key in src else {}
 
     x = sparse_dataset(src["X"])
-    return _stream_sorted_store(
+    warnings = _stream_sorted_store(
         x, read_elem(src["obs"]), read_elem(src["var"]), _read("uns"), _read("obsm"),
         _read("varm"), _read("varp"), Path(output_zarr), cfg, [], [],
     )
+    if gexp_params is not None:
+        fmt, chunk_elems, target_sum = gexp_params
+        if target_sum is None:
+            warnings.append("layers/gexp has no recorded target_sum; re-deriving at 1e4.")
+            target_sum = 1e4
+        add_expr_layer(output_zarr, cfg, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum)
+        warnings.append(f"layers/gexp re-derived ({fmt}) on the sorted store.")
+    return warnings

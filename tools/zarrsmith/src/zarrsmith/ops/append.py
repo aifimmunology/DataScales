@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from ..config import AppConfig
 from ..engine import _run_parallel_threads, _stage, configure_runtime
 from ..errors import ConversionError
 from ..storage import open_input_group, open_store_rw
-from .expr import add_expr_layer
+from .expr import _introspect_gexp, add_expr_layer
 
 _SEG_BYTES = 256 * 1024 * 1024
 
@@ -21,6 +22,7 @@ def append_cells(
     *,
     drop_obsp: bool = False,
     refresh_expr: bool = False,
+    assume_yes: bool = False,
 ) -> list[str]:
     """Append the cells of another zarr store onto this one, in place."""
     import numpy as np
@@ -48,20 +50,14 @@ def append_cells(
 
     layer_keys = list(root["layers"]) if "layers" in root else []
     gexp_params = None
+    if layer_keys and layer_keys != ["gexp"]:
+        raise ConversionError(
+            f"append cannot handle layers {layer_keys}; only a lone gexp layer is supported."
+        )
     if layer_keys:
-        if not refresh_expr or layer_keys != ["gexp"]:
-            raise ConversionError(
-                f"store has layers {layer_keys} that new cells would leave stale; pass "
-                "--refresh-expr to re-derive layers/gexp (other layers are unsupported)."
-            )
         gexp_params = _introspect_gexp(root["layers"]["gexp"])
 
-    # validation only here — the deletion happens with the other mutations below
     obsp_keys = list(root["obsp"]) if "obsp" in root else []
-    if obsp_keys and not drop_obsp:
-        raise ConversionError(
-            f"store has obsp graphs {obsp_keys} invalidated by new cells; pass --drop-obsp."
-        )
 
     var_t, var_s = read_elem(root["var"]), read_elem(src["var"])
     if len(var_t) != len(var_s) or not (var_t.index == var_s.index).all():
@@ -106,6 +102,23 @@ def append_cells(
 
     indptr_t = np.asarray(x_t["indptr"][:], dtype=np.int64)
     indptr_s = np.asarray(x_s["indptr"][:], dtype=np.int64)
+
+    plan = []
+    if obsp_keys:
+        plan.append((f"drop obsp graphs {obsp_keys} (invalidated by new cells)", drop_obsp))
+    if gexp_params is not None:
+        plan.append(("re-derive layers/gexp (stale over the appended matrix)", refresh_expr))
+    extras = []
+    if "layers" in src and list(src["layers"]):
+        extras.append(f"layers {list(src['layers'])}")
+    if "raw" in src and len(list(src["raw"])) > 0:
+        extras.append("raw")
+    extra_obsm = [k for k in (list(src_obsm) if src_obsm is not None else []) if k not in obsm_keys]
+    if extra_obsm:
+        extras.append(f"obsm {extra_obsm}")
+    if extras:
+        plan.append(("leave behind (not carried from the cells store): " + ", ".join(extras), False))
+    _confirm(plan, assume_yes)
 
     # mutations start here; order keeps the store readable as its old self until
     # indptr/shape flip (plain zarr has no rollback — icechunk discards on failure)
@@ -196,12 +209,19 @@ def _copy_shifted(src, dst, s0, s1, off):
     dst[off + s0:off + s1] = src[s0:s1]
 
 
-def _introspect_gexp(node) -> tuple[str, int, float | None]:
-    target_sum = node.attrs.get("zarrsmith_target_sum")
-    if isinstance(node, zarr.Array):
-        return "dense", node.chunks[0] * node.chunks[1], target_sum
-    enc = node.attrs.get("encoding-type")
-    fmt = {"csr_matrix": "csr", "csc_matrix": "csc"}.get(enc)
-    if fmt is None:
-        raise ConversionError(f"cannot refresh layers/gexp: unsupported encoding {enc!r}.")
-    return fmt, int(node["data"].chunks[0]), target_sum
+def _confirm(plan: list[tuple[str, bool]], assume_yes: bool) -> None:
+    """Present the loss plan; proceed only with a flag, --yes, or an interactive yes."""
+    if not plan or all(ok for _, ok in plan):
+        return
+    lines = "\n".join(f"  - {d}" for d, _ in plan)
+    print(f"append will:\n{lines}", flush=True, file=sys.stderr)
+    if assume_yes:
+        return
+    if sys.stdin.isatty():
+        if input("Proceed? [y/N] ").strip().lower() in ("y", "yes"):
+            return
+        raise ConversionError("append cancelled.")
+    raise ConversionError(
+        f"append needs confirmation:\n{lines}\n"
+        "Pass --yes (or --drop-obsp / --refresh-expr) to proceed non-interactively."
+    )

@@ -9,7 +9,7 @@ so every existing writer (``write_elem``, ``da.store``, ``require_array`` …) w
 * ``backend="icechunk"`` — commits the writable session (one commit per conversion, per the
   Icechunk "few, large commits" guidance).
 
-Icechunk's API is verified against the vendored source (v2.0.6); it is imported lazily so the
+Icechunk's API is verified against the vendored source (v2.1.2); it is imported lazily so the
 default zarr path never touches it.
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ def open_output_store(
         root = zarr.open_group(store=session.store, mode="w")
 
         def finalize() -> None:
-            msg = commit_message or f"convert-to-zarr convert → {output_path.name}"
+            msg = commit_message or f"zarrsmith write → {output_path.name}"
             snapshot_id = session.commit(msg)
             print(
                 f"  icechunk commit {snapshot_id} on branch 'main'",
@@ -143,14 +143,25 @@ def open_store_rw(
     return root, finalize
 
 
+def _is_icechunk_repo(path: Path) -> bool:
+    """Local icechunk repos carry repo/ + snapshots/ and no zarr.json at the root."""
+    return (
+        path.is_dir()
+        and not (path / "zarr.json").exists()
+        and (path / "snapshots").is_dir()
+        and (path / "repo").exists()
+    )
+
+
 def open_input_group(
     path: str, *, icechunk: bool = False, branch: str = "main"
 ) -> zarr.Group:
     """Open an existing store read-only as a zarr group (for the reader).
 
-    Plain zarr opens the directory directly; icechunk opens a read-only session at ``branch``.
+    Icechunk repos are auto-detected and opened as a read-only session at ``branch``;
+    anything else opens as a plain zarr directory.
     """
-    if icechunk:
+    if icechunk or _is_icechunk_repo(Path(path)):
         import icechunk as ic
 
         repo = ic.Repository.open(ic.local_filesystem_storage(path))

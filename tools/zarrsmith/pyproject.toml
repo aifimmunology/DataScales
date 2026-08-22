@@ -17,7 +17,7 @@ dependencies = [
   "scipy>=1.10.0",
   "PyYAML>=6.0",
   "scanpy>=1.9.0",
-  "dask[array]>=2023.1.0",
+  "dask[array]>=2026.3",
   "icechunk>=2.0.6",
 ]
 

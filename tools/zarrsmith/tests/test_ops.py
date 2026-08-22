@@ -268,6 +268,80 @@ def test_append_refresh_expr(tmp_path):
     )
 
 
+def test_add_expr_multiband(tmp_path, monkeypatch):
+    # tiny band budget → many column bands + multiple row batches, exercising the
+    # bucket cursors and band-edge math the default 256 MB budget never hits in tests
+    monkeypatch.setattr("zarrsmith.ops.expr._BAND_BYTES", 600)
+    adata = _adata(n=1200, v=12, seed=4)
+    for fmt in ("csc", "dense"):
+        out = _store(tmp_path, adata, f"mb-{fmt}.zarr")
+        add_expr_layer(str(out), _cfg(), fmt=fmt, chunk_elems=80)
+        got = ad.read_zarr(str(out))
+        vals = got.layers["gexp"]
+        vals = np.asarray(vals) if fmt == "dense" else vals.toarray()
+        np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
+
+
+def test_lifecycle_plain(tmp_path):
+    a, b = _adata(n=40, seed=0), _adata(n=15, seed=1)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    scfg = replace(_cfg(), grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)))
+
+    sorted1 = tmp_path / "sorted1.zarr"
+    sort_store(str(sa), str(sorted1), scfg)
+    add_expr_layer(str(sorted1), _cfg(), fmt="csc", chunk_elems=32)
+    append_cells(str(sorted1), str(sb), _cfg(), assume_yes=True)
+    sorted2 = tmp_path / "sorted2.zarr"
+    warnings = sort_store(str(sorted1), str(sorted2), scfg)
+    assert any("re-derived" in w for w in warnings)
+
+    got = ad.read_zarr(str(sorted2))
+    assert got.n_obs == 55 and "gexp" in got.layers
+    codes = got.obs["cell_type"].cat.codes.to_numpy()
+    assert (np.diff(codes) >= 0).all()
+    orig = {n: r for src in (a, b) for n, r in zip(src.obs_names, src.X.toarray())}
+    for i, n in enumerate(got.obs_names):
+        np.testing.assert_allclose(got.X[i].toarray().ravel(), orig[n])
+    np.testing.assert_allclose(
+        got.layers["gexp"].toarray(), _expected_gexp(got.X), rtol=1e-5
+    )
+
+
+def test_lifecycle_icechunk(tmp_path):
+    pytest.importorskip("icechunk")
+    from anndata.io import read_elem, sparse_dataset
+    from zarrsmith.storage import open_input_group
+
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    cfg_ic = AppConfig(
+        io=IOConfig(backend="icechunk"),
+        chunks=ChunkConfig(x_row_chunk=16, x_col_chunk=4, sparse_flat_chunk=64),
+    )
+    h5 = tmp_path / "a.h5ad"
+    a.write_h5ad(h5)
+    sa = tmp_path / "a.icechunk"
+    convert_h5ad_to_zarr(str(h5), str(sa), cfg_ic)
+    add_expr_layer(str(sa), cfg_ic, fmt="csc", chunk_elems=32)
+    sb = _store(tmp_path, b, "b.zarr")
+    append_cells(str(sa), str(sb), cfg_ic, assume_yes=True)
+
+    sorted_ic = tmp_path / "sorted.icechunk"
+    scfg = replace(cfg_ic, grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)))
+    sort_store(str(sa), str(sorted_ic), scfg)  # icechunk input auto-detected
+
+    root = open_input_group(str(sorted_ic))
+    obs = read_elem(root["obs"])
+    assert len(obs) == 42
+    assert (np.diff(obs["cell_type"].cat.codes.to_numpy()) >= 0).all()
+    x = sparse_dataset(root["X"])[:]
+    orig = {n: r for src in (a, b) for n, r in zip(src.obs_names, src.X.toarray())}
+    for i, n in enumerate(obs.index):
+        np.testing.assert_allclose(x[i].toarray().ravel(), orig[n])
+    gexp = sparse_dataset(root["layers/gexp"])[:]
+    np.testing.assert_allclose(gexp.toarray(), _expected_gexp(x), rtol=1e-5)
+
+
 def test_sort_store_output_exists(tmp_path):
     out = _store(tmp_path, _adata())
     out2 = tmp_path / "sorted.zarr"

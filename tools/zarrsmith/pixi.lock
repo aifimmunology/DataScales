@@ -13568,7 +13568,7 @@ packages:
 - pypi: ./
   name: zarrsmith
   version: 0.2.0
-  sha256: 1b6db39c240577d515efc955949ddc1b1c1192879ceb99dbca0295db6a9c6a07
+  sha256: fd48188c9466b3b97099a3179be626e967fc929a0f100ffe4acc59d0f7c7d854
   requires_dist:
   - anndata>=0.12.10,<0.13
   - zarr>=3.0.0
@@ -13576,7 +13576,7 @@ packages:
   - scipy>=1.10.0
   - pyyaml>=6.0
   - scanpy>=1.9.0
-  - dask[array]>=2023.1.0
+  - dask[array]>=2026.3
   - icechunk>=2.0.6
   - pytest>=8.0 ; extra == 'dev'
   requires_python: '>=3.10,<3.13'
