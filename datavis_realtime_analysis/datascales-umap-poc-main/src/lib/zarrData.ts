@@ -102,8 +102,18 @@ type GeneSource =
 const geneSources = new Map<string, Promise<GeneSource>>()
 const cscIndptrs = new Map<string, Promise<number[]>>()
 
-function openAt(path: string) {
-  return zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${path}`), { kind: 'array' })
+// Opened-array cache: zarr.open fetches the array's zarr.json, so without this
+// every gene click pays extra metadata round-trips through the proxy.
+type OpenedArray = Awaited<ReturnType<typeof openArray>>
+const openedArrays = new Map<string, Promise<OpenedArray>>()
+
+function openAt(path: string): Promise<OpenedArray> {
+  let arr = openedArrays.get(path)
+  if (!arr) {
+    arr = zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${path}`), { kind: 'array' })
+    openedArrays.set(path, arr)
+  }
+  return arr
 }
 
 async function probe(path: string) {
