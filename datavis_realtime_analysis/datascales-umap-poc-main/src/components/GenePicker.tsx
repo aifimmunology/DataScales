@@ -6,12 +6,13 @@ type Props = {
   active: string | null
   range: [number, number] | null
   error: string | null
+  warning: string | null
   onChange: (gene: string | null) => void
 }
 
 const MAX_MATCHES = 50
 
-export default function GenePicker({ genes, active, range, error, onChange }: Props) {
+export default function GenePicker({ genes, active, range, error, warning, onChange }: Props) {
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
 
@@ -65,6 +66,9 @@ export default function GenePicker({ genes, active, range, error, onChange }: Pr
         </div>
       )}
       {error && <div style={{ marginTop: 6, fontSize: 11, color: '#f88' }}>{error}</div>}
+      {active && warning && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#cc5' }}>{warning}</div>
+      )}
     </div>
   )
 }

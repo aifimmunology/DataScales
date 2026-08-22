@@ -103,7 +103,7 @@ export async function loadGeneNames(group = ''): Promise<string[]> {
   return Array.from((await zarr.get(arr)).data as ArrayLike<string>)
 }
 
-export type GeneExpression = { colors: Uint8Array; range: [number, number] }
+export type GeneExpression = { colors: Uint8Array; range: [number, number]; warning?: string }
 
 // A dense one-column read fetches every chunk intersecting the column; refuse
 // layouts where that means streaming a large share of X (row-oriented chunks).
@@ -222,7 +222,12 @@ export async function loadGeneExpression(geneIdx: number, group = ''): Promise<G
     colors[i * 3 + 1] = g
     colors[i * 3 + 2] = b
   }
-  return { colors, range: [min, max] }
+  // integer dtype = raw counts (dtype comes from the cached open — no data scan)
+  const stored = await openAt(src.kind === 'csc' ? `${src.path}/data` : src.path)
+  const warning = String(stored.dtype).includes('int')
+    ? 'raw counts (integer dtype): colors follow skewed counts — use a normalized store/layer'
+    : undefined
+  return { colors, range: [min, max], warning }
 }
 
 // ── Groups: switchable embeddings (the root store + any nested view stores) ─────

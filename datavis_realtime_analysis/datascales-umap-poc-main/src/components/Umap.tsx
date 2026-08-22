@@ -301,7 +301,7 @@ export default function Umap() {
           onClear={clearSelection}
         />
         <GroupPicker groups={groups} active={group} onChange={setGroup} />
-        <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} onChange={setGene} />
+        <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
       </div>
       <RunsPanel refresh={submitCount} />
       {/* legend tracks the actual coloring mode, not the picked gene */}
