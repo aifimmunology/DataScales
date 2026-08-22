@@ -206,49 +206,23 @@ export async function loadGeneExpression(geneIdx: number, group = ''): Promise<G
   const vals = src.kind === 'csc'
     ? await readCscColumn(src, geneIdx)
     : await readDenseColumn(src.path, geneIdx)
-  // a gexp layer is already log-normalized; raw X counts are right-skewed, so
-  // display log1p clipped at the p99 of non-zeros (else a few cells own the ramp)
-  return toGeneExpression(vals, !src.path.endsWith('layers/gexp'))
-}
-
-function toGeneExpression(vals: ArrayLike<number>, raw: boolean): GeneExpression {
   const n = vals.length
-  let disp: ArrayLike<number> = vals
-  let rangeLo = Infinity
-  let rangeHi = -Infinity
-  let lo: number
-  let hi: number
-  if (raw) {
-    const nz: number[] = []
-    for (let i = 0; i < n; i++) if ((vals[i] as number) > 0) nz.push(vals[i] as number)
-    nz.sort((a, b) => a - b)
-    const cap = nz.length ? nz[Math.min(nz.length - 1, Math.floor(nz.length * 0.99))] : 0
-    const d = new Float32Array(n)
-    const capLog = Math.log1p(cap)
-    for (let i = 0; i < n; i++) d[i] = Math.min(Math.log1p(vals[i] as number), capLog)
-    disp = d
-    lo = 0
-    hi = capLog || 1
-    rangeLo = 0
-    rangeHi = cap // ramp-end labels in raw counts (top = p99 clip)
-  } else {
-    for (let i = 0; i < n; i++) {
-      const v = vals[i] as number
-      if (v < rangeLo) rangeLo = v
-      if (v > rangeHi) rangeHi = v
-    }
-    lo = rangeLo
-    hi = rangeHi
+  let min = Infinity
+  let max = -Infinity
+  for (let i = 0; i < n; i++) {
+    const v = vals[i] as number
+    if (v < min) min = v
+    if (v > max) max = v
   }
-  const span = hi - lo || 1
+  const span = max - min || 1
   const colors = new Uint8Array(n * 3)
   for (let i = 0; i < n; i++) {
-    const [r, g, b] = exprColor(((disp[i] as number) - lo) / span)
+    const [r, g, b] = exprColor(((vals[i] as number) - min) / span)
     colors[i * 3] = r
     colors[i * 3 + 1] = g
     colors[i * 3 + 2] = b
   }
-  return { colors, range: [rangeLo, rangeHi] }
+  return { colors, range: [min, max] }
 }
 
 // ── Groups: switchable embeddings (the root store + any nested view stores) ─────
