@@ -3,16 +3,29 @@ import * as zarr from 'zarrita'
 // All zarr reads go through the backend's /api/data proxy (Vite in dev, nginx in Docker).
 export const DATA_BASE_URL = window.location.origin + '/api/data'
 
+type AppConfig = { store?: string; rapids_store?: string }
+let cfgPromise: Promise<AppConfig> | null = null
+function getConfig(): Promise<AppConfig> {
+  cfgPromise ??= fetch(window.location.origin + '/api/config')
+    .then(res => (res.ok ? res.json() : {}))
+    .catch(() => ({}))
+  return cfgPromise
+}
+
 // Store recorded in selection exports/submissions: the rapids store when the backend
 // was given a separate one (RAPIDS_DIR), else the vis store itself.
-let storeIdPromise: Promise<string> | null = null
-export function getStoreId(): Promise<string> {
-  storeIdPromise ??= fetch('/api/config')
-    .then(res => (res.ok ? res.json() : Promise.reject(res.status)))
-    .then((cfg: { store?: string; rapids_store?: string }) =>
-      cfg.rapids_store || cfg.store || DATA_BASE_URL)
-    .catch(() => DATA_BASE_URL)
-  return storeIdPromise
+export async function getStoreId(): Promise<string> {
+  const cfg = await getConfig()
+  return cfg.rapids_store || cfg.store || DATA_BASE_URL
+}
+
+// With two stores, coords/labels/barcodes/views come from the rapids store
+// (/api/rapids-data); the vis store (/api/data) only answers gene expression.
+async function coordBase(): Promise<string> {
+  const cfg = await getConfig()
+  return cfg.rapids_store && cfg.rapids_store !== cfg.store
+    ? window.location.origin + '/api/rapids-data'
+    : DATA_BASE_URL
 }
 
 // AIFI cell-type annotation levels, coarse -> fine. L1 is the default color-by.
@@ -42,9 +55,9 @@ export function exprColor(t: number): RGB {
 // A "group" is either the served store root (path '') or a nested view store
 // (e.g. 'umap_views/bcell_selection'). Every array fetch is prefixed by it, so the
 // same obsm/X_umap + obs/* paths resolve inside whichever group is active.
-async function openArray(path: string, group = '') {
+async function openArray(path: string, group: string, base: string) {
   const rel = group ? `${group}/${path}` : path
-  const store = new zarr.FetchStore(`${DATA_BASE_URL}/${rel}`)
+  const store = new zarr.FetchStore(`${base}/${rel}`)
   return zarr.open.v3(store, { kind: 'array' })
 }
 
@@ -52,7 +65,7 @@ export type Point = { position: [number, number]; index: number }
 
 /** obsm/X_umap -> one Point per cell, for the given group. */
 export async function loadUmapCoords(group = ''): Promise<Point[]> {
-  const arr = await openArray('obsm/X_umap', group)
+  const arr = await openArray('obsm/X_umap', group, await coordBase())
   const data = (await zarr.get(arr)).data as Float32Array | Float64Array
   const n = arr.shape[0]
   const points: Point[] = new Array(n)
@@ -64,7 +77,7 @@ export async function loadUmapCoords(group = ''): Promise<Point[]> {
 
 /** obs/barcodes -> one id per cell (obs_names). Used for the selection export. */
 export async function loadBarcodes(group = ''): Promise<string[]> {
-  const arr = await openArray('obs/barcodes', group)
+  const arr = await openArray('obs/barcodes', group, await coordBase())
   const data = (await zarr.get(arr)).data as ArrayLike<string>
   return Array.from(data)
 }
@@ -73,9 +86,10 @@ export type Categorical = { codes: Int8Array | Int16Array | Int32Array; categori
 
 /** An AnnData categorical obs column: per-cell integer `codes` + `categories`. */
 export async function loadCategorical(col: Level, group = ''): Promise<Categorical> {
-  const codesArr = await openArray(`obs/${col}/codes`, group)
+  const base = await coordBase()
+  const codesArr = await openArray(`obs/${col}/codes`, group, base)
   const codes = (await zarr.get(codesArr)).data as Int8Array | Int16Array | Int32Array
-  const catsArr = await openArray(`obs/${col}/categories`, group)
+  const catsArr = await openArray(`obs/${col}/categories`, group, base)
   const categories = Array.from((await zarr.get(catsArr)).data as ArrayLike<string>)
   return { codes, categories }
 }
@@ -85,7 +99,7 @@ export async function loadGeneNames(group = ''): Promise<string[]> {
   const rel = group ? `${group}/var` : 'var'
   const varGroup = await zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${rel}`), { kind: 'group' })
   const idxCol = (varGroup.attrs['_index'] as string) ?? '_index'
-  const arr = await openArray(`var/${idxCol}`, group)
+  const arr = await openArray(`var/${idxCol}`, group, DATA_BASE_URL)
   return Array.from((await zarr.get(arr)).data as ArrayLike<string>)
 }
 
@@ -222,7 +236,7 @@ const DEFAULT_GROUPS: Group[] = [{ id: 'main', label: 'Full store', path: '' }]
  * invalid -> a single root group. */
 export async function loadGroups(): Promise<Group[]> {
   try {
-    const res = await fetch(`${DATA_BASE_URL}/groups.json`)
+    const res = await fetch(`${await coordBase()}/groups.json`)
     if (!res.ok) return DEFAULT_GROUPS
     const gs = (await res.json()) as Group[]
     return Array.isArray(gs) && gs.length > 0 ? gs : DEFAULT_GROUPS

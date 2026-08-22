@@ -29,7 +29,7 @@ Download and install Docker Desktop for your platform from https://docs.docker.c
 - a local path, e.g. `./data/soundlife-other-tiny.zarr`
 - a private GCS store, e.g. `gs://my-bucket/path/store.zarr` — read with your Google credentials (see [Docker deployment](#docker-deployment-gcs))
 
-Optionally set `RAPIDS_DIR` to a second store (e.g. the CSR store RAPIDS consumes): the app reads everything it displays from `DATA_DIR`, and selection exports/submissions record `RAPIDS_DIR` as their `store`. Unset, one store serves both roles.
+Optionally set `RAPIDS_DIR` to a second store (e.g. the CSR store RAPIDS consumes): coords, labels, barcodes, and views then come from `RAPIDS_DIR` (served at `/api/rapids-data`), `DATA_DIR` answers only gene-expression reads, and selection exports/submissions record `RAPIDS_DIR` as their `store`. The two stores must share cell order. Unset, one store serves everything.
 
 In the app: lasso a cell selection, then download it as `selection.json` (with barcodes) or submit it — `POST /api/submit` sends store/group/lasso/indices, logs the payload, and runs a fake 10s GPU job (`server/simulate_gpu.sh`); submitted runs show running/done/failed status in a panel. A gene dropdown colors the UMAP by that gene's expression, resolved in order: `layers/gexp` (csc or dense, the `zarrsmith add-expr` setup) → dense `X` → CSC `X`. CSR-only stores are refused with a pointer at `zarrsmith add-expr`; dense reads are refused when the chunk layout would stream the matrix for one gene.
 
@@ -78,9 +78,13 @@ gcloud auth application-default login
 This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs read access on the bucket (`roles/storage.objectViewer`). If your ADC has no default project, also export `GOOGLE_CLOUD_PROJECT=<project-id>`.
 
 ### 2. Build and run
-
+using 1 store, X/ is used for rapids runs (best if csr), layers/gexp is used for gene highlighting (best if dense/csc) (zarrsmith can create the layers/gexp for a zarr easily for datavis use)
 ```bash
 DATA_DIR=gs://MY_BUCKET/stores/soundlife-other-tiny.zarr docker compose up --build -d
+```
+or if two different stores:
+```
+DATA_DIR=gs://bucket/vis-csc-store.zarr RAPIDS_DIR=gs://bucket/rapids-csr.zarr docker compose up --build
 ```
 
 App: http://localhost:3000 · API docs: http://localhost:8000/docs
