@@ -26,3 +26,8 @@ export async function fetchJobs(): Promise<Job[]> {
   if (!res.ok) return []
   return res.json()
 }
+
+export async function deleteView(id: string): Promise<void> {
+  const res = await fetch(`/api/views/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`delete view failed: ${res.status}`)
+}

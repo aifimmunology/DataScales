@@ -32,38 +32,40 @@ def main():
     # Heavy/CUDA imports live inside main() so the worker-bootstrap re-import of this
     # module (see module docstring) stays trivial and doesn't init CUDA before the
     # worker has claimed its device.
-    import dask
-    from dask_cuda import LocalCUDACluster
-    from dask.distributed import Client
-
     import json
     import time
     import numpy as np
     import zarr
     import anndata as ad
-    from anndata.experimental import read_elem_lazy as read_dask
     import rapids_singlecell as rsc
 
     import rmm
     import cupy as cp
     from rmm.allocators.cupy import rmm_cupy_allocator
 
-    # ── CUDA dask cluster ────────────────────────────────────────────────────────
-    print("stage: starting CUDA cluster", flush=True)
-    dask.config.set({"distributed.scheduler.worker-ttl": None})
-    cluster = LocalCUDACluster(
-        CUDA_VISIBLE_DEVICES=GPUS,
-        protocol="tcp",
-        threads_per_worker=16,
-        rmm_managed_memory=True,
-        rmm_allocator_external_lib_list="cupy",
-        enable_cudf_spill=True,
-    )
-    client = Client(cluster)
+    selection = json.load(open(SELECTION_FILE))         # {"barcodes": [...], ...}
+    # small selections fit one GPU eagerly — skip the dask-cuda cluster entirely
+    eager = len(selection["barcodes"]) <= int(os.environ.get("RERUN_EAGER_MAX", "150000"))
 
-    # zarr read-tuning is per worker process — set it ON the workers, not the client.
-    client.run(lambda: __import__("zarr").config.set(
-        {"async.concurrency": 4, "threading.max_workers": 4}))
+    if not eager:
+        print("stage: starting CUDA cluster", flush=True)
+        import dask
+        from dask_cuda import LocalCUDACluster
+        from dask.distributed import Client
+
+        dask.config.set({"distributed.scheduler.worker-ttl": None})
+        cluster = LocalCUDACluster(
+            CUDA_VISIBLE_DEVICES=GPUS,
+            protocol="tcp",
+            threads_per_worker=16,
+            rmm_managed_memory=True,
+            rmm_allocator_external_lib_list="cupy",
+            enable_cudf_spill=True,
+        )
+        client = Client(cluster)
+        # zarr read-tuning is per worker process — set it ON the workers, not the client.
+        client.run(lambda: __import__("zarr").config.set(
+            {"async.concurrency": 4, "threading.max_workers": 4}))
 
     # ── Managed memory (client process) ──────────────────────────────────────────
     rmm.reinitialize(managed_memory=True, pool_allocator=False)
@@ -78,19 +80,26 @@ def main():
     shape = f["X"].attrs["shape"]                       # [n_obs, n_vars]
     obs = ad.io.read_elem(f["obs"])
 
-    selection = json.load(open(SELECTION_FILE))         # {"barcodes": [...], ...}
     rows = obs.index.get_indexer(selection["barcodes"])
     assert (rows >= 0).all(), "some selected barcodes are not in this store"
     rows = np.unique(rows)                              # ascending, deduped → chunk-friendly
 
-    X_dask = read_dask(f["X"], (ROW_CHUNK_SIZE, shape[1]))
-    raw_counts = np.issubdtype(X_dask.dtype, np.integer)
-    X_dask = X_dask[rows]                               # keep only the selected cells (lazy)
-    if raw_counts:
-        X_dask = X_dask.astype(np.float32)
+    if eager:
+        X = ad.io.sparse_dataset(f["X"])[rows]          # host scipy CSR, selected rows only
+        raw_counts = np.issubdtype(X.dtype, np.integer)
+        if raw_counts:
+            X = X.astype(np.float32)
+    else:
+        from anndata.experimental import read_elem_lazy as read_dask
 
-    adata = ad.AnnData(X=X_dask, obs=obs.iloc[rows].copy(), var=ad.io.read_elem(f["var"]))
-    print("Selected cells:", adata.shape)
+        X = read_dask(f["X"], (ROW_CHUNK_SIZE, shape[1]))
+        raw_counts = np.issubdtype(X.dtype, np.integer)
+        X = X[rows]                                     # keep only the selected cells (lazy)
+        if raw_counts:
+            X = X.astype(np.float32)
+
+    adata = ad.AnnData(X=X, obs=obs.iloc[rows].copy(), var=ad.io.read_elem(f["var"]))
+    print("Selected cells:", adata.shape, "(eager)" if eager else "(dask)")
     rsc.get.anndata_to_GPU(adata)
 
     # ── Preprocess (only if raw counts) ──────────────────────────────────────────
@@ -103,17 +112,19 @@ def main():
     rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=2000)
     adata = adata[:, adata.var["highly_variable"].to_numpy()].copy()
 
-    n_rows, n_cols = adata.shape
-    n_gpus = len(GPUS.split(","))
-    adata.X = adata.X.rechunk(((n_rows + n_gpus - 1) // n_gpus, n_cols)).persist()  # one band per GPU
-    adata.X.compute_chunk_sizes()
+    if not eager:
+        n_rows, n_cols = adata.shape
+        n_gpus = len(GPUS.split(","))
+        adata.X = adata.X.rechunk(((n_rows + n_gpus - 1) // n_gpus, n_cols)).persist()  # one band per GPU
+        adata.X.compute_chunk_sizes()
 
     # ── Scale + PCA ──────────────────────────────────────────────────────────────
     print("stage: scale + PCA", flush=True)
     adata.X = adata.X.astype("float64")                 # rounding accuracy for scale only
     rsc.pp.scale(adata, zero_center=False, max_value=10)
     rsc.pp.pca(adata, n_comps=50, random_state=RANDOM_SEED)
-    adata.obsm["X_pca"] = adata.obsm["X_pca"].persist().compute()
+    if not eager:
+        adata.obsm["X_pca"] = adata.obsm["X_pca"].persist().compute()
 
     # ── Harmony (optional) ───────────────────────────────────────────────────────
     rep = "X_pca"

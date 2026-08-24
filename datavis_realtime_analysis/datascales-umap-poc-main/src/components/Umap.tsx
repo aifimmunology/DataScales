@@ -23,7 +23,7 @@ import {
   type GeneExpression,
 } from '../lib/zarrData'
 import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
-import { submitSelection } from '../lib/api'
+import { deleteView, submitSelection } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
 
@@ -224,6 +224,18 @@ export default function Umap() {
     })
   }
 
+  const deleteCurrentView = async (id: string) => {
+    if (!window.confirm('Delete this view from the store? This cannot be undone.')) return
+    try {
+      await deleteView(id)
+      const gs = await loadGroups()
+      setGroups(gs)
+      setGroup('')
+    } catch (err) {
+      console.error('Delete view failed:', err)
+    }
+  }
+
   const layer = new ScatterplotLayer<Point>({
     id: 'umap-scatter',
     data: points,
@@ -312,7 +324,7 @@ export default function Umap() {
           onSubmit={submitCurrent}
           onClear={clearSelection}
         />
-        <GroupPicker groups={groups} active={group} onChange={setGroup} />
+        <GroupPicker groups={groups} active={group} onChange={setGroup} onDelete={deleteCurrentView} />
         <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
       </div>
       <RunsPanel refresh={submitCount} onViewReady={onViewReady} />

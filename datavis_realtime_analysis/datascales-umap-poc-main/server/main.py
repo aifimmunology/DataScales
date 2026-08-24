@@ -169,8 +169,8 @@ def _ssh_cmd(remote: str) -> list[str]:
             "--command", remote]
 
 
-def _scp_cmd(local: str, remote: str) -> list[str]:
-    return ["gcloud", "compute", "scp", local, f"{GPU_INSTANCE}:{remote}",
+def _scp_cmd(locals_: list[str], remote: str) -> list[str]:
+    return ["gcloud", "compute", "scp", *locals_, f"{GPU_INSTANCE}:{remote}",
             f"--zone={GPU_ZONE}"]
 
 
@@ -194,17 +194,24 @@ def _register_view(slug: str, label: str) -> None:
 
 
 def _run_gpu_job(job: dict, slug: str, sel_path: str) -> None:
-    rdir = f"/tmp/datavis_job_{job['id']}"
+    # two remote invocations total: one scp (selection + script), one ssh that
+    # chains pipeline -> GCS upload -> cleanup, streaming stage lines back
+    rid = job["id"]
+    sel_remote = f"/tmp/{Path(sel_path).name}"
+    out_remote = f"/tmp/datavis_view_{rid}"
     job["stage"] = "shipping selection"
-    _run(_ssh_cmd(f"mkdir -p {rdir}"))
-    _run(_scp_cmd(sel_path, f"{rdir}/selection.json"))
-    _run(_scp_cmd(str(RERUN_SCRIPT), f"{rdir}/rerun.py"))
+    _run(_scp_cmd([sel_path, str(RERUN_SCRIPT)], "/tmp/"))
 
     job["stage"] = "starting pipeline"
-    env = (f"RERUN_DATA={GPU_DATA} RERUN_SELECTION={rdir}/selection.json "
-           f"RERUN_OUT={rdir}/view RERUN_GPUS=0")
-    remote = f"cd {GPU_PIXI_DIR} && {env} ~/.pixi/bin/pixi run python {rdir}/rerun.py"
-    log = open(f"/tmp/datavis_job_{job['id']}.log", "w")
+    dest = f"{RAPIDS_DIR.rstrip('/')}/umap_views/{slug}"
+    env = (f"RERUN_DATA={GPU_DATA} RERUN_SELECTION={sel_remote} "
+           f"RERUN_OUT={out_remote} RERUN_GPUS=0")
+    remote = (f"cd {GPU_PIXI_DIR} && {env} ~/.pixi/bin/pixi run python "
+              f"/tmp/{RERUN_SCRIPT.name} && "
+              f"echo 'stage: uploading view to GCS' && "
+              f"gcloud -q storage rsync -r {out_remote} {dest} && "
+              f"rm -rf {out_remote} {sel_remote}")
+    log = open(f"/tmp/datavis_job_{rid}.log", "w")
     proc = subprocess.Popen(_ssh_cmd(remote), stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
@@ -215,11 +222,7 @@ def _run_gpu_job(job: dict, slug: str, sel_path: str) -> None:
     log.close()
     if proc.wait() != 0:
         raise RuntimeError(f"pipeline exited {proc.returncode} during '{job['stage']}' "
-                           f"(log: /tmp/datavis_job_{job['id']}.log)")
-
-    job["stage"] = "uploading view to GCS"
-    dest = f"{RAPIDS_DIR.rstrip('/')}/umap_views/{slug}"
-    _run(_ssh_cmd(f"gcloud storage rsync -r {rdir}/view {dest} && rm -rf {rdir}"))
+                           f"(log: /tmp/datavis_job_{rid}.log)")
 
     job["stage"] = "registering view"
     _register_view(slug, job["name"])
@@ -287,3 +290,28 @@ def submit(artifact: dict):
 @app.get("/api/jobs")
 def jobs():
     return list(JOBS.values())[::-1]
+
+
+@app.delete("/api/views/{view_id}")
+def delete_view(view_id: str):
+    src = _SOURCES["rapids-data"]
+    if not src["gcs"]:
+        raise HTTPException(400, "view management requires a gs:// rapids store")
+    bucket = _bucket(src["bucket"])
+    key = f"{src['prefix']}/groups.json" if src["prefix"] else "groups.json"
+    blob = bucket.blob(key)
+    if not blob.exists():
+        raise HTTPException(404, "no views registered")
+    groups = json.loads(blob.download_as_bytes())
+    entry = next((g for g in groups if g.get("id") == view_id and g.get("path")), None)
+    if entry is None:
+        raise HTTPException(404, f"view '{view_id}' not found")
+    prefix = f"{src['prefix']}/{entry['path']}/" if src["prefix"] else f"{entry['path']}/"
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    for i in range(0, len(blobs), 100):
+        bucket.delete_blobs(blobs[i:i + 100])
+    blob.upload_from_string(
+        json.dumps([g for g in groups if g is not entry], indent=1),
+        content_type="application/json",
+    )
+    return {"deleted": view_id, "objects": len(blobs)}
