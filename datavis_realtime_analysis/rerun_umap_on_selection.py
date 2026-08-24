@@ -43,6 +43,10 @@ def main():
     import cupy as cp
     from rmm.allocators.cupy import rmm_cupy_allocator
 
+    # RERUN_DATA may be gs:// (zarr resolves it via gcsfs + ADC on the box);
+    # crank read concurrency so the cold obs/X loads don't serialize on GCS latency
+    zarr.config.set({"async.concurrency": 32, "threading.max_workers": 8})
+
     selection = json.load(open(SELECTION_FILE))         # {"barcodes": [...], ...}
     # if small selections fit one GPU eagerly — skip the dask-cuda cluster entirely
     eager = len(selection["barcodes"]) <= int(os.environ.get("RERUN_EAGER_MAX", "150000"))

@@ -24,16 +24,18 @@ Download and install Docker Desktop for your platform from https://docs.docker.c
 
 ## Data
 
-`DATA_DIR` points at the root of an AnnData zarr v3 store — the directory (or GCS prefix) containing `zarr.json` and `obsm/`, with UMAP coordinates at `obsm/X_umap` (shape `(n_obs, 2)`, the standard layout from scanpy's `sc.tl.umap`). It can be:
+`DATA_DIR` points at the root of an AnnData zarr v3 store — the directory (or GCS prefix) containing `zarr.json`. It can be a local path (`./data/soundlife-other-tiny.zarr`) or a private GCS store (`gs://my-bucket/path/store.zarr`, read with your Google credentials — see [Docker deployment](#docker-deployment-gcs)).
 
-- a local path, e.g. `./data/soundlife-other-tiny.zarr`
-- a private GCS store, e.g. `gs://my-bucket/path/store.zarr` — read with your Google credentials (see [Docker deployment](#docker-deployment-gcs))
+One store serves everything:
 
-Optionally set `RAPIDS_DIR` to a second store (e.g. the CSR store RAPIDS consumes): coords, labels, barcodes, and views then come from `RAPIDS_DIR` (served at `/api/rapids-data`), `DATA_DIR` answers only gene-expression reads, and selection exports/submissions record `RAPIDS_DIR` as their `store`. The two stores must share cell order. Unset, one store serves everything.
+- `obsm/X_umap` — the coordinates the viewer renders (`(n_obs, 2)`, scanpy layout)
+- `X/` (best if csr) — what the GPU pipeline consumes
+- `layers/gexp` (csc or dense; `zarrsmith add-expr` creates it) — gene-expression highlighting, resolved in order `layers/gexp` → dense `X` → CSC `X`
+- `umap_views/`, `groups.json`, `jobs/` — written by the app: returned views, the view listing, and the GPU job queue + status objects
 
-In the app: lasso a cell selection, name it, and hit "GPU run" — the backend queues the job to the GPU box over `gcloud compute ssh` (warm runner `../gpu_runner.py`: RAPIDS + obs stay loaded; ~20s per run), the view lands in the rapids store's `umap_views/` on GCS, and the runs panel marks it ready in the View picker. The runs panel shows queued/running with a live timer and pipeline stage; views are deletable from the View picker (✕). A gene dropdown colors the UMAP by that gene's expression, resolved in order: `layers/gexp` (csc or dense, the `zarrsmith add-expr` setup) → dense `X` → CSC `X`.
+In the app: lasso a cell selection, name it, and hit "GPU run". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `../gpu_job.sh` sets up the pixi env fresh, runs `../rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
 
-GPU runs: config via `GPU_INSTANCE` (defaults to the datavis GPU box; set `""` for the 10s simulator), `GPU_ZONE`, `GPU_DATA` (store path the pipeline reads on the box, default `/mnt/subset3M_megazarr_v1.0.zarr`). Works in docker (the backend image ships gcloud + your mounted credentials/ssh key) and in dev mode. The runner caches obs at warm-up — after changing the store, `gcloud compute ssh <box> --command 'pkill -f gpu_runner'` and the next submit restarts it fresh.
+GPU runs: config via `GPU_INSTANCE` (defaults to the datavis GPU box; set `""` for the 10s simulator), `GPU_ZONE`, `GPU_PIXI_DIR` (pixi project on the box, default `/mnt/DataScales/rapids_user_notebook`). Works in docker (the backend image ships gcloud + your mounted credentials/ssh key) and in dev mode. One-time on the box: `gcloud auth application-default login` so python can read `gs://` stores.
 
 ---
 
@@ -80,13 +82,9 @@ gcloud auth application-default login
 This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs read access on the bucket (`roles/storage.objectViewer`). If your ADC has no default project, also export `GOOGLE_CLOUD_PROJECT=<project-id>`.
 
 ### 2. Build and run
-using 1 store, X/ is used for rapids runs (best if csr), layers/gexp is used for gene highlighting (best if dense/csc) (zarrsmith can create the layers/gexp for a zarr easily for datavis use)
+
 ```bash
-DATA_DIR=gs://MY_BUCKET/stores/soundlife-other-tiny.zarr docker compose up --build -d
-```
-or if two different stores:
-```
-DATA_DIR=gs://bucket/vis-csc-store.zarr RAPIDS_DIR=gs://bucket/rapids-csr.zarr docker compose up --build
+DATA_DIR=gs://MY_BUCKET/stores/store.zarr docker compose up --build -d
 ```
 
 App: http://localhost:3000
