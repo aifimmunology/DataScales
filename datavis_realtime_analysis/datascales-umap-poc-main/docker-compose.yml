@@ -15,6 +15,8 @@ services:
     environment:
       DATA_DIR: ${DATA_DIR}
       RAPIDS_DIR: ${RAPIDS_DIR:-}
+      GPU_DATA: ${GPU_DATA:-/mnt/subset3M_megazarr_v1.0.zarr}
+      GPU_INSTANCE: ${GPU_INSTANCE:-}  # container has no gcloud — GPU runs need the dev-mode backend
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
     volumes:
       - ~/.config/gcloud:/root/.config/gcloud:ro

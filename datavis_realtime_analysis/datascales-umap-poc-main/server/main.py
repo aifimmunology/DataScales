@@ -19,9 +19,9 @@ RAPIDS_DIR = os.environ.get("RAPIDS_DIR", "") or DATA_DIR
 SIMULATE_SCRIPT = Path(__file__).parent / "simulate_gpu.sh"
 MAX_JOBS = 50
 
-# Real GPU runs happen when GPU_INSTANCE is set (gcloud compute ssh); else the
-# sleep-script simulator handles submits.
-GPU_INSTANCE = os.environ.get("GPU_INSTANCE", "")
+# Real GPU runs go through gcloud compute ssh to this instance; set GPU_INSTANCE=""
+# to use the sleep-script simulator instead.
+GPU_INSTANCE = os.environ.get("GPU_INSTANCE", "my-gpu-instance")
 GPU_ZONE = os.environ.get("GPU_ZONE", "us-central1-c")
 GPU_DATA = os.environ.get("GPU_DATA", "/mnt/subset3M_megazarr_v1.0.zarr")
 GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "/mnt/DataScales/rapids_user_notebook")
