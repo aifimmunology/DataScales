@@ -85,7 +85,7 @@ using 1 store, X/ is used for rapids runs (best if csr), layers/gexp is used for
 DATA_DIR=gs://MY_BUCKET/stores/soundlife-other-tiny.zarr docker compose up --build -d
 ```
 or if two different stores:
-```
+```bash
 DATA_DIR=gs://bucket/vis-csc-store.zarr RAPIDS_DIR=gs://bucket/rapids-csr.zarr docker compose up --build
 ```
 

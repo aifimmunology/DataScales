@@ -63,6 +63,11 @@ def _media_type(path: str) -> str:
     return "application/json" if path.endswith(".json") else "application/octet-stream"
 
 
+@app.get("/")
+def root():
+    return {"this": "datavis backend API", "app_ui": "http://localhost:3000"}
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
