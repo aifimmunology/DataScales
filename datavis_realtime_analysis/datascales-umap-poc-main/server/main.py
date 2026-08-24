@@ -27,7 +27,7 @@ GPU_DATA = os.environ.get("GPU_DATA", "/mnt/subset3M_megazarr_v1.0.zarr")
 GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "/mnt/DataScales/rapids_user_notebook")
 RERUN_SCRIPT = Path(__file__).resolve().parents[2] / "rerun_umap_on_selection.py"
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 JOBS: dict[str, dict] = {}
 

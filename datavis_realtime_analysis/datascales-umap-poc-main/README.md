@@ -54,7 +54,7 @@ This starts both servers concurrently:
 - Vite (frontend) → http://localhost:3000
 - FastAPI (backend) → http://localhost:8000
 
-Frontend requests to `/api/*` are proxied to the FastAPI server. API docs are available at http://localhost:8000/docs.
+Frontend requests to `/api/*` are proxied to the FastAPI server.
 
 To run the servers separately:
 
@@ -87,7 +87,7 @@ or if two different stores:
 DATA_DIR=gs://bucket/vis-csc-store.zarr RAPIDS_DIR=gs://bucket/rapids-csr.zarr docker compose up --build
 ```
 
-App: http://localhost:3000 · API docs: http://localhost:8000/docs
+App: http://localhost:3000
 
 ### 3. Verify
 

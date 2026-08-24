@@ -19,10 +19,10 @@ the current process has finished its bootstrapping phase".
 # ── Variables (env-overridable so the datavis backend can drive this per job) ──
 import os
 
-data_pth       = os.environ.get("RERUN_DATA", "/home/workspace/temp/expression.zarr")  # CSR zarr store (raw counts)
+data_pth       = os.environ.get("RERUN_DATA", "/home/workspace/temp/expression.zarr")  
 SELECTION_FILE = os.environ.get("RERUN_SELECTION", "./datascales-umap-poc-main/data/3M_subset_bcell_selection.json")
 VIEW_STORE     = os.environ.get("RERUN_OUT", data_pth + "/umap_views/bcell_selection")  # view store to write (obsm/X_umap + obs, no X)
-GPUS           = os.environ.get("RERUN_GPUS", "0")  # comma-separated CUDA device ids
+GPUS           = os.environ.get("RERUN_GPUS", "0") 
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
 BATCH_KEY      = []   # obs columns to harmony-integrate on; [] = skip harmony
@@ -44,7 +44,7 @@ def main():
     from rmm.allocators.cupy import rmm_cupy_allocator
 
     selection = json.load(open(SELECTION_FILE))         # {"barcodes": [...], ...}
-    # small selections fit one GPU eagerly — skip the dask-cuda cluster entirely
+    # if small selections fit one GPU eagerly — skip the dask-cuda cluster entirely
     eager = len(selection["barcodes"]) <= int(os.environ.get("RERUN_EAGER_MAX", "150000"))
 
     if not eager:
@@ -63,7 +63,7 @@ def main():
             enable_cudf_spill=True,
         )
         client = Client(cluster)
-        # zarr read-tuning is per worker process — set it ON the workers, not the client.
+        
         client.run(lambda: __import__("zarr").config.set(
             {"async.concurrency": 4, "threading.max_workers": 4}))
 
@@ -77,7 +77,7 @@ def main():
     # ── Load ONLY the selected cells ─────────────────────────────────────────────
     print("stage: loading selected cells", flush=True)
     f = zarr.open(data_pth, mode="r")
-    shape = f["X"].attrs["shape"]                       # [n_obs, n_vars]
+    shape = f["X"].attrs["shape"]      # [n_obs, n_vars]
     obs = ad.io.read_elem(f["obs"])
 
     rows = obs.index.get_indexer(selection["barcodes"])
@@ -85,17 +85,15 @@ def main():
     rows = np.unique(rows)                              # ascending, deduped → chunk-friendly
 
     if eager:
-        X = ad.io.sparse_dataset(f["X"])[rows]          # host scipy CSR, selected rows only
-        raw_counts = np.issubdtype(X.dtype, np.integer)
-        if raw_counts:
-            X = X.astype(np.float32)
-    else:
-        from anndata.experimental import read_elem_lazy as read_dask
+        X = ad.io.sparse_dataset(f["X"])[rows]      
 
+    else: #dask
+        from anndata.experimental import read_elem_lazy as read_dask
         X = read_dask(f["X"], (ROW_CHUNK_SIZE, shape[1]))
-        raw_counts = np.issubdtype(X.dtype, np.integer)
-        X = X[rows]                                     # keep only the selected cells (lazy)
-        if raw_counts:
+        X = X[rows]                                     
+    
+    raw_counts = np.issubdtype(X.dtype, np.integer)
+    if raw_counts:
             X = X.astype(np.float32)
 
     adata = ad.AnnData(X=X, obs=obs.iloc[rows].copy(), var=ad.io.read_elem(f["var"]))
