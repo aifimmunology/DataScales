@@ -26,6 +26,7 @@ GPU_ZONE = os.environ.get("GPU_ZONE", "us-central1-c")
 GPU_DATA = os.environ.get("GPU_DATA", "/mnt/subset3M_megazarr_v1.0.zarr")
 GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "/mnt/DataScales/rapids_user_notebook")
 RERUN_SCRIPT = Path(__file__).resolve().parents[2] / "rerun_umap_on_selection.py"
+RUNNER_SCRIPT = Path(__file__).resolve().parents[2] / "gpu_runner.py"
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -193,36 +194,91 @@ def _register_view(slug: str, label: str) -> None:
     blob.upload_from_string(json.dumps(groups, indent=1), content_type="application/json")
 
 
-def _run_gpu_job(job: dict, slug: str, sel_path: str) -> None:
-    # two remote invocations total: one scp (selection + script), one ssh that
-    # chains pipeline -> GCS upload -> cleanup, streaming stage lines back
-    rid = job["id"]
-    sel_remote = f"/tmp/{Path(sel_path).name}"
-    out_remote = f"/tmp/datavis_view_{rid}"
-    job["stage"] = "shipping selection"
-    _run(_scp_cmd([sel_path, str(RERUN_SCRIPT)], "/tmp/"))
+_scripts_shipped = False
 
-    job["stage"] = "starting pipeline"
-    dest = f"{RAPIDS_DIR.rstrip('/')}/umap_views/{slug}"
-    env = (f"RERUN_DATA={GPU_DATA} RERUN_SELECTION={sel_remote} "
-           f"RERUN_OUT={out_remote} RERUN_GPUS=0")
-    remote = (f"cd {GPU_PIXI_DIR} && {env} ~/.pixi/bin/pixi run python "
-              f"/tmp/{RERUN_SCRIPT.name} && "
-              f"echo 'stage: uploading view to GCS' && "
-              f"gcloud -q storage rsync -r {out_remote} {dest} && "
-              f"rm -rf {out_remote} {sel_remote}")
-    log = open(f"/tmp/datavis_job_{rid}.log", "w")
-    proc = subprocess.Popen(_ssh_cmd(remote), stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
+
+def _ship_scripts() -> None:
+    global _scripts_shipped
+    if not _scripts_shipped:
+        _run(_scp_cmd([str(RUNNER_SCRIPT), str(RERUN_SCRIPT)], "/tmp/"))
+        _scripts_shipped = True
+
+
+def _warm_remote(job_id: str) -> str:
+    start_runner = (f"nohup env RUNNER_DATA={GPU_DATA} bash -c "
+                    f"'cd {GPU_PIXI_DIR} && ~/.pixi/bin/pixi run python /tmp/gpu_runner.py' "
+                    f">> /tmp/datavis_runner.log 2>&1 < /dev/null &")
+    # one ssh: receive the job json on stdin, (re)start the runner if its heartbeat
+    # is stale, then stream the job log until a terminal line appears
+    return f"""
+mkdir -p /tmp/datavis_jobs
+cat > /tmp/datavis_jobs/{job_id}.json.tmp
+if [ ! -f /tmp/datavis_runner.alive ] || [ $(($(date +%s) - $(stat -c %Y /tmp/datavis_runner.alive))) -gt 60 ]; then
+  echo "stage: starting warm runner (first job pays the warm-up)"
+  {start_runner}
+fi
+: > /tmp/datavis_jobs/{job_id}.log
+mv /tmp/datavis_jobs/{job_id}.json.tmp /tmp/datavis_jobs/{job_id}.json
+tail -n +1 -F /tmp/datavis_jobs/{job_id}.log &
+TP=$!
+for i in $(seq 1 7200); do
+  grep -qE "^(done|failed|fallback)$" /tmp/datavis_jobs/{job_id}.log && break
+  sleep 0.5
+done
+sleep 1
+kill $TP 2>/dev/null || true
+"""
+
+
+def _stream_stages(job: dict, cmd: list[str], stdin_payload: str | None = None) -> str | None:
+    """Run cmd streaming 'stage:' lines into the job; return the terminal marker seen."""
+    log = open(f"/tmp/datavis_job_{job['id']}.log", "a")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if stdin_payload else None,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if stdin_payload:
+        proc.stdin.write(stdin_payload)
+        proc.stdin.close()
+    outcome = None
     for line in proc.stdout:
         log.write(line)
         log.flush()
-        if line.startswith("stage: "):
-            job["stage"] = line[7:].strip()
+        s = line.strip()
+        if s.startswith("stage: "):
+            job["stage"] = s[7:]
+        elif s in ("done", "failed", "fallback"):
+            outcome = s
     log.close()
-    if proc.wait() != 0:
-        raise RuntimeError(f"pipeline exited {proc.returncode} during '{job['stage']}' "
-                           f"(log: /tmp/datavis_job_{rid}.log)")
+    proc.wait()
+    return outcome
+
+
+def _run_gpu_job(job: dict, slug: str, sel_path: str) -> None:
+    rid = job["id"]
+    dest = f"{RAPIDS_DIR.rstrip('/')}/umap_views/{slug}"
+    artifact = json.loads(Path(sel_path).read_text())
+    artifact["dest"] = dest
+    _ship_scripts()
+
+    job["stage"] = "submitting to GPU runner"
+    outcome = _stream_stages(job, _ssh_cmd(_warm_remote(rid)), json.dumps(artifact))
+
+    if outcome == "fallback":
+        # too large for the eager runner: dask-cuda cold path on the same box
+        job["stage"] = "starting cold pipeline (large selection)"
+        out_remote = f"/tmp/datavis_view_{rid}"
+        sel_remote = f"/tmp/datavis_jobs/{rid}.json.fallback"
+        env = (f"RERUN_DATA={GPU_DATA} RERUN_SELECTION={sel_remote} "
+               f"RERUN_OUT={out_remote} RERUN_GPUS=0")
+        remote = (f"cd {GPU_PIXI_DIR} && {env} ~/.pixi/bin/pixi run python "
+                  f"/tmp/{RERUN_SCRIPT.name} && "
+                  f"echo 'stage: uploading view to GCS' && "
+                  f"gcloud -q storage rsync -r {out_remote} {dest} && "
+                  f"rm -rf {out_remote} {sel_remote} && echo done")
+        outcome = _stream_stages(job, _ssh_cmd(remote))
+
+    if outcome != "done":
+        raise RuntimeError(f"gpu job did not complete (last stage: '{job['stage']}', "
+                           f"log: /tmp/datavis_job_{rid}.log)")
 
     job["stage"] = "registering view"
     _register_view(slug, job["name"])
