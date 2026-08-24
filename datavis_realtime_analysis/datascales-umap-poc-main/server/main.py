@@ -368,12 +368,14 @@ def delete_view(view_id: str):
     entry = next((g for g in groups if g.get("id") == view_id and g.get("path")), None)
     if entry is None:
         raise HTTPException(404, f"view '{view_id}' not found")
-    prefix = f"{src['prefix']}/{entry['path']}/" if src["prefix"] else f"{entry['path']}/"
-    blobs = list(bucket.list_blobs(prefix=prefix))
-    for i in range(0, len(blobs), 100):
-        bucket.delete_blobs(blobs[i:i + 100])
+    # unregister first: an interrupted delete then leaves unlisted orphan objects,
+    # never a listed-but-broken view
     blob.upload_from_string(
         json.dumps([g for g in groups if g is not entry], indent=1),
         content_type="application/json",
     )
+    prefix = f"{src['prefix']}/{entry['path']}/" if src["prefix"] else f"{entry['path']}/"
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    for i in range(0, len(blobs), 100):
+        bucket.delete_blobs(blobs[i:i + 100])
     return {"deleted": view_id, "objects": len(blobs)}

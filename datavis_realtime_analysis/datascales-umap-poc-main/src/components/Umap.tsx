@@ -71,8 +71,10 @@ export default function Umap() {
 
   // Coordinates + barcodes (re)load whenever the active group changes. Row indices
   // are per-group, so drop any selection and re-fit the camera to the new extent.
+  const [retryTick, setRetryTick] = useState(0)
   useEffect(() => {
     setLoading(true)
+    setError(null)
     setSelection(null)
     setSelVersion(v => v + 1)
     Promise.all([loadUmapCoords(group), loadBarcodes(group)])
@@ -87,7 +89,7 @@ export default function Umap() {
         setError(String(err))
         setLoading(false)
       })
-  }, [group])
+  }, [group, retryTick])
 
   // Category codes reload whenever the AIFI level OR the active group changes.
   useEffect(() => {
@@ -273,8 +275,15 @@ export default function Umap() {
 
   if (error) {
     return (
-      <div style={{ ...overlayStyle, color: '#f44' }}>
-        Failed to load UMAP data: {error}
+      <div style={{ ...overlayStyle, color: '#f44', flexDirection: 'column', gap: 12 }}>
+        <div>Failed to load UMAP data: {error}</div>
+        <button
+          onClick={() => setRetryTick(t => t + 1)}
+          style={{ background: '#1c1c1c', color: '#ddd', border: '1px solid #444',
+                   borderRadius: 4, padding: '6px 14px', fontSize: 13, cursor: 'pointer' }}
+        >
+          Retry
+        </button>
       </div>
     )
   }
