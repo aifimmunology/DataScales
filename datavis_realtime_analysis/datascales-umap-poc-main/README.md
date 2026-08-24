@@ -33,7 +33,7 @@ Optionally set `RAPIDS_DIR` to a second store (e.g. the CSR store RAPIDS consume
 
 In the app: lasso a cell selection, name it, and hit "Generate new UMAP with subset" — the backend queues the job to the GPU box over `gcloud compute ssh` (warm runner `../gpu_runner.py`: RAPIDS + obs stay loaded; ~20s per run), the view lands in the rapids store's `umap_views/` on GCS, and the app jumps to it. The runs panel shows queued/running with a live timer and pipeline stage; views are deletable from the View picker (✕). A gene dropdown colors the UMAP by that gene's expression, resolved in order: `layers/gexp` (csc or dense, the `zarrsmith add-expr` setup) → dense `X` → CSC `X`.
 
-GPU runs: config via `GPU_INSTANCE` (defaults to the datavis GPU box; set `""` for the 10s simulator), `GPU_ZONE`, `GPU_DATA` (store path the pipeline reads on the box, default `/mnt/subset3M_megazarr_v1.0.zarr`). Requires the dev-mode backend (the docker container has no gcloud identity). The runner caches obs at warm-up — after changing the store, `gcloud compute ssh <box> --command 'pkill -f gpu_runner'` and the next submit restarts it fresh.
+GPU runs: config via `GPU_INSTANCE` (defaults to the datavis GPU box; set `""` for the 10s simulator), `GPU_ZONE`, `GPU_DATA` (store path the pipeline reads on the box, default `/mnt/subset3M_megazarr_v1.0.zarr`). Works in docker (the backend image ships gcloud + your mounted credentials/ssh key) and in dev mode. The runner caches obs at warm-up — after changing the store, `gcloud compute ssh <box> --command 'pkill -f gpu_runner'` and the next submit restarts it fresh.
 
 ---
 

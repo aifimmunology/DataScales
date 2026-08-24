@@ -16,9 +16,13 @@ services:
       DATA_DIR: ${DATA_DIR}
       RAPIDS_DIR: ${RAPIDS_DIR:-}
       GPU_DATA: ${GPU_DATA:-/mnt/subset3M_megazarr_v1.0.zarr}
-      GPU_INSTANCE: ${GPU_INSTANCE:-}  # container has no gcloud — GPU runs need the dev-mode backend
+      GPU_INSTANCE: ${GPU_INSTANCE:-my-gpu-instance}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
     volumes:
-      - ~/.config/gcloud:/root/.config/gcloud:ro
+      - ~/.config/gcloud:/gcloud-ro:ro
+      - ~/.ssh/google_compute_engine:/ssh-ro/google_compute_engine:ro
+      - ~/.ssh/google_compute_engine.pub:/ssh-ro/google_compute_engine.pub:ro
+      - ../gpu_runner.py:/gpu_runner.py:ro
+      - ../rerun_umap_on_selection.py:/rerun_umap_on_selection.py:ro
       # local store instead of GCS: uncomment and run with DATA_DIR=/data
       # - ./data/soundlife-other-tiny.zarr:/data:ro
