@@ -28,7 +28,7 @@ GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "/mnt/DataScales/rapids_user_noteb
 RERUN_SCRIPT = Path(__file__).resolve().parents[2] / "rerun_umap_on_selection.py"
 RUNNER_SCRIPT = Path(__file__).resolve().parents[2] / "gpu_runner.py"
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(redoc_url=None)  # /docs = interactive API console; health lives at /api/health
 
 JOBS: dict[str, dict] = {}
 
@@ -65,7 +65,8 @@ def _media_type(path: str) -> str:
 
 @app.get("/")
 def root():
-    return {"this": "datavis backend API", "app_ui": "http://localhost:3000"}
+    return {"this": "datavis backend API", "app_ui": "http://localhost:3000",
+            "api_console": "/docs", "health": "/api/health"}
 
 
 @app.get("/api/health")
