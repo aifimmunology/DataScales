@@ -1,6 +1,8 @@
 """Zarr data proxy: /api/data serves DATA_DIR (gene vis); /api/rapids-data serves RAPIDS_DIR."""
 
+import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -16,6 +18,14 @@ DATA_DIR = os.environ.get("DATA_DIR", "")
 RAPIDS_DIR = os.environ.get("RAPIDS_DIR", "") or DATA_DIR
 SIMULATE_SCRIPT = Path(__file__).parent / "simulate_gpu.sh"
 MAX_JOBS = 50
+
+# Real GPU runs happen when GPU_INSTANCE is set (gcloud compute ssh); else the
+# sleep-script simulator handles submits.
+GPU_INSTANCE = os.environ.get("GPU_INSTANCE", "")
+GPU_ZONE = os.environ.get("GPU_ZONE", "us-central1-c")
+GPU_DATA = os.environ.get("GPU_DATA", "/mnt/subset3M_megazarr_v1.0.zarr")
+GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "/mnt/DataScales/rapids_user_notebook")
+RERUN_SCRIPT = Path(__file__).resolve().parents[2] / "rerun_umap_on_selection.py"
 
 app = FastAPI()
 
@@ -147,22 +157,130 @@ def _run_job(job_id: str):
         JOBS[job_id]["status"] = "failed"
 
 
+# ── Real GPU queue: one job at a time on the box, driven over gcloud ssh ──────
+
+JOB_QUEUE: queue.Queue = queue.Queue()
+_worker_lock = threading.Lock()
+_worker_started = False
+
+
+def _ssh_cmd(remote: str) -> list[str]:
+    return ["gcloud", "compute", "ssh", GPU_INSTANCE, f"--zone={GPU_ZONE}",
+            "--command", remote]
+
+
+def _scp_cmd(local: str, remote: str) -> list[str]:
+    return ["gcloud", "compute", "scp", local, f"{GPU_INSTANCE}:{remote}",
+            f"--zone={GPU_ZONE}"]
+
+
+def _run(cmd: list[str]) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd[:3])}… failed: {r.stderr.strip()[-300:]}")
+
+
+def _register_view(slug: str, label: str) -> None:
+    src = _SOURCES["rapids-data"]
+    if not src["gcs"]:
+        raise RuntimeError("GPU view return requires a gs:// RAPIDS_DIR store")
+    bucket = _bucket(src["bucket"])
+    key = f"{src['prefix']}/groups.json" if src["prefix"] else "groups.json"
+    blob = bucket.blob(key)
+    groups = (json.loads(blob.download_as_bytes()) if blob.exists()
+              else [{"id": "main", "label": "Full store", "path": ""}])
+    groups.append({"id": slug, "label": label, "path": f"umap_views/{slug}"})
+    blob.upload_from_string(json.dumps(groups, indent=1), content_type="application/json")
+
+
+def _run_gpu_job(job: dict, slug: str, sel_path: str) -> None:
+    rdir = f"/tmp/datavis_job_{job['id']}"
+    job["stage"] = "shipping selection"
+    _run(_ssh_cmd(f"mkdir -p {rdir}"))
+    _run(_scp_cmd(sel_path, f"{rdir}/selection.json"))
+    _run(_scp_cmd(str(RERUN_SCRIPT), f"{rdir}/rerun.py"))
+
+    job["stage"] = "starting pipeline"
+    env = (f"RERUN_DATA={GPU_DATA} RERUN_SELECTION={rdir}/selection.json "
+           f"RERUN_OUT={rdir}/view RERUN_GPUS=0")
+    remote = f"cd {GPU_PIXI_DIR} && {env} ~/.pixi/bin/pixi run python {rdir}/rerun.py"
+    log = open(f"/tmp/datavis_job_{job['id']}.log", "w")
+    proc = subprocess.Popen(_ssh_cmd(remote), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        log.write(line)
+        log.flush()
+        if line.startswith("stage: "):
+            job["stage"] = line[7:].strip()
+    log.close()
+    if proc.wait() != 0:
+        raise RuntimeError(f"pipeline exited {proc.returncode} during '{job['stage']}' "
+                           f"(log: /tmp/datavis_job_{job['id']}.log)")
+
+    job["stage"] = "uploading view to GCS"
+    dest = f"{RAPIDS_DIR.rstrip('/')}/umap_views/{slug}"
+    _run(_ssh_cmd(f"gcloud storage rsync -r {rdir}/view {dest} && rm -rf {rdir}"))
+
+    job["stage"] = "registering view"
+    _register_view(slug, job["name"])
+    job["view"] = f"umap_views/{slug}"
+    job["stage"] = "done"
+
+
+def _gpu_worker() -> None:
+    while True:
+        job_id, slug, sel_path = JOB_QUEUE.get()
+        job = JOBS.get(job_id)
+        if job is None:
+            continue
+        job["status"] = "running"
+        try:
+            _run_gpu_job(job, slug, sel_path)
+            job["status"] = "done"
+        except Exception as e:
+            job["stage"] = str(e)[:200]
+            job["status"] = "failed"
+        finally:
+            Path(sel_path).unlink(missing_ok=True)
+
+
+def _ensure_worker() -> None:
+    global _worker_started
+    with _worker_lock:
+        if not _worker_started:
+            threading.Thread(target=_gpu_worker, daemon=True).start()
+            _worker_started = True
+
+
 @app.post("/api/submit")
 def submit(artifact: dict):
     job_id = uuid.uuid4().hex[:8]
     cells = len(artifact.get("indices", []))
-    print(f"[submit] job {job_id}: {cells} cells, group '{artifact.get('group', '')}'",
+    name = str(artifact.get("name") or f"view {job_id}").strip()[:60]
+    print(f"[submit] job {job_id} '{name}': {cells} cells, group '{artifact.get('group', '')}'",
           file=sys.stderr, flush=True)
     while len(JOBS) >= MAX_JOBS:
         del JOBS[next(iter(JOBS))]
     JOBS[job_id] = {
         "id": job_id,
+        "name": name,
         "cells": cells,
         "group": artifact.get("group", ""),
         "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "status": "running",
+        "status": "queued" if GPU_INSTANCE else "running",
+        "stage": "queued" if GPU_INSTANCE else "",
+        "view": None,
     }
-    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+    if GPU_INSTANCE:
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
+        slug = f"{slug}_{job_id}"
+        sel_path = f"/tmp/datavis_selection_{job_id}.json"
+        with open(sel_path, "w") as fh:
+            json.dump(artifact, fh)
+        _ensure_worker()
+        JOB_QUEUE.put((job_id, slug, sel_path))
+    else:
+        threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
     return {"job_id": job_id, "status": "submitted"}
 
 

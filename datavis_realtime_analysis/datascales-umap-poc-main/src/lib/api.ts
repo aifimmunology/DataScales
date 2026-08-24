@@ -2,14 +2,17 @@ import type { SelectionArtifact } from './selection'
 
 export type Job = {
   id: string
+  name?: string
   cells: number
   group: string
   submitted_at: string
-  status: 'running' | 'done' | 'failed'
+  status: 'queued' | 'running' | 'done' | 'failed'
+  stage?: string
+  view?: string | null
 }
 
-// Submit omits barcodes: the backend derives them from the store when needed.
-export async function submitSelection(artifact: Omit<SelectionArtifact, 'barcodes'>): Promise<void> {
+// Barcodes ride along: the GPU pipeline selects cells by barcode (view-safe).
+export async function submitSelection(artifact: SelectionArtifact & { name: string }): Promise<void> {
   const res = await fetch('/api/submit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

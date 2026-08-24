@@ -16,10 +16,13 @@ multiprocessing aborts with "an attempt has been made to start a new process bef
 the current process has finished its bootstrapping phase".
 """
 
-# ── Variables ────────────────────────────────────────────────────────────────
-data_pth       = "/home/workspace/temp/expression.zarr"  # CSR zarr store (raw counts)
-SELECTION_FILE = "./datascales-umap-poc-main/data/3M_subset_bcell_selection.json"  # barcodes from the datavis app
-VIEW_STORE     = data_pth + "/umap_views/bcell_selection"  # mini view store to write (obsm/X_umap + obs, no X); point the datavis app's DATA_DIR here
+# ── Variables (env-overridable so the datavis backend can drive this per job) ──
+import os
+
+data_pth       = os.environ.get("RERUN_DATA", "/home/workspace/temp/expression.zarr")  # CSR zarr store (raw counts)
+SELECTION_FILE = os.environ.get("RERUN_SELECTION", "./datascales-umap-poc-main/data/3M_subset_bcell_selection.json")
+VIEW_STORE     = os.environ.get("RERUN_OUT", data_pth + "/umap_views/bcell_selection")  # view store to write (obsm/X_umap + obs, no X)
+GPUS           = os.environ.get("RERUN_GPUS", "0")  # comma-separated CUDA device ids
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
 BATCH_KEY      = []   # obs columns to harmony-integrate on; [] = skip harmony
@@ -46,9 +49,10 @@ def main():
     from rmm.allocators.cupy import rmm_cupy_allocator
 
     # ── CUDA dask cluster ────────────────────────────────────────────────────────
+    print("stage: starting CUDA cluster", flush=True)
     dask.config.set({"distributed.scheduler.worker-ttl": None})
     cluster = LocalCUDACluster(
-        CUDA_VISIBLE_DEVICES="0,1,2,3",
+        CUDA_VISIBLE_DEVICES=GPUS,
         protocol="tcp",
         threads_per_worker=16,
         rmm_managed_memory=True,
@@ -69,6 +73,7 @@ def main():
     t0 = time.perf_counter()
 
     # ── Load ONLY the selected cells ─────────────────────────────────────────────
+    print("stage: loading selected cells", flush=True)
     f = zarr.open(data_pth, mode="r")
     shape = f["X"].attrs["shape"]                       # [n_obs, n_vars]
     obs = ad.io.read_elem(f["obs"])
@@ -94,14 +99,17 @@ def main():
         rsc.pp.log1p(adata)
 
     # ── Highly variable genes ────────────────────────────────────────────────────
+    print("stage: highly variable genes", flush=True)
     rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=2000)
     adata = adata[:, adata.var["highly_variable"].to_numpy()].copy()
 
     n_rows, n_cols = adata.shape
-    adata.X = adata.X.rechunk(((n_rows + 3) // 4, n_cols)).persist()  # one band per GPU
+    n_gpus = len(GPUS.split(","))
+    adata.X = adata.X.rechunk(((n_rows + n_gpus - 1) // n_gpus, n_cols)).persist()  # one band per GPU
     adata.X.compute_chunk_sizes()
 
     # ── Scale + PCA ──────────────────────────────────────────────────────────────
+    print("stage: scale + PCA", flush=True)
     adata.X = adata.X.astype("float64")                 # rounding accuracy for scale only
     rsc.pp.scale(adata, zero_center=False, max_value=10)
     rsc.pp.pca(adata, n_comps=50, random_state=RANDOM_SEED)
@@ -116,6 +124,7 @@ def main():
         rep = "X_pca_harmony"
 
     # ── Neighbors → UMAP → Leiden ────────────────────────────────────────────────
+    print("stage: neighbors + UMAP + leiden", flush=True)
     rsc.pp.neighbors(adata, n_neighbors=20, n_pcs=30, use_rep=rep,
                      algorithm="brute", random_state=RANDOM_SEED)
     rsc.tl.umap(adata, min_dist=0.45, init_pos="spectral", n_components=2,
@@ -123,6 +132,7 @@ def main():
     rsc.tl.leiden(adata, resolution=1.1, n_iterations=100, random_state=RANDOM_SEED)
     print("clusters:", len(adata.obs["leiden"].cat.categories))
 
+    print("stage: writing view store", flush=True)
     umap = adata.obsm["X_umap"]
     if hasattr(umap, "get"):                            # cupy → host
         umap = umap.get()

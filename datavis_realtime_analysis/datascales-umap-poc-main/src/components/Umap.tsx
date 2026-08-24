@@ -202,14 +202,26 @@ export default function Umap() {
     downloadSelection(artifact)
   }
 
-  const submitCurrent = async () => {
+  const submitCurrent = async (name: string) => {
     if (!selection) return
     try {
-      await submitSelection(await selectionPayload(selection))
+      await submitSelection({
+        ...(await selectionPayload(selection)),
+        barcodes: selection.indices.map(i => barcodes[i] ?? ''),
+        name,
+      })
       setSubmitCount(c => c + 1)
     } catch (err) {
       console.error('Submit failed:', err)
     }
+  }
+
+  // a finished GPU run registered a new view in groups.json: reload + jump to it
+  const onViewReady = (path: string) => {
+    loadGroups().then(gs => {
+      setGroups(gs)
+      setGroup(path)
+    })
   }
 
   const layer = new ScatterplotLayer<Point>({
@@ -303,7 +315,7 @@ export default function Umap() {
         <GroupPicker groups={groups} active={group} onChange={setGroup} />
         <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
       </div>
-      <RunsPanel refresh={submitCount} />
+      <RunsPanel refresh={submitCount} onViewReady={onViewReady} />
       {/* legend tracks the actual coloring mode, not the picked gene */}
       {!exprData && (
         <Legend level={level} onLevelChange={setLevel} categories={cat?.categories ?? null} />

@@ -1,11 +1,13 @@
 import { panel, control } from '../lib/styles'
 
+import { useState } from 'react'
+
 type Props = {
   selecting: boolean
   onToggle: () => void
   count: number
   onDownload: () => void
-  onSubmit: () => void
+  onSubmit: (name: string) => void
   onClear: () => void
 }
 
@@ -18,6 +20,7 @@ export default function SelectionControls({
   onSubmit,
   onClear,
 }: Props) {
+  const [name, setName] = useState('')
   return (
     <div style={panelStyle}>
       <button onClick={onToggle} style={{ ...btnStyle, ...(selecting ? activeStyle : {}) }}>
@@ -32,8 +35,20 @@ export default function SelectionControls({
           <button onClick={onDownload} style={btnStyle}>
             ⬇ Download selection.json
           </button>
-          <button onClick={onSubmit} style={btnStyle}>
-            🚀 Submit to GPU
+          <input
+            value={name}
+            placeholder="new view name…"
+            onChange={e => setName(e.target.value)}
+            style={{ ...btnStyle, cursor: 'text' }}
+          />
+          <button
+            onClick={() => {
+              onSubmit(name.trim())
+              setName('')
+            }}
+            style={btnStyle}
+          >
+            ⚡ Generate new UMAP with subset
           </button>
           <button onClick={onClear} style={{ ...btnStyle, color: '#f88', borderColor: '#622' }}>
             Clear
