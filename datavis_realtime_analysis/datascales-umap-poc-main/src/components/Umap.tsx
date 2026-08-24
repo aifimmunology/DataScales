@@ -248,18 +248,20 @@ export default function Umap() {
         name,
       })
       setSubmitCount(c => c + 1)
+      // submitted: drop lasso mode and the highlighted subset
+      setSelecting(false)
+      setSelection(null)
+      setSelVersion(v => v + 1)
     } catch (err) {
       console.error('Submit failed:', err)
       setNotice(`Submit failed: ${err instanceof Error ? err.message : err}`)
     }
   }
 
-  // a finished GPU run registered a new view in groups.json: reload + jump to it
-  const onViewReady = (path: string) => {
-    loadGroups().then(gs => {
-      setGroups(gs)
-      setGroup(path)
-    })
+  // a finished GPU run registered a new view in groups.json: reload the picker;
+  // the runs panel marks it ready — no automatic switch
+  const onViewReady = () => {
+    loadGroups().then(setGroups)
   }
 
   // Relocate to the full store immediately, then delete behind the scrim; the

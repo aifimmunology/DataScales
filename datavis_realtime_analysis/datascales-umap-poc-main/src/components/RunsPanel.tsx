@@ -17,7 +17,7 @@ const fmtElapsed = (iso: string) => {
 type Props = { refresh: number; onViewReady: (path: string) => void }
 
 // refresh bumps on submit; polling runs while a job is queued/running; when a job
-// finishes with a view path, onViewReady fires once so the app can jump to it.
+// finishes with a view path, onViewReady fires once so the View picker can refresh.
 export default function RunsPanel({ refresh, onViewReady }: Props) {
   const [jobs, setJobs] = useState<Job[]>([])
   const notified = useRef(new Set<string>())
@@ -65,6 +65,9 @@ export default function RunsPanel({ refresh, onViewReady }: Props) {
             <span style={{ color: '#ffe94d' }}>{fmtElapsed(j.submitted_at)}</span>
           )}
           {j.status === 'running' && j.stage && <span>— {j.stage}</span>}
+          {j.status === 'done' && j.view && (
+            <span style={{ color: '#7f7' }}>— view ready in the View picker</span>
+          )}
           {j.status === 'failed' && j.stage && (
             <span style={{ color: '#f88' }} title={j.stage}>— {j.stage.slice(0, 60)}</span>
           )}

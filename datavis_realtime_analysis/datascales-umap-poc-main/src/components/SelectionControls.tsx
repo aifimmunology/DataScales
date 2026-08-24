@@ -48,7 +48,7 @@ export default function SelectionControls({
             }}
             style={btnStyle}
           >
-            ⚡ GPU run
+            GPU run
           </button>
           <button onClick={onClear} style={{ ...btnStyle, color: '#f88', borderColor: '#622' }}>
             Clear
