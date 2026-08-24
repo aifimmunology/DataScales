@@ -5,10 +5,12 @@ type Props = {
   level: Level
   onLevelChange: (level: Level) => void
   categories: string[] | null
+  error: string | null
+  onRetry: () => void
 }
 
 // Top-right overlay: pick which AIFI level colors the UMAP + show the key.
-export default function Legend({ level, onLevelChange, categories }: Props) {
+export default function Legend({ level, onLevelChange, categories, error, onRetry }: Props) {
   return (
     <div style={panelStyle}>
       <label style={label}>Color by</label>
@@ -25,7 +27,15 @@ export default function Legend({ level, onLevelChange, categories }: Props) {
       </select>
 
       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
-        {categories === null ? (
+        {error ? (
+          <span
+            style={{ color: '#f88', fontSize: 12, cursor: 'pointer' }}
+            onClick={onRetry}
+            title={error}
+          >
+            failed to load — retry
+          </span>
+        ) : categories === null ? (
           <span style={{ color: '#888', fontSize: 12 }}>Loading…</span>
         ) : (
           categories.map((name, code) => (

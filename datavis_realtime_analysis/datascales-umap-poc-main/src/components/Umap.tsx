@@ -113,18 +113,34 @@ export default function Umap() {
   }, [group, retryTick])
 
   // Category codes reload whenever the AIFI level OR the active group changes.
+  // One silent retry covers a backend blip mid-load; after that the failure is
+  // surfaced in the Legend (previously it hung on "Loading…" forever).
+  const [catError, setCatError] = useState<string | null>(null)
+  const [catTick, setCatTick] = useState(0)
   useEffect(() => {
     let stale = false
     setCat(null)
-    loadCategorical(level, group)
-      .then(c => {
-        if (!stale) setCat(c)
-      })
-      .catch(err => console.error(`Failed to load ${level}:`, err))
+    setCatError(null)
+    const attempt = (retriesLeft: number) => {
+      loadCategorical(level, group)
+        .then(c => {
+          if (!stale) setCat(c)
+        })
+        .catch(err => {
+          if (stale) return
+          if (retriesLeft > 0) {
+            setTimeout(() => !stale && attempt(retriesLeft - 1), 1500)
+            return
+          }
+          console.error(`Failed to load ${level}:`, err)
+          setCatError(err instanceof Error ? err.message : String(err))
+        })
+    }
+    attempt(1)
     return () => {
       stale = true
     }
-  }, [level, group])
+  }, [level, group, catTick])
 
   // Gene list is per-group; switching groups clears the active gene.
   useEffect(() => {
@@ -383,7 +399,13 @@ export default function Umap() {
       <RunsPanel refresh={submitCount} onViewReady={onViewReady} />
       {/* legend tracks the actual coloring mode, not the picked gene */}
       {!exprData && (
-        <Legend level={level} onLevelChange={setLevel} categories={cat?.categories ?? null} />
+        <Legend
+          level={level}
+          onLevelChange={setLevel}
+          categories={cat?.categories ?? null}
+          error={catError}
+          onRetry={() => setCatTick(t => t + 1)}
+        />
       )}
 
       {notice && (
