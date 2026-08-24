@@ -7,8 +7,11 @@ type AppConfig = { store?: string; rapids_store?: string }
 let cfgPromise: Promise<AppConfig> | null = null
 function getConfig(): Promise<AppConfig> {
   cfgPromise ??= fetch(window.location.origin + '/api/config')
-    .then(res => (res.ok ? res.json() : {}))
-    .catch(() => ({}))
+    .then(res => (res.ok ? res.json() : Promise.reject(new Error(`config ${res.status}`))))
+    .catch(() => {
+      cfgPromise = null // transient failure (backend restarting): retry on next call
+      return {}
+    })
   return cfgPromise
 }
 
@@ -94,12 +97,19 @@ export async function loadCategorical(col: Level, group = ''): Promise<Categoric
   return { codes, categories }
 }
 
+// Views live under the coord (rapids) store; only the root reads genes from the
+// vis store (DATA_DIR, the gene-query-optimized layout).
+async function geneBase(group: string): Promise<string> {
+  return group ? coordBase() : DATA_BASE_URL
+}
+
 /** Gene names from the var index column (named per the group's `_index` attr). */
 export async function loadGeneNames(group = ''): Promise<string[]> {
+  const base = await geneBase(group)
   const rel = group ? `${group}/var` : 'var'
-  const varGroup = await zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${rel}`), { kind: 'group' })
+  const varGroup = await zarr.open.v3(new zarr.FetchStore(`${base}/${rel}`), { kind: 'group' })
   const idxCol = (varGroup.attrs['_index'] as string) ?? '_index'
-  const arr = await openArray(`var/${idxCol}`, group, DATA_BASE_URL)
+  const arr = await openArray(`var/${idxCol}`, group, base)
   return Array.from((await zarr.get(arr)).data as ArrayLike<string>)
 }
 
@@ -110,8 +120,8 @@ export type GeneExpression = { colors: Uint8Array; range: [number, number]; warn
 const MAX_COLUMN_READ_BYTES = 256 * 1024 * 1024
 
 type GeneSource =
-  | { kind: 'dense'; path: string }
-  | { kind: 'csc'; path: string; nObs: number }
+  | { kind: 'dense'; base: string; path: string }
+  | { kind: 'csc'; base: string; path: string; nObs: number }
 
 const geneSources = new Map<string, Promise<GeneSource>>()
 const cscIndptrs = new Map<string, Promise<number[]>>()
@@ -121,17 +131,20 @@ const cscIndptrs = new Map<string, Promise<number[]>>()
 type OpenedArray = Awaited<ReturnType<typeof openArray>>
 const openedArrays = new Map<string, Promise<OpenedArray>>()
 
-function openAt(path: string): Promise<OpenedArray> {
-  let arr = openedArrays.get(path)
+// Caches evict on rejection: a transient failure (backend restart, view still
+// uploading) must not poison the entry for the rest of the session.
+function openAt(url: string): Promise<OpenedArray> {
+  let arr = openedArrays.get(url)
   if (!arr) {
-    arr = zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${path}`), { kind: 'array' })
-    openedArrays.set(path, arr)
+    arr = zarr.open.v3(new zarr.FetchStore(url), { kind: 'array' })
+    arr.catch(() => openedArrays.delete(url))
+    openedArrays.set(url, arr)
   }
   return arr
 }
 
-async function probe(path: string) {
-  const res = await fetch(`${DATA_BASE_URL}/${path}/zarr.json`)
+async function probe(base: string, path: string) {
+  const res = await fetch(`${base}/${path}/zarr.json`)
   if (!res.ok) return null
   const meta = await res.json()
   return { node: meta.node_type as string, attrs: (meta.attributes ?? {}) as Record<string, unknown> }
@@ -140,14 +153,15 @@ async function probe(path: string) {
 // Gene reads resolve to layers/gexp first (the zarrsmith setup), then X itself;
 // dense arrays and CSC groups are readable, CSR is not (a column read would scan it all).
 async function resolveGeneSource(group: string): Promise<GeneSource> {
+  const base = await geneBase(group)
   const prefix = group ? `${group}/` : ''
   for (const path of [`${prefix}layers/gexp`, `${prefix}X`]) {
-    const p = await probe(path)
+    const p = await probe(base, path)
     if (!p) continue
-    if (p.node === 'array') return { kind: 'dense', path }
+    if (p.node === 'array') return { kind: 'dense', base, path }
     if (p.attrs['encoding-type'] === 'csc_matrix') {
       const [nObs] = p.attrs['shape'] as [number, number]
-      return { kind: 'csc', path, nObs }
+      return { kind: 'csc', base, path, nObs }
     }
   }
   throw new Error(
@@ -159,6 +173,7 @@ function geneSource(group: string): Promise<GeneSource> {
   let src = geneSources.get(group)
   if (!src) {
     src = resolveGeneSource(group)
+    src.catch(() => geneSources.delete(group))
     geneSources.set(group, src)
   }
   return src
@@ -166,13 +181,15 @@ function geneSource(group: string): Promise<GeneSource> {
 
 // CSC column = two tiny range reads: data/indices[indptr[j]:indptr[j+1]], scattered
 // into a dense per-cell vector. indptr is read once per source and cached.
-async function readCscColumn(src: { path: string; nObs: number }, geneIdx: number): Promise<Float32Array> {
-  let indptr = cscIndptrs.get(src.path)
+async function readCscColumn(src: { base: string; path: string; nObs: number }, geneIdx: number): Promise<Float32Array> {
+  const url = `${src.base}/${src.path}`
+  let indptr = cscIndptrs.get(url)
   if (!indptr) {
-    indptr = openAt(`${src.path}/indptr`)
+    indptr = openAt(`${url}/indptr`)
       .then(arr => zarr.get(arr))
       .then(r => Array.from(r.data as ArrayLike<number | bigint>, Number))
-    cscIndptrs.set(src.path, indptr)
+    indptr.catch(() => cscIndptrs.delete(url))
+    cscIndptrs.set(url, indptr)
   }
   const ip = await indptr
   const out = new Float32Array(src.nObs)
@@ -180,8 +197,8 @@ async function readCscColumn(src: { path: string; nObs: number }, geneIdx: numbe
   if (start === end) return out
   const sel = [zarr.slice(start, end)]
   const [vals, rows] = await Promise.all([
-    openAt(`${src.path}/data`).then(a => zarr.get(a, sel)),
-    openAt(`${src.path}/indices`).then(a => zarr.get(a, sel)),
+    openAt(`${url}/data`).then(a => zarr.get(a, sel)),
+    openAt(`${url}/indices`).then(a => zarr.get(a, sel)),
   ])
   const v = vals.data as ArrayLike<number>
   const r = rows.data as ArrayLike<number | bigint>
@@ -189,8 +206,8 @@ async function readCscColumn(src: { path: string; nObs: number }, geneIdx: numbe
   return out
 }
 
-async function readDenseColumn(path: string, geneIdx: number): Promise<ArrayLike<number>> {
-  const arr = await openAt(path)
+async function readDenseColumn(src: { base: string; path: string }, geneIdx: number): Promise<ArrayLike<number>> {
+  const arr = await openAt(`${src.base}/${src.path}`)
   const readBytes = arr.shape[0] * arr.chunks[1] * 4
   if (readBytes > MAX_COLUMN_READ_BYTES) {
     throw new Error(
@@ -205,25 +222,25 @@ export async function loadGeneExpression(geneIdx: number, group = ''): Promise<G
   const src = await geneSource(group)
   const vals = src.kind === 'csc'
     ? await readCscColumn(src, geneIdx)
-    : await readDenseColumn(src.path, geneIdx)
+    : await readDenseColumn(src, geneIdx)
   const n = vals.length
   let min = Infinity
   let max = -Infinity
   for (let i = 0; i < n; i++) {
-    const v = vals[i] as number
+    const v = Number(vals[i]) // int64 stores yield BigInt — normalize before math
     if (v < min) min = v
     if (v > max) max = v
   }
   const span = max - min || 1
   const colors = new Uint8Array(n * 3)
   for (let i = 0; i < n; i++) {
-    const [r, g, b] = exprColor(((vals[i] as number) - min) / span)
+    const [r, g, b] = exprColor((Number(vals[i]) - min) / span)
     colors[i * 3] = r
     colors[i * 3 + 1] = g
     colors[i * 3 + 2] = b
   }
   // integer dtype = raw counts (dtype comes from the cached open — no data scan)
-  const stored = await openAt(src.kind === 'csc' ? `${src.path}/data` : src.path)
+  const stored = await openAt(src.kind === 'csc' ? `${src.base}/${src.path}/data` : `${src.base}/${src.path}`)
   const warning = String(stored.dtype).includes('int')
     ? 'raw counts (integer dtype): colors follow skewed counts — use a normalized store/layer'
     : undefined
@@ -241,7 +258,8 @@ const DEFAULT_GROUPS: Group[] = [{ id: 'main', label: 'Full store', path: '' }]
  * invalid -> a single root group. */
 export async function loadGroups(): Promise<Group[]> {
   try {
-    const res = await fetch(`${await coordBase()}/groups.json`)
+    // no-store: a cached listing would resurrect just-deleted views
+    const res = await fetch(`${await coordBase()}/groups.json`, { cache: 'no-store' })
     if (!res.ok) return DEFAULT_GROUPS
     const gs = (await res.json()) as Group[]
     return Array.isArray(gs) && gs.length > 0 ? gs : DEFAULT_GROUPS

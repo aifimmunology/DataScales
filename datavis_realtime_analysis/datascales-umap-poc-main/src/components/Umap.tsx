@@ -34,6 +34,8 @@ export default function Umap() {
   const [cat, setCat] = useState<Categorical | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [deleting, setDeleting] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null) // dismissible banner (failures, relocations)
 
   // group ("view") state — which embedding is shown
   const [groups, setGroups] = useState<Group[]>([])
@@ -71,40 +73,73 @@ export default function Umap() {
 
   // Coordinates + barcodes (re)load whenever the active group changes. Row indices
   // are per-group, so drop any selection and re-fit the camera to the new extent.
+  // The stale flag stops a slow response from a previous group landing after a
+  // switch — mixed-group points/barcodes would corrupt a selection artifact.
   const [retryTick, setRetryTick] = useState(0)
   useEffect(() => {
+    let stale = false
     setLoading(true)
     setError(null)
     setSelection(null)
     setSelVersion(v => v + 1)
     Promise.all([loadUmapCoords(group), loadBarcodes(group)])
       .then(([pts, bcs]) => {
+        if (stale) return
         setPoints(pts)
         setBarcodes(bcs)
         setViewState(fitView(pts))
         setLoading(false)
       })
-      .catch(err => {
+      .catch(async err => {
+        if (stale) return
+        // a view that 404s was likely deleted: re-check the listing, fall back to root
+        if (group) {
+          const gs = await loadGroups()
+          if (stale) return
+          setGroups(gs)
+          if (!gs.some(g => g.path === group)) {
+            setGroup('')
+            setNotice('That view no longer exists — returned to the full store.')
+            return
+          }
+        }
         console.error('Failed to load UMAP data:', err)
         setError(String(err))
         setLoading(false)
       })
+    return () => {
+      stale = true
+    }
   }, [group, retryTick])
 
   // Category codes reload whenever the AIFI level OR the active group changes.
   useEffect(() => {
+    let stale = false
     setCat(null)
     loadCategorical(level, group)
-      .then(setCat)
+      .then(c => {
+        if (!stale) setCat(c)
+      })
       .catch(err => console.error(`Failed to load ${level}:`, err))
+    return () => {
+      stale = true
+    }
   }, [level, group])
 
   // Gene list is per-group; switching groups clears the active gene.
   useEffect(() => {
+    let stale = false
     setGene(null)
     loadGeneNames(group)
-      .then(setGenes)
-      .catch(() => setGenes([]))
+      .then(gs => {
+        if (!stale) setGenes(gs)
+      })
+      .catch(() => {
+        if (!stale) setGenes([])
+      })
+    return () => {
+      stale = true
+    }
   }, [group])
 
   useEffect(() => {
@@ -215,6 +250,7 @@ export default function Umap() {
       setSubmitCount(c => c + 1)
     } catch (err) {
       console.error('Submit failed:', err)
+      setNotice(`Submit failed: ${err instanceof Error ? err.message : err}`)
     }
   }
 
@@ -226,15 +262,21 @@ export default function Umap() {
     })
   }
 
+  // Relocate to the full store immediately, then delete behind the scrim; the
+  // groups list refreshes either way so a failed delete stays visible in the picker.
   const deleteCurrentView = async (id: string) => {
     if (!window.confirm('Delete this view from the store? This cannot be undone.')) return
+    setDeleting(true)
+    setNotice(null)
+    setGroup('')
     try {
       await deleteView(id)
-      const gs = await loadGroups()
-      setGroups(gs)
-      setGroup('')
     } catch (err) {
       console.error('Delete view failed:', err)
+      setNotice(`Delete failed: ${err instanceof Error ? err.message : err}`)
+    } finally {
+      setGroups(await loadGroups())
+      setDeleting(false)
     }
   }
 
@@ -341,6 +383,18 @@ export default function Umap() {
       {!exprData && (
         <Legend level={level} onLevelChange={setLevel} categories={cat?.categories ?? null} />
       )}
+
+      {notice && (
+        <div style={noticeStyle} onClick={() => setNotice(null)} title="dismiss">
+          {notice}
+        </div>
+      )}
+      {/* pointer-blocking scrim: also prevents a second ✕ click mid-delete */}
+      {deleting && (
+        <div style={{ ...overlayStyle, background: 'rgba(17,17,17,0.75)', zIndex: 40 }}>
+          Deleting view…
+        </div>
+      )}
     </>
   )
 }
@@ -390,4 +444,19 @@ const overlayStyle: React.CSSProperties = {
   color: '#ccc',
   fontSize: 16,
   background: '#111',
+}
+
+const noticeStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: 12,
+  left: '50%',
+  transform: 'translateX(-50%)',
+  zIndex: 30,
+  background: '#2a2a18',
+  color: '#ffe94d',
+  border: '1px solid #665c1e',
+  borderRadius: 4,
+  padding: '6px 12px',
+  fontSize: 13,
+  cursor: 'pointer',
 }

@@ -45,6 +45,9 @@ _SOURCES = {"data": _parse_dir(DATA_DIR), "rapids-data": _parse_dir(RAPIDS_DIR)}
 # Client created on first data request so /api/health works without credentials.
 _gcs_client = None
 _size_cache: dict[str, int] = {}
+# register (GPU worker thread) and delete (request thread) both read-modify-write
+# groups.json; unserialized, a finishing job can resurrect a just-deleted view
+_groups_lock = threading.Lock()
 
 
 def _bucket(name: str):
@@ -105,7 +108,9 @@ def _serve(source: str, path: str, request: Request):
     file = (Path(src["root"]) / path).resolve()
     if not file.is_relative_to(Path(src["root"]).resolve()) or not file.is_file():
         raise HTTPException(404, "Not found")
-    return FileResponse(file, media_type=_media_type(path))
+    # groups.json mutates on register/delete — a cached copy resurrects deleted views
+    headers = {"Cache-Control": "no-store"} if path.endswith("groups.json") else None
+    return FileResponse(file, media_type=_media_type(path), headers=headers)
 
 
 def _gcs_response(src: dict, path: str, request: Request) -> Response:
@@ -153,6 +158,8 @@ def _gcs_response(src: dict, path: str, request: Request) -> Response:
         payload = bucket.blob(key).download_as_bytes()
     except NotFound:
         raise HTTPException(404, "Not found")
+    if path.endswith("groups.json"):  # mutable listing — never let a cache serve it
+        headers["Cache-Control"] = "no-store"
     return Response(payload, media_type=media, headers=headers)
 
 
@@ -193,11 +200,12 @@ def _register_view(slug: str, label: str) -> None:
         raise RuntimeError("GPU view return requires a gs:// RAPIDS_DIR store")
     bucket = _bucket(src["bucket"])
     key = f"{src['prefix']}/groups.json" if src["prefix"] else "groups.json"
-    blob = bucket.blob(key)
-    groups = (json.loads(blob.download_as_bytes()) if blob.exists()
-              else [{"id": "main", "label": "Full store", "path": ""}])
-    groups.append({"id": slug, "label": label, "path": f"umap_views/{slug}"})
-    blob.upload_from_string(json.dumps(groups, indent=1), content_type="application/json")
+    with _groups_lock:
+        blob = bucket.blob(key)
+        groups = (json.loads(blob.download_as_bytes()) if blob.exists()
+                  else [{"id": "main", "label": "Full store", "path": ""}])
+        groups.append({"id": slug, "label": label, "path": f"umap_views/{slug}"})
+        blob.upload_from_string(json.dumps(groups, indent=1), content_type="application/json")
 
 
 _scripts_shipped = False
@@ -324,8 +332,12 @@ def submit(artifact: dict):
     name = str(artifact.get("name") or f"view {job_id}").strip()[:60]
     print(f"[submit] job {job_id} '{name}': {cells} cells, group '{artifact.get('group', '')}'",
           file=sys.stderr, flush=True)
+    # evict only finished jobs — dropping a queued entry would orphan its GPU run
     while len(JOBS) >= MAX_JOBS:
-        del JOBS[next(iter(JOBS))]
+        victim = next((k for k, j in JOBS.items() if j["status"] in ("done", "failed")), None)
+        if victim is None:
+            break
+        del JOBS[victim]
     JOBS[job_id] = {
         "id": job_id,
         "name": name,
@@ -361,21 +373,29 @@ def delete_view(view_id: str):
         raise HTTPException(400, "view management requires a gs:// rapids store")
     bucket = _bucket(src["bucket"])
     key = f"{src['prefix']}/groups.json" if src["prefix"] else "groups.json"
-    blob = bucket.blob(key)
-    if not blob.exists():
-        raise HTTPException(404, "no views registered")
-    groups = json.loads(blob.download_as_bytes())
-    entry = next((g for g in groups if g.get("id") == view_id and g.get("path")), None)
-    if entry is None:
-        raise HTTPException(404, f"view '{view_id}' not found")
-    # unregister first: an interrupted delete then leaves unlisted orphan objects,
-    # never a listed-but-broken view
-    blob.upload_from_string(
-        json.dumps([g for g in groups if g is not entry], indent=1),
-        content_type="application/json",
-    )
-    prefix = f"{src['prefix']}/{entry['path']}/" if src["prefix"] else f"{entry['path']}/"
+    path = None
+    with _groups_lock:
+        blob = bucket.blob(key)
+        if blob.exists():
+            groups = json.loads(blob.download_as_bytes())
+            entry = next((g for g in groups if g.get("id") == view_id and g.get("path")), None)
+            if entry is not None:
+                path = entry["path"]
+                # unregister first: an interrupted delete then leaves unlisted orphan
+                # objects, never a listed-but-broken view
+                blob.upload_from_string(
+                    json.dumps([g for g in groups if g is not entry], indent=1),
+                    content_type="application/json",
+                )
+    # sweep even when unlisted, so retrying an interrupted delete clears the orphans
+    path = path or f"umap_views/{view_id}"
+    prefix = f"{src['prefix']}/{path}/" if src["prefix"] else f"{path}/"
     blobs = list(bucket.list_blobs(prefix=prefix))
+    # delete_blobs alone is one HTTPS round-trip per object; a batch does 100 at a time
     for i in range(0, len(blobs), 100):
-        bucket.delete_blobs(blobs[i:i + 100])
+        with _gcs_client.batch(raise_exception=False):
+            for b in blobs[i:i + 100]:
+                b.delete()
+    for k in [k for k in _size_cache if k.startswith(f"{src['bucket']}/{prefix}")]:
+        del _size_cache[k]
     return {"deleted": view_id, "objects": len(blobs)}
