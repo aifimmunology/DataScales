@@ -19,13 +19,29 @@ the current process has finished its bootstrapping phase".
 # ── Variables (env-overridable so the datavis backend can drive this per job) ──
 import os
 
-data_pth       = os.environ.get("RERUN_DATA", "/home/workspace/temp/expression.zarr")  
+# Pin host BLAS/OpenMP threads (env vars inherit into dask-cuda worker children) so
+# worker threads don't each spawn a full BLAS pool — same as rapids-benchmark.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+data_pth       = os.environ.get("RERUN_DATA", "/home/workspace/temp/expression.zarr")
 SELECTION_FILE = os.environ.get("RERUN_SELECTION", "./datascales-umap-poc-main/data/3M_subset_bcell_selection.json")
 VIEW_STORE     = os.environ.get("RERUN_OUT", data_pth + "/umap_views/bcell_selection")  # view store to write (obsm/X_umap + obs, no X)
-GPUS           = os.environ.get("RERUN_GPUS", "0") 
+GPUS           = os.environ.get("RERUN_GPUS", "0")
+THREADS_PER_WORKER = int(os.environ.get("RERUN_THREADS_PER_WORKER", "12"))  # dask-cuda worker threadpool
+ZARR_CONCURRENCY   = int(os.environ.get("RERUN_ZARR_CONCURRENCY", "12"))    # zarr fetch-dispatch semaphore
+ZARR_MAX_WORKERS   = int(os.environ.get("RERUN_ZARR_MAX_WORKERS", "12"))    # zarr decode threadpool
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
 BATCH_KEY      = []   # obs columns to harmony-integrate on; [] = skip harmony
+
+
+def _set_zarr_config(concurrency: int, max_workers: int) -> None:
+    """Module-level so it's picklable for client.run: zarr.config is runtime state,
+    per process — setting it on the client does NOT reach the dask-cuda workers,
+    and the lazy chunk reads happen ON the workers (rapids-benchmark pattern)."""
+    import zarr
+    zarr.config.set({"async.concurrency": concurrency, "threading.max_workers": max_workers})
 
 
 def main():
@@ -44,8 +60,8 @@ def main():
     from rmm.allocators.cupy import rmm_cupy_allocator
 
     # RERUN_DATA may be gs:// (zarr resolves it via gcsfs + ADC on the box);
-    # crank read concurrency so the cold obs/X loads don't serialize on GCS latency
-    zarr.config.set({"async.concurrency": 32, "threading.max_workers": 8})
+    # concurrency hides GCS latency, max_workers sizes the decode pool
+    _set_zarr_config(ZARR_CONCURRENCY, ZARR_MAX_WORKERS)
 
     selection = json.load(open(SELECTION_FILE))         # {"barcodes": [...], ...}
     # if small selections fit one GPU eagerly — skip the dask-cuda cluster entirely
@@ -61,15 +77,16 @@ def main():
         cluster = LocalCUDACluster(
             CUDA_VISIBLE_DEVICES=GPUS,
             protocol="tcp",
-            threads_per_worker=16,
+            threads_per_worker=THREADS_PER_WORKER,
             rmm_managed_memory=True,
             rmm_allocator_external_lib_list="cupy",
             enable_cudf_spill=True,
         )
         client = Client(cluster)
-        
-        client.run(lambda: __import__("zarr").config.set(
-            {"async.concurrency": 4, "threading.max_workers": 4}))
+        client.run(_set_zarr_config, ZARR_CONCURRENCY, ZARR_MAX_WORKERS)
+        n_gpus = len(GPUS.split(","))
+        print(f"host decode budget ≈ {n_gpus} gpu × {THREADS_PER_WORKER} threads × "
+              f"{ZARR_MAX_WORKERS} zarr workers", flush=True)
 
     # ── Managed memory (client process) ──────────────────────────────────────────
     rmm.reinitialize(managed_memory=True, pool_allocator=False)
