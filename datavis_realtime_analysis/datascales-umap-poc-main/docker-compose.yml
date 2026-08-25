@@ -12,13 +12,13 @@ services:
       dockerfile: server/Dockerfile
     ports:
       - "8000:8000"
-    # connection config — set in .env (auto-loaded) or the shell; pipeline args
-    # live in ../rerun_umap_on_selection.py
+    # values come from .env (auto-loaded, gitignored); pipeline args live in
+    # ../rerun_umap_on_selection.py
     environment:
       DATA_DIR: ${DATA_DIR}
-      GPU_INSTANCE: ${GPU_INSTANCE:-my-gpu-instance}
-      GPU_ZONE: ${GPU_ZONE:-us-central1-c}
-      GPU_PIXI_DIR: ${GPU_PIXI_DIR:-/mnt/DataScales/rapids_user_notebook}
+      GPU_INSTANCE: ${GPU_INSTANCE:-}   # unset -> 10s simulator
+      GPU_ZONE: ${GPU_ZONE:-}
+      GPU_PIXI_DIR: ${GPU_PIXI_DIR:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
     volumes:
       - ~/.config/gcloud:/gcloud-ro:ro

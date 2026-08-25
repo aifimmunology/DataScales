@@ -7,10 +7,10 @@ from pathlib import Path
 # jobs/ queue + status objects, and returned umap_views/.
 DATA_DIR = os.environ.get("DATA_DIR", "")
 
-# GPU box for cold per-job runs; GPU_INSTANCE="" switches to the sleep simulator.
-GPU_INSTANCE = os.environ.get("GPU_INSTANCE", "my-gpu-instance")
-GPU_ZONE = os.environ.get("GPU_ZONE", "us-central1-c")
-GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "/mnt/DataScales/rapids_user_notebook")
+# GPU box for cold per-job runs (from .env); unset GPU_INSTANCE = sleep simulator.
+GPU_INSTANCE = os.environ.get("GPU_INSTANCE", "")
+GPU_ZONE = os.environ.get("GPU_ZONE", "")
+GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "")
 
 MAX_JOBS = 50
 

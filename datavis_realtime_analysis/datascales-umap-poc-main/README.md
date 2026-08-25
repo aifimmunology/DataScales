@@ -35,7 +35,7 @@ One store serves everything:
 
 In the app: lasso a cell selection, name it, and hit "GPU run". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `../gpu_job.sh` sets up the pixi env fresh, runs `../rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
 
-GPU runs: config via `GPU_INSTANCE` (defaults to the datavis GPU box; set `""` for the 10s simulator), `GPU_ZONE`, `GPU_PIXI_DIR` (pixi project on the box, default `/mnt/DataScales/rapids_user_notebook`). Works in docker (the backend image ships gcloud + your mounted credentials/ssh key) and in dev mode. One-time on the box: `gcloud auth application-default login` so python can read `gs://` stores.
+GPU runs: set `GPU_INSTANCE`, `GPU_ZONE`, and `GPU_PIXI_DIR` (the pixi project on the box) in `.env`; leaving `GPU_INSTANCE` unset uses a 10s simulator instead. Works in docker (the backend image ships gcloud + your mounted credentials/ssh key) and in dev mode. One-time on the box: `gcloud auth application-default login` so python can read `gs://` stores.
 
 ---
 
