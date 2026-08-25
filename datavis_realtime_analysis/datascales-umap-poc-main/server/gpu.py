@@ -4,9 +4,10 @@ setup, rerun_umap_on_selection.py, view upload — and the script reports progre
 to jobs/status/<id>.json, which the worker polls to drive the app's job status.
 """
 
-import json
+import os
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -44,7 +45,11 @@ def _run_gpu_job(job: dict, slug: str) -> None:
     rid = job["id"]
     _ship(rid)
     job["stage"] = "dispatching to GPU"
-    remote = f"bash /tmp/{JOB_SCRIPT.name} {DATA_DIR} {rid} {slug} {GPU_PIXI_DIR}"
+    # RERUN_* vars from the backend env (compose) ride along as pipeline tuning;
+    # gpu_job.sh's own RERUN_DATA/SELECTION/OUT/GPUS assignments still win
+    tuning = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(os.environ.items())
+                      if k.startswith("RERUN_"))
+    remote = f"{tuning} bash /tmp/{JOB_SCRIPT.name} {DATA_DIR} {rid} {slug} {GPU_PIXI_DIR}".strip()
     log = open(f"/tmp/datavis_job_{rid}.log", "ab")
     proc = subprocess.Popen(_ssh_cmd(remote), stdout=log, stderr=subprocess.STDOUT)
 

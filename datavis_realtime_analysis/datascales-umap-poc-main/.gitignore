@@ -5,3 +5,4 @@
 # re-include what the repo-root .gitignore blanket-ignores (package.json, lib/)
 !package.json
 !src/lib/
+.env
