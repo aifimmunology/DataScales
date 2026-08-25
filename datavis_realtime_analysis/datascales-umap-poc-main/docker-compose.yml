@@ -12,14 +12,14 @@ services:
       dockerfile: server/Dockerfile
     ports:
       - "8000:8000"
+    # connection config — set in .env (auto-loaded) or the shell; pipeline args
+    # live in ../rerun_umap_on_selection.py
     environment:
       DATA_DIR: ${DATA_DIR}
       GPU_INSTANCE: ${GPU_INSTANCE:-my-gpu-instance}
       GPU_ZONE: ${GPU_ZONE:-us-central1-c}
       GPU_PIXI_DIR: ${GPU_PIXI_DIR:-/mnt/DataScales/rapids_user_notebook}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
-      # any RERUN_* var set here is forwarded to the GPU job as pipeline tuning,
-      # e.g. RERUN_THREADS_PER_WORKER: "1"  /  RERUN_EAGER_MAX: "200000"
     volumes:
       - ~/.config/gcloud:/gcloud-ro:ro
       - ~/.ssh/google_compute_engine:/ssh-ro/google_compute_engine:ro

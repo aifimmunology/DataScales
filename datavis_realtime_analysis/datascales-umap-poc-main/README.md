@@ -83,9 +83,13 @@ This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-
 
 ### 2. Build and run
 
+Put the connection config in `.env` next to `docker-compose.yml` (auto-loaded, gitignored) — `DATA_DIR`, and `GPU_INSTANCE`/`GPU_ZONE`/`GPU_PIXI_DIR` when overriding the defaults — then:
+
 ```
-DATA_DIR=gs://MY_BUCKET/stores/store.zarr docker compose up --build -d
+docker compose up --build -d
 ```
+
+(or inline: `DATA_DIR=gs://MY_BUCKET/store.zarr docker compose up --build -d`)
 
 App: http://localhost:3000
 
