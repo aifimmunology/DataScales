@@ -298,11 +298,15 @@ export default function Umap() {
     }
   }
 
+  // 0.5px reads as density at 3M points but vanishes on a small view; scale dots
+  // to the embedding size, with a bump under gene coloring so expression pops.
+  const baseRadius =
+    points.length > 1_500_000 ? 0.5 : points.length > 300_000 ? 1 : points.length > 50_000 ? 1.6 : 2.2
   const layer = new ScatterplotLayer<Point>({
     id: 'umap-scatter',
     data: points,
     getPosition: d => d.position,
-    getRadius: 0.5,
+    getRadius: exprData ? Math.min(baseRadius * 1.5, 3) : baseRadius,
     radiusUnits: 'pixels',
     getFillColor: d => {
       const i = d.index * 3

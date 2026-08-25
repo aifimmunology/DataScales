@@ -50,10 +50,13 @@ export function colorForCode(code: number): RGB {
   return PALETTE[code % PALETTE.length]
 }
 
-// Expression ramp: dim gray (low) -> bright yellow (high), t in [0, 1].
+// Expression ramp over EXPRESSING cells: light blue (low) -> neon yellow (high).
 export function exprColor(t: number): RGB {
-  return [60 + t * 195, 60 + t * 160, 70 - t * 10]
+  return [110 + t * 145, 185 + t * 70, 255 - t * 235]
 }
+
+// Zero/no expression: dark, recedes behind the ramp.
+export const EXPR_NONE: RGB = [46, 46, 58]
 
 // A "group" is either the served store root (path '') or a nested view store
 // (e.g. 'umap_views/bcell_selection'). Every array fetch is prefixed by it, so the
@@ -223,28 +226,34 @@ export async function loadGeneExpression(geneIdx: number, group = ''): Promise<G
   const vals = src.kind === 'csc'
     ? await readCscColumn(src, geneIdx)
     : await readDenseColumn(src, geneIdx)
+  // ramp spans only the expressing cells (v > 0); zeros stay dark so the range
+  // isn't wasted on the non-expressing majority
   const n = vals.length
-  let min = Infinity
-  let max = -Infinity
+  let lo = Infinity
+  let hi = -Infinity
   for (let i = 0; i < n; i++) {
     const v = Number(vals[i]) // int64 stores yield BigInt — normalize before math
-    if (v < min) min = v
-    if (v > max) max = v
+    if (v <= 0) continue
+    if (v < lo) lo = v
+    if (v > hi) hi = v
   }
-  const span = max - min || 1
+  const none = lo === Infinity // gene expressed nowhere
+  const span = hi - lo || 1
   const colors = new Uint8Array(n * 3)
   for (let i = 0; i < n; i++) {
-    const [r, g, b] = exprColor((Number(vals[i]) - min) / span)
+    const v = Number(vals[i])
+    const [r, g, b] = v > 0 ? exprColor((v - lo) / span) : EXPR_NONE
     colors[i * 3] = r
     colors[i * 3 + 1] = g
     colors[i * 3 + 2] = b
   }
+  const range: [number, number] = none ? [0, 0] : [lo, hi]
   // integer dtype = raw counts (dtype comes from the cached open — no data scan)
   const stored = await openAt(src.kind === 'csc' ? `${src.base}/${src.path}/data` : `${src.base}/${src.path}`)
   const warning = String(stored.dtype).includes('int')
     ? 'raw counts (integer dtype): colors follow skewed counts — use a normalized store/layer'
     : undefined
-  return { colors, range: [min, max], warning }
+  return { colors, range, warning }
 }
 
 // ── Groups: switchable embeddings (the root store + any nested view stores) ─────
