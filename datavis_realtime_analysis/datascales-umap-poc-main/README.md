@@ -35,7 +35,12 @@ One store serves everything:
 
 In the app: lasso a cell selection, name it, and hit "GPU run". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `../gpu_job.sh` sets up the pixi env fresh, runs `../rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
 
-GPU runs: set `GPU_INSTANCE`, `GPU_ZONE`, and `GPU_PIXI_DIR` (the pixi project on the box) in `.env`; leaving `GPU_INSTANCE` unset uses a 10s simulator instead. Works in docker (the backend image ships gcloud + your mounted credentials/ssh key) and in dev mode. One-time on the box: `gcloud auth application-default login` so python can read `gs://` stores.
+GPU runs require `GPU_INSTANCE`, `GPU_ZONE`, and `GPU_PIXI_DIR` (the pixi project on the box) in `.env` — submits error if any is unset. Works in docker (the backend image ships gcloud + your mounted credentials/ssh keys) and in dev mode. One-time per bucket: grant the GPU instance's service account storage access so jobs on the box can read/write the store no matter who sshs in:
+
+```bash
+gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
+  --member="serviceAccount:<instance-service-account>" --role="roles/storage.objectAdmin"
+```
 
 ---
 
@@ -79,7 +84,7 @@ Two services via compose: nginx serves the built frontend and proxies `/api`; th
 gcloud auth application-default login
 ```
 
-This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs read access on the bucket (`roles/storage.objectViewer`). If your ADC has no default project, also export `GOOGLE_CLOUD_PROJECT=<project-id>`.
+This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs `roles/storage.objectAdmin` on the bucket (the app writes views, the view listing, and job objects; read-only viewing works with `objectViewer`) and, for GPU runs, permission to `gcloud compute ssh` into the instance. If your ADC has no default project, set `GOOGLE_CLOUD_PROJECT` in `.env`.
 
 ### 2. Build and run
 

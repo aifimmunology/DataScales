@@ -18,7 +18,10 @@ export async function submitSelection(artifact: SelectionArtifact & { name: stri
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(artifact),
   })
-  if (!res.ok) throw new Error(`submit failed: ${res.status}`)
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => null))?.detail
+    throw new Error(detail ?? `submit failed: ${res.status}`)
+  }
 }
 
 export async function fetchJobs(): Promise<Job[]> {

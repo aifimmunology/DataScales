@@ -12,11 +12,12 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+
+from fastapi import HTTPException
 
 from . import storage, views
 from .config import (DATA_DIR, GPU_INSTANCE, GPU_PIXI_DIR, GPU_ZONE, JOB_SCRIPT,
-                     MAX_JOBS, RERUN_SCRIPT, SIMULATE_SCRIPT, SOURCE)
+                     MAX_JOBS, RERUN_SCRIPT, SOURCE)
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: queue.Queue = queue.Queue()
@@ -25,14 +26,16 @@ _worker_started = False
 POLL_S = 1.5
 
 
+# gcloud -q: non-interactive — on a fresh machine the first ssh/scp auto-generates
+# the ssh keypair (no passphrase prompt) and waits for it to propagate
 def _ssh_cmd(remote: str) -> list[str]:
-    return ["gcloud", "compute", "ssh", GPU_INSTANCE, f"--zone={GPU_ZONE}",
+    return ["gcloud", "-q", "compute", "ssh", GPU_INSTANCE, f"--zone={GPU_ZONE}",
             "--command", remote]
 
 
 def _ship(job_id: str) -> None:
     # fresh scripts every job: the repo stays the source of truth on the box
-    r = subprocess.run(["gcloud", "compute", "scp", str(JOB_SCRIPT), str(RERUN_SCRIPT),
+    r = subprocess.run(["gcloud", "-q", "compute", "scp", str(JOB_SCRIPT), str(RERUN_SCRIPT),
                         f"{GPU_INSTANCE}:/tmp/", f"--zone={GPU_ZONE}"],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -103,15 +106,13 @@ def _ensure_worker() -> None:
             _worker_started = True
 
 
-def _simulate(job_id: str) -> None:
-    try:
-        rc = subprocess.run(["bash", str(SIMULATE_SCRIPT), job_id]).returncode
-        JOBS[job_id]["status"] = "done" if rc == 0 else "failed"
-    except Exception:
-        JOBS[job_id]["status"] = "failed"
-
-
 def submit(artifact: dict) -> dict:
+    missing = [k for k, v in (("GPU_INSTANCE", GPU_INSTANCE), ("GPU_ZONE", GPU_ZONE),
+                              ("GPU_PIXI_DIR", GPU_PIXI_DIR)) if not v]
+    if missing:
+        raise HTTPException(400, f"GPU config missing in .env: {', '.join(missing)}")
+    if not SOURCE["gcs"]:
+        raise HTTPException(400, "GPU jobs require a gs:// DATA_DIR store")
     job_id = uuid.uuid4().hex[:8]
     cells = len(artifact.get("indices", []))
     name = str(artifact.get("name") or f"view {job_id}").strip()[:60]
@@ -129,22 +130,15 @@ def submit(artifact: dict) -> dict:
         "cells": cells,
         "group": artifact.get("group", ""),
         "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "status": "queued" if GPU_INSTANCE else "running",
-        "stage": "queued" if GPU_INSTANCE else "",
+        "status": "queued",
+        "stage": "queued",
         "view": None,
     }
-    if GPU_INSTANCE:
-        if not SOURCE["gcs"]:
-            JOBS[job_id]["status"] = "failed"
-            JOBS[job_id]["stage"] = "GPU jobs require a gs:// DATA_DIR store"
-            return {"job_id": job_id, "status": "failed"}
-        slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
-        slug = f"{slug}_{job_id}"
-        storage.write_json(f"jobs/submitted/{job_id}.json", artifact)
-        _ensure_worker()
-        JOB_QUEUE.put((job_id, slug))
-    else:
-        threading.Thread(target=_simulate, args=(job_id,), daemon=True).start()
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
+    slug = f"{slug}_{job_id}"
+    storage.write_json(f"jobs/submitted/{job_id}.json", artifact)
+    _ensure_worker()
+    JOB_QUEUE.put((job_id, slug))
     return {"job_id": job_id, "status": "submitted"}
 
 

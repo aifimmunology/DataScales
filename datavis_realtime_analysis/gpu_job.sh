@@ -24,6 +24,10 @@ gcloud -q storage cp "$STORE/jobs/submitted/$ID.json" "/tmp/datavis_job_$ID.json
   || fail "could not fetch job json from the store"
 
 status running "setting up GPU env"
+[ -x "$PIXI" ] || {  # fresh user account on the box: bootstrap pixi first
+  status running "installing pixi"
+  curl -fsSL https://pixi.sh/install.sh | bash >> "$LOG" 2>&1 || fail "pixi install failed"
+}
 cd "$PIXI_DIR" || fail "pixi dir $PIXI_DIR missing"
 $PIXI install >> "$LOG" 2>&1 || fail "pixi env setup failed (see $LOG on the box)"
 

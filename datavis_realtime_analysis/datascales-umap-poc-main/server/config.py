@@ -7,7 +7,7 @@ from pathlib import Path
 # jobs/ queue + status objects, and returned umap_views/.
 DATA_DIR = os.environ.get("DATA_DIR", "")
 
-# GPU box for cold per-job runs (from .env); unset GPU_INSTANCE = sleep simulator.
+# GPU box for cold per-job runs (from .env); submit rejects jobs if any is unset.
 GPU_INSTANCE = os.environ.get("GPU_INSTANCE", "")
 GPU_ZONE = os.environ.get("GPU_ZONE", "")
 GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "")
@@ -18,7 +18,6 @@ MAX_JOBS = 50
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RERUN_SCRIPT = REPO_ROOT / "rerun_umap_on_selection.py"
 JOB_SCRIPT = REPO_ROOT / "gpu_job.sh"
-SIMULATE_SCRIPT = Path(__file__).parent / "simulate_gpu.sh"
 
 
 def _parse_dir(d: str) -> dict:

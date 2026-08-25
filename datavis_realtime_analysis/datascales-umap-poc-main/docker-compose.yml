@@ -16,14 +16,15 @@ services:
     # ../rerun_umap_on_selection.py
     environment:
       DATA_DIR: ${DATA_DIR}
-      GPU_INSTANCE: ${GPU_INSTANCE:-}   # unset -> 10s simulator
+      GPU_INSTANCE: ${GPU_INSTANCE:-}
       GPU_ZONE: ${GPU_ZONE:-}
       GPU_PIXI_DIR: ${GPU_PIXI_DIR:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
     volumes:
       - ~/.config/gcloud:/gcloud-ro:ro
-      - ~/.ssh/google_compute_engine:/ssh-ro/google_compute_engine:ro
-      - ~/.ssh/google_compute_engine.pub:/ssh-ro/google_compute_engine.pub:ro
+      # whole dir, not the key files: they may not exist yet — the first in-container
+      # gcloud ssh generates a keypair itself when IAM allows
+      - ~/.ssh:/ssh-ro:ro
       - ../gpu_job.sh:/gpu_job.sh:ro
       - ../rerun_umap_on_selection.py:/rerun_umap_on_selection.py:ro
       # local store instead of GCS: uncomment and run with DATA_DIR=/data
