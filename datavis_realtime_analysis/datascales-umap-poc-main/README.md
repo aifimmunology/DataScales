@@ -44,7 +44,7 @@ GPU runs: config via `GPU_INSTANCE` (defaults to the datavis GPU box; set `""` f
 ### Python setup (first time)
 
 ```bash
-cd datascales-umap-poc
+cd datascales-umap-poc-main
 pip install -r server/requirements.txt
 ```
 
@@ -83,7 +83,7 @@ This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-
 
 ### 2. Build and run
 
-```bash
+```
 DATA_DIR=gs://MY_BUCKET/stores/store.zarr docker compose up --build -d
 ```
 

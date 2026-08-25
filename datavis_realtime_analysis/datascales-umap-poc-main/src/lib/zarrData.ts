@@ -50,9 +50,23 @@ export function colorForCode(code: number): RGB {
   return PALETTE[code % PALETTE.length]
 }
 
-// Expression ramp over EXPRESSING cells: light blue (low) -> neon yellow (high).
+// Expression ramp over EXPRESSING cells: viridis-style blue -> teal -> green ->
+// yellow. Multi-hue so adjacent expression levels stay distinguishable; starts at
+// blue (not viridis's near-black purple) to keep the low end distinct from EXPR_NONE.
+const RAMP: RGB[] = [
+  [59, 82, 139],
+  [33, 145, 140],
+  [94, 201, 98],
+  [253, 231, 37],
+]
+
 export function exprColor(t: number): RGB {
-  return [110 + t * 145, 185 + t * 70, 255 - t * 235]
+  const x = Math.min(Math.max(t, 0), 1) * (RAMP.length - 1)
+  const i = Math.min(Math.floor(x), RAMP.length - 2)
+  const f = x - i
+  const a = RAMP[i]
+  const b = RAMP[i + 1]
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
 }
 
 // Zero/no expression: dark, recedes behind the ramp.

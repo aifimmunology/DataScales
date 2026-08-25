@@ -28,4 +28,6 @@ export const label: CSSProperties = {
   marginBottom: 4,
 }
 
-export const exprGradient = `linear-gradient(to right, ${rgb(exprColor(0))}, ${rgb(exprColor(1))})`
+export const exprGradient = `linear-gradient(to right, ${[0, 0.25, 0.5, 0.75, 1]
+  .map(t => rgb(exprColor(t)))
+  .join(', ')})`

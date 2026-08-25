@@ -41,6 +41,7 @@ export default function Umap() {
   const [groups, setGroups] = useState<Group[]>([])
   const [group, setGroup] = useState<string>('') // active group path ('' = store root)
   const [viewState, setViewState] = useState<any>({ target: [0, 0, 0], zoom: 3 })
+  const [worldRadius, setWorldRadius] = useState(0.01) // point radius in embedding units
 
   // gene expression color-by
   const [genes, setGenes] = useState<string[]>([])
@@ -87,7 +88,12 @@ export default function Umap() {
         if (stale) return
         setPoints(pts)
         setBarcodes(bcs)
-        setViewState(fitView(pts))
+        const fit = fitView(pts)
+        setViewState(fit)
+        // world-space radius sized so dots render ~fitPx pixels at the fitted zoom;
+        // they then scale with zoom (crisp when zoomed out, resolvable zoomed in)
+        const fitPx = pts.length > 1_500_000 ? 0.5 : pts.length > 300_000 ? 0.9 : pts.length > 50_000 ? 1.4 : 1.8
+        setWorldRadius(fitPx / Math.pow(2, fit.zoom))
         setLoading(false)
       })
       .catch(async err => {
@@ -298,16 +304,14 @@ export default function Umap() {
     }
   }
 
-  // 0.5px reads as density at 3M points but vanishes on a small view; scale dots
-  // to the embedding size, with a bump under gene coloring so expression pops.
-  const baseRadius =
-    points.length > 1_500_000 ? 0.5 : points.length > 300_000 ? 1 : points.length > 50_000 ? 1.6 : 2.2
   const layer = new ScatterplotLayer<Point>({
     id: 'umap-scatter',
     data: points,
     getPosition: d => d.position,
-    getRadius: exprData ? Math.min(baseRadius * 1.5, 3) : baseRadius,
-    radiusUnits: 'pixels',
+    getRadius: exprData ? worldRadius * 1.4 : worldRadius, // gene coloring pops a bit more
+    radiusUnits: 'common',
+    radiusMinPixels: 0.4,
+    radiusMaxPixels: 5,
     getFillColor: d => {
       const i = d.index * 3
       const base: readonly number[] = exprData
@@ -319,9 +323,9 @@ export default function Umap() {
         // highlight selected in yellow; dim the rest to make it pop
         return selection.mask[d.index] ? [255, 240, 30, 255] : [base[0], base[1], base[2], 40]
       }
-      // Low alpha so millions of overlapping points read as density instead of
-      // saturating into one solid blob (this store is ~2.7M cells).
-      return [base[0], base[1], base[2], 90]
+      // Millions of overlapping points need low alpha to read as density; small
+      // views need near-solid dots or they look fuzzy.
+      return [base[0], base[1], base[2], points.length > 300_000 ? 90 : 180]
     },
     // `cat` MUST be here: it loads async, and deck.gl only re-runs getFillColor when
     // a trigger changes. Without it, colors stay at the default until some *other*
