@@ -1,0 +1,304 @@
+Rapids-Singlecell Benchmark  —  2026-08-20T21:35:15  —  label: -
+store: /mnt/5M_sparse_sorted_9.zarr  —  GPUs: [0]
+changed cfg: (defaults)
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr           15.55s       5167 MB       1721 MB
+  h2d_transfer         0.40s       4154 MB       1723 MB
+  preprocessing      136.39s      15406 MB       5183 MB
+  hvg                162.06s      16328 MB       9715 MB
+  scaling              0.52s       9467 MB       4483 MB
+  pca                  7.94s      10987 MB       6305 MB
+  neighbors           47.13s      11931 MB      15819 MB
+  umap                37.14s      14648 MB       9679 MB
+  leiden             104.53s      14279 MB       9953 MB
+  write_results        0.19s      12344 MB       5181 MB
+  ----------------  --------  ------------  ------------
+  TOTAL              511.85s      16328 MB      15819 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-20T21:46:27  —  label: -
+store: /mnt/2M_sparse_sorted_9M.zarr  —  GPUs: [0]
+changed cfg: (defaults)
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr            1.94s       1910 MB       1721 MB
+  h2d_transfer         0.06s       1926 MB       1723 MB
+  preprocessing       37.53s       9820 MB       6893 MB
+  hvg                 41.04s      10289 MB       8963 MB
+  scaling              0.12s       6324 MB       3261 MB
+  pca                  1.52s       7005 MB       3893 MB
+  neighbors            9.35s       7496 MB       7475 MB
+  umap                10.72s       8259 MB       5061 MB
+  leiden              24.07s       8559 MB       5441 MB
+  write_results        0.15s       8026 MB       3661 MB
+  ----------------  --------  ------------  ------------
+  TOTAL              126.49s      10289 MB       8963 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-20T23:26:40  —  label: -
+store: /mnt/13M_50M_pbmc_soundlife.zarr  —  GPUs: [0]
+changed cfg: (defaults)
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr          121.13s      34298 MB       1721 MB
+  h2d_transfer         0.06s      20980 MB       1723 MB
+  preprocessing      332.87s      28335 MB       5677 MB
+  hvg                378.88s      31932 MB      25029 MB
+  scaling              0.40s      27403 MB       9653 MB
+  pca                  6.71s      30794 MB      14373 MB
+  neighbors          114.14s      33338 MB      37675 MB
+  umap               203.90s      39102 MB      22933 MB
+  leiden             265.34s      39228 MB      23223 MB
+  write_results        0.38s      33921 MB      11347 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             1423.81s      39228 MB      37675 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-25T19:54:40  —  label: -
+store: /mnt/13M_50M_pbmc_soundlife.zarr  —  GPUs: [0]
+changed cfg: (defaults)
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr          125.43s      34380 MB       1721 MB
+  h2d_transfer         0.10s      21271 MB       1723 MB
+  preprocessing      333.99s      28026 MB       4819 MB
+  hvg                379.95s      32220 MB      24915 MB
+  scaling              0.36s      27953 MB       9653 MB
+  pca                  6.56s      31363 MB      14373 MB
+  neighbors          115.19s      33838 MB      37755 MB
+  umap               209.70s      39600 MB      22757 MB
+  leiden             285.91s      39772 MB      23145 MB
+  write_results        0.41s      34441 MB      11261 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             1457.60s      39772 MB      37755 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-25T23:53:47  —  label: subset3M_megazarr_v1.0_g0_managed_ck24000_t12x12c12
+store: /mnt/subset3M_megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr            8.99s       3808 MB       1721 MB
+  h2d_transfer         0.06s       3282 MB       1723 MB
+  preprocessing       47.07s      10307 MB       7585 MB
+  hvg                 56.02s      10668 MB       8573 MB
+  scaling              0.15s       6894 MB       3423 MB
+  pca                  1.79s       7754 MB       4479 MB
+  neighbors           15.04s       8374 MB       9597 MB
+  umap                22.57s       9762 MB       6275 MB
+  leiden              59.88s       9829 MB       6405 MB
+  write_results        0.18s       8891 MB       3827 MB
+  ----------------  --------  ------------  ------------
+  TOTAL              211.75s      10668 MB       9597 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-25T23:57:32  —  label: subset3M_megazarr_v1.0_g0_managed_ck48000_t12x12c12
+store: /mnt/subset3M_megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=48000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr            8.96s       3810 MB       1721 MB
+  h2d_transfer         0.06s       3253 MB       1723 MB
+  preprocessing       45.61s      16866 MB      15087 MB
+  hvg                 54.88s      19465 MB      15003 MB
+  scaling              0.15s      10810 MB       3433 MB
+  pca                  1.78s      11662 MB       4445 MB
+  neighbors           14.92s      12289 MB       9605 MB
+  umap                22.52s      13677 MB       6155 MB
+  leiden              57.97s      13726 MB       6411 MB
+  write_results        0.18s      12801 MB       3835 MB
+  ----------------  --------  ------------  ------------
+  TOTAL              207.04s      19465 MB      15087 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T00:01:12  —  label: subset3M_megazarr_v1.0_g0_managed_ck6000_t12x12c12
+store: /mnt/subset3M_megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=6000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr            8.81s       3813 MB       1721 MB
+  h2d_transfer         0.06s       3277 MB       1723 MB
+  preprocessing       59.92s       5520 MB       2757 MB
+  hvg                 68.28s       6000 MB       7055 MB
+  scaling              0.14s       4986 MB       3587 MB
+  pca                  1.81s       5846 MB       4599 MB
+  neighbors           14.91s       6465 MB       9759 MB
+  umap                22.19s       7853 MB       6437 MB
+  leiden              56.38s       7915 MB       6591 MB
+  write_results        0.18s       6977 MB       4009 MB
+  ----------------  --------  ------------  ------------
+  TOTAL              232.67s       7915 MB       9759 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T00:05:17  —  label: subset3M_megazarr_v1.0_g0_managed_ck12000_t12x12c12
+store: /mnt/subset3M_megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=12000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr            9.06s       3830 MB       1721 MB
+  h2d_transfer         0.06s       3259 MB       1723 MB
+  preprocessing       50.38s       7360 MB       4515 MB
+  hvg                 59.46s       8188 MB       6707 MB
+  scaling              0.14s       5779 MB       3433 MB
+  pca                  1.77s       6642 MB       4441 MB
+  neighbors           14.95s       7258 MB       9573 MB
+  umap                22.13s       8646 MB       6367 MB
+  leiden              65.04s       8708 MB       6485 MB
+  write_results        0.18s       7770 MB       3897 MB
+  ----------------  --------  ------------  ------------
+  TOTAL              223.18s       8708 MB       9573 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T02:18:42  —  label: 13M_50M_pbmc_soundlife_g0_managed_ck24000_t12x12c12
+store: /mnt/13M_50M_pbmc_soundlife.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr          120.66s      34274 MB       1721 MB
+  h2d_transfer         0.07s      21002 MB       1723 MB
+  preprocessing      331.82s      29512 MB       8707 MB
+  hvg                378.40s      32577 MB      24981 MB
+  scaling              0.38s      27780 MB       9647 MB
+  pca                  6.82s      31204 MB      14367 MB
+  neighbors          112.98s      33664 MB      37683 MB
+  umap               206.21s      39427 MB      22945 MB
+  leiden             261.97s      39598 MB      23185 MB
+  write_results        0.39s      34272 MB      11303 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             1419.70s      39598 MB      37683 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T02:42:41  —  label: 13M_50M_pbmc_soundlife_g0_managed_ck48000_t12x12c12
+store: /mnt/13M_50M_pbmc_soundlife.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=48000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr          120.71s      34338 MB       1721 MB
+  h2d_transfer         0.07s      21038 MB       1723 MB
+  preprocessing      256.62s      34128 MB       7979 MB
+  hvg                310.32s      39555 MB      24961 MB
+  scaling              0.36s      30713 MB       9643 MB
+  pca                  6.46s      34108 MB      14363 MB
+  neighbors          112.85s      36565 MB      37657 MB
+  umap               204.31s      42328 MB      22659 MB
+  leiden             272.45s      42506 MB      23183 MB
+  write_results        0.40s      37176 MB      11301 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             1284.53s      42506 MB      37657 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T03:04:25  —  label: 13M_50M_pbmc_soundlife_g0_managed_ck6000_t12x12c12
+store: /mnt/13M_50M_pbmc_soundlife.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=6000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr          120.31s      34319 MB       1721 MB
+  h2d_transfer         0.08s      21158 MB       1723 MB
+  preprocessing      817.00s      25359 MB       2541 MB
+  hvg                860.33s      29122 MB      27709 MB
+  scaling              0.35s      26418 MB      10217 MB
+  pca                  6.56s      29761 MB      14977 MB
+  neighbors          113.12s      32226 MB      38303 MB
+  umap               204.76s      37989 MB      23183 MB
+  leiden             271.12s      38124 MB      23795 MB
+  write_results        0.40s      32832 MB      11913 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             2394.03s      38124 MB      38303 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T03:44:38  —  label: 13M_50M_pbmc_soundlife_g0_managed_ck12000_t12x12c12
+store: /mnt/13M_50M_pbmc_soundlife.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=12000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr          120.25s      34410 MB       1721 MB
+  h2d_transfer         0.07s      21249 MB       1723 MB
+  preprocessing      490.95s      26437 MB       3261 MB
+  hvg                534.79s      30346 MB      25069 MB
+  scaling              0.39s      26897 MB       9683 MB
+  pca                  6.52s      30220 MB      14403 MB
+  neighbors          113.10s      32697 MB      37785 MB
+  umap               205.58s      38461 MB      22915 MB
+  leiden             269.45s      38589 MB      23199 MB
+  write_results        0.38s      33270 MB      11321 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             1741.49s      38589 MB      37785 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T04:13:59  —  label: megazarr_v1.0_g0_managed_ck24000_t12x12c12
+store: /mnt/megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr           97.51s      22231 MB       1721 MB
+  h2d_transfer         0.07s      14900 MB       1723 MB
+  preprocessing      457.59s      22862 MB       5545 MB
+  hvg                590.77s      26074 MB      47583 MB
+  scaling              0.77s      21641 MB      17427 MB
+  pca                 38.83s      28700 MB      27651 MB
+  neighbors          434.43s      33974 MB      78791 MB
+  umap               366.68s      45819 MB      46151 MB
+  leiden             595.94s      46626 MB      46869 MB
+  write_results        0.55s      34684 MB      20823 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             2583.16s      46626 MB      78791 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T04:57:20  —  label: megazarr_v1.0_g0_managed_ck48000_t12x12c12
+store: /mnt/megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=48000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr           97.43s      23383 MB       1721 MB
+  h2d_transfer         0.13s      15065 MB       1723 MB
+  preprocessing      404.56s      28623 MB      12129 MB
+  hvg                546.86s      34956 MB      47555 MB
+  scaling              0.67s      26587 MB      17261 MB
+  pca                 12.81s      33731 MB      27599 MB
+  neighbors          369.63s      38994 MB      78713 MB
+  umap               349.67s      50842 MB      46207 MB
+  leiden             626.41s      51651 MB      46783 MB
+  write_results        0.58s      39704 MB      20737 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             2408.76s      51651 MB      78713 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T05:37:48  —  label: megazarr_v1.0_g0_managed_ck6000_t12x12c12
+store: /mnt/megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=6000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr           97.58s      22169 MB       1721 MB
+  h2d_transfer         0.07s      15054 MB       1723 MB
+  preprocessing      710.22s      18766 MB       3081 MB
+  hvg                851.94s      21016 MB      49839 MB
+  scaling              0.69s      20052 MB      19201 MB
+  pca                 12.85s      27064 MB      29557 MB
+  neighbors          372.24s      32373 MB      80549 MB
+  umap               350.39s      44220 MB      47787 MB
+  leiden             602.00s      44886 MB      48581 MB
+  write_results        0.57s      33091 MB      22533 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             2998.56s      44886 MB      80549 MB
+
+Rapids-Singlecell Benchmark  —  2026-08-26T06:28:06  —  label: megazarr_v1.0_g0_managed_ck12000_t12x12c12
+store: /mnt/megazarr_v1.0.zarr  —  GPUs: [0]
+changed cfg: protocol=tcp, rmm_mode=managed, chunk_rows=12000
+================================================================================
+  Step                  Wall     Peak Host      Peak GPU
+  ----                  ----     ---------      --------
+  load_zarr           97.31s      22112 MB       1721 MB
+  h2d_transfer         0.07s      14609 MB       1723 MB
+  preprocessing      521.92s      19690 MB       4093 MB
+  hvg                666.45s      21952 MB      48575 MB
+  scaling              0.69s      20149 MB      17693 MB
+  pca                 12.96s      27139 MB      28099 MB
+  neighbors          370.48s      32439 MB      79047 MB
+  umap               348.87s      44287 MB      46529 MB
+  leiden             575.77s      45102 MB      47187 MB
+  write_results        0.60s      33153 MB      21141 MB
+  ----------------  --------  ------------  ------------
+  TOTAL             2595.13s      45102 MB      79047 MB
+
