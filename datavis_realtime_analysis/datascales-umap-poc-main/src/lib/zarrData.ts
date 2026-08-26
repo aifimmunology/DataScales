@@ -31,9 +31,32 @@ async function coordBase(): Promise<string> {
     : DATA_BASE_URL
 }
 
-// AIFI cell-type annotation levels, coarse -> fine. L1 is the default color-by.
-export const LEVELS = ['AIFI_L1', 'AIFI_L2', 'AIFI_L3'] as const
-export type Level = (typeof LEVELS)[number]
+// A color-by label set is any categorical obs column; discovered per group.
+export type Level = string
+export type LabelSetInfo = { name: string; own: boolean } // own = app-created (extendable)
+
+/** Columns for the color-by dropdown: leiden + AIFI_L* + app-created labelsets
+ * always (when stored as categoricals), plus any other categorical column with
+ * < 20 categories. Metadata-only — counts come from categories/zarr.json shape. */
+export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
+  const base = await coordBase()
+  const prefix = group ? `${group}/` : ''
+  const obsMeta = await probe(base, `${prefix}obs`)
+  const cols = (obsMeta?.attrs['column-order'] as string[]) ?? []
+  const keep = await Promise.all(
+    cols.map(async col => {
+      const p = await probe(base, `${prefix}obs/${col}`)
+      if (p?.attrs['encoding-type'] !== 'categorical') return null
+      const own = p.attrs['datavis-labelset'] === true
+      if (own || col === 'leiden' || col.startsWith('AIFI_L')) return { name: col, own }
+      const res = await fetch(`${base}/${prefix}obs/${col}/categories/zarr.json`)
+      if (!res.ok) return null
+      const meta = await res.json()
+      return ((meta.shape?.[0] as number) ?? Infinity) < 20 ? { name: col, own } : null
+    }),
+  )
+  return keep.filter((c): c is LabelSetInfo => c !== null)
+}
 
 export type RGB = [number, number, number]
 

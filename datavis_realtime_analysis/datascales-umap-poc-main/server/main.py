@@ -4,7 +4,7 @@ config (env), storage (zarr proxy + store JSON), views (groups.json), gpu (jobs)
 
 from fastapi import FastAPI, Request
 
-from . import gpu, storage, views
+from . import gpu, labels, storage, views
 from .config import DATA_DIR
 
 app = FastAPI(redoc_url=None)  # /docs = interactive API console
@@ -44,3 +44,8 @@ def jobs():
 @app.delete("/api/views/{view_id}")
 def delete_view(view_id: str):
     return views.delete_view(view_id)
+
+
+@app.post("/api/labels")
+def save_labels(payload: dict):
+    return labels.save_labels(payload)

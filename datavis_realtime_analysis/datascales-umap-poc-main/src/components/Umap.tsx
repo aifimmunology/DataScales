@@ -5,6 +5,7 @@ import { OrthographicView } from '@deck.gl/core'
 import Legend from './Legend'
 import GroupPicker from './GroupPicker'
 import GenePicker from './GenePicker'
+import LabelsPanel from './LabelsPanel'
 import RunsPanel from './RunsPanel'
 import SelectionControls from './SelectionControls'
 import {
@@ -14,6 +15,7 @@ import {
   loadGroups,
   loadGeneNames,
   loadGeneExpression,
+  loadLabelSets,
   colorForCode,
   getStoreId,
   type Point,
@@ -21,9 +23,10 @@ import {
   type Level,
   type Group,
   type GeneExpression,
+  type LabelSetInfo,
 } from '../lib/zarrData'
 import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
-import { deleteView, submitSelection } from '../lib/api'
+import { deleteView, saveLabels, submitSelection } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
 
@@ -31,6 +34,7 @@ export default function Umap() {
   const [points, setPoints] = useState<Point[]>([])
   const [barcodes, setBarcodes] = useState<string[]>([])
   const [level, setLevel] = useState<Level>('AIFI_L1') // default color-by
+  const [labelSets, setLabelSets] = useState<LabelSetInfo[]>([]) // categorical obs columns in this group
   const [cat, setCat] = useState<Categorical | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -58,6 +62,16 @@ export default function Umap() {
   const [selVersion, setSelVersion] = useState(0) // bumps deck's getFillColor updateTrigger
   const [lassoScreen, setLassoScreen] = useState<[number, number][]>([])
 
+  // cluster-select (legend clicks) + labeling workspace
+  const [selectedCats, setSelectedCats] = useState<Set<number>>(new Set())
+  const [selectedLabels, setSelectedLabels] = useState<Set<number>>(new Set()) // working-label rows toggled in
+  type Labeling = { name: string; cats: string[]; counts: number[]; codes: Int16Array }
+  const [labeling, setLabeling] = useState<Labeling | null>(null)
+  const [pending, setPending] = useState<{ label: string; indices: number[] }[]>([])
+  const [labelVersion, setLabelVersion] = useState(0) // bumps fill colors on assign
+  const [savingLabels, setSavingLabels] = useState(false)
+  const [savedLabels, setSavedLabels] = useState<{ name: string; labeled: number } | null>(null)
+
   const deckRef = useRef<any>(null)
   const draggingRef = useRef(false)
   const pathRef = useRef<[number, number][]>([])
@@ -82,6 +96,10 @@ export default function Umap() {
     setLoading(true)
     setError(null)
     setSelection(null)
+    setSelectedCats(new Set())
+    setSelectedLabels(new Set())
+    setLabeling(null) // labeling rides per-group row indices — can't cross groups
+    setPending([])
     setSelVersion(v => v + 1)
     Promise.all([loadUmapCoords(group), loadBarcodes(group)])
       .then(([pts, bcs]) => {
@@ -118,7 +136,26 @@ export default function Umap() {
     }
   }, [group, retryTick])
 
-  // Category codes reload whenever the AIFI level OR the active group changes.
+  // Discover which categorical obs columns this group offers; keep the current
+  // level when it still exists, else fall back (AIFI_L1 first, then whatever is).
+  useEffect(() => {
+    let stale = false
+    loadLabelSets(group)
+      .then(ls => {
+        if (stale) return
+        setLabelSets(ls)
+        const names = ls.map(s => s.name)
+        setLevel(l => (names.includes(l) ? l : names.includes('AIFI_L1') ? 'AIFI_L1' : names[0] ?? ''))
+      })
+      .catch(() => {
+        if (!stale) setLabelSets([])
+      })
+    return () => {
+      stale = true
+    }
+  }, [group])
+
+  // Category codes reload whenever the level OR the active group changes.
   // One silent retry covers a backend blip mid-load; after that the failure is
   // surfaced in the Legend (previously it hung on "Loading…" forever).
   const [catError, setCatError] = useState<string | null>(null)
@@ -127,6 +164,8 @@ export default function Umap() {
     let stale = false
     setCat(null)
     setCatError(null)
+    setSelectedCats(new Set()) // codes are per-level; stale highlights would lie
+    if (!level) return // group has no categorical columns
     const attempt = (retriesLeft: number) => {
       loadCategorical(level, group)
         .then(c => {
@@ -230,6 +269,8 @@ export default function Umap() {
     const mask = new Uint8Array(points.length)
     for (const i of indices) mask[i] = 1
     setSelection({ mask, indices, world })
+    setSelectedCats(new Set()) // a lasso replaces any category selection
+    setSelectedLabels(new Set())
     setSelVersion(v => v + 1)
   }
 
@@ -242,7 +283,122 @@ export default function Umap() {
 
   const clearSelection = () => {
     setSelection(null)
+    setSelectedCats(new Set())
+    setSelectedLabels(new Set())
     setSelVersion(v => v + 1)
+  }
+
+  // Category-select: toggle all cells whose code (in `codes`) is in the toggled
+  // set. Backs both the legend rows (cat codes) and the Labels-panel rows
+  // (working labelset codes); the two are mutually exclusive selections.
+  const selectByCodes = (codes: ArrayLike<number>, toggled: Set<number>) => {
+    if (toggled.size === 0) {
+      setSelection(null)
+      setSelVersion(v => v + 1)
+      return
+    }
+    const mask = new Uint8Array(points.length)
+    const indices: number[] = []
+    for (let i = 0; i < codes.length; i++) {
+      if (toggled.has(codes[i] as number)) {
+        mask[i] = 1
+        indices.push(i)
+      }
+    }
+    setSelection({ mask, indices, world: [] })
+    setSelVersion(v => v + 1)
+  }
+
+  const toggleCategory = (code: number) => {
+    if (!cat) return
+    const next = new Set(selectedCats)
+    if (next.has(code)) next.delete(code)
+    else next.add(code)
+    setSelectedCats(next)
+    setSelectedLabels(new Set())
+    selectByCodes(cat.codes, next)
+  }
+
+  const toggleLabelCat = (k: number) => {
+    if (!labeling) return
+    const next = new Set(selectedLabels)
+    if (next.has(k)) next.delete(k)
+    else next.add(k)
+    setSelectedLabels(next)
+    setSelectedCats(new Set())
+    selectByCodes(labeling.codes, next)
+  }
+
+  // ---- labeling: build a labelset from selections, save as an obs categorical ----
+  const startLabeling = async (name: string) => {
+    setSavedLabels(null)
+    const codes = new Int16Array(points.length).fill(-1)
+    let cats: string[] = []
+    if (labelSets.some(s => s.name === name && s.own)) {
+      try {
+        const existing = await loadCategorical(name, group)
+        cats = existing.categories
+        for (let i = 0; i < codes.length; i++) codes[i] = existing.codes[i]
+      } catch {
+        // labelset not materialized in this group (e.g. a view made before it) — start empty
+      }
+    }
+    const counts = new Array(cats.length).fill(0)
+    for (let i = 0; i < codes.length; i++) if (codes[i] >= 0) counts[codes[i]]++
+    setLabeling({ name, cats, counts, codes })
+    setPending([])
+    setLabelVersion(v => v + 1)
+  }
+
+  const assignLabel = (label: string) => {
+    if (!labeling || !selection) return
+    const cats = labeling.cats.includes(label) ? labeling.cats : [...labeling.cats, label]
+    const k = cats.indexOf(label)
+    const counts = [...labeling.counts]
+    while (counts.length < cats.length) counts.push(0)
+    for (const i of selection.indices) {
+      if (labeling.codes[i] >= 0) counts[labeling.codes[i]]--
+      labeling.codes[i] = k
+      counts[k]++
+    }
+    setLabeling({ ...labeling, cats, counts })
+    setPending(p => [...p, { label, indices: selection.indices }])
+    setSelection(null)
+    setSelectedCats(new Set())
+    setSelectedLabels(new Set())
+    setSelVersion(v => v + 1)
+    setLabelVersion(v => v + 1)
+  }
+
+  const saveLabeling = async () => {
+    if (!labeling || pending.length === 0) return
+    setSavingLabels(true)
+    try {
+      // barcodes make the assignment group-agnostic: the backend maps them to
+      // root-store rows, so view labels land on the full store
+      const assignments = pending.map(p => ({
+        label: p.label,
+        barcodes: p.indices.map(i => barcodes[i] ?? ''),
+      }))
+      const res = await saveLabels(labeling.name, assignments)
+      setSavedLabels({ name: res.name, labeled: res.labeled })
+      setLabeling(null)
+      setPending([])
+      setSelectedLabels(new Set())
+      setLabelVersion(v => v + 1)
+      setLabelSets(await loadLabelSets(group)) // the new column joins Color by
+    } catch (err) {
+      setNotice(`Label save failed: ${err instanceof Error ? err.message : err}`)
+    } finally {
+      setSavingLabels(false)
+    }
+  }
+
+  const cancelLabeling = () => {
+    setLabeling(null)
+    setPending([])
+    setSelectedLabels(new Set())
+    setLabelVersion(v => v + 1)
   }
 
   const selectionPayload = async (sel: Sel) => ({
@@ -314,24 +470,36 @@ export default function Umap() {
     radiusMaxPixels: 5,
     getFillColor: d => {
       const i = d.index * 3
-      const base: readonly number[] = exprData
+      let base: readonly number[] = exprData
         ? [exprData.colors[i], exprData.colors[i + 1], exprData.colors[i + 2]]
         : cat
           ? colorForCode(cat.codes[d.index])
           : [130, 70, 255]
+      // Millions of overlapping points need low alpha to read as density; small
+      // views need near-solid dots or they look fuzzy.
+      let alpha = points.length > 300_000 ? 90 : 180
+      if (labeling) {
+        // labeled cells show their working label; the rest keep the underlying
+        // coloring, dimmed, so unlabeled structure stays visible while labeling
+        const wc = labeling.codes[d.index]
+        if (wc >= 0) {
+          base = colorForCode(wc)
+          alpha = 235
+        } else {
+          alpha = Math.min(alpha, 55)
+        }
+      }
       if (selection) {
         // highlight selected in yellow; dim the rest to make it pop
         return selection.mask[d.index] ? [255, 240, 30, 255] : [base[0], base[1], base[2], 40]
       }
-      // Millions of overlapping points need low alpha to read as density; small
-      // views need near-solid dots or they look fuzzy.
-      return [base[0], base[1], base[2], points.length > 300_000 ? 90 : 180]
+      return [base[0], base[1], base[2], alpha]
     },
     // `cat` MUST be here: it loads async, and deck.gl only re-runs getFillColor when
     // a trigger changes. Without it, colors stay at the default until some *other*
     // trigger fires (e.g. a lasso bumping selVersion) — which is exactly the bug where
     // color-by looked dead until you selected a subset.
-    updateTriggers: { getFillColor: [level, selVersion, cat, exprData] },
+    updateTriggers: { getFillColor: [level, selVersion, cat, exprData, labelVersion] },
     pickable: false,
   })
 
@@ -401,6 +569,21 @@ export default function Umap() {
           onSubmit={submitCurrent}
           onClear={clearSelection}
         />
+        <LabelsPanel
+          active={labeling ? { name: labeling.name, cats: labeling.cats, counts: labeling.counts } : null}
+          ownSets={labelSets.filter(s => s.own).map(s => s.name)}
+          selectionCount={selection?.indices.length ?? 0}
+          saving={savingLabels}
+          saved={savedLabels}
+          dirty={pending.length > 0}
+          selectedLabels={selectedLabels}
+          onLabelClick={toggleLabelCat}
+          onStart={startLabeling}
+          onAssign={assignLabel}
+          onSave={saveLabeling}
+          onCancel={cancelLabeling}
+          onDismissSaved={() => setSavedLabels(null)}
+        />
         <GroupPicker groups={groups} active={group} onChange={setGroup} onDelete={deleteCurrentView} />
         <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
       </div>
@@ -408,9 +591,12 @@ export default function Umap() {
       {/* legend tracks the actual coloring mode, not the picked gene */}
       {!exprData && (
         <Legend
+          levels={labelSets.map(s => s.name)}
           level={level}
           onLevelChange={setLevel}
           categories={cat?.categories ?? null}
+          selected={selectedCats}
+          onCategoryClick={toggleCategory}
           error={catError}
           onRetry={() => setCatTick(t => t + 1)}
         />

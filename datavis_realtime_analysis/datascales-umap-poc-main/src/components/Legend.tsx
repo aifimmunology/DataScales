@@ -1,16 +1,21 @@
-import { LEVELS, type Level, colorForCode } from '../lib/zarrData'
+import { type Level, colorForCode } from '../lib/zarrData'
 import { panel, control, label, rgb } from '../lib/styles'
 
 type Props = {
+  levels: string[] // label sets discovered in the store (per group)
   level: Level
   onLevelChange: (level: Level) => void
   categories: string[] | null
+  selected: Set<number> // category codes currently cluster-selected
+  onCategoryClick: (code: number) => void
   error: string | null
   onRetry: () => void
 }
 
-// Top-right overlay: pick which AIFI level colors the UMAP + show the key.
-export default function Legend({ level, onLevelChange, categories, error, onRetry }: Props) {
+// Top-right overlay: pick which label set colors the UMAP + show the key.
+// Clicking a key row toggles selecting every cell of that category (cluster select).
+export default function Legend({ levels, level, onLevelChange, categories, selected, onCategoryClick, error, onRetry }: Props) {
+  if (levels.length === 0) return null
   return (
     <div style={panelStyle}>
       <label style={label}>Color by</label>
@@ -19,7 +24,7 @@ export default function Legend({ level, onLevelChange, categories, error, onRetr
         onChange={e => onLevelChange(e.target.value as Level)}
         style={control}
       >
-        {LEVELS.map(l => (
+        {levels.map(l => (
           <option key={l} value={l}>
             {l}
           </option>
@@ -39,9 +44,22 @@ export default function Legend({ level, onLevelChange, categories, error, onRetr
           <span style={{ color: '#888', fontSize: 12 }}>Loading…</span>
         ) : (
           categories.map((name, code) => (
-            <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <div
+              key={name}
+              onClick={() => onCategoryClick(code)}
+              title="click to select these cells"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                cursor: 'pointer',
+                padding: '1px 4px',
+                borderRadius: 3,
+                background: selected.has(code) ? '#3a3411' : 'transparent',
+              }}
+            >
               <span style={{ ...swatchStyle, background: rgb(colorForCode(code)) }} />
-              <span style={{ fontSize: 12, color: '#ddd' }}>{name}</span>
+              <span style={{ fontSize: 12, color: selected.has(code) ? '#ffe94d' : '#ddd' }}>{name}</span>
             </div>
           ))
         )}

@@ -84,33 +84,42 @@ Two services via compose: nginx serves the built frontend and proxies `/api`; th
 gcloud auth application-default login
 ```
 
-This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs `roles/storage.objectAdmin` on the bucket (the app writes views, the view listing, and job objects; read-only viewing works with `objectViewer`) and, for GPU runs, permission to `gcloud compute ssh` into the instance. If your ADC has no default project, set `GOOGLE_CLOUD_PROJECT` in `.env`.
+This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs `roles/storage.objectAdmin` on the bucket
 
-### 2. Build and run
+### 2. Configure `.env`
 
-Put the connection config in `.env` next to `docker-compose.yml` (auto-loaded, gitignored) — `DATA_DIR`, and `GPU_INSTANCE`/`GPU_ZONE`/`GPU_PIXI_DIR` when overriding the defaults — then:
+Create `.env` in the repo
 
+```bash
+DATA_DIR=gs://MY_BUCKET/store.zarr
+GPU_INSTANCE=my-gpu-instance
+GPU_ZONE=us-central1-c
+GPU_PIXI_DIR=/path/on/box/to/pixi-project
 ```
+
+- `DATA_DIR` — the zarr store everything runs against (a `gs://` prefix, or a local path for dev).
+- `GPU_INSTANCE` — the GCE instance name GPU jobs are dispatched to over `gcloud compute ssh`.
+- `GPU_ZONE` — that instance's compute zone.
+- `GPU_PIXI_DIR` — the pixi project directory on the instance whose env the pipeline runs in.
+
+
+### 3. Build and run
+
+```bash
 docker compose up --build -d
 ```
 
-(or inline: `DATA_DIR=gs://MY_BUCKET/store.zarr docker compose up --build -d`)
-
 App: http://localhost:3000
 
-### 3. Verify
+### 4. Verify & monitor
 
 ```bash
-curl http://localhost:8000/api/health        # {"status":"ok"}
-curl http://localhost:8000/api/config        # echoes the gs:// DATA_DIR
-curl -sI http://localhost:3000/api/data/zarr.json | head -1   # 200 through the full chain
-docker compose logs -f backend               # request log / GCS errors
+docker compose logs -f backend       
 ```
 
 ### Troubleshooting
 
 - `503 GCS auth failed` — re-run step 1 on the host; confirm `~/.config/gcloud/application_default_credentials.json` exists.
-- `404` on `/api/data/zarr.json` — `DATA_DIR` must point at the store root (the prefix containing `zarr.json`).
 - `port is already allocated` — something else is publishing 3000/8000; `docker ps`, then stop it.
 
 `docker compose down` stops the stack. For a local store instead of GCS, uncomment the data volume in `docker-compose.yml` and run with `DATA_DIR=/data`.
