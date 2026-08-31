@@ -1,5 +1,7 @@
 # convert-to-zarr
 
+[![convert-to-zarr](https://github.com/aifimmunology/DataScales/actions/workflows/convert-to-zarr.yml/badge.svg?branch=main)](https://github.com/aifimmunology/DataScales/actions/workflows/convert-to-zarr.yml)
+
 A configurable converter for h5 data(currently only single cell) to Zarr stores, non-spatial single-cell AnnData.
 
 > **This README covers the convert-to-zarr tool.** The repo also ships a separate,
@@ -177,6 +179,12 @@ method notes, cache-warmth caveats, and the remaining flags (`--outdir`, …).
 ```bash
 pixi run -e dev pytest tests/ -v
 ```
+
+The suite runs on every PR to `main` (`.github/workflows/convert-to-zarr.yml`). It includes
+`tests/test_cli.py`, which drives the installed console script via subprocess to pin the
+surface out-of-repo consumers install against: the `tools/convert-to-zarr` path, the
+`convert-to-zarr` entry point, and the `convert-h5ad` flags. Moving the tool or renaming a
+flag is a breaking change for them.
 
 ## License
 

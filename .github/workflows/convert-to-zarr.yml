@@ -1,0 +1,36 @@
+# Gate on PRs to main for the convert-to-zarr tool.
+name: convert-to-zarr
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/convert-to-zarr/**'
+      - '.github/workflows/convert-to-zarr.yml'
+  # Also run post-merge so the README badge has main-branch runs to report; a PR-only
+  # workflow renders as "no status".
+  push:
+    branches: [main]
+    paths:
+      - 'tools/convert-to-zarr/**'
+      - '.github/workflows/convert-to-zarr.yml'
+
+defaults:
+  run:
+    working-directory: tools/convert-to-zarr
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          manifest-path: tools/convert-to-zarr/pyproject.toml
+          environments: dev
+          cache: true
+
+      - name: Tool test suite
+        run: pixi run -e dev pytest tests/ -v
