@@ -25,7 +25,7 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXP
     os.environ.setdefault(_v, "1")
 
 data_pth       = os.environ.get("RERUN_DATA", "/home/workspace/temp/expression.zarr")
-SELECTION_FILE = os.environ.get("RERUN_SELECTION", "./datascales-umap-poc-main/data/3M_subset_bcell_selection.json")
+SELECTION_FILE = os.environ.get("RERUN_SELECTION", "./data/3M_subset_bcell_selection.json")
 VIEW_STORE     = os.environ.get("RERUN_OUT", data_pth + "/umap_views/bcell_selection")  # view store to write (obsm/X_umap + obs, no X)
 GPUS           = os.environ.get("RERUN_GPUS", "0")
 THREADS_PER_WORKER = int(os.environ.get("RERUN_THREADS_PER_WORKER", "12"))  # dask-cuda worker threadpool
@@ -117,7 +117,9 @@ def main():
     if raw_counts:
             X = X.astype(np.float32)
 
-    adata = ad.AnnData(X=X, obs=obs.iloc[rows].copy(), var=ad.io.read_elem(f["var"]))
+    obs_sel = obs.iloc[rows].copy()
+    obs_sel["root_row"] = rows.astype(np.int32)  # view row -> source-store row (gene highlighting in views)
+    adata = ad.AnnData(X=X, obs=obs_sel, var=ad.io.read_elem(f["var"]))
     print("Selected cells:", adata.shape, "(eager)" if eager else "(dask)")
     rsc.get.anndata_to_GPU(adata)
 

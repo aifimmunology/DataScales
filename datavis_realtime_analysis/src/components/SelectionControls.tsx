@@ -1,4 +1,4 @@
-import { panel, control } from '../lib/styles'
+import { panel, control, primaryBtn } from '../lib/styles'
 
 import { useState } from 'react'
 
@@ -11,7 +11,7 @@ type Props = {
   onClear: () => void
 }
 
-// Top-left overlay: toggle lasso mode, then download / submit / clear the selection.
+// Rail section: toggle lasso mode, then download / submit / clear the selection.
 export default function SelectionControls({
   selecting,
   onToggle,
@@ -46,7 +46,7 @@ export default function SelectionControls({
               onSubmit(name.trim())
               setName('')
             }}
-            style={btnStyle}
+            style={primaryBtn}
           >
             GPU run
           </button>

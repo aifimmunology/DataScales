@@ -33,7 +33,7 @@ One store serves everything:
 - `layers/gexp` (csc or dense; `zarrsmith add-expr` creates it) — gene-expression highlighting, resolved in order `layers/gexp` → dense `X` → CSC `X`
 - `umap_views/`, `groups.json`, `jobs/` — written by the app: returned views, the view listing, and the GPU job queue + status objects
 
-In the app: lasso a cell selection, name it, and hit "GPU run". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `../gpu_job.sh` sets up the pixi env fresh, runs `../rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
+In the app: lasso a cell selection, name it, and hit "GPU run". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `gpu/gpu_job.sh` sets up the pixi env fresh, runs `gpu/rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
 
 GPU runs require `GPU_INSTANCE`, `GPU_ZONE`, and `GPU_PIXI_DIR` (the pixi project on the box) in `.env` — submits error if any is unset. Works in docker (the backend image ships gcloud + your mounted credentials/ssh keys) and in dev mode. One-time per bucket: grant the GPU instance's service account storage access so jobs on the box can read/write the store no matter who sshs in:
 
@@ -49,7 +49,7 @@ gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
 ### Python setup (first time)
 
 ```bash
-cd datascales-umap-poc-main
+cd datavis_realtime_analysis
 pip install -r server/requirements.txt
 ```
 

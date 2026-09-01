@@ -14,10 +14,12 @@ GPU_PIXI_DIR = os.environ.get("GPU_PIXI_DIR", "")
 
 MAX_JOBS = 50
 
-# In the container these resolve to / where compose mounts them; in dev, the repo.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-RERUN_SCRIPT = REPO_ROOT / "rerun_umap_on_selection.py"
-JOB_SCRIPT = REPO_ROOT / "gpu_job.sh"
+# gpu/ holds the scripts shipped to the box. Compose bind-mounts the DIRECTORY
+# (mounting single files pins their inode — edits that replace the file leave the
+# container serving stale, truncated content).
+APP_ROOT = Path(__file__).resolve().parents[1]
+RERUN_SCRIPT = APP_ROOT / "gpu" / "rerun_umap_on_selection.py"
+JOB_SCRIPT = APP_ROOT / "gpu" / "gpu_job.sh"
 
 
 def _parse_dir(d: str) -> dict:

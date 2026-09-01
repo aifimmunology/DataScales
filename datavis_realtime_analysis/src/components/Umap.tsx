@@ -2,20 +2,24 @@ import { useEffect, useRef, useState } from 'react'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
+import Header, { HEADER_HEIGHT } from './Header'
 import Legend from './Legend'
 import GroupPicker from './GroupPicker'
 import GenePicker from './GenePicker'
 import LabelsPanel from './LabelsPanel'
 import RunsPanel from './RunsPanel'
 import SelectionControls from './SelectionControls'
+import SideRail from './SideRail'
 import {
   loadUmapCoords,
   loadCategorical,
+  gatherRootCategorical,
   loadBarcodes,
   loadGroups,
   loadGeneNames,
   loadGeneExpression,
   loadLabelSets,
+  dropdownLabelSets,
   colorForCode,
   getStoreId,
   type Point,
@@ -55,6 +59,7 @@ export default function Umap() {
 
   // submitted-runs refresh counter (bumped on each submit)
   const [submitCount, setSubmitCount] = useState(0)
+  const [runsActive, setRunsActive] = useState(false) // any job queued/running → rail badge
 
   // selection state
   const [selecting, setSelecting] = useState(false)
@@ -65,7 +70,7 @@ export default function Umap() {
   // cluster-select (legend clicks) + labeling workspace
   const [selectedCats, setSelectedCats] = useState<Set<number>>(new Set())
   const [selectedLabels, setSelectedLabels] = useState<Set<number>>(new Set()) // working-label rows toggled in
-  type Labeling = { name: string; cats: string[]; counts: number[]; codes: Int16Array }
+  type Labeling = { name: string; cats: string[]; counts: number[]; codes: Int16Array; seed?: string }
   const [labeling, setLabeling] = useState<Labeling | null>(null)
   const [pending, setPending] = useState<{ label: string; indices: number[] }[]>([])
   const [labelVersion, setLabelVersion] = useState(0) // bumps fill colors on assign
@@ -108,9 +113,12 @@ export default function Umap() {
         setBarcodes(bcs)
         const fit = fitView(pts)
         setViewState(fit)
-        // world-space radius sized so dots render ~fitPx pixels at the fitted zoom;
-        // they then scale with zoom (crisp when zoomed out, resolvable zoomed in)
-        const fitPx = pts.length > 1_500_000 ? 0.5 : pts.length > 300_000 ? 0.9 : pts.length > 50_000 ? 1.4 : 1.8
+        // Dot radius ∝ 1/√n (dot AREA ∝ 1/n, scanpy's law): total ink stays
+        // constant across dataset sizes instead of jumping between tiers.
+        // ≈0.4px at 3M (density regime), ≈0.9px at 300k, ≈2.2px at 50k,
+        // ≈5px at 10k, capped at 6px for tiny views. Sized at the fitted zoom,
+        // then scales with zoom (crisp zoomed out, resolvable zoomed in).
+        const fitPx = Math.min(6, Math.max(0.4, 500 / Math.sqrt(pts.length || 1)))
         setWorldRadius(fitPx / Math.pow(2, fit.zoom))
         setLoading(false)
       })
@@ -136,19 +144,29 @@ export default function Umap() {
     }
   }, [group, retryTick])
 
-  // Discover which categorical obs columns this group offers; keep the current
-  // level when it still exists, else fall back (AIFI_L1 first, then whatever is).
+  // Discover the group's categorical columns AND the root's: app labelsets live
+  // only on root (edited by barcode, read in views via root_row gather), so views
+  // must see them regardless of what got frozen into their own obs at creation.
+  const [rootLabelSets, setRootLabelSets] = useState<LabelSetInfo[]>([])
+  const rootOwn = rootLabelSets.filter(s => s.own)
   useEffect(() => {
     let stale = false
-    loadLabelSets(group)
-      .then(ls => {
+    Promise.all([loadLabelSets(group), group ? loadLabelSets('') : null])
+      .then(([ls, rootLs]) => {
         if (stale) return
         setLabelSets(ls)
-        const names = ls.map(s => s.name)
+        setRootLabelSets(rootLs ?? ls)
+        // legend options: the group's columns plus root labelsets (root wins on
+        // name clashes — a view's copy is frozen at creation time)
+        const ownNames = (rootLs ?? ls).filter(s => s.own).map(s => s.name)
+        const names = [...new Set([...dropdownLabelSets(ls), ...ownNames])]
         setLevel(l => (names.includes(l) ? l : names.includes('AIFI_L1') ? 'AIFI_L1' : names[0] ?? ''))
       })
       .catch(() => {
-        if (!stale) setLabelSets([])
+        if (!stale) {
+          setLabelSets([])
+          setRootLabelSets([])
+        }
       })
     return () => {
       stale = true
@@ -166,8 +184,10 @@ export default function Umap() {
     setCatError(null)
     setSelectedCats(new Set()) // codes are per-level; stale highlights would lie
     if (!level) return // group has no categorical columns
+    // app labelsets in a view read the CURRENT root state via root_row gather
+    const fromRoot = group !== '' && rootOwn.some(s => s.name === level)
     const attempt = (retriesLeft: number) => {
-      loadCategorical(level, group)
+      ;(fromRoot ? gatherRootCategorical(level, group) : loadCategorical(level, group))
         .then(c => {
           if (!stale) setCat(c)
         })
@@ -185,13 +205,14 @@ export default function Umap() {
     return () => {
       stale = true
     }
-  }, [level, group, catTick])
+  }, [level, group, catTick, rootLabelSets])
 
-  // Gene list is per-group; switching groups clears the active gene.
+  // Gene names come from the root store (views gather root expression via
+  // obs/root_row); switching groups just clears the active gene.
   useEffect(() => {
     let stale = false
     setGene(null)
-    loadGeneNames(group)
+    loadGeneNames()
       .then(gs => {
         if (!stale) setGenes(gs)
       })
@@ -330,23 +351,29 @@ export default function Umap() {
   }
 
   // ---- labeling: build a labelset from selections, save as an obs categorical ----
-  const startLabeling = async (name: string) => {
+  // seedFrom forks any ROOT categorical into a new labelset: local codes seed from
+  // it here; at save the backend copies the same column as the stored baseline.
+  // Labeling always operates in root space — in a view, seeds are gathered from
+  // the current root column via root_row (never the view's frozen copy).
+  const startLabeling = async (name: string, seedFrom?: string) => {
     setSavedLabels(null)
     const codes = new Int16Array(points.length).fill(-1)
     let cats: string[] = []
-    if (labelSets.some(s => s.name === name && s.own)) {
+    const src = seedFrom ?? (rootOwn.some(s => s.name === name) ? name : undefined)
+    if (src) {
       try {
-        const existing = await loadCategorical(name, group)
+        const existing = group ? await gatherRootCategorical(src, group) : await loadCategorical(src, '')
         cats = existing.categories
         for (let i = 0; i < codes.length; i++) codes[i] = existing.codes[i]
       } catch {
-        // labelset not materialized in this group (e.g. a view made before it) — start empty
+        // seed column unreadable (e.g. a pre-root_row view) — start empty
       }
     }
     const counts = new Array(cats.length).fill(0)
     for (let i = 0; i < codes.length; i++) if (codes[i] >= 0) counts[codes[i]]++
-    setLabeling({ name, cats, counts, codes })
+    setLabeling({ name, cats, counts, codes, seed: seedFrom })
     setPending([])
+    setSelectedLabels(new Set())
     setLabelVersion(v => v + 1)
   }
 
@@ -380,13 +407,16 @@ export default function Umap() {
         label: p.label,
         barcodes: p.indices.map(i => barcodes[i] ?? ''),
       }))
-      const res = await saveLabels(labeling.name, assignments)
+      const res = await saveLabels(labeling.name, assignments, labeling.seed)
       setSavedLabels({ name: res.name, labeled: res.labeled })
       setLabeling(null)
       setPending([])
       setSelectedLabels(new Set())
       setLabelVersion(v => v + 1)
-      setLabelSets(await loadLabelSets(group)) // the new column joins Color by
+      // the saved set lives on root: refresh both lists so it joins Color by here too
+      const [ls, rootLs] = await Promise.all([loadLabelSets(group), group ? loadLabelSets('') : null])
+      setLabelSets(ls)
+      setRootLabelSets(rootLs ?? ls)
     } catch (err) {
       setNotice(`Label save failed: ${err instanceof Error ? err.message : err}`)
     } finally {
@@ -467,7 +497,7 @@ export default function Umap() {
     getRadius: exprData ? worldRadius * 1.4 : worldRadius, // gene coloring pops a bit more
     radiusUnits: 'common',
     radiusMinPixels: 0.4,
-    radiusMaxPixels: 5,
+    radiusMaxPixels: 8, // let small views' dots grow when zoomed in for cell-level inspection
     getFillColor: d => {
       const i = d.index * 3
       let base: readonly number[] = exprData
@@ -503,64 +533,16 @@ export default function Umap() {
     pickable: false,
   })
 
-  // Full-screen overlay only for the very first load; keep the UI (incl. the group
-  // picker) mounted during a group switch so the dropdown doesn't vanish.
-  if (loading && points.length === 0) {
-    return <div style={overlayStyle}>Loading UMAP coordinates…</div>
-  }
-
-  if (error) {
-    return (
-      <div style={{ ...overlayStyle, color: '#f44', flexDirection: 'column', gap: 12 }}>
-        <div>Failed to load UMAP data: {error}</div>
-        <button
-          onClick={() => setRetryTick(t => t + 1)}
-          style={{ background: '#1c1c1c', color: '#ddd', border: '1px solid #444',
-                   borderRadius: 4, padding: '6px 14px', fontSize: 13, cursor: 'pointer' }}
-        >
-          Retry
-        </button>
-      </div>
-    )
-  }
-
-  return (
-    <>
-      <DeckGL
-        ref={deckRef}
-        views={new OrthographicView({ id: 'umap' })}
-        viewState={viewState}
-        onViewStateChange={e => setViewState(e.viewState)}
-        controller={{ dragPan: !selecting }} // free the drag gesture for the lasso
-        layers={[layer]}
-        style={{ width: '100%', height: '100%' }}
-      />
-
-      {/* Lasso overlay — a div captures the pointer (reliable full-box hit-testing);
-          the inner svg only draws the polygon (pointer-events:none so it never
-          intercepts). Present only while selecting. */}
-      {selecting && (
-        <div
-          style={{ position: 'absolute', inset: 0, zIndex: 10, cursor: 'crosshair' }}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-        >
-          <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
-            {lassoScreen.length > 1 && (
-              <polygon
-                points={lassoScreen.map(p => `${p[0]},${p[1]}`).join(' ')}
-                fill="rgba(255, 240, 30, 0.12)"
-                stroke="rgba(255, 240, 30, 0.9)"
-                strokeWidth={1.5}
-              />
-            )}
-          </svg>
-        </div>
-      )}
-
-      {/* Top-left stack: selection tool on top, View picker beneath it. */}
-      <div style={topLeftStack}>
+  // Side-rail sections: the app's feature panels, spatial-explorer style. The
+  // Legend stays floating on the canvas — it's the plot key and the
+  // cluster-click surface, so it can't live behind a rail click.
+  const railSections = [
+    {
+      id: 'select',
+      icon: 'material-symbols-light:lasso-select',
+      title: 'Selection',
+      badge: (selection?.indices.length ?? 0) > 0,
+      content: (
         <SelectionControls
           selecting={selecting}
           onToggle={toggleSelecting}
@@ -569,13 +551,21 @@ export default function Umap() {
           onSubmit={submitCurrent}
           onClear={clearSelection}
         />
+      ),
+    },
+    {
+      id: 'labels',
+      icon: 'material-symbols-light:new-label-outline',
+      title: 'Labels',
+      badge: !!labeling,
+      content: (
         <LabelsPanel
           active={labeling ? { name: labeling.name, cats: labeling.cats, counts: labeling.counts } : null}
-          ownSets={labelSets.filter(s => s.own).map(s => s.name)}
+          columns={rootLabelSets /* labeling operates in root space, even inside views */}
           selectionCount={selection?.indices.length ?? 0}
           saving={savingLabels}
           saved={savedLabels}
-          dirty={pending.length > 0}
+          dirty={pending.length > 0 || !!labeling?.seed}
           selectedLabels={selectedLabels}
           onLabelClick={toggleLabelCat}
           onStart={startLabeling}
@@ -584,36 +574,127 @@ export default function Umap() {
           onCancel={cancelLabeling}
           onDismissSaved={() => setSavedLabels(null)}
         />
-        <GroupPicker groups={groups} active={group} onChange={setGroup} onDelete={deleteCurrentView} />
-        <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
-      </div>
-      <RunsPanel refresh={submitCount} onViewReady={onViewReady} />
-      {/* legend tracks the actual coloring mode, not the picked gene */}
-      {!exprData && (
-        <Legend
-          levels={labelSets.map(s => s.name)}
-          level={level}
-          onLevelChange={setLevel}
-          categories={cat?.categories ?? null}
-          selected={selectedCats}
-          onCategoryClick={toggleCategory}
-          error={catError}
-          onRetry={() => setCatTick(t => t + 1)}
-        />
-      )}
+      ),
+    },
+    {
+      id: 'views',
+      icon: 'material-symbols-light:scatter-plot-outline',
+      title: 'Views',
+      content:
+        groups.length > 1 ? (
+          <GroupPicker groups={groups} active={group} onChange={setGroup} onDelete={deleteCurrentView} />
+        ) : (
+          <span style={mutedStyle}>No saved views yet — lasso a selection and run it on the GPU.</span>
+        ),
+    },
+    {
+      id: 'genes',
+      icon: 'material-symbols-light:genetics',
+      title: 'Genes',
+      badge: !!gene,
+      content:
+        genes.length > 0 ? (
+          <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
+        ) : (
+          <span style={mutedStyle}>No gene-readable matrix in this store.</span>
+        ),
+    },
+    {
+      id: 'runs',
+      icon: 'material-symbols-light:memory',
+      title: 'GPU runs',
+      badge: runsActive,
+      content: <RunsPanel refresh={submitCount} onViewReady={onViewReady} onActiveChange={setRunsActive} />,
+    },
+  ]
 
-      {notice && (
-        <div style={noticeStyle} onClick={() => setNotice(null)} title="dismiss">
-          {notice}
+  const canvas =
+    loading && points.length === 0 ? (
+      <div style={overlayStyle}>Loading UMAP coordinates…</div>
+    ) : error ? (
+      <div style={{ ...overlayStyle, color: '#f44', flexDirection: 'column', gap: 12 }}>
+        <div>Failed to load UMAP data: {error}</div>
+        <button
+          onClick={() => setRetryTick(t => t + 1)}
+          style={{ background: '#1c1c1c', color: '#ddd', border: '1px solid #444',
+                   borderRadius: 6, padding: '6px 14px', fontSize: 13, cursor: 'pointer' }}
+        >
+          Retry
+        </button>
+      </div>
+    ) : (
+      <>
+        <DeckGL
+          ref={deckRef}
+          views={new OrthographicView({ id: 'umap' })}
+          viewState={viewState}
+          onViewStateChange={e => setViewState(e.viewState)}
+          controller={{ dragPan: !selecting }} // free the drag gesture for the lasso
+          layers={[layer]}
+          style={{ width: '100%', height: '100%' }}
+        />
+
+        {/* Lasso overlay — a div captures the pointer (reliable full-box hit-testing);
+            the inner svg only draws the polygon (pointer-events:none so it never
+            intercepts). Present only while selecting. */}
+        {selecting && (
+          <div
+            style={{ position: 'absolute', inset: 0, zIndex: 10, cursor: 'crosshair' }}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+          >
+            <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+              {lassoScreen.length > 1 && (
+                <polygon
+                  points={lassoScreen.map(p => `${p[0]},${p[1]}`).join(' ')}
+                  fill="rgba(255, 240, 30, 0.12)"
+                  stroke="rgba(255, 240, 30, 0.9)"
+                  strokeWidth={1.5}
+                />
+              )}
+            </svg>
+          </div>
+        )}
+
+        {/* legend tracks the actual coloring mode, not the picked gene */}
+        {!exprData && (
+          <Legend
+            levels={[...new Set([...dropdownLabelSets(labelSets), ...rootOwn.map(s => s.name)])]}
+            level={level}
+            onLevelChange={setLevel}
+            categories={cat?.categories ?? null}
+            selected={selectedCats}
+            onCategoryClick={toggleCategory}
+            error={catError}
+            onRetry={() => setCatTick(t => t + 1)}
+          />
+        )}
+
+        {notice && (
+          <div style={noticeStyle} onClick={() => setNotice(null)} title="dismiss">
+            {notice}
+          </div>
+        )}
+      </>
+    )
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <Header />
+      <div style={{ display: 'flex', flex: 1, minHeight: 0, position: 'relative' }}>
+        <SideRail sections={railSections} />
+        <div style={{ flex: 1, position: 'relative', minWidth: 0, background: '#111' }}>
+          {canvas}
         </div>
-      )}
-      {/* pointer-blocking scrim: also prevents a second ✕ click mid-delete */}
-      {deleting && (
-        <div style={{ ...overlayStyle, background: 'rgba(17,17,17,0.75)', zIndex: 40 }}>
-          Deleting view…
-        </div>
-      )}
-    </>
+        {/* pointer-blocking scrim: also prevents a second ✕ click mid-delete */}
+        {deleting && (
+          <div style={{ ...overlayStyle, background: 'rgba(17,17,17,0.75)', zIndex: 40 }}>
+            Deleting view…
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -635,22 +716,15 @@ function fitView(pts: Point[]): { target: [number, number, number]; zoom: number
   if (!Number.isFinite(minX)) return { target: [0, 0, 0], zoom: 3 }
   const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2
   const extentX = Math.max(maxX - minX, 1e-6), extentY = Math.max(maxY - minY, 1e-6)
-  const vw = window.innerWidth || 800, vh = window.innerHeight || 600
+  // canvas = viewport minus the header (top) and rail (left)
+  const vw = (window.innerWidth || 800) - HEADER_HEIGHT, vh = (window.innerHeight || 600) - HEADER_HEIGHT
   const zoom = Math.log2(Math.min(vw / extentX, vh / extentY) * 0.9)
   return { target: [cx, cy, 0], zoom: Math.max(-2, Math.min(zoom, 10)) }
 }
 
-// Top-left overlay column: selection controls, then the View picker below them.
-// zIndex 20 keeps it above the lasso svg overlay (zIndex 10).
-const topLeftStack: React.CSSProperties = {
-  position: 'absolute',
-  top: 12,
-  left: 12,
-  zIndex: 20,
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 8,
-  alignItems: 'flex-start',
+const mutedStyle: React.CSSProperties = {
+  fontSize: 12,
+  color: '#888',
 }
 
 const overlayStyle: React.CSSProperties = {

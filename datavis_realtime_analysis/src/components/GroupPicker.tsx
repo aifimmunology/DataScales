@@ -8,7 +8,7 @@ type Props = {
   onDelete: (id: string) => void
 }
 
-// Top-left overlay: pick which embedding ("group") to view — the root store or any
+// Rail section: pick which embedding ("group") to view — the root store or any
 // nested view store (e.g. a re-clustered cell subset). Hidden when there's nothing
 // to switch between (a single group), so it stays out of the way by default.
 export default function GroupPicker({ groups, active, onChange, onDelete }: Props) {

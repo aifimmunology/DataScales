@@ -16,21 +16,31 @@ from .config import DATA_DIR, SOURCE
 
 # Client created on first use so /api/health works without credentials.
 _gcs_client = None
+_bucket_obj = None
 _client_lock = threading.Lock()
 _size_cache: dict[str, int] = {}
+_LOCAL_ROOT = Path(SOURCE["root"]).resolve() if not SOURCE["gcs"] else None
 
 
 def bucket():
-    global _gcs_client
-    with _client_lock:
-        if _gcs_client is None:
-            from google.cloud import storage
+    global _gcs_client, _bucket_obj
+    if _bucket_obj is None:
+        with _client_lock:
+            if _bucket_obj is None:
+                from google.cloud import storage
+                from requests.adapters import HTTPAdapter
 
-            try:
-                _gcs_client = storage.Client()
-            except Exception as e:
-                raise HTTPException(503, f"GCS auth failed: {e}")
-    return _gcs_client.bucket(SOURCE["bucket"])
+                try:
+                    client = storage.Client()
+                except Exception as e:
+                    raise HTTPException(503, f"GCS auth failed: {e}")
+                # default transport pools 10 connections; a page load fans out far
+                # wider through the request threadpool and would churn TCP+TLS
+                # handshakes on every over-cap request
+                client._http.mount("https://", HTTPAdapter(pool_connections=64, pool_maxsize=64))
+                _gcs_client = client
+                _bucket_obj = client.bucket(SOURCE["bucket"])
+    return _bucket_obj
 
 
 def key(rel: str) -> str:
@@ -50,17 +60,24 @@ def serve(path: str, request: Request):
     if SOURCE["gcs"]:
         return _gcs_response(path, request)
 
-    file = (Path(SOURCE["root"]) / path).resolve()
-    if not file.is_relative_to(Path(SOURCE["root"]).resolve()) or not file.is_file():
+    file = (_LOCAL_ROOT / path).resolve()
+    if not file.is_relative_to(_LOCAL_ROOT) or not file.is_file():
         raise HTTPException(404, "Not found")
     # groups.json mutates on register/delete — a cached copy resurrects deleted views
     headers = {"Cache-Control": "no-store"} if path.endswith("groups.json") else None
     return FileResponse(file, media_type=_media_type(path), headers=headers)
 
 
-def _gcs_response(path: str, request: Request) -> Response:
+def _download(b, k: str, start=None, end=None) -> bytes:
     from google.api_core.exceptions import NotFound
 
+    try:
+        return b.blob(k).download_as_bytes(start=start, end=end)
+    except NotFound:
+        raise HTTPException(404, "Not found")
+
+
+def _gcs_response(path: str, request: Request) -> Response:
     b = bucket()
     k = key(path)
     media = _media_type(path)
@@ -71,7 +88,9 @@ def _gcs_response(path: str, request: Request) -> Response:
             blob = b.get_blob(k)
             if blob is None:
                 raise HTTPException(404, "Not found")
-            size = _size_cache[k] = blob.size
+            size = blob.size
+            if not path.endswith(".json"):  # json objects are the mutable ones
+                _size_cache[k] = size
         headers = {"Content-Length": str(size), "Accept-Ranges": "bytes"}
         return Response(headers=headers, media_type=media)
 
@@ -87,10 +106,7 @@ def _gcs_response(path: str, request: Request) -> Response:
     headers = {"Accept-Ranges": "bytes"}
     if start is not None:
         # ranged reads are small (shard indexes) — buffered is fine
-        try:
-            payload = b.blob(k).download_as_bytes(start=start, end=end)
-        except NotFound:
-            raise HTTPException(404, "Not found")
+        payload = _download(b, k, start=start, end=end)
         if start >= 0:
             headers["Content-Range"] = f"bytes {start}-{start + len(payload) - 1}/*"
         return Response(payload, status_code=206, media_type=media, headers=headers)
@@ -98,10 +114,7 @@ def _gcs_response(path: str, request: Request) -> Response:
     # full-object GET. Buffered on purpose: zarr chunks compress to KBs (a 3M-row
     # dense uint16 column is ~4 KB), so streaming buys nothing — benchmarked via
     # both BlobReader and a download_to_file relay, no measurable win.
-    try:
-        payload = b.blob(k).download_as_bytes()
-    except NotFound:
-        raise HTTPException(404, "Not found")
+    payload = _download(b, k)
     if path.endswith("groups.json"):  # mutable listing — never let a cache serve it
         headers["Cache-Control"] = "no-store"
     return Response(payload, media_type=media, headers=headers)
@@ -123,6 +136,7 @@ def write_json(rel: str, obj) -> None:
     bucket().blob(key(rel)).upload_from_string(
         json.dumps(obj, indent=1), content_type="application/json"
     )
+    _size_cache.pop(key(rel), None)  # a rewritten object must not serve a stale HEAD
 
 
 def delete_object(rel: str) -> None:

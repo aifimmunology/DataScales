@@ -13,7 +13,7 @@ services:
     ports:
       - "8000:8000"
     # values come from .env (auto-loaded, gitignored); pipeline args live in
-    # ../rerun_umap_on_selection.py
+    # ./gpu/rerun_umap_on_selection.py
     environment:
       DATA_DIR: ${DATA_DIR}
       GPU_INSTANCE: ${GPU_INSTANCE:-}
@@ -25,7 +25,8 @@ services:
       # whole dir, not the key files: they may not exist yet — the first in-container
       # gcloud ssh generates a keypair itself when IAM allows
       - ~/.ssh:/ssh-ro:ro
-      - ../gpu_job.sh:/gpu_job.sh:ro
-      - ../rerun_umap_on_selection.py:/rerun_umap_on_selection.py:ro
+      # the directory, not the files: file mounts pin inodes and serve stale
+      # content after an edit replaces the file
+      - ./gpu:/app/gpu:ro
       # local store instead of GCS: uncomment and run with DATA_DIR=/data
       # - ./data/soundlife-other-tiny.zarr:/data:ro

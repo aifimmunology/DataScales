@@ -33,7 +33,7 @@ def _ssh_cmd(remote: str) -> list[str]:
             "--command", remote]
 
 
-def _ship(job_id: str) -> None:
+def _ship() -> None:
     # fresh scripts every job: the repo stays the source of truth on the box
     r = subprocess.run(["gcloud", "-q", "compute", "scp", str(JOB_SCRIPT), str(RERUN_SCRIPT),
                         f"{GPU_INSTANCE}:/tmp/", f"--zone={GPU_ZONE}"],
@@ -44,11 +44,11 @@ def _ship(job_id: str) -> None:
 
 def _run_gpu_job(job: dict, slug: str) -> None:
     rid = job["id"]
-    _ship(rid)
+    _ship()
     job["stage"] = "dispatching to GPU"
     remote = f"bash /tmp/{JOB_SCRIPT.name} {DATA_DIR} {rid} {slug} {GPU_PIXI_DIR}"
-    log = open(f"/tmp/datavis_job_{rid}.log", "ab")
-    proc = subprocess.Popen(_ssh_cmd(remote), stdout=log, stderr=subprocess.STDOUT)
+    with open(f"/tmp/datavis_job_{rid}.log", "ab") as log:  # child keeps its own fd
+        proc = subprocess.Popen(_ssh_cmd(remote), stdout=log, stderr=subprocess.STDOUT)
 
     # the job script owns the truth: poll its status object until terminal
     dead_polls = 0

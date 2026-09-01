@@ -14,11 +14,15 @@ const fmtElapsed = (iso: string) => {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`
 }
 
-type Props = { refresh: number; onViewReady: (path: string) => void }
+type Props = {
+  refresh: number
+  onViewReady: (path: string) => void
+  onActiveChange?: (active: boolean) => void // drives the side-rail badge
+}
 
 // refresh bumps on submit; polling runs while a job is queued/running; when a job
 // finishes with a view path, onViewReady fires once so the View picker can refresh.
-export default function RunsPanel({ refresh, onViewReady }: Props) {
+export default function RunsPanel({ refresh, onViewReady, onActiveChange }: Props) {
   const [jobs, setJobs] = useState<Job[]>([])
   const notified = useRef(new Set<string>())
   const poll = () => fetchJobs().then(setJobs).catch(() => {})
@@ -28,6 +32,9 @@ export default function RunsPanel({ refresh, onViewReady }: Props) {
   }, [refresh])
 
   const active = jobs.some(j => j.status === 'running' || j.status === 'queued')
+  useEffect(() => {
+    onActiveChange?.(active)
+  }, [active, onActiveChange])
   useEffect(() => {
     if (!active) return
     const t = setInterval(poll, 2000)
@@ -51,11 +58,12 @@ export default function RunsPanel({ refresh, onViewReady }: Props) {
     }
   }, [jobs, onViewReady])
 
-  if (jobs.length === 0) return null
+  if (jobs.length === 0) {
+    return <div style={{ fontSize: 12, color: '#888' }}>No GPU runs yet this session.</div>
+  }
 
   return (
     <div style={panelStyle}>
-      <div style={{ fontSize: 11, color: '#888', marginBottom: 6 }}>GPU runs</div>
       {jobs.map(j => (
         <div key={j.id} style={rowStyle}>
           <span style={{ color: STATUS[j.status].color }}>{STATUS[j.status].icon}</span>
@@ -79,15 +87,8 @@ export default function RunsPanel({ refresh, onViewReady }: Props) {
 
 const panelStyle: React.CSSProperties = {
   ...panel,
-  position: 'absolute',
-  bottom: 12,
-  left: 12,
-  zIndex: 20,
   fontSize: 12,
   color: '#999',
-  maxHeight: 200,
-  maxWidth: 520,
-  overflowY: 'auto',
 }
 
 const rowStyle: React.CSSProperties = {
@@ -95,5 +96,5 @@ const rowStyle: React.CSSProperties = {
   gap: 8,
   alignItems: 'baseline',
   padding: '2px 0',
-  whiteSpace: 'nowrap',
+  flexWrap: 'wrap',
 }

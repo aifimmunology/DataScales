@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from .config import DATA_DIR
 
 _lock = threading.Lock()
-_barcode_index = None  # (sorted names, argsort order); root obs is effectively static
+_barcode_index = None  # {barcode: root row} built once; root obs is effectively static
 
 CODES_CHUNK = 375_000  # matches the store's obs column chunking
 
@@ -30,16 +30,14 @@ def _rows_for(obs, barcodes: list[str]):
 
     global _barcode_index
     if _barcode_index is None:
-        names = np.asarray(obs[obs.attrs.get("_index", "_index")][:], dtype=object)
-        order = np.argsort(names)
-        _barcode_index = (names[order], order)
-    sorted_names, order = _barcode_index
-    q = np.asarray(barcodes, dtype=object)
-    pos = np.clip(np.searchsorted(sorted_names, q), 0, len(sorted_names) - 1)
-    ok = sorted_names[pos] == q
-    if not bool(ok.all()):
-        raise HTTPException(400, f"{int((~ok).sum())} barcodes not found in the store")
-    return order[pos]
+        names = obs[obs.attrs.get("_index", "_index")][:]
+        _barcode_index = {str(b): i for i, b in enumerate(names)}
+    idx = _barcode_index
+    try:
+        return np.fromiter((idx[b] for b in barcodes), dtype=np.int64, count=len(barcodes))
+    except KeyError:
+        missing = sum(1 for b in barcodes if b not in idx)
+        raise HTTPException(400, f"{missing} barcodes not found in the store")
 
 
 def _write_categorical(obs, name: str, codes, cats: list[str]) -> None:
@@ -66,21 +64,32 @@ def save_labels(payload: dict) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,59}", name):
         raise HTTPException(400, "labelset name must be alphanumeric/_/./- (max 60 chars)")
     assignments = payload.get("assignments") or []
-    if not assignments:
+    seed = str(payload.get("seed") or "")
+    if not assignments and not seed:
         raise HTTPException(400, "no label assignments")
 
     import numpy as np
 
     with _lock:
         obs = _open_obs()
-        n = obs[obs.attrs.get("_index", "_index")].shape[0]
         if name in obs:
             g = obs[name]
             if not g.attrs.get("datavis-labelset"):
                 raise HTTPException(409, f"obs column '{name}' exists and is not a datavis labelset")
             codes = g["codes"][:].astype(np.int16)
             cats = [str(c) for c in g["categories"][:]]
+        elif seed:
+            # fork-to-edit: copy the seed column server-side as the baseline (the
+            # seeded labels are too many to ride the request payload)
+            if seed not in obs:
+                raise HTTPException(400, f"seed column '{seed}' not found in obs")
+            sg = obs[seed]
+            if sg.attrs.get("encoding-type") != "categorical":
+                raise HTTPException(400, f"seed column '{seed}' is not categorical")
+            codes = sg["codes"][:].astype(np.int16)
+            cats = [str(c) for c in sg["categories"][:]]
         else:
+            n = obs[obs.attrs.get("_index", "_index")].shape[0]
             codes = np.full(n, -1, dtype=np.int16)
             cats = []
         for a in assignments:  # applied in order: later assignments win on overlap

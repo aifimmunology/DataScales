@@ -7,6 +7,7 @@ COPY package.json bun.lock* ./
 RUN bun install
 
 COPY tsconfig.json vite.config.ts index.html ./
+COPY public ./public
 COPY src ./src
 
 RUN bun run build
