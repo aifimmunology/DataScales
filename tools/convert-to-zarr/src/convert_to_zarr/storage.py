@@ -9,7 +9,7 @@ so every existing writer (``write_elem``, ``da.store``, ``require_array`` …) w
 * ``backend="icechunk"`` — commits the writable session (one commit per conversion, per the
   Icechunk "few, large commits" guidance).
 
-Icechunk's API is verified against the vendored source (v2.0.6); it is imported lazily so the
+Icechunk's API is verified against the vendored source (v2.1.2); it is imported lazily so the
 default zarr path never touches it.
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ def open_output_store(
         root = zarr.open_group(store=session.store, mode="w")
 
         def finalize() -> None:
-            msg = commit_message or f"convert-to-zarr convert → {output_path.name}"
+            msg = commit_message or f"convert-to-zarr write → {output_path.name}"
             snapshot_id = session.commit(msg)
             print(
                 f"  icechunk commit {snapshot_id} on branch 'main'",
@@ -101,14 +101,67 @@ def open_output_store(
     return root, finalize
 
 
+def open_store_rw(
+    store_path: Path, cfg: AppConfig, *, commit_message: str | None = None
+) -> tuple[zarr.Group, Callable[[], None]]:
+    """Open an existing store for in-place update; finalize() commits/re-consolidates."""
+    if cfg.io.backend == "icechunk":
+        import icechunk
+
+        repo = icechunk.Repository.open(_icechunk_storage(store_path, cfg))
+        session = repo.writable_session("main")
+        root = zarr.open_group(store=session.store, mode="r+")
+
+        def finalize() -> None:
+            msg = commit_message or f"convert-to-zarr update → {store_path.name}"
+            snapshot_id = session.commit(msg)
+            print(
+                f"  icechunk commit {snapshot_id} on branch 'main'",
+                flush=True, file=sys.stderr,
+            )
+
+        return root, finalize
+
+    if not store_path.exists():
+        raise StorageError(f"Store does not exist: {store_path}")
+    # use_consolidated=False: anndata's write_elem refuses to edit a group opened
+    # through consolidated metadata; finalize() re-consolidates below.
+    root = zarr.open_group(str(store_path), mode="r+", use_consolidated=False)
+
+    import json
+
+    meta_file = store_path / "zarr.json"
+    had_consolidated = (
+        meta_file.exists()
+        and json.loads(meta_file.read_text()).get("consolidated_metadata") is not None
+    )
+
+    def finalize() -> None:
+        if had_consolidated or cfg.io.consolidate_metadata:
+            zarr.consolidate_metadata(str(store_path))
+
+    return root, finalize
+
+
+def _is_icechunk_repo(path: Path) -> bool:
+    """Local icechunk repos carry repo/ + snapshots/ and no zarr.json at the root."""
+    return (
+        path.is_dir()
+        and not (path / "zarr.json").exists()
+        and (path / "snapshots").is_dir()
+        and (path / "repo").exists()
+    )
+
+
 def open_input_group(
     path: str, *, icechunk: bool = False, branch: str = "main"
 ) -> zarr.Group:
     """Open an existing store read-only as a zarr group (for the reader).
 
-    Plain zarr opens the directory directly; icechunk opens a read-only session at ``branch``.
+    Icechunk repos are auto-detected and opened as a read-only session at ``branch``;
+    anything else opens as a plain zarr directory.
     """
-    if icechunk:
+    if icechunk or _is_icechunk_repo(Path(path)):
         import icechunk as ic
 
         repo = ic.Repository.open(ic.local_filesystem_storage(path))
