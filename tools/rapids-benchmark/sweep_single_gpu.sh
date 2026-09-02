@@ -9,11 +9,12 @@ OUTDIR="${OUTDIR:-$HERE/results}"
 
 DATASETS=(
   #"/mnt/5M_sparse_sorted_9.zarr"
-  "/mnt/subset3M_megazarr_v1.0.zarr"
+  "/mnt/subset3M_megazarr_v1.0.zarr",
+  "/mnt"
 )
 
 RMM=(managed) #pool)
-CHUNK_ROWS=(48000)
+CHUNK_ROWS=(48000 24000)
 
 THREAD_SPLITS=(12:12) #12:12)
 ZARR_CONCURRENCY=12
