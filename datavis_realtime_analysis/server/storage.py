@@ -51,6 +51,12 @@ def _media_type(path: str) -> str:
     return "application/json" if path.endswith(".json") else "application/octet-stream"
 
 
+# zarr member names are plain (letters, digits, . _ -, no leading dot), so a strict
+# per-segment whitelist rejects nothing legitimate while making traversal, dotfiles,
+# and malformed bytes unrepresentable before any filesystem use.
+_SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
 def serve(path: str, request: Request):
     if not DATA_DIR:
         raise HTTPException(503, "DATA_DIR is not set")
@@ -60,8 +66,14 @@ def serve(path: str, request: Request):
     if SOURCE["gcs"]:
         return _gcs_response(path, request)
 
-    file = (_LOCAL_ROOT / path).resolve()
-    if not file.is_relative_to(_LOCAL_ROOT) or not file.is_file():
+    if not all(_SAFE_SEGMENT.fullmatch(s) for s in path.split("/")):
+        raise HTTPException(404, "Not found")
+    try:
+        file = (_LOCAL_ROOT / path).resolve()
+        ok = file.is_relative_to(_LOCAL_ROOT) and file.is_file()
+    except (OSError, ValueError):  # malformed paths must 404, never 500
+        ok = False
+    if not ok:
         raise HTTPException(404, "Not found")
     # groups.json mutates on register/delete — a cached copy resurrects deleted views
     headers = {"Cache-Control": "no-store"} if path.endswith("groups.json") else None
