@@ -78,15 +78,7 @@ DATA_DIR=./data/soundlife-other-tiny.zarr uvicorn server.main:app --reload
 
 Two services via compose: nginx serves the built frontend and proxies `/api`; the FastAPI backend reads the store from GCS.
 
-### 1. Authenticate (once per machine)
-
-```bash
-gcloud auth application-default login
-```
-
-This writes ADC credentials under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs `roles/storage.objectAdmin` on the bucket
-
-### 2. Configure `.env`
+### 1. Configure `.env`
 
 Create `.env` in the repo
 
@@ -101,6 +93,22 @@ GPU_PIXI_DIR=/path/on/box/to/pixi-project
 - `GPU_INSTANCE` — the GCE instance name GPU jobs are dispatched to over `gcloud compute ssh`.
 - `GPU_ZONE` — that instance's compute zone.
 - `GPU_PIXI_DIR` — the pixi project directory on the instance whose env the pipeline runs in.
+
+
+### 2. Authenticate (once per machine)
+
+```bash
+gcloud auth login                       # CLI credential — GPU dispatch (compute ssh/scp)
+gcloud auth application-default login   # ADC — the fastAPI backend's GCS reads/writes
+gcloud config set project MY_PROJECT
+```
+
+Credentials land under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs `roles/storage.objectAdmin` on the bucket; GPU runs also need instance SSH rights (`roles/compute.osLogin` or `instanceAdmin.v1`) plus `roles/iam.serviceAccountUser` on the instance's service account.
+
+test GPU access (also generates the ssh key compose mounts in):
+```bash
+gcloud compute ssh MY_GPU_INSTANCE --zone=MY_ZONE --command='echo ok'
+```
 
 
 ### 3. Build and run
@@ -119,6 +127,7 @@ docker compose logs -f backend
 
 ### Troubleshooting
 
+- `Reauthentication required/failed` on GPU submit — the org session policy expires user credentials (~weekly). Re-run both `gcloud auth` commands on the **host**, then `docker compose restart backend` (credentials are copied in at container start). The GPU box never needs reauth — jobs there run as the instance's service account.
 - `503 GCS auth failed` — re-run step 1 on the host; confirm `~/.config/gcloud/application_default_credentials.json` exists.
 - `port is already allocated` — something else is publishing 3000/8000; `docker ps`, then stop it.
 
