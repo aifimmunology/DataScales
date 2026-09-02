@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import anndata as ad
+import numpy as np
 import scipy.sparse as sp
 
 from ..config import AppConfig, _resolve_backend_cfg
@@ -15,7 +16,7 @@ from ..sources import _close_backed_if_needed, _load_h5ad_for_conversion
 from ..storage import open_output_store
 from ..validation import validate_single_cell_anndata
 from ..writers import _write_csr_adata_direct
-from .sort import _maybe_sort_adata, _write_sorted_backed
+from ..sorting import _maybe_sort_adata, _write_sorted_backed
 
 
 def _write_adata_to_zarr(
@@ -27,8 +28,9 @@ def _write_adata_to_zarr(
 ) -> list[str]:
     """Write AnnData to zarr (or icechunk).
 
-    adata.X is expected to be CSR, but CSC is accepted and converted to CSR in memory with
-    a warning. When ``allow_grouping`` and grouping is enabled, rows are sorted first.
+    adata.X is expected to be CSR; CSC is converted to CSR in memory with a warning, and
+    dense X is accepted (streamed for dense output, sparsified in memory for sparse output
+    on eager loads). When ``allow_grouping`` and grouping is enabled, rows are sorted first.
     """
     cfg = _resolve_backend_cfg(cfg)
     configure_runtime(cfg.chunks.cpus)
@@ -45,25 +47,47 @@ def _write_adata_to_zarr(
         )
 
     x_for_write: Any | None = None
-    is_csr = sp.isspmatrix_csr(adata.X) or (
-        not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csr"  # backed mode
-    )
-    is_csc = sp.isspmatrix_csc(adata.X) or (
-        not sp.issparse(adata.X) and getattr(adata.X, "format", None) == "csc"  # backed mode
+    x = adata.X
+    is_sparse_mem = sp.issparse(x)
+    backed_format = getattr(x, "format", None)  # anndata backed sparse datasets
+    is_csr = sp.isspmatrix_csr(x) or (not is_sparse_mem and backed_format == "csr")
+    is_csc = sp.isspmatrix_csc(x) or (not is_sparse_mem and backed_format == "csc")
+    # dense: in-memory ndarray, or a backed h5py dataset (2-D, no sparse format);
+    # masked arrays are excluded — silently dropping a mask would corrupt values
+    is_dense = (
+        not is_sparse_mem
+        and backed_format is None
+        and getattr(x, "ndim", 0) == 2
+        and not np.ma.isMaskedArray(x)
     )
 
     if not is_csr:
         if is_csc:
-            if sp.issparse(adata.X):
-                x_for_write = adata.X.tocsr()
+            if is_sparse_mem:
+                x_for_write = x.tocsr()
             else:
-                x_for_write = adata.X[:].tocsr()
+                x_for_write = x[:].tocsr()
             warnings.append(
                 "adata.X was CSC and has been converted to CSR in memory before zarr conversion."
             )
+        elif is_dense and cfg.io.x_storage == "dense":
+            pass  # the writer streams dense input to dense output directly
+        elif is_dense and not cfg.io.backed:
+            # eager dense (issue #4): X is already in memory — sparsify for sparse output,
+            # directly in the target format (no CSR->CSC double conversion)
+            to_sparse = sp.csr_matrix if cfg.io.x_storage == "sparse-csr" else sp.csc_matrix
+            x_for_write = to_sparse(np.asarray(x))
+            warnings.append(
+                "adata.X was dense and has been converted to sparse in memory for sparse output."
+            )
+        elif is_dense:
+            raise ConversionError(
+                "backed dense X with sparse output is not supported: use --x-storage dense "
+                "(streamed) or omit --backed to convert in memory."
+            )
         else:
             raise ConversionError(
-                f"adata.X must be CSR or CSC format. Got: {type(adata.X).__name__}"
+                f"adata.X must be CSR, CSC, or dense. Got: {type(x).__name__}"
             )
 
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
@@ -76,7 +100,7 @@ def _write_adata_to_zarr(
     )
     t0 = time.perf_counter()
     store, finalize = open_output_store(
-        output_path, cfg, commit_message=f"zarrsmith convert → {output_path.name}",
+        output_path, cfg, commit_message=f"convert-to-zarr convert → {output_path.name}",
     )
     _write_csr_adata_direct(adata, store, cfg, x_override=x_for_write)
     finalize()

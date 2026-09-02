@@ -6,10 +6,10 @@ from pathlib import Path
 
 import zarr
 
-from ..config import AppConfig
-from ..engine import _run_parallel_threads, _stage, configure_runtime
-from ..errors import ConversionError
-from ..storage import open_input_group, open_store_rw
+from convert_to_zarr.config import AppConfig
+from convert_to_zarr.engine import _run_parallel_threads, _stage, configure_runtime
+from convert_to_zarr.errors import ConversionError
+from convert_to_zarr.storage import open_input_group, open_store_rw
 from .expr import _introspect_gexp, add_expr_layer
 
 _SEG_BYTES = 256 * 1024 * 1024

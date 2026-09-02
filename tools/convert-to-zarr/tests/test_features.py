@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from zarrsmith.config import (
+from convert_to_zarr.config import (
     AppConfig,
     ChunkConfig,
     ConcatConfig,
@@ -15,13 +15,13 @@ from zarrsmith.config import (
     IOConfig,
     ValidationConfig,
 )
-from zarrsmith import (
+from convert_to_zarr import (
     ConversionError,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
 )
-from zarrsmith.config import _validate_config
-from zarrsmith.storage import open_input_group
+from convert_to_zarr.config import _validate_config
+from convert_to_zarr.storage import open_input_group
 
 
 # ---------------------------------------------------------------------------

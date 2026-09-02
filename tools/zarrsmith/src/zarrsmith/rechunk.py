@@ -4,11 +4,11 @@ from pathlib import Path
 
 import zarr
 
-from ..config import AppConfig, _resolve_backend_cfg
-from ..engine import _run_parallel_threads, _stage, configure_runtime
-from ..errors import ConversionError
-from ..layout import _dense_shards
-from ..storage import open_input_group, open_output_store
+from convert_to_zarr.config import AppConfig, _resolve_backend_cfg
+from convert_to_zarr.engine import _run_parallel_threads, _stage, configure_runtime
+from convert_to_zarr.errors import ConversionError
+from convert_to_zarr.layout import _dense_shards
+from convert_to_zarr.storage import open_input_group, open_output_store
 
 _SMALL_ELEMS = ("obs", "var", "uns", "varm", "varp")
 _SEG_BYTES = 256 * 1024 * 1024

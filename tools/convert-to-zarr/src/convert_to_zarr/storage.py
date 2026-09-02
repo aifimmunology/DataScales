@@ -81,7 +81,7 @@ def open_output_store(
         root = zarr.open_group(store=session.store, mode="w")
 
         def finalize() -> None:
-            msg = commit_message or f"zarrsmith write → {output_path.name}"
+            msg = commit_message or f"convert-to-zarr write → {output_path.name}"
             snapshot_id = session.commit(msg)
             print(
                 f"  icechunk commit {snapshot_id} on branch 'main'",
@@ -113,7 +113,7 @@ def open_store_rw(
         root = zarr.open_group(store=session.store, mode="r+")
 
         def finalize() -> None:
-            msg = commit_message or f"zarrsmith update → {store_path.name}"
+            msg = commit_message or f"convert-to-zarr update → {store_path.name}"
             snapshot_id = session.commit(msg)
             print(
                 f"  icechunk commit {snapshot_id} on branch 'main'",

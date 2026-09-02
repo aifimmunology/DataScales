@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from zarrsmith.config import AppConfig, apply_cli_overrides, load_config
+from convert_to_zarr.config import AppConfig, apply_cli_overrides, load_config
 
 
 def test_default_config() -> None:

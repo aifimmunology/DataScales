@@ -9,15 +9,9 @@ import pytest
 import scipy.sparse as sp
 import zarr
 
-from zarrsmith import (
-    ConversionError,
-    add_expr_layer,
-    append_cells,
-    convert_h5ad_to_zarr,
-    rechunk_store,
-    sort_store,
-)
-from zarrsmith.config import AppConfig, ChunkConfig, GroupingConfig, IOConfig
+from convert_to_zarr import ConversionError, convert_h5ad_to_zarr
+from convert_to_zarr.config import AppConfig, ChunkConfig, GroupingConfig, IOConfig
+from zarrsmith import add_expr_layer, append_cells, rechunk_store, sort_store
 
 
 def _cfg(**io):
@@ -271,7 +265,7 @@ def test_append_refresh_expr(tmp_path):
 def test_add_expr_multiband(tmp_path, monkeypatch):
     # tiny band budget → many column bands + multiple row batches, exercising the
     # bucket cursors and band-edge math the default 256 MB budget never hits in tests
-    monkeypatch.setattr("zarrsmith.ops.expr._BAND_BYTES", 600)
+    monkeypatch.setattr("zarrsmith.expr._BAND_BYTES", 600)
     adata = _adata(n=1200, v=12, seed=4)
     for fmt in ("csc", "dense"):
         out = _store(tmp_path, adata, f"mb-{fmt}.zarr")
@@ -311,7 +305,7 @@ def test_lifecycle_plain(tmp_path):
 def test_lifecycle_icechunk(tmp_path):
     pytest.importorskip("icechunk")
     from anndata.io import read_elem, sparse_dataset
-    from zarrsmith.storage import open_input_group
+    from convert_to_zarr.storage import open_input_group
 
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     cfg_ic = AppConfig(

@@ -4,6 +4,7 @@ import sys
 from typing import Any
 
 import anndata as ad
+import numpy as np
 import scipy.sparse as sp
 import zarr
 
@@ -196,6 +197,9 @@ def _write_matrix_direct(
             matrix = matrix[:].tocsc()
         elif mode == "sparse-csr" and dataset_format != "csr":
             matrix = matrix[:].tocsr()
+    elif isinstance(matrix, np.ndarray):
+        # eager dense layer / raw.X under sparse output: sparsify in memory (issue #4)
+        matrix = sp.csr_matrix(matrix) if mode == "sparse-csr" else sp.csc_matrix(matrix)
     elif mode == "sparse-csr" and sp.issparse(matrix) and not sp.isspmatrix_csr(matrix):
         matrix = matrix.tocsr()
     elif mode == "sparse-csc" and sp.issparse(matrix) and not sp.isspmatrix_csc(matrix):

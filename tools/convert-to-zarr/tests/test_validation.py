@@ -1,8 +1,8 @@
 import numpy as np
 from anndata import AnnData
 
-from zarrsmith.config import ValidationConfig
-from zarrsmith.validation import ValidationError, validate_single_cell_anndata
+from convert_to_zarr.config import ValidationConfig
+from convert_to_zarr.validation import ValidationError, validate_single_cell_anndata
 
 
 def test_validate_non_spatial_ok() -> None:

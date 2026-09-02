@@ -1,12 +1,18 @@
 # zarrsmith build spec
 
-zarrsmith = convert-to-zarr (h5ad→zarr creation) merged with store-surgery ops on existing
-AnnData zarr stores. One streaming/parallel engine, one config/storage/encoding layer, ops on top.
+zarrsmith = store-surgery ops on existing AnnData zarr stores (add-expr, rechunk, sort,
+append), built on convert-to-zarr's shared core (one streaming/parallel engine, one
+config/storage/encoding layer).
 
 ## Decisions (locked)
 
-- Name: **zarrsmith**; CLI `zarrsmith convert|convert-10x|concat|sort|rechunk|append|add-expr`.
-- Clean break from `convert-to-zarr` (no alias).
+- **Split (2026-09):** two tools again. `tools/convert-to-zarr` owns creation
+  (`convert-to-zarr convert-h5ad|convert-10x-h5|concat-h5ads` — the public surface the repo
+  workflows/tests pin) plus the shared core modules (sources/writers/engine/layout/config/
+  storage/validation/errors/sorting). `tools/zarrsmith` owns editing
+  (`zarrsmith add-expr|rechunk|sort|append`) and depends on convert-to-zarr as a local path
+  dependency — the core lives once.
+- Name: **zarrsmith** for the editing tool.
 - Mutation policy: additive ops (append, add-expr) write in place on plain zarr (new
   arrays/groups only, re-consolidate metadata if present); rewriting ops (rechunk, sort)
   always write a new store via temp + atomic swap. `--icechunk` turns any op into one commit.
@@ -59,20 +65,28 @@ above, --version/inspect, README fixes (--cpus/--backed row, 64 MB cap claim,
 Tests (still open): remaining append guards, int32→int64 promotion via patchable
 constant, rechunk of layers/raw/sharded arrays, memory-bound assertions.
 
-## Module map
+## Module map (post-split)
 
 ```
-src/zarrsmith/
-├── cli.py         subcommand → op (thin)
+tools/convert-to-zarr/src/convert_to_zarr/   # creation + the shared core
+├── cli.py         convert-h5ad | convert-10x-h5 | concat-h5ads (thin)
 ├── config.py      frozen dataclasses + TOML/YAML + CLI overrides + _resolve_backend_cfg
 ├── storage.py     plain-zarr / icechunk open_output_store + finalize
 ├── validation.py  input checks
 ├── errors.py      ConversionError
 ├── layout.py      codec + shard math (_x_compressors, _dense_shards)
 ├── engine.py      parallel band workers, _run_parallel, _stage progress
-├── sources.py     input readers: h5ad eager/backed, 10x h5; zarr-store source lands in Phase 1+
+├── sources.py     input readers: h5ad eager/backed, 10x h5
 ├── writers.py     streaming dense/sparse/concat writers + anndata encoding attrs
-└── ops/           convert, concat, sort (+ rechunk, append, expr as they land)
+├── sorting.py     _compute_sort + eager/streamed sort core (used by convert --sort-by)
+└── ops/           convert, concat
+
+tools/zarrsmith/src/zarrsmith/               # editing (this tool); core via path dependency
+├── cli.py         add-expr | rechunk | sort | append (thin)
+├── expr.py        add_expr_layer
+├── rechunk.py     rechunk_store
+├── sort.py        sort_store (standalone; wraps convert_to_zarr.sorting)
+└── append.py      append_cells
 ```
 
 New ops read bands from a source and write through `writers.py`; each op should stay ~100–300
@@ -110,7 +124,7 @@ is the shared piece the new ops need first.
 
 `zarrsmith sort STORE --by COL... -o OUT`
 
-- Zarr input; reuse the bucket-per-group + concat engine from ops/sort.py
+- Zarr input; reuse the bucket-per-group + concat engine from convert_to_zarr/sorting.py
   (`_write_sorted_backed` is the reference implementation).
 - Refuse when obsp present (permutation must reorder both axes). Same policy as today.
 

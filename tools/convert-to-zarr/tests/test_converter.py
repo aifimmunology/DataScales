@@ -7,8 +7,8 @@ import numpy as np
 import scipy.sparse as sp
 import zarr
 
-from zarrsmith.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
-from zarrsmith import (
+from convert_to_zarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
+from convert_to_zarr import (
     ConversionError,
     convert_10x_h5_to_zarr,
     convert_h5ad_to_zarr,
@@ -139,7 +139,7 @@ def test_h5ad_eager_csc_x_converts_to_csr_with_warning(tmp_path: Path) -> None:
 def test_h5ad_backed_flag_uses_backed_read(tmp_path: Path) -> None:
     """--backed causes backed="r" load; omitting it causes eager load."""
     _make_h5ad(tmp_path / "input.h5ad")
-    with patch("zarrsmith.sources.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
+    with patch("convert_to_zarr.sources.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
         convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csr"))
     assert mocked.call_args_list[0].kwargs.get("backed") == "r"
 
@@ -147,7 +147,7 @@ def test_h5ad_backed_flag_uses_backed_read(tmp_path: Path) -> None:
 def test_h5ad_eager_does_not_use_backed_read(tmp_path: Path) -> None:
     """Default (backed=False) uses eager load."""
     _make_h5ad(tmp_path / "input.h5ad")
-    with patch("zarrsmith.sources.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
+    with patch("convert_to_zarr.sources.ad.read_h5ad", wraps=ad.read_h5ad) as mocked:
         convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csr"))
     assert "backed" not in mocked.call_args_list[0].kwargs
 
@@ -241,3 +241,77 @@ def test_flat_chunk_applied_csc(tmp_path: Path) -> None:
     convert_h5ad_to_zarr(str(tmp_path / "input.h5ad"), str(tmp_path / "out.zarr"), _cfg("sparse-csc", sparse_flat_chunk=75))
     assert _flat_chunks(tmp_path / "out.zarr", "X") == (75,)
     assert _flat_chunks(tmp_path / "out.zarr", "layers/counts") == (75,)
+
+
+# ---------------------------------------------------------------------------
+# Dense adata.X input (issue #4)
+# ---------------------------------------------------------------------------
+
+def _make_dense_h5ad(path: Path) -> np.ndarray:
+    """Write an h5ad whose X is a plain dense ndarray (issue #4's input shape)."""
+    dense = np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]], dtype=np.float32)
+    ad.AnnData(X=dense.copy()).write_h5ad(path)
+    return dense
+
+
+def test_h5ad_eager_dense_input_csr_output(tmp_path: Path) -> None:
+    """Issue #4: a dense-X h5ad converts to sparse output instead of erroring."""
+    h5 = tmp_path / "in.h5ad"
+    dense = _make_dense_h5ad(h5)
+    out = tmp_path / "out.zarr"
+    warnings = convert_h5ad_to_zarr(str(h5), str(out), _cfg("sparse-csr"))
+    z = zarr.open(str(out), mode="r")
+    assert z["X"].attrs["encoding-type"] == "csr_matrix"
+    got = sp.csr_matrix(
+        (z["X/data"][:], z["X/indices"][:], z["X/indptr"][:]), shape=tuple(z["X"].attrs["shape"])
+    ).toarray()
+    np.testing.assert_array_equal(got, dense)
+    assert any("dense" in w for w in warnings)
+
+
+def test_h5ad_eager_dense_input_dense_output(tmp_path: Path) -> None:
+    h5 = tmp_path / "in.h5ad"
+    dense = _make_dense_h5ad(h5)
+    out = tmp_path / "out.zarr"
+    convert_h5ad_to_zarr(str(h5), str(out), _cfg("dense"))
+    z = zarr.open(str(out), mode="r")
+    np.testing.assert_array_equal(z["X"][:], dense)
+
+
+def test_h5ad_backed_dense_input_dense_output(tmp_path: Path) -> None:
+    """Backed dense X streams to dense output without materialising."""
+    h5 = tmp_path / "in.h5ad"
+    dense = _make_dense_h5ad(h5)
+    out = tmp_path / "out.zarr"
+    convert_h5ad_to_zarr(str(h5), str(out), _cfg_backed("dense"))
+    z = zarr.open(str(out), mode="r")
+    np.testing.assert_array_equal(z["X"][:], dense)
+
+
+def test_h5ad_backed_dense_input_sparse_rejected(tmp_path: Path) -> None:
+    """Backed dense -> sparse would silently materialise; refuse with guidance."""
+    h5 = tmp_path / "in.h5ad"
+    _make_dense_h5ad(h5)
+    try:
+        convert_h5ad_to_zarr(str(h5), str(tmp_path / "out.zarr"), _cfg_backed("sparse-csr"))
+        raise AssertionError("expected ConversionError")
+    except ConversionError as exc:
+        assert "dense" in str(exc)
+
+
+def test_h5ad_eager_dense_input_with_dense_layer_csr_output(tmp_path: Path) -> None:
+    """Dense X plus a dense layer both sparsify under sparse output (no mid-write crash)."""
+    dense = np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]], dtype=np.float32)
+    adata = ad.AnnData(X=dense.copy())
+    adata.layers["scaled"] = dense * 2
+    h5 = tmp_path / "in.h5ad"
+    adata.write_h5ad(h5)
+    out = tmp_path / "out.zarr"
+    convert_h5ad_to_zarr(str(h5), str(out), _cfg("sparse-csr"))
+    z = zarr.open(str(out), mode="r")
+    assert z["layers/scaled"].attrs["encoding-type"] == "csr_matrix"
+    got = sp.csr_matrix(
+        (z["layers/scaled/data"][:], z["layers/scaled/indices"][:], z["layers/scaled/indptr"][:]),
+        shape=tuple(z["layers/scaled"].attrs["shape"]),
+    ).toarray()
+    np.testing.assert_array_equal(got, dense * 2)

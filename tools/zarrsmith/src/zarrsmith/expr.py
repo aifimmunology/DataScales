@@ -4,11 +4,11 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from ..config import AppConfig
-from ..engine import _stage, configure_runtime
-from ..errors import ConversionError
-from ..layout import _x_compressors
-from ..storage import open_store_rw
+from convert_to_zarr.config import AppConfig
+from convert_to_zarr.engine import _stage, configure_runtime
+from convert_to_zarr.errors import ConversionError
+from convert_to_zarr.layout import _x_compressors
+from convert_to_zarr.storage import open_store_rw
 
 _BAND_BYTES = 256 * 1024 * 1024
 

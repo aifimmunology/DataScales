@@ -183,7 +183,7 @@ def convert_h5ads_to_zarr(
         t0 = time.perf_counter()
 
         store, finalize = open_output_store(
-            output_path, cfg, commit_message=f"zarrsmith concat → {output_path.name}",
+            output_path, cfg, commit_message=f"convert-to-zarr concat → {output_path.name}",
         )
         store.attrs["encoding-type"] = "anndata"
         store.attrs["encoding-version"] = "0.1.0"
