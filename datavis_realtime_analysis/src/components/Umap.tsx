@@ -68,7 +68,7 @@ export default function Umap() {
   const [lassoScreen, setLassoScreen] = useState<[number, number][]>([])
 
   // cluster-select (legend clicks) + labeling workspace
-  const [selectedCats, setSelectedCats] = useState<Set<number>>(new Set())
+  const [selectedCats, setSelectedCats] = useState<Set<string>>(new Set()) // category names, not codes — survives view switches
   const [selectedLabels, setSelectedLabels] = useState<Set<number>>(new Set()) // working-label rows toggled in
   type Labeling = { name: string; cats: string[]; counts: number[]; codes: Int16Array; seed?: string }
   const [labeling, setLabeling] = useState<Labeling | null>(null)
@@ -101,7 +101,6 @@ export default function Umap() {
     setLoading(true)
     setError(null)
     setSelection(null)
-    setSelectedCats(new Set())
     setSelectedLabels(new Set())
     setLabeling(null) // labeling rides per-group row indices — can't cross groups
     setPending([])
@@ -173,6 +172,11 @@ export default function Umap() {
     }
   }, [group])
 
+  // new labelset = new categories; group switches keep the selection
+  useEffect(() => {
+    setSelectedCats(new Set())
+  }, [level])
+
   // Category codes reload whenever the level OR the active group changes.
   // One silent retry covers a backend blip mid-load; after that the failure is
   // surfaced in the Legend (previously it hung on "Loading…" forever).
@@ -182,7 +186,6 @@ export default function Umap() {
     let stale = false
     setCat(null)
     setCatError(null)
-    setSelectedCats(new Set()) // codes are per-level; stale highlights would lie
     if (!level) return // group has no categorical columns
     // app labelsets in a view read the CURRENT root state via root_row gather
     const fromRoot = group !== '' && rootOwn.some(s => s.name === level)
@@ -330,15 +333,31 @@ export default function Umap() {
     setSelVersion(v => v + 1)
   }
 
+  const codesFor = (c: Categorical, names: Set<string>) => {
+    const out = new Set<number>()
+    c.categories.forEach((name, k) => {
+      if (names.has(name)) out.add(k)
+    })
+    return out
+  }
+
   const toggleCategory = (code: number) => {
     if (!cat) return
+    const name = cat.categories[code]
     const next = new Set(selectedCats)
-    if (next.has(code)) next.delete(code)
-    else next.add(code)
+    if (next.has(name)) next.delete(name)
+    else next.add(name)
     setSelectedCats(next)
     setSelectedLabels(new Set())
-    selectByCodes(cat.codes, next)
+    selectByCodes(cat.codes, codesFor(cat, next))
   }
+
+  // reapply the kept legend selection once the new group's cat + points both land
+  useEffect(() => {
+    if (!cat || selectedCats.size === 0) return
+    if (cat.codes.length !== points.length) return
+    selectByCodes(cat.codes, codesFor(cat, selectedCats))
+  }, [cat, points])
 
   const toggleLabelCat = (k: number) => {
     if (!labeling) return
@@ -456,10 +475,12 @@ export default function Umap() {
         name,
       })
       setSubmitCount(c => c + 1)
-      // submitted: drop lasso mode and the highlighted subset
       setSelecting(false)
-      setSelection(null)
-      setSelVersion(v => v + 1)
+      // a submitted lasso is done; label-driven selections stay
+      if (selectedCats.size === 0 && selectedLabels.size === 0) {
+        setSelection(null)
+        setSelVersion(v => v + 1)
+      }
     } catch (err) {
       console.error('Submit failed:', err)
       setNotice(`Submit failed: ${err instanceof Error ? err.message : err}`)
@@ -664,7 +685,7 @@ export default function Umap() {
             level={level}
             onLevelChange={setLevel}
             categories={cat?.categories ?? null}
-            selected={selectedCats}
+            selected={cat ? codesFor(cat, selectedCats) : new Set<number>()}
             onCategoryClick={toggleCategory}
             error={catError}
             onRetry={() => setCatTick(t => t + 1)}
