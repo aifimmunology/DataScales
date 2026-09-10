@@ -82,13 +82,30 @@ export default function Umap() {
   const pathRef = useRef<[number, number][]>([])
 
   // Discover switchable groups once; default to the first (usually the store root).
+  // Retries cover a backend boot blip (same story as labelset discovery) — no
+  // retryTick here: re-running would reset the active group to the root.
   useEffect(() => {
-    loadGroups()
-      .then(gs => {
-        setGroups(gs)
-        setGroup(gs[0]?.path ?? '')
-      })
-      .catch(err => console.error('Failed to load groups:', err))
+    let stale = false
+    const attempt = (retriesLeft: number) => {
+      loadGroups()
+        .then(gs => {
+          if (stale) return
+          setGroups(gs)
+          setGroup(gs[0]?.path ?? '')
+        })
+        .catch(err => {
+          if (stale) return
+          if (retriesLeft > 0) {
+            setTimeout(() => !stale && attempt(retriesLeft - 1), 1500)
+            return
+          }
+          console.error('Failed to load groups:', err)
+        })
+    }
+    attempt(3)
+    return () => {
+      stale = true
+    }
   }, [])
 
   // Coordinates + barcodes (re)load whenever the active group changes. Row indices
@@ -123,15 +140,18 @@ export default function Umap() {
       })
       .catch(async err => {
         if (stale) return
-        // a view that 404s was likely deleted: re-check the listing, fall back to root
+        // a view that 404s was likely deleted: re-check the listing, fall back to
+        // root (listing may be down too — then just surface the coords error)
         if (group) {
-          const gs = await loadGroups()
+          const gs = await loadGroups().catch(() => null)
           if (stale) return
-          setGroups(gs)
-          if (!gs.some(g => g.path === group)) {
-            setGroup('')
-            setNotice('That view no longer exists — returned to the full store.')
-            return
+          if (gs) {
+            setGroups(gs)
+            if (!gs.some(g => g.path === group)) {
+              setGroup('')
+              setNotice('That view no longer exists — returned to the full store.')
+              return
+            }
           }
         }
         console.error('Failed to load UMAP data:', err)
@@ -148,29 +168,39 @@ export default function Umap() {
   // must see them regardless of what got frozen into their own obs at creation.
   const [rootLabelSets, setRootLabelSets] = useState<LabelSetInfo[]>([])
   const rootOwn = rootLabelSets.filter(s => s.own)
+  // Discovery failures retry silently (a 502 during backend boot must not hide
+  // the legend for the whole session); retryTick lets the UMAP Retry button
+  // re-run discovery too, since both fail together when the backend is down.
   useEffect(() => {
     let stale = false
-    Promise.all([loadLabelSets(group), group ? loadLabelSets('') : null])
-      .then(([ls, rootLs]) => {
-        if (stale) return
-        setLabelSets(ls)
-        setRootLabelSets(rootLs ?? ls)
-        // legend options: the group's columns plus root labelsets (root wins on
-        // name clashes — a view's copy is frozen at creation time)
-        const ownNames = (rootLs ?? ls).filter(s => s.own).map(s => s.name)
-        const names = [...new Set([...dropdownLabelSets(ls), ...ownNames])]
-        setLevel(l => (names.includes(l) ? l : names.includes('AIFI_L1') ? 'AIFI_L1' : names[0] ?? ''))
-      })
-      .catch(() => {
-        if (!stale) {
+    const attempt = (retriesLeft: number) => {
+      Promise.all([loadLabelSets(group), group ? loadLabelSets('') : null])
+        .then(([ls, rootLs]) => {
+          if (stale) return
+          setLabelSets(ls)
+          setRootLabelSets(rootLs ?? ls)
+          // legend options: the group's columns plus root labelsets (root wins on
+          // name clashes — a view's copy is frozen at creation time)
+          const ownNames = (rootLs ?? ls).filter(s => s.own).map(s => s.name)
+          const names = [...new Set([...dropdownLabelSets(ls), ...ownNames])]
+          setLevel(l => (names.includes(l) ? l : names.includes('AIFI_L1') ? 'AIFI_L1' : names[0] ?? ''))
+        })
+        .catch(err => {
+          if (stale) return
+          if (retriesLeft > 0) {
+            setTimeout(() => !stale && attempt(retriesLeft - 1), 1500)
+            return
+          }
+          console.error('Failed to discover label sets:', err)
           setLabelSets([])
           setRootLabelSets([])
-        }
-      })
+        })
+    }
+    attempt(3)
     return () => {
       stale = true
     }
-  }, [group])
+  }, [group, retryTick])
 
   // new labelset = new categories; group switches keep the selection
   useEffect(() => {
@@ -490,7 +520,7 @@ export default function Umap() {
   // a finished GPU run registered a new view in groups.json: reload the picker;
   // the runs panel marks it ready — no automatic switch
   const onViewReady = () => {
-    loadGroups().then(setGroups)
+    loadGroups().then(setGroups).catch(err => console.error('Groups refresh failed:', err))
   }
 
   // Relocate to the full store immediately, then delete behind the scrim; the
@@ -506,7 +536,8 @@ export default function Umap() {
       console.error('Delete view failed:', err)
       setNotice(`Delete failed: ${err instanceof Error ? err.message : err}`)
     } finally {
-      setGroups(await loadGroups())
+      // keep the stale list if the refresh fails — better than an empty picker
+      await loadGroups().then(setGroups).catch(err => console.error('Groups refresh failed:', err))
       setDeleting(false)
     }
   }

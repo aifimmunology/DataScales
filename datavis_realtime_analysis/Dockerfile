@@ -20,5 +20,7 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 
 EXPOSE 80
 
+# 127.0.0.1, not localhost: in-container localhost resolves to [::1] but nginx
+# only listens on IPv4, so the check always refused and flagged unhealthy
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD wget -q --spider http://localhost:80 || exit 1
+  CMD wget -q --spider http://127.0.0.1:80 || exit 1

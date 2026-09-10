@@ -48,7 +48,7 @@ export default function SelectionControls({
             }}
             style={primaryBtn}
           >
-            GPU run
+            Generate New UMAP
           </button>
           <button onClick={onClear} style={{ ...btnStyle, color: '#f88', borderColor: '#622' }}>
             Clear

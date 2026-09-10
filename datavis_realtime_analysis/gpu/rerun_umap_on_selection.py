@@ -29,7 +29,7 @@ SELECTION_FILE = os.environ.get("RERUN_SELECTION", "./data/3M_subset_bcell_selec
 VIEW_STORE     = os.environ.get("RERUN_OUT", data_pth + "/umap_views/bcell_selection")  # view store to write (obsm/X_umap + obs, no X)
 GPUS           = os.environ.get("RERUN_GPUS", "0")
 THREADS_PER_WORKER = int(os.environ.get("RERUN_THREADS_PER_WORKER", "12"))  # dask-cuda worker threadpool
-ZARR_CONCURRENCY   = int(os.environ.get("RERUN_ZARR_CONCURRENCY", "12"))    # zarr fetch-dispatch semaphore
+ZARR_CONCURRENCY   = int(os.environ.get("RERUN_ZARR_CONCURRENCY", "64"))    # zarr fetch-dispatch semaphore
 ZARR_MAX_WORKERS   = int(os.environ.get("RERUN_ZARR_MAX_WORKERS", "12"))    # zarr decode threadpool
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
@@ -51,6 +51,7 @@ def main():
     import json
     import time
     import numpy as np
+    import pandas as pd
     import zarr
     import anndata as ad
     import rapids_singlecell as rsc
@@ -65,7 +66,7 @@ def main():
 
     selection = json.load(open(SELECTION_FILE))         # {"barcodes": [...], ...}
     # if small selections fit one GPU eagerly — skip the dask-cuda cluster entirely
-    eager = len(selection["barcodes"]) <= int(os.environ.get("RERUN_EAGER_MAX", "150000"))
+    eager = len(selection["barcodes"]) <= int(os.environ.get("RERUN_EAGER_MAX", "500000"))
 
     if not eager:
         print("stage: starting CUDA cluster", flush=True)
@@ -99,7 +100,14 @@ def main():
     print("stage: loading selected cells", flush=True)
     f = zarr.open(data_pth, mode="r")
     shape = f["X"].attrs["shape"]      # [n_obs, n_vars]
-    obs = ad.io.read_elem(f["obs"])
+    # index + categorical columns only: the string/numeric extras are the bulk of
+    # a full obs read (~19s vs ~2s on the 3M store) and the viewer never shows them
+    obs_grp = f["obs"]
+    idx_name = obs_grp.attrs["_index"]
+    obs = pd.DataFrame(index=pd.Index(ad.io.read_elem(obs_grp[idx_name]), name=idx_name))
+    for c in obs_grp.attrs.get("column-order", []):
+        if obs_grp[c].attrs.get("encoding-type") == "categorical":
+            obs[c] = ad.io.read_elem(obs_grp[c])
 
     rows = obs.index.get_indexer(selection["barcodes"])
     assert (rows >= 0).all(), "some selected barcodes are not in this store"
@@ -122,6 +130,13 @@ def main():
     adata = ad.AnnData(X=X, obs=obs_sel, var=ad.io.read_elem(f["var"]))
     print("Selected cells:", adata.shape, "(eager)" if eager else "(dask)")
     rsc.get.anndata_to_GPU(adata)
+
+    if not eager:
+        # one full pass over X now; without it normalize (median), HVG, and the
+        # post-HVG rechunk each re-read X from GCS (measured ~2.5x total wall)
+        from dask.distributed import wait, futures_of
+        adata.X = adata.X.persist()
+        wait(futures_of(adata.X))
 
     # ── Preprocess (only if raw counts) ──────────────────────────────────────────
     if raw_counts:

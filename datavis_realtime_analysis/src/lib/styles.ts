@@ -25,7 +25,7 @@ export const control: CSSProperties = {
   fontSize: 13,
 }
 
-// Filled action button (GPU run, Save to store) — MUI contained-primary look.
+// Filled action button (Generate New UMAP, Save to store) — MUI contained-primary look.
 export const primaryBtn: CSSProperties = {
   ...{ borderRadius: 6, padding: '6px 10px', fontSize: 13 },
   background: PRIMARY,

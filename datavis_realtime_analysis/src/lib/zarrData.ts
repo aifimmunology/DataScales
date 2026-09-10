@@ -39,7 +39,8 @@ export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
       const p = await probe(base, `${prefix}obs/${col}`)
       if (p?.attrs['encoding-type'] !== 'categorical') return null
       const res = await fetch(`${base}/${prefix}obs/${col}/categories/zarr.json`)
-      if (!res.ok) return null
+      if (res.status === 404) return null
+      if (!res.ok) throw new Error(`obs/${col}/categories: ${res.status} ${res.statusText}`)
       const meta = await res.json()
       return {
         name: col,
@@ -119,9 +120,13 @@ export async function loadUmapCoords(group = ''): Promise<Point[]> {
   return points
 }
 
-/** obs/barcodes -> one id per cell (obs_names). Used for the selection export. */
+/** obs index column (named per its `_index` attr) -> one id per cell (obs_names).
+ * Used for the selection export. */
 export async function loadBarcodes(group = ''): Promise<string[]> {
-  const arr = await openArray('obs/barcodes', group, DATA_BASE_URL)
+  const rel = group ? `${group}/obs` : 'obs'
+  const obsGroup = await zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${rel}`), { kind: 'group' })
+  const idxCol = (obsGroup.attrs['_index'] as string) ?? '_index'
+  const arr = await openArray(`obs/${idxCol}`, group, DATA_BASE_URL)
   const data = (await zarr.get(arr)).data as ArrayLike<string>
   return Array.from(data)
 }
@@ -197,9 +202,12 @@ function openAt(url: string): Promise<OpenedArray> {
   return arr
 }
 
+// null means the node genuinely doesn't exist; transient failures (backend
+// booting -> 502, etc.) throw so callers retry instead of caching "absent".
 async function probe(base: string, path: string) {
   const res = await fetch(`${base}/${path}/zarr.json`)
-  if (!res.ok) return null
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`${path}: ${res.status} ${res.statusText}`)
   const meta = await res.json()
   return { node: meta.node_type as string, attrs: (meta.attributes ?? {}) as Record<string, unknown> }
 }
@@ -338,12 +346,14 @@ export type Group = { id: string; label: string; path: string }
 const DEFAULT_GROUPS: Group[] = [{ id: 'main', label: 'Full store', path: '' }]
 
 /** groups.json at the served root lists the switchable embeddings. Missing or
- * invalid -> a single root group. */
+ * invalid -> a single root group; transient failures (backend booting) throw so
+ * callers retry instead of settling on the root-only fallback. */
 export async function loadGroups(): Promise<Group[]> {
+  // no-store: a cached listing would resurrect just-deleted views
+  const res = await fetch(`${DATA_BASE_URL}/groups.json`, { cache: 'no-store' })
+  if (res.status === 404) return DEFAULT_GROUPS
+  if (!res.ok) throw new Error(`groups.json: ${res.status} ${res.statusText}`)
   try {
-    // no-store: a cached listing would resurrect just-deleted views
-    const res = await fetch(`${DATA_BASE_URL}/groups.json`, { cache: 'no-store' })
-    if (!res.ok) return DEFAULT_GROUPS
     const gs = (await res.json()) as Group[]
     return Array.isArray(gs) && gs.length > 0 ? gs : DEFAULT_GROUPS
   } catch {

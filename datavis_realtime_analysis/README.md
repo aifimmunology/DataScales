@@ -33,7 +33,7 @@ One store serves everything:
 - `layers/gexp` (csc or dense; `zarrsmith add-expr` creates it) — gene-expression highlighting, resolved in order `layers/gexp` → dense `X` → CSC `X`
 - `umap_views/`, `groups.json`, `jobs/` — written by the app: returned views, the view listing, and the GPU job queue + status objects
 
-In the app: lasso a cell selection, name it, and hit "GPU run". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `gpu/gpu_job.sh` sets up the pixi env fresh, runs `gpu/rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
+In the app: lasso a cell selection, name it, and hit "Generate New UMAP". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `gpu/gpu_job.sh` sets up the pixi env fresh, runs `gpu/rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
 
 GPU runs require `GPU_INSTANCE`, `GPU_ZONE`, and `GPU_PIXI_DIR` (the pixi project on the box) in `.env` — submits error if any is unset. Works in docker (the backend image ships gcloud + your mounted credentials/ssh keys) and in dev mode. One-time per bucket: grant the GPU instance's service account storage access so jobs on the box can read/write the store no matter who sshs in:
 
@@ -77,6 +77,8 @@ DATA_DIR=./data/soundlife-other-tiny.zarr uvicorn server.main:app --reload
 ## Docker deployment (GCS)
 
 Two services via compose: nginx serves the built frontend and proxies `/api`; the FastAPI backend reads the store from GCS.
+
+**gcloud and docker need to be installed locally for the steps below**
 
 ### 1. Configure `.env`
 
@@ -127,7 +129,7 @@ docker compose logs -f backend
 
 ### Troubleshooting
 
-- `Reauthentication required/failed` on GPU submit — the org session policy expires user credentials (~weekly). Re-run both `gcloud auth` commands on the **host**, then `docker compose restart backend` (credentials are copied in at container start). The GPU box never needs reauth — jobs there run as the instance's service account.
+- `Reauthentication required/failed` on GPU submit — the org session policy expires user credentials (~weekly). Re-run both `gcloud auth` commands on the **host**, then `docker compose restart backend` (credentials are copied in at container start). With the instance-SA bucket grant in place (see [Data](#data)), the GPU box never needs reauth. If that grant hasn't been made, box-side gcloud runs as a user account instead: ssh in and re-run both `gcloud auth` commands with `--no-launch-browser` when jobs die with `ssh exited rc=1` and the box log shows a reauth error.
 - `503 GCS auth failed` — re-run step 1 on the host; confirm `~/.config/gcloud/application_default_credentials.json` exists.
 - `port is already allocated` — something else is publishing 3000/8000; `docker ps`, then stop it.
 
