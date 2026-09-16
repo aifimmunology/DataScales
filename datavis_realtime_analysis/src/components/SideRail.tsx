@@ -8,6 +8,7 @@ export type RailSection = {
   icon: string
   title: string
   badge?: boolean // e.g. a GPU run is active
+  badgeColor?: string // overrides the default yellow, e.g. red for a GPU access problem
   content: ReactNode
 }
 
@@ -29,7 +30,9 @@ export default function SideRail({ sections }: Props) {
             style={{ ...railBtnStyle, ...(active === s.id ? railBtnActiveStyle : {}) }}
           >
             <Icon icon={s.icon} width={26} height={26} />
-            {s.badge && <span style={badgeStyle} />}
+            {s.badge && (
+              <span style={s.badgeColor ? { ...badgeStyle, background: s.badgeColor } : badgeStyle} />
+            )}
           </button>
         ))}
       </div>

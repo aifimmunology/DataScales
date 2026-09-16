@@ -39,6 +39,24 @@ export async function fetchJobs(): Promise<Job[]> {
   return res.json()
 }
 
+export type GpuHealth = {
+  status: 'ok' | 'error' | 'checking' | 'unconfigured'
+  checking: boolean
+  problem?: string | null
+  summary?: string
+  detail?: string
+  fix?: string[]
+  checked_at?: string | null
+}
+
+// Temp while GPU dispatch rides ssh: cached backend probe of the permission chain
+// (backend GCS creds, ssh to the box, store write from the box). refresh forces a re-probe.
+export async function fetchGpuHealth(refresh = false): Promise<GpuHealth | null> {
+  const res = await fetch(`/api/gpu/health${refresh ? '?refresh=1' : ''}`)
+  if (!res.ok) return null
+  return res.json()
+}
+
 export async function deleteView(id: string): Promise<void> {
   await request(`/api/views/${encodeURIComponent(id)}`, { method: 'DELETE' }, 'delete view')
 }

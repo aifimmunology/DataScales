@@ -129,6 +129,7 @@ docker compose logs -f backend
 
 ### Troubleshooting
 
+- The app probes the GPU permission chain on load (backend GCS creds → ssh to the box → store write from the box); a problem turns the **GPU runs** rail badge red, and the tab shows the failing step with fix commands — hit *Re-check* after fixing. Temporary until dispatch moves off ssh to an HPC-style queue.
 - `Reauthentication required/failed` on GPU submit — the org session policy expires user credentials (~weekly). Re-run both `gcloud auth` commands on the **host**, then `docker compose restart backend` (credentials are copied in at container start). With the instance-SA bucket grant in place (see [Data](#data)), the GPU box never needs reauth. If that grant hasn't been made, box-side gcloud runs as a user account instead: ssh in and re-run both `gcloud auth` commands with `--no-launch-browser` when jobs die with `ssh exited rc=1` and the box log shows a reauth error.
 - `503 GCS auth failed` — re-run step 1 on the host; confirm `~/.config/gcloud/application_default_credentials.json` exists.
 - `port is already allocated` — something else is publishing 3000/8000; `docker ps`, then stop it.

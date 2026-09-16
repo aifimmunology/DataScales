@@ -30,7 +30,7 @@ import {
   type LabelSetInfo,
 } from '../lib/zarrData'
 import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
-import { deleteView, saveLabels, submitSelection } from '../lib/api'
+import { deleteView, fetchGpuHealth, saveLabels, submitSelection, type GpuHealth } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
 
@@ -60,6 +60,23 @@ export default function Umap() {
   // submitted-runs refresh counter (bumped on each submit)
   const [submitCount, setSubmitCount] = useState(0)
   const [runsActive, setRunsActive] = useState(false) // any job queued/running → rail badge
+
+  // GPU access probe (temp while dispatch rides ssh): runs on app load so an
+  // expired credential lights up the GPU-runs rail tab before anyone submits.
+  const [gpuHealth, setGpuHealth] = useState<GpuHealth | null>(null)
+  const checkGpuHealth = (refresh = false) =>
+    fetchGpuHealth(refresh).then(h => h && setGpuHealth(h)).catch(() => {})
+  useEffect(() => {
+    checkGpuHealth()
+    const t = setInterval(() => checkGpuHealth(), 600_000) // keep the badge honest across a long session
+    return () => clearInterval(t)
+  }, [])
+  useEffect(() => {
+    if (!gpuHealth?.checking) return // fast-poll only while a probe is in flight
+    const t = setInterval(() => checkGpuHealth(), 3000)
+    return () => clearInterval(t)
+  }, [gpuHealth?.checking])
+  const gpuProblem = gpuHealth?.status === 'error'
 
   // selection state
   const [selecting, setSelecting] = useState(false)
@@ -655,8 +672,17 @@ export default function Umap() {
       id: 'runs',
       icon: 'material-symbols-light:memory',
       title: 'GPU runs',
-      badge: runsActive,
-      content: <RunsPanel refresh={submitCount} onViewReady={onViewReady} onActiveChange={setRunsActive} />,
+      badge: runsActive || gpuProblem,
+      badgeColor: gpuProblem ? '#f88' : undefined, // access problem outranks the run-active yellow
+      content: (
+        <RunsPanel
+          refresh={submitCount}
+          onViewReady={onViewReady}
+          onActiveChange={setRunsActive}
+          health={gpuHealth}
+          onRecheckHealth={checkGpuHealth}
+        />
+      ),
     },
   ]
 
