@@ -206,7 +206,8 @@ def test_ops_on_consolidated_store(tmp_path):
     sa = _store(tmp_path, a, "a.zarr", cfg=_cfg(consolidate_metadata=True))
     sb = _store(tmp_path, b, "b.zarr")
     add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
-    append_cells(str(sa), str(sb), _cfg(), refresh_expr=True)
+    append_cells(str(sa), str(sb), _cfg(), drop_layers=True)
+    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
     got = ad.read_zarr(str(sa))  # reads via the re-consolidated metadata
     assert got.n_obs == 42 and "gexp" in got.layers
 
@@ -233,6 +234,50 @@ def test_append_categorical_order_mismatch(tmp_path):
         append_cells(str(sa), str(sb), _cfg())
 
 
+def test_append_obs_column_types(tmp_path):
+    # exercises every per-column append path: categorical (from _adata), plain numeric,
+    # string-array, and nullable-integer with an NA
+    def build(n, seed):
+        adata = _adata(n=n, seed=seed)
+        rng = np.random.default_rng(seed + 100)
+        adata.obs["n_genes"] = rng.integers(0, 1000, n)
+        adata.obs["doublet_score"] = rng.random(n)
+        # unique per row so anndata keeps it a string-array (repetitive strings
+        # become categorical on write, with per-store categories)
+        adata.obs["sample"] = [f"s{seed}_{i}" for i in range(n)]
+        qc = pd.array(rng.integers(0, 5, n), dtype="Int64")
+        qc[0] = pd.NA
+        adata.obs["qc_flag"] = qc
+        return adata
+
+    a, b = build(25, 0), build(11, 1)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    append_cells(str(sa), str(sb), _cfg())
+    got = ad.read_zarr(str(sa))
+    expected = pd.concat([a.obs, b.obs], axis=0)
+    pd.testing.assert_frame_equal(got.obs, expected, check_dtype=False)
+
+
+def test_append_obs_dtype_mismatch(tmp_path):
+    a, b = _adata(n=20, seed=0), _adata(n=10, seed=1)
+    a.obs["n_genes"] = np.arange(20, dtype=np.int64)
+    b.obs["n_genes"] = np.arange(10, dtype=np.float64)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    # obs columns extend in place now, so dtypes must match exactly (no silent
+    # pandas-concat unification)
+    with pytest.raises(ConversionError, match="dtype mismatch"):
+        append_cells(str(sa), str(sb), _cfg())
+
+
+def test_append_duplicate_names_warn(tmp_path):
+    sa = _store(tmp_path, _adata(n=20, seed=0), "a.zarr")
+    sb = _store(tmp_path, _adata(n=20, seed=0), "b.zarr")
+    warnings = append_cells(str(sa), str(sb), _cfg())
+    assert any("duplicate" in w for w in warnings)
+
+
 def test_cli_store_ops(tmp_path):
     from zarrsmith.cli import run
 
@@ -245,15 +290,20 @@ def test_cli_store_ops(tmp_path):
     assert run(["add-expr", "--store", str(tmp_path / "missing.zarr")]) == 1
 
 
-def test_append_refresh_expr(tmp_path):
+def test_append_drop_layers(tmp_path):
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
     sb = _store(tmp_path, b, "b.zarr")
-    # non-default target_sum must survive the refresh (persisted on the layer)
-    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32, target_sum=1e6)
-    with pytest.raises(ConversionError, match="stale"):
+    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
+    # append never touches layers itself: an existing layer must be explicitly dropped,
+    # then re-derived with add-expr
+    with pytest.raises(ConversionError, match="drop layers"):
         append_cells(str(sa), str(sb), _cfg())
-    append_cells(str(sa), str(sb), _cfg(), refresh_expr=True)
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_layers=True)
+    assert any("add-expr" in w for w in warnings)
+    got = ad.read_zarr(str(sa))
+    assert got.n_obs == 42 and len(got.layers) == 0
+    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32, target_sum=1e6)
     got = ad.read_zarr(str(sa))
     np.testing.assert_allclose(
         got.layers["gexp"].toarray(),
@@ -284,8 +334,8 @@ def test_lifecycle_plain(tmp_path):
 
     sorted1 = tmp_path / "sorted1.zarr"
     sort_store(str(sa), str(sorted1), scfg)
-    add_expr_layer(str(sorted1), _cfg(), fmt="csc", chunk_elems=32)
     append_cells(str(sorted1), str(sb), _cfg(), assume_yes=True)
+    add_expr_layer(str(sorted1), _cfg(), fmt="csc", chunk_elems=32)
     sorted2 = tmp_path / "sorted2.zarr"
     warnings = sort_store(str(sorted1), str(sorted2), scfg)
     assert any("re-derived" in w for w in warnings)
@@ -316,9 +366,9 @@ def test_lifecycle_icechunk(tmp_path):
     a.write_h5ad(h5)
     sa = tmp_path / "a.icechunk"
     convert_h5ad_to_zarr(str(h5), str(sa), cfg_ic)
-    add_expr_layer(str(sa), cfg_ic, fmt="csc", chunk_elems=32)
     sb = _store(tmp_path, b, "b.zarr")
-    append_cells(str(sa), str(sb), cfg_ic, assume_yes=True)
+    append_cells(str(sa), str(sb), _cfg(), assume_yes=True)  # icechunk target auto-detected
+    add_expr_layer(str(sa), cfg_ic, fmt="csc", chunk_elems=32)
 
     sorted_ic = tmp_path / "sorted.icechunk"
     scfg = replace(cfg_ic, grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)))

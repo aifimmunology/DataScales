@@ -64,6 +64,15 @@ def _run_parallel(worker, jobs, cpus):
             fut.result()
 
 
+def _pin_blas() -> None:
+    """Pin BLAS/OMP pools to 1 thread. Must run before numpy loads — OpenBLAS reads
+    these env vars at library import, so the package __init__ calls this first."""
+    import os
+
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+
+
 _configured = False
 
 
@@ -76,8 +85,7 @@ def configure_runtime(cpus: int) -> None:
     import os
     import zarr
 
-    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ.setdefault(var, "1")
+    _pin_blas()
     workers = max(cpus, os.cpu_count() or 1)
     zarr.config.set({"async.concurrency": 64, "threading.max_workers": workers})
 

@@ -30,17 +30,20 @@ pixi run zarrsmith rechunk --store in.zarr --output out.zarr --array X --x-row-c
 pixi run zarrsmith sort --store in.zarr --output sorted.zarr --by AIFI_L1 batch_id
 
 # append the cells of another zarr store, in place (strict var/obs/dtype match)
-pixi run zarrsmith append --store store.zarr --cells new_cells.zarr [--drop-obsp] [--refresh-expr]
+pixi run zarrsmith append --store store.zarr --cells new_cells.zarr [--drop-obsp] [--drop-layers]
 ```
 
 `add-expr` and `append` mutate the store in place (one commit with `--icechunk`); `rechunk` and
 `sort` always write a new store. Appending refuses to silently invalidate things: obsp graphs
-need `--drop-obsp`, an existing gexp layer needs `--refresh-expr` (re-derived after the append),
-and a previously sorted store should be re-sorted. `sort` re-derives a lone `layers/gexp` on the
-sorted output automatically.
+need `--drop-obsp`, existing layers need `--drop-layers` (dropped; re-derive with `add-expr`),
+and a previously sorted store should be re-sorted. obs extends per column in place (schema,
+dtypes, and categorical categories must match exactly), so append memory scales with the
+appended cells, not the store. `sort` re-derives a lone `layers/gexp` on the sorted output
+automatically.
 
-Icechunk inputs are auto-detected; pass `--icechunk` to write outputs through an Icechunk
-repository.
+Icechunk stores are auto-detected for inputs and the in-place ops (`add-expr`, `append`),
+including `s3://bucket/prefix` URLs (AWS env credentials); pass `--icechunk` to write a new
+output (`rechunk`, `sort`) through an Icechunk repository.
 
 ## Development
 

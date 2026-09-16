@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
-from pathlib import Path
 
 import zarr
 
 from convert_to_zarr.config import AppConfig
 from convert_to_zarr.engine import _run_parallel_threads, _stage, configure_runtime
 from convert_to_zarr.errors import ConversionError
-from convert_to_zarr.storage import open_input_group, open_store_rw
-from .expr import _introspect_gexp, add_expr_layer
+from convert_to_zarr.storage import _store_name, open_input_group, open_store_rw
 
 _SEG_BYTES = 256 * 1024 * 1024
+_INDEX_SCAN_ROWS = 1 << 20
+_NULLABLE_ENCODINGS = ("nullable-integer", "nullable-boolean", "nullable-string-array")
 
 
 def append_cells(
@@ -21,20 +20,18 @@ def append_cells(
     cfg: AppConfig,
     *,
     drop_obsp: bool = False,
-    refresh_expr: bool = False,
+    drop_layers: bool = False,
     assume_yes: bool = False,
 ) -> list[str]:
     """Append the cells of another zarr store onto this one, in place."""
     import numpy as np
-    import pandas as pd
-    from anndata._io.specs import write_elem
     from anndata.io import read_elem
 
     configure_runtime(cfg.chunks.cpus)
     src = open_input_group(cells)
-    store_path = Path(store)
     root, finalize = open_store_rw(
-        store_path, cfg, commit_message=f"zarrsmith append {Path(cells).name} → {store_path.name}"
+        store, cfg,
+        commit_message=f"zarrsmith append {_store_name(cells)} → {_store_name(store)}",
     )
     warnings: list[str] = []
 
@@ -49,36 +46,13 @@ def append_cells(
         raise ConversionError("append does not extend raw (it is obs-aligned); drop raw first.")
 
     layer_keys = list(root["layers"]) if "layers" in root else []
-    gexp_params = None
-    if layer_keys and layer_keys != ["gexp"]:
-        raise ConversionError(
-            f"append cannot handle layers {layer_keys}; only a lone gexp layer is supported."
-        )
-    if layer_keys:
-        gexp_params = _introspect_gexp(root["layers"]["gexp"])
-
     obsp_keys = list(root["obsp"]) if "obsp" in root else []
 
     var_t, var_s = read_elem(root["var"]), read_elem(src["var"])
     if len(var_t) != len(var_s) or not (var_t.index == var_s.index).all():
         raise ConversionError("var mismatch: names + order must be identical between stores.")
 
-    obs_t, obs_s = read_elem(root["obs"]), read_elem(src["obs"])
-    if list(obs_t.columns) != list(obs_s.columns):
-        raise ConversionError(
-            f"obs schema mismatch: store {list(obs_t.columns)} vs cells {list(obs_s.columns)}."
-        )
-    for c in obs_t.columns:
-        is_cat = isinstance(obs_t[c].dtype, pd.CategoricalDtype) or isinstance(
-            obs_s[c].dtype, pd.CategoricalDtype
-        )
-        # dtype equality covers categories, order (for ordered), and the ordered flag —
-        # anything less degrades the column to a string array on concat
-        if is_cat and obs_t[c].dtype != obs_s[c].dtype:
-            raise ConversionError(
-                f"obs column '{c}' categorical dtype mismatch "
-                f"({obs_t[c].dtype} vs {obs_s[c].dtype}); reconcile before append."
-            )
+    _check_obs_schema(root["obs"], src["obs"])
 
     x_t, x_s = root["X"], src["X"]
     if x_t["data"].dtype != x_s["data"].dtype:
@@ -87,7 +61,6 @@ def append_cells(
         )
     n_t, n_vars = (int(v) for v in x_t.attrs["shape"])
     n_s = int(x_s.attrs["shape"][0])
-    n_new = n_t + n_s
 
     obsm_keys = list(root["obsm"]) if "obsm" in root else []
     src_obsm = src["obsm"] if "obsm" in src else None
@@ -103,11 +76,16 @@ def append_cells(
     indptr_t = np.asarray(x_t["indptr"][:], dtype=np.int64)
     indptr_s = np.asarray(x_s["indptr"][:], dtype=np.int64)
 
+    has_dup_names = _has_duplicate_names(root["obs"], src["obs"], n_t)
+
     plan = []
     if obsp_keys:
         plan.append((f"drop obsp graphs {obsp_keys} (invalidated by new cells)", drop_obsp))
-    if gexp_params is not None:
-        plan.append(("re-derive layers/gexp (stale over the appended matrix)", refresh_expr))
+    if layer_keys:
+        plan.append(
+            (f"drop layers {layer_keys} (not extended by append; re-derive with add-expr)",
+             drop_layers)
+        )
     extras = []
     if "layers" in src and list(src["layers"]):
         extras.append(f"layers {list(src['layers'])}")
@@ -123,45 +101,108 @@ def append_cells(
     # mutations start here; order keeps the store readable as its old self until
     # indptr/shape flip (plain zarr has no rollback — icechunk discards on failure)
     try:
-        if obsp_keys:
-            for k in obsp_keys:
-                del root["obsp"][k]
-            warnings.append(f"dropped obsp graphs {obsp_keys} (invalidated by appended cells).")
-        _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
-                       indptr_t, indptr_s, n_t, n_s, n_vars, warnings, cfg)
+        for group_key, keys, note in (
+            ("obsp", obsp_keys, "invalidated by appended cells"),
+            ("layers", layer_keys, "stale after append; re-derive with add-expr"),
+        ):
+            for k in keys:
+                del root[group_key][k]
+            if keys:
+                warnings.append(f"dropped {group_key} {keys} ({note}).")
+        _append_arrays(root, src, x_t, x_s, obsm_keys, src_obsm,
+                       indptr_t, indptr_s, n_t, n_s, n_vars, cfg)
     except ConversionError:
         raise
     except Exception as e:
         raise ConversionError(
-            f"append failed mid-mutation; {store_path} may be inconsistent "
+            f"append failed mid-mutation; {store} may be inconsistent "
             f"(plain zarr cannot roll back — icechunk discards uncommitted changes): {e}"
         ) from e
 
+    if has_dup_names:
+        warnings.append("obs names contain duplicates after append.")
     warnings.append(
         "appended cells break any sorted-store contiguity; re-run `zarrsmith sort` if the "
         "store was sorted."
     )
     finalize()
-
-    if gexp_params is not None:
-        fmt, chunk_elems, target_sum = gexp_params
-        cfg_ow = replace(cfg, io=replace(cfg.io, overwrite=True))
-        if target_sum is None:
-            warnings.append(
-                "layers/gexp has no recorded target_sum (pre-zarrsmith layer); "
-                "re-deriving at the default 1e4."
-            )
-            target_sum = 1e4
-        add_expr_layer(store, cfg_ow, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum)
-        warnings.append(f"layers/gexp re-derived ({fmt}) over the appended matrix.")
     return warnings
 
 
-def _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
-                   indptr_t, indptr_s, n_t, n_s, n_vars, warnings, cfg):
+def _check_obs_schema(obs_t, obs_s) -> None:
+    """Column-level schema equality at the zarr encoding level — no full obs read."""
     import numpy as np
-    import pandas as pd
-    from anndata._io.specs import write_elem
+
+    cols_t = list(obs_t.attrs["column-order"])
+    cols_s = list(obs_s.attrs["column-order"])
+    if cols_t != cols_s:
+        raise ConversionError(f"obs schema mismatch: store {cols_t} vs cells {cols_s}.")
+    for g, label, cols in ((obs_t, "store", cols_t), (obs_s, "cells", cols_s)):
+        stray = sorted(set(g) - set(cols) - {g.attrs["_index"]})
+        if stray:
+            raise ConversionError(f"obs in {label} has elements outside column-order: {stray}.")
+
+    pairs = [(c, obs_t[c], obs_s[c]) for c in cols_t]
+    pairs.append(("<index>", obs_t[obs_t.attrs["_index"]], obs_s[obs_s.attrs["_index"]]))
+    for name, t, s in pairs:
+        enc = t.attrs.get("encoding-type")
+        if enc != s.attrs.get("encoding-type"):
+            raise ConversionError(
+                f"obs column '{name}' encoding mismatch "
+                f"({enc!r} vs {s.attrs.get('encoding-type')!r}); reconcile before append."
+            )
+        if enc == "categorical":
+            cat_t, cat_s = t["categories"][:], s["categories"][:]
+            # codes are positional, so categories must match in value AND order —
+            # anything less silently remaps the appended labels
+            if (
+                bool(t.attrs.get("ordered", False)) != bool(s.attrs.get("ordered", False))
+                or len(cat_t) != len(cat_s)
+                or not (np.asarray(cat_t) == np.asarray(cat_s)).all()
+            ):
+                raise ConversionError(
+                    f"obs column '{name}' categorical dtype mismatch "
+                    "(categories, order, and the ordered flag must be identical); "
+                    "reconcile before append."
+                )
+        elif enc in _NULLABLE_ENCODINGS:
+            if t["values"].dtype != s["values"].dtype:
+                raise ConversionError(
+                    f"obs column '{name}' dtype mismatch "
+                    f"({t['values'].dtype} vs {s['values'].dtype})."
+                )
+        elif enc == "array":
+            if t.dtype != s.dtype:
+                raise ConversionError(
+                    f"obs column '{name}' dtype mismatch ({t.dtype} vs {s.dtype}); "
+                    "obs columns extend in place, so dtypes must match exactly."
+                )
+        elif enc != "string-array":
+            raise ConversionError(
+                f"obs column '{name}': unsupported encoding {enc!r} for in-place append."
+            )
+
+
+def _has_duplicate_names(obs_t, obs_s, n_t: int) -> bool:
+    """Duplicate obs-name check involving the appended cells — streamed over the store
+    index in chunk-aligned slices, so memory stays O(cells store)."""
+    import numpy as np
+
+    idx_s = np.asarray(obs_s[obs_s.attrs["_index"]][:])
+    if len(np.unique(idx_s)) < len(idx_s):
+        return True
+    t_arr = obs_t[obs_t.attrs["_index"]]
+    chunk0 = t_arr.chunks[0]
+    step = max(chunk0, (_INDEX_SCAN_ROWS // max(1, chunk0)) * chunk0)
+    for i0 in range(0, n_t, step):
+        if np.isin(np.asarray(t_arr[i0:min(i0 + step, n_t)]), idx_s).any():
+            return True
+    return False
+
+
+def _append_arrays(root, src, x_t, x_s, obsm_keys, src_obsm,
+                   indptr_t, indptr_s, n_t, n_s, n_vars, cfg):
+    import numpy as np
 
     nnz_t, nnz_s = int(indptr_t[-1]), int(indptr_s[-1])
     nnz_new = nnz_t + nnz_s
@@ -193,16 +234,34 @@ def _append_arrays(root, x_t, x_s, obs_t, obs_s, obsm_keys, src_obsm,
         x_t.attrs["shape"] = [n_new, n_vars]
 
     with _stage(f"Appending obs + obsm ({n_s} cells)"):
-        obs_new = pd.concat([obs_t, obs_s], axis=0)
-        if obs_new.index.duplicated().any():
-            warnings.append("obs names contain duplicates after append.")
-        if "obs" in root:
-            del root["obs"]
-        write_elem(root, "obs", obs_new)
+        _append_obs(root["obs"], src["obs"], n_t, n_new)
         for k in obsm_keys:
             a = root["obsm"][k]
             a.resize((n_new,) + a.shape[1:])
             a[n_t:n_new] = src_obsm[k][:]
+
+
+def _append_obs(obs_t, obs_s, n_t: int, n_new: int) -> None:
+    """Extend each obs column in place — O(cells store) memory, no target rewrite."""
+    pairs = [(c, c) for c in obs_t.attrs["column-order"]]
+    pairs.append((obs_t.attrs["_index"], obs_s.attrs["_index"]))
+    for name_t, name_s in pairs:
+        t, s = obs_t[name_t], obs_s[name_s]
+        if isinstance(t, zarr.Array):
+            _extend_1d(t, s, n_t, n_new)
+        elif t.attrs.get("encoding-type") == "categorical":
+            _extend_1d(t["codes"], s["codes"], n_t, n_new)  # categories validated identical
+        else:  # nullable-*: values + mask
+            _extend_1d(t["values"], s["values"], n_t, n_new)
+            _extend_1d(t["mask"], s["mask"], n_t, n_new)
+
+
+def _extend_1d(dst, src, n_t: int, n_new: int) -> None:
+    vals = src[:]
+    if src.dtype != dst.dtype:  # e.g. categorical codes stored at different widths
+        vals = vals.astype(dst.dtype)
+    dst.resize((n_new,))
+    dst[n_t:n_new] = vals
 
 
 def _copy_shifted(src, dst, s0, s1, off):
@@ -223,5 +282,5 @@ def _confirm(plan: list[tuple[str, bool]], assume_yes: bool) -> None:
         raise ConversionError("append cancelled.")
     raise ConversionError(
         f"append needs confirmation:\n{lines}\n"
-        "Pass --yes (or --drop-obsp / --refresh-expr) to proceed non-interactively."
+        "Pass --yes (or --drop-obsp / --drop-layers) to proceed non-interactively."
     )

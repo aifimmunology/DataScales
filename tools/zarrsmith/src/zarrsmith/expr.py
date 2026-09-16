@@ -8,7 +8,7 @@ from convert_to_zarr.config import AppConfig
 from convert_to_zarr.engine import _stage, configure_runtime
 from convert_to_zarr.errors import ConversionError
 from convert_to_zarr.layout import _x_compressors
-from convert_to_zarr.storage import open_store_rw
+from convert_to_zarr.storage import _is_s3_url, open_store_rw
 
 _BAND_BYTES = 256 * 1024 * 1024
 
@@ -29,9 +29,8 @@ def add_expr_layer(
         raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
 
     configure_runtime(cfg.chunks.cpus)
-    store_path = Path(store)
     root, finalize = open_store_rw(
-        store_path, cfg, commit_message=f"zarrsmith add-expr {fmt} → layers/{layer}"
+        store, cfg, commit_message=f"zarrsmith add-expr {fmt} → layers/{layer}"
     )
     if "X" not in root:
         raise ConversionError(f"no X in {store} — not an AnnData zarr store?")
@@ -112,7 +111,9 @@ def add_expr_layer(
     n_bands = len(edges) - 1
     band_nnz = [int(csc_indptr[edges[i + 1]] - csc_indptr[edges[i]]) for i in range(n_bands)]
 
-    tmp_root = Path(tempfile.mkdtemp(prefix="zarrsmith_expr_", dir=str(store_path.parent)))
+    # bucket temp files sit next to a local store (same filesystem); system tmp for s3
+    tmp_dir = None if _is_s3_url(store) else str(Path(store).parent)
+    tmp_root = Path(tempfile.mkdtemp(prefix="zarrsmith_expr_", dir=tmp_dir))
     try:
         buckets = []
         for i, m in enumerate(band_nnz):

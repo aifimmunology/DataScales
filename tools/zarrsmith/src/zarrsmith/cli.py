@@ -66,12 +66,15 @@ def _build_parser() -> argparse.ArgumentParser:
     append = subparsers.add_parser(
         "append", help="Append the cells of another zarr store onto this one, in place"
     )
-    append.add_argument("--store", required=True, help="Store to extend (CSR X)")
+    append.add_argument("--store", required=True,
+                        help="Store to extend (CSR X); icechunk repos are auto-detected, "
+                             "including s3://bucket/prefix URLs")
     append.add_argument("--cells", required=True, help="Zarr store with the cells to append")
     append.add_argument("--drop-obsp", action="store_true",
                         help="Pre-approve dropping obsp graphs (invalidated by new cells)")
-    append.add_argument("--refresh-expr", action="store_true",
-                        help="Pre-approve re-deriving layers/gexp after the append")
+    append.add_argument("--drop-layers", action="store_true",
+                        help="Pre-approve dropping layers (stale after append; re-derive "
+                             "with add-expr)")
     append.add_argument("--yes", action="store_true",
                         help="Approve the printed loss plan non-interactively")
     append.add_argument("--icechunk", action="store_true", help="Store is an Icechunk repository")
@@ -105,7 +108,7 @@ def _run_store_op(args) -> tuple[list[str], str]:
         return sort_store(args.store, args.output, config), args.output
     return append_cells(
         args.store, args.cells, config,
-        drop_obsp=args.drop_obsp, refresh_expr=args.refresh_expr, assume_yes=args.yes,
+        drop_obsp=args.drop_obsp, drop_layers=args.drop_layers, assume_yes=args.yes,
     ), args.store
 
 

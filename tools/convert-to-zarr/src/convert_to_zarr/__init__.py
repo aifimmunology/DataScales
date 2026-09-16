@@ -1,5 +1,9 @@
 """convert-to-zarr: convert and concatenate single-cell data into AnnData zarr stores."""
 
+from .engine import _pin_blas
+
+_pin_blas()  # before .ops pulls in numpy — BLAS pools read these env vars at library load
+
 from .config import AppConfig, GroupingConfig, load_config
 from .errors import ConversionError
 from .ops import (

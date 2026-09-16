@@ -92,8 +92,8 @@ x_storage = "sparse-csr"
 backed = false
 # backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
 # one commit per conversion). icechunk requires eager input (not backed) for now.
+# An icechunk target is a local path or an s3://bucket/prefix URL (AWS env credentials).
 backend = "zarr"
-icechunk_storage = "local"   # "gcs" is scaffolded but not wired up yet
 
 [chunks]
 #Chunk size for 2d dense arrays

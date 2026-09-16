@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from importlib.resources import path
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,7 +14,6 @@ except Exception:  # pragma: no cover
 
 XStorageMode = Literal["sparse-csr", "sparse-csc", "dense"]
 BackendMode = Literal["zarr", "icechunk"]
-IcechunkStorageMode = Literal["local", "gcs"]
 
 
 @dataclass(frozen=True)
@@ -26,11 +24,8 @@ class IOConfig:
     backed: bool = False  # load h5ad in backed (HDF5-streamed) mode; opt-in only
     # Storage backend for the output store. "zarr" writes a plain on-disk zarr; "icechunk"
     # writes through a transactional, versioned Icechunk repository (one commit per convert).
+    # Icechunk targets are a local path or an s3://bucket/prefix URL (env credentials).
     backend: BackendMode = "zarr"
-    icechunk_storage: IcechunkStorageMode = "local"
-    # GCS scaffolding — not wired into a working path yet (local only for now).
-    gcs_bucket: str | None = None
-    gcs_prefix: str = ""
 
 
 @dataclass(frozen=True)

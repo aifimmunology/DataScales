@@ -17,6 +17,11 @@ config/storage/encoding layer).
   arrays/groups only, re-consolidate metadata if present); rewriting ops (rechunk, sort)
   always write a new store via temp + atomic swap. `--icechunk` turns any op into one commit.
 - Append input: zarr stores only (convert h5ad first).
+- Append never derives layers (2026-09): an existing layer is dropped with consent
+  (`--drop-layers`, mirroring `--drop-obsp`) and re-derived separately with add-expr —
+  the per-append full-matrix refresh was O(store) each time.
+- Icechunk storage targets: local path or `s3://bucket/prefix` (env credentials). GCS
+  scaffolding dropped. Icechunk repos auto-detected for inputs AND in-place targets.
 - Build order: restructure → add-expr → rechunk → sort (standalone) → append.
 - Code style: minimal, sparse comments (one-liners for real constraints only), no module headers.
 
@@ -42,25 +47,29 @@ target_sum persisted on the layer and honored by --refresh-expr; rechunk validat
 --array before touching the output, streams obsm/obsp, caps workers×block RAM; sort
 fail-fast on existing output, argsort-run bucketing (no per-group masks).
 
-Efficiency (still open): incremental csr gexp refresh on append; rechunk tile alignment
-to both grids (source chunks straddling output tiles are re-decoded); buffered temp-group
-appends in sort (tail-chunk RMW remains at high-cardinality keys); icechunk Session.fork()
-for the backed process-pool writers.
+Efficiency (landed, 2026-09): append obs extends per column in place (schema validated at
+the zarr encoding level, categorical codes/nullable values+mask appended directly, duplicate
+check streamed over the store index) — append peak RAM is O(appended cells), not O(store),
+and each icechunk commit no longer rewrites obs history; BLAS env pinned in the package
+__init__ before numpy loads (setdefault after import was a no-op for OpenBLAS).
+
+Efficiency (still open): rechunk tile alignment to both grids (source chunks straddling
+output tiles are re-decoded); buffered temp-group appends in sort (tail-chunk RMW remains
+at high-cardinality keys); icechunk Session.fork() for the backed process-pool writers.
 
 Workflow (landed): sort auto-re-derives a lone gexp layer on the sorted output
-(introspected fmt/chunks/target_sum); icechunk inputs auto-detected by open_input_group
-(repo/ + snapshots/, no zarr.json) — rechunk/sort/append --cells read icechunk repos with
-no extra flags; append presents a loss plan (obsp drop, gexp re-derive, cells-store
-extras left behind) and requires a flag, --yes, or an interactive confirmation.
+(introspected fmt/chunks/target_sum); icechunk repos auto-detected (repo/ + snapshots/,
+no zarr.json, or an s3:// URL) for inputs and in-place targets — add-expr/append work on
+a repo with no extra flags; append presents a loss plan (obsp drop, layers drop,
+cells-store extras left behind) and requires a flag, --yes, or an interactive confirmation.
 Vendored libs re-synced to the locked versions (zarr 3.3.0, anndata 0.12.19,
 dask 2026.7.1, icechunk 2.1.2, rapids-singlecell 0.16.1); key APIs re-verified.
 
 Hygiene (still open): one batch-bytes constant + helper (currently 6 copies), one
 make-sparse-group helper (currently 5 hand-rolled), ZarrsmithError root + unified CLI
-dispatch, merge the two parallel runners, drop GCS config scaffolding + dead importlib
-import, scanpy → optional extra, temp+atomic-swap for rechunk/sort or amend the claim
-above, --version/inspect, README fixes (--cpus/--backed row, 64 MB cap claim,
-"Planned ops", example_config backed=true drift).
+dispatch, merge the two parallel runners, scanpy → optional extra, temp+atomic-swap for
+rechunk/sort or amend the claim above, --version/inspect, README fixes (--cpus/--backed
+row, 64 MB cap claim, "Planned ops").
 
 Tests (still open): remaining append guards, int32→int64 promotion via patchable
 constant, rechunk of layers/raw/sharded arrays, memory-bound assertions.
@@ -137,7 +146,7 @@ is the shared piece the new ops need first.
   union/coercion), X dtype mismatch.
 - Detect indices/indptr int32 → int64 promotion when nnz crosses 2^31.
 - Loud refusal + explicit flags for invalidated elements: obsp graphs (`--drop-obsp`),
-  sorted-store contiguity (`--resort`), stale gexp layer (`--refresh-expr`).
+  stale layers (`--drop-layers`); sorted-store contiguity gets a warning to re-sort.
 
 ## Cross-cutting invariants (every op)
 

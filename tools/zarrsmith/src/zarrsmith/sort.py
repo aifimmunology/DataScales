@@ -12,10 +12,14 @@ def sort_store(input_store: str, output_zarr: str, cfg: AppConfig) -> list[str]:
     from anndata.io import read_elem, sparse_dataset
 
     from convert_to_zarr.config import _resolve_backend_cfg
-    from convert_to_zarr.storage import open_input_group
+    from convert_to_zarr.storage import _is_s3_url, open_input_group
     from .expr import _introspect_gexp, add_expr_layer
 
     cfg = _resolve_backend_cfg(cfg)
+    if _is_s3_url(output_zarr):
+        raise ConversionError(
+            "sort streams through local temp stores; s3:// output is not supported yet."
+        )
     if not cfg.grouping.sort_by:
         raise ConversionError("sort requires --by OBS_COLUMN [OBS_COLUMN ...].")
     if cfg.io.x_storage != "sparse-csr":

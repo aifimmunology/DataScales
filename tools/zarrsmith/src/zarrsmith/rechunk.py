@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import zarr
 
 from convert_to_zarr.config import AppConfig, _resolve_backend_cfg
 from convert_to_zarr.engine import _run_parallel_threads, _stage, configure_runtime
 from convert_to_zarr.errors import ConversionError
 from convert_to_zarr.layout import _dense_shards
-from convert_to_zarr.storage import open_input_group, open_output_store
+from convert_to_zarr.storage import _store_name, open_input_group, open_output_store
 
 _SMALL_ELEMS = ("obs", "var", "uns", "varm", "varp")
 _SEG_BYTES = 256 * 1024 * 1024
@@ -36,9 +34,9 @@ def rechunk_store(
         raise ConversionError(f"array '{array}' is not a matrix element ({matrix_keys}).")
 
     ad.settings.zarr_write_format = 3
-    output_path = Path(output_zarr)
     dst, finalize = open_output_store(
-        output_path, cfg, commit_message=f"zarrsmith rechunk {array} → {output_path.name}"
+        output_zarr, cfg,
+        commit_message=f"zarrsmith rechunk {array} → {_store_name(output_zarr)}",
     )
     dst.attrs.update(dict(src.attrs))
 
