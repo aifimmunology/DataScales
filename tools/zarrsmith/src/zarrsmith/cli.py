@@ -70,11 +70,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Store to extend (CSR X); icechunk repos are auto-detected, "
                              "including s3://bucket/prefix URLs")
     append.add_argument("--cells", required=True, help="Zarr store with the cells to append")
-    append.add_argument("--drop-obsp", action="store_true",
-                        help="Pre-approve dropping obsp graphs (invalidated by new cells)")
-    append.add_argument("--drop-layers", action="store_true",
-                        help="Pre-approve dropping layers (stale after append; re-derive "
-                             "with add-expr)")
+    append.add_argument("--drop-derived", action="store_true",
+                        help="Pre-approve dropping obs-aligned derived elements (obsm, obsp, "
+                             "layers) invalidated by the append; re-derive layers with add-expr")
     append.add_argument("--yes", action="store_true",
                         help="Approve the printed loss plan non-interactively")
     append.add_argument("--icechunk", action="store_true", help="Store is an Icechunk repository")
@@ -108,7 +106,7 @@ def _run_store_op(args) -> tuple[list[str], str]:
         return sort_store(args.store, args.output, config), args.output
     return append_cells(
         args.store, args.cells, config,
-        drop_obsp=args.drop_obsp, drop_layers=args.drop_layers, assume_yes=args.yes,
+        drop_derived=args.drop_derived, assume_yes=args.yes,
     ), args.store
 
 

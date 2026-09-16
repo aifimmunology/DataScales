@@ -11,6 +11,7 @@ from convert_to_zarr.config import AppConfig, ChunkConfig, IOConfig, ValidationC
 from convert_to_zarr import (
     ConversionError,
     convert_10x_h5_to_zarr,
+    convert_adata_to_zarr,
     convert_h5ad_to_zarr,
 )
 
@@ -315,3 +316,18 @@ def test_h5ad_eager_dense_input_with_dense_layer_csr_output(tmp_path: Path) -> N
         shape=tuple(z["layers/scaled"].attrs["shape"]),
     ).toarray()
     np.testing.assert_array_equal(got, dense * 2)
+
+
+def test_convert_adata_in_memory(tmp_path: Path) -> None:
+    """Public library entry: an in-memory AnnData converts like convert-h5ad."""
+    X = sp.csr_matrix(np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]]))
+    adata = ad.AnnData(X=X)
+    out = tmp_path / "out.zarr"
+    convert_adata_to_zarr(adata, str(out), _cfg("sparse-csr"))
+    got = ad.read_zarr(str(out))
+    np.testing.assert_array_equal(got.X.toarray(), X.toarray())
+
+    import pytest
+
+    with pytest.raises(ConversionError, match="in-memory"):
+        convert_adata_to_zarr(adata, str(tmp_path / "b.zarr"), _cfg_backed("sparse-csr"))

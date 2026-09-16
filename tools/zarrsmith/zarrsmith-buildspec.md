@@ -17,9 +17,11 @@ config/storage/encoding layer).
   arrays/groups only, re-consolidate metadata if present); rewriting ops (rechunk, sort)
   always write a new store via temp + atomic swap. `--icechunk` turns any op into one commit.
 - Append input: zarr stores only (convert h5ad first).
-- Append never derives layers (2026-09): an existing layer is dropped with consent
-  (`--drop-layers`, mirroring `--drop-obsp`) and re-derived separately with add-expr —
-  the per-append full-matrix refresh was O(store) each time.
+- Append extends X + obs only (2026-09): derived obs-aligned elements (obsm, obsp, layers)
+  are all invalidated by new cells — embeddings from different runs don't share a coordinate
+  space, graphs and layers go shape-inconsistent — so one `--drop-derived` flag drops them
+  with consent; layers are re-derived separately with add-expr (the per-append full-matrix
+  refresh was O(store) each time).
 - Icechunk storage targets: local path or `s3://bucket/prefix` (env credentials). GCS
   scaffolding dropped. Icechunk repos auto-detected for inputs AND in-place targets.
 - Build order: restructure → add-expr → rechunk → sort (standalone) → append.
@@ -60,8 +62,8 @@ at high-cardinality keys); icechunk Session.fork() for the backed process-pool w
 Workflow (landed): sort auto-re-derives a lone gexp layer on the sorted output
 (introspected fmt/chunks/target_sum); icechunk repos auto-detected (repo/ + snapshots/,
 no zarr.json, or an s3:// URL) for inputs and in-place targets — add-expr/append work on
-a repo with no extra flags; append presents a loss plan (obsp drop, layers drop,
-cells-store extras left behind) and requires a flag, --yes, or an interactive confirmation.
+a repo with no extra flags; append presents a loss plan (derived-elements drop, cells-store
+extras left behind) and requires a flag, --yes, or an interactive confirmation.
 Vendored libs re-synced to the locked versions (zarr 3.3.0, anndata 0.12.19,
 dask 2026.7.1, icechunk 2.1.2, rapids-singlecell 0.16.1); key APIs re-verified.
 
@@ -145,8 +147,8 @@ is the shared piece the new ops need first.
 - Hard errors: var mismatch (names + order), categorical category mismatch (no silent
   union/coercion), X dtype mismatch.
 - Detect indices/indptr int32 → int64 promotion when nnz crosses 2^31.
-- Loud refusal + explicit flags for invalidated elements: obsp graphs (`--drop-obsp`),
-  stale layers (`--drop-layers`); sorted-store contiguity gets a warning to re-sort.
+- Loud refusal + an explicit flag for invalidated derived elements — obsm/obsp/layers
+  (`--drop-derived`); sorted-store contiguity gets a warning to re-sort.
 
 ## Cross-cutting invariants (every op)
 

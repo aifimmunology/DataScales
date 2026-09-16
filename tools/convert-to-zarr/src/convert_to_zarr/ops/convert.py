@@ -13,7 +13,7 @@ from ..config import AppConfig, _resolve_backend_cfg
 from ..engine import configure_runtime
 from ..errors import ConversionError
 from ..sources import _close_backed_if_needed, _load_h5ad_for_conversion
-from ..storage import open_output_store
+from ..storage import _store_name, open_output_store
 from ..validation import validate_single_cell_anndata
 from ..writers import _write_csr_adata_direct
 from ..sorting import _maybe_sort_adata, _write_sorted_backed
@@ -21,7 +21,7 @@ from ..sorting import _maybe_sort_adata, _write_sorted_backed
 
 def _write_adata_to_zarr(
     adata: ad.AnnData,
-    output_path: Path,
+    output_path: str | Path,
     cfg: AppConfig,
     load_warnings: list[str],
     allow_grouping: bool = False,
@@ -39,7 +39,7 @@ def _write_adata_to_zarr(
     if allow_grouping:
         if cfg.grouping.enabled and cfg.io.backed:
             # Backed input: sort X without ever materialising it (streamed bucket + concat).
-            return _write_sorted_backed(adata, output_path, cfg, warnings)
+            return _write_sorted_backed(adata, Path(output_path), cfg, warnings)
         adata = _maybe_sort_adata(adata, cfg, warnings)
     elif cfg.grouping.enabled:
         raise ConversionError(
@@ -100,7 +100,7 @@ def _write_adata_to_zarr(
     )
     t0 = time.perf_counter()
     store, finalize = open_output_store(
-        output_path, cfg, commit_message=f"convert-to-zarr convert → {output_path.name}",
+        output_path, cfg, commit_message=f"convert-to-zarr convert → {_store_name(output_path)}",
     )
     _write_csr_adata_direct(adata, store, cfg, x_override=x_for_write)
     finalize()
@@ -111,13 +111,26 @@ def _write_adata_to_zarr(
     return [*warnings, *validation_result.warnings]
 
 
+def convert_adata_to_zarr(adata: ad.AnnData, output_zarr: str, cfg: AppConfig) -> list[str]:
+    """Write an in-memory AnnData to a zarr (or icechunk) store; returns warnings.
+
+    Public library entry for data that doesn't start as .h5ad/10x: X may be CSR, CSC
+    (converted), or dense; honors x_storage/backend/sort_by exactly like convert-h5ad.
+    """
+    if cfg.io.backed:
+        raise ConversionError(
+            "convert_adata_to_zarr takes an in-memory AnnData; io.backed does not apply."
+        )
+    return _write_adata_to_zarr(adata, output_zarr, cfg, [], allow_grouping=True)
+
+
 def convert_h5ad_to_zarr(input_h5ad: str, output_zarr: str, cfg: AppConfig) -> list[str]:
     """Convert a .h5ad file to zarr; returns the warnings encountered."""
     adata = None
     load_warnings: list[str] = []
     try:
         adata, load_warnings = _load_h5ad_for_conversion(Path(input_h5ad), cfg)
-        return _write_adata_to_zarr(adata, Path(output_zarr), cfg, load_warnings, allow_grouping=True)
+        return _write_adata_to_zarr(adata, output_zarr, cfg, load_warnings, allow_grouping=True)
     except Exception as e:
         load_warnings = f"Warnings: {load_warnings}" if load_warnings else ""
         raise ConversionError(f"Failed to convert .h5ad file: {e}.{load_warnings}") from e
@@ -134,4 +147,4 @@ def convert_10x_h5_to_zarr(input_h5: str, output_zarr: str, cfg: AppConfig) -> l
     except Exception as e:
         raise ConversionError(f"Failed to read 10x H5 file: {e}") from e
 
-    return _write_adata_to_zarr(adata, Path(output_zarr), cfg, [])
+    return _write_adata_to_zarr(adata, output_zarr, cfg, [])
