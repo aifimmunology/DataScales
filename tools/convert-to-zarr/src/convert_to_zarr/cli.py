@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from .config import apply_cli_overrides, load_config
-from .converter import (
+from .ops import (
     convert_10x_h5_to_zarr,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
@@ -77,7 +77,6 @@ def _add_common_args(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="convert-to-zarr")
-    #dest is what field to grab froms args object. EG args.command will be the below subparser name
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     h5ad = subparsers.add_parser(
@@ -97,7 +96,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="OBS_COLUMN",
         help="Sort + partition rows by these obs column(s), primary key first "
              "(e.g. --sort-by AIFI_L1 batch_id). Physically sorts rows so each distinct key "
-             "tuple is a contiguous block; the output is a plain sorted AnnData (no convert-to-zarr "
+             "tuple is a contiguous block; the output is a plain sorted AnnData (no tool "
              "index) — derive ranges from the sorted obs column(s) and slice X[start:end] with "
              "stock anndata/zarr. Eager load handles sparse-csr or dense; with --backed the "
              "sort is streamed (memory-bounded) for sparse-csr only, and layers/raw/obsp must "
@@ -203,4 +202,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

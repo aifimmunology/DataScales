@@ -13,6 +13,8 @@ pixi environment; each project folder holds a README and its scripts. A single a
 - **[convert-to-zarr](tools/convert-to-zarr/README.md)** — AnnData / `.h5ad` → anndata-readable
   Zarr v3 (streaming dense/sparse, multi-h5ad concat, sort/partition, optional Icechunk);
   includes a conversion benchmark vs anndata / h5py / icechunk (`benchmarking/`).
+- **[zarrsmith](tools/zarrsmith/README.md)** — edit existing AnnData zarr stores in place:
+  add-expr (lognorm gene layer), rechunk, physical sort, append; builds on convert-to-zarr's core.
 - **[zarr-query-bench](tools/zarr-query-bench/README.md)** — query-time benchmark for a store's
   `X` (row/column, sequential/random/cell-type; dense vs CSR/CSC).
 - **[rapids-benchmark](tools/rapids-benchmark/README.md)** — per-step GPU single-cell pipeline
