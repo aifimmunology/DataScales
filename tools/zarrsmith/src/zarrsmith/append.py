@@ -19,11 +19,14 @@ def append_cells(
     cells: str,
     cfg: AppConfig,
     *,
-    drop_obsp: bool = False,
-    drop_layers: bool = False,
+    drop_derived: bool = False,
     assume_yes: bool = False,
 ) -> list[str]:
-    """Append the cells of another zarr store onto this one, in place."""
+    """Append the cells of another zarr store onto this one, in place.
+
+    Extends X and obs only. Derived obs-aligned elements on the store (obsm embeddings,
+    obsp graphs, layers) are invalidated by new cells and are dropped with consent
+    (``drop_derived``); re-derive layers afterwards with add-expr."""
     import numpy as np
     from anndata.io import read_elem
 
@@ -63,15 +66,6 @@ def append_cells(
     n_s = int(x_s.attrs["shape"][0])
 
     obsm_keys = list(root["obsm"]) if "obsm" in root else []
-    src_obsm = src["obsm"] if "obsm" in src else None
-    for k in obsm_keys:
-        if src_obsm is None or k not in src_obsm:
-            raise ConversionError(f"cells store lacks obsm entry '{k}' present in store.")
-        a, b = root["obsm"][k], src_obsm[k]
-        if not isinstance(a, zarr.Array) or not isinstance(b, zarr.Array):
-            raise ConversionError(f"append only supports plain-array obsm entries (obsm/{k}).")
-        if a.shape[1:] != b.shape[1:] or a.dtype != b.dtype:
-            raise ConversionError(f"obsm/{k} shape/dtype mismatch between stores.")
 
     indptr_t = np.asarray(x_t["indptr"][:], dtype=np.int64)
     indptr_s = np.asarray(x_s["indptr"][:], dtype=np.int64)
@@ -79,38 +73,42 @@ def append_cells(
     has_dup_names = _has_duplicate_names(root["obs"], src["obs"], n_t)
 
     plan = []
-    if obsp_keys:
-        plan.append((f"drop obsp graphs {obsp_keys} (invalidated by new cells)", drop_obsp))
-    if layer_keys:
-        plan.append(
-            (f"drop layers {layer_keys} (not extended by append; re-derive with add-expr)",
-             drop_layers)
-        )
+    derived = [
+        f"{g} {keys}"
+        for g, keys in (("obsm", obsm_keys), ("obsp", obsp_keys), ("layers", layer_keys))
+        if keys
+    ]
+    layer_hint = "; re-derive layers with add-expr" if layer_keys else ""
+    if derived:
+        plan.append((
+            "drop derived elements (invalidated by appended cells): "
+            + ", ".join(derived) + layer_hint,
+            drop_derived,
+        ))
+    # not a loss on the store — append carries X + obs only — so report, don't gate
     extras = []
     if "layers" in src and list(src["layers"]):
         extras.append(f"layers {list(src['layers'])}")
     if "raw" in src and len(list(src["raw"])) > 0:
         extras.append("raw")
-    extra_obsm = [k for k in (list(src_obsm) if src_obsm is not None else []) if k not in obsm_keys]
-    if extra_obsm:
-        extras.append(f"obsm {extra_obsm}")
+    if "obsm" in src and list(src["obsm"]):
+        extras.append(f"obsm {list(src['obsm'])}")
     if extras:
-        plan.append(("leave behind (not carried from the cells store): " + ", ".join(extras), False))
+        warnings.append("left behind (not carried from the cells store): " + ", ".join(extras))
     _confirm(plan, assume_yes)
 
     # mutations start here; order keeps the store readable as its old self until
     # indptr/shape flip (plain zarr has no rollback — icechunk discards on failure)
     try:
-        for group_key, keys, note in (
-            ("obsp", obsp_keys, "invalidated by appended cells"),
-            ("layers", layer_keys, "stale after append; re-derive with add-expr"),
-        ):
+        for group_key, keys in (("obsm", obsm_keys), ("obsp", obsp_keys), ("layers", layer_keys)):
             for k in keys:
                 del root[group_key][k]
-            if keys:
-                warnings.append(f"dropped {group_key} {keys} ({note}).")
-        _append_arrays(root, src, x_t, x_s, obsm_keys, src_obsm,
-                       indptr_t, indptr_s, n_t, n_s, n_vars, cfg)
+        if derived:
+            warnings.append(
+                "dropped " + ", ".join(derived)
+                + f" (invalidated by appended cells{layer_hint})."
+            )
+        _append_arrays(root, src, x_t, x_s, indptr_t, indptr_s, n_t, n_s, n_vars, cfg)
     except ConversionError:
         raise
     except Exception as e:
@@ -200,8 +198,7 @@ def _has_duplicate_names(obs_t, obs_s, n_t: int) -> bool:
     return False
 
 
-def _append_arrays(root, src, x_t, x_s, obsm_keys, src_obsm,
-                   indptr_t, indptr_s, n_t, n_s, n_vars, cfg):
+def _append_arrays(root, src, x_t, x_s, indptr_t, indptr_s, n_t, n_s, n_vars, cfg):
     import numpy as np
 
     nnz_t, nnz_s = int(indptr_t[-1]), int(indptr_s[-1])
@@ -233,12 +230,8 @@ def _append_arrays(root, src, x_t, x_s, obsm_keys, src_obsm,
         ip[:] = np.concatenate([indptr_t, indptr_s[1:] + nnz_t]).astype(indptr_dtype)
         x_t.attrs["shape"] = [n_new, n_vars]
 
-    with _stage(f"Appending obs + obsm ({n_s} cells)"):
+    with _stage(f"Appending obs ({n_s} cells)"):
         _append_obs(root["obs"], src["obs"], n_t, n_new)
-        for k in obsm_keys:
-            a = root["obsm"][k]
-            a.resize((n_new,) + a.shape[1:])
-            a[n_t:n_new] = src_obsm[k][:]
 
 
 def _append_obs(obs_t, obs_s, n_t: int, n_new: int) -> None:
@@ -282,5 +275,5 @@ def _confirm(plan: list[tuple[str, bool]], assume_yes: bool) -> None:
         raise ConversionError("append cancelled.")
     raise ConversionError(
         f"append needs confirmation:\n{lines}\n"
-        "Pass --yes (or --drop-obsp / --drop-layers) to proceed non-interactively."
+        "Pass --yes (or --drop-derived) to proceed non-interactively."
     )

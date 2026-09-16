@@ -153,15 +153,14 @@ def test_append(tmp_path):
     a, b = _adata(n=40, seed=0), _adata(n=15, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
     sb = _store(tmp_path, b, "b.zarr")
-    append_cells(str(sa), str(sb), _cfg())
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_derived=True)
+    assert any("obsm" in w and "dropped" in w for w in warnings)
     got = ad.read_zarr(str(sa))
     assert got.n_obs == 55
     np.testing.assert_allclose(got.X.toarray(), sp.vstack([a.X, b.X]).toarray())
     assert list(got.obs_names) == list(a.obs_names) + list(b.obs_names)
     assert list(got.obs["cell_type"]) == list(a.obs["cell_type"]) + list(b.obs["cell_type"])
-    np.testing.assert_allclose(
-        got.obsm["X_umap"], np.vstack([a.obsm["X_umap"], b.obsm["X_umap"]])
-    )
+    assert len(got.obsm) == 0  # embeddings are invalidated, not extended
 
 
 def test_append_guards(tmp_path):
@@ -176,8 +175,9 @@ def test_append_guards(tmp_path):
     sb = _store(tmp_path, _adata(n=10, seed=3), "b.zarr")
     with pytest.raises(ConversionError, match="obsp"):
         append_cells(str(sa2), str(sb), _cfg())
-    append_cells(str(sa2), str(sb), _cfg(), drop_obsp=True)
-    assert ad.read_zarr(str(sa2)).n_obs == 30
+    append_cells(str(sa2), str(sb), _cfg(), drop_derived=True)
+    got = ad.read_zarr(str(sa2))
+    assert got.n_obs == 30 and len(got.obsp) == 0
 
 
 @pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
@@ -206,7 +206,7 @@ def test_ops_on_consolidated_store(tmp_path):
     sa = _store(tmp_path, a, "a.zarr", cfg=_cfg(consolidate_metadata=True))
     sb = _store(tmp_path, b, "b.zarr")
     add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
-    append_cells(str(sa), str(sb), _cfg(), drop_layers=True)
+    append_cells(str(sa), str(sb), _cfg(), drop_derived=True)
     add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
     got = ad.read_zarr(str(sa))  # reads via the re-consolidated metadata
     assert got.n_obs == 42 and "gexp" in got.layers
@@ -218,7 +218,7 @@ def test_append_failed_validation_mutates_nothing(tmp_path):
     sa = _store(tmp_path, a, "a.zarr")
     sb_bad = _store(tmp_path, _adata(n=10, v=5, seed=1), "bad.zarr")
     with pytest.raises(ConversionError, match="var mismatch"):
-        append_cells(str(sa), str(sb_bad), _cfg(), drop_obsp=True)
+        append_cells(str(sa), str(sb_bad), _cfg(), drop_derived=True)
     got = ad.read_zarr(str(sa))
     assert got.n_obs == 20 and "conn" in got.obsp
 
@@ -253,7 +253,7 @@ def test_append_obs_column_types(tmp_path):
     a, b = build(25, 0), build(11, 1)
     sa = _store(tmp_path, a, "a.zarr")
     sb = _store(tmp_path, b, "b.zarr")
-    append_cells(str(sa), str(sb), _cfg())
+    append_cells(str(sa), str(sb), _cfg(), drop_derived=True)
     got = ad.read_zarr(str(sa))
     expected = pd.concat([a.obs, b.obs], axis=0)
     pd.testing.assert_frame_equal(got.obs, expected, check_dtype=False)
@@ -274,7 +274,7 @@ def test_append_obs_dtype_mismatch(tmp_path):
 def test_append_duplicate_names_warn(tmp_path):
     sa = _store(tmp_path, _adata(n=20, seed=0), "a.zarr")
     sb = _store(tmp_path, _adata(n=20, seed=0), "b.zarr")
-    warnings = append_cells(str(sa), str(sb), _cfg())
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_derived=True)
     assert any("duplicate" in w for w in warnings)
 
 
@@ -290,19 +290,19 @@ def test_cli_store_ops(tmp_path):
     assert run(["add-expr", "--store", str(tmp_path / "missing.zarr")]) == 1
 
 
-def test_append_drop_layers(tmp_path):
+def test_append_drop_derived(tmp_path):
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
     sb = _store(tmp_path, b, "b.zarr")
     add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
-    # append never touches layers itself: an existing layer must be explicitly dropped,
-    # then re-derived with add-expr
-    with pytest.raises(ConversionError, match="drop layers"):
+    # append never touches derived elements itself: obsm/obsp/layers must be explicitly
+    # dropped; layers are then re-derived with add-expr
+    with pytest.raises(ConversionError, match="layers"):
         append_cells(str(sa), str(sb), _cfg())
-    warnings = append_cells(str(sa), str(sb), _cfg(), drop_layers=True)
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_derived=True)
     assert any("add-expr" in w for w in warnings)
     got = ad.read_zarr(str(sa))
-    assert got.n_obs == 42 and len(got.layers) == 0
+    assert got.n_obs == 42 and len(got.layers) == 0 and len(got.obsm) == 0
     add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32, target_sum=1e6)
     got = ad.read_zarr(str(sa))
     np.testing.assert_allclose(

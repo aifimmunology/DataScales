@@ -8,6 +8,7 @@ from .config import AppConfig, GroupingConfig, load_config
 from .errors import ConversionError
 from .ops import (
     convert_10x_h5_to_zarr,
+    convert_adata_to_zarr,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "load_config",
     "ConversionError",
     "ValidationError",
+    "convert_adata_to_zarr",
     "convert_h5ad_to_zarr",
     "convert_h5ads_to_zarr",
     "convert_10x_h5_to_zarr",

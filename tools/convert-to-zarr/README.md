@@ -78,6 +78,17 @@ Requirements (strict; conversion errors otherwise):
 - `adata.X` in each file must be CSR or CSC (CSC is auto-converted to CSR).
 - All `X` matrices must share the same dtype.
 
+### Library entry: in-memory AnnData
+
+For data that doesn't start as `.h5ad`/10x, `convert_adata_to_zarr` writes an in-memory
+AnnData through the same pipeline (X coercion, validation, `x_storage`/`backend`/`sort_by`):
+
+```python
+from convert_to_zarr import convert_adata_to_zarr, load_config
+
+convert_adata_to_zarr(adata, "path/to/output.zarr", load_config("example_config.toml"))
+```
+
 # Argument passing
 
 ## Config (TOML or YAML)
