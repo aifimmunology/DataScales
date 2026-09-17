@@ -44,9 +44,9 @@ class Config:
     data_path: str = "/mnt/external_megazarr_v1.0.zarr"
     chunk_rows: int = 24_000           # row block for read (multiple of the store's row chunk)
 
-    # -- optional obs subset (run the whole pipeline on cells matching one metadata value) --
+    # -- optional obs subset (run the whole pipeline on cells matching metadata value(s)) --
     subset_column: str = ""   # obs column to filter on; "" = no subset (run on the whole store)
-    subset_value: str = ""    # value in subset_column to keep (string compare, categorical-safe)
+    subset_value: str = ""    # value(s) in subset_column to keep, comma-separated for multiple
 
     # -- result write-back (UMAP embedding + leiden labels, no h5ad) --
     write_results: bool = True         # final step (full run: onto master root; subset: a data_path/subsets/ store)
@@ -391,16 +391,18 @@ def _write_subset(adata, cfg: Config) -> None:
           f"{subset.n_obs} cells, no X")
 
 
-# ── optional obs subset (filter by one metadata value, by SLICING) ──────────────
+# ── optional obs subset (filter by metadata value(s), by SLICING) ───────────────
 def _subset_rows(X_dask, obs, cfg: Config):
-    """Subset the lazy X + obs to rows where obs[subset_column] == subset_value, by SLICING.
+    """Subset the lazy X + obs to rows where obs[subset_column] is in subset_value
+    (comma-separated for multiple values), by SLICING.
 
-    On a store sorted by subset_column the matched rows are one contiguous block, so this is
-    a single X[start:end]: dask reads only the chunks that span it, decodes them, and trims to
-    the rows — the common 'filter then fetch' access, same path as zarr-query-bench celltype
-    mode. If the value spans a few runs (store sorted by a different key) each run is sliced and
-    the slices concatenated lazily — still slicing, never a scattered per-row gather. The slice
-    keeps known chunk sizes, so no compute_chunk_sizes() is needed before the pipeline.
+    On a store sorted by subset_column the matched rows are one contiguous block per value,
+    so this is one X[start:end] per value: dask reads only the chunks that span it, decodes
+    them, and trims to the rows — the common 'filter then fetch' access, same path as
+    zarr-query-bench celltype mode. If a value spans a few runs (store sorted by a different
+    key) each run is sliced and the slices concatenated lazily — still slicing, never a
+    scattered per-row gather. The slices keep known chunk sizes, so no compute_chunk_sizes()
+    is needed before the pipeline.
     """
     import numpy as np
     import dask.array as da
@@ -408,13 +410,14 @@ def _subset_rows(X_dask, obs, cfg: Config):
     if cfg.subset_column not in obs.columns:
         raise KeyError(f"subset column '{cfg.subset_column}' not in obs. "
                        f"Available: {', '.join(map(str, obs.columns))}")
-    idx = np.flatnonzero((obs[cfg.subset_column] == cfg.subset_value).to_numpy())
+    values = [v.strip() for v in str(cfg.subset_value).split(",") if v.strip()]
+    idx = np.flatnonzero(obs[cfg.subset_column].isin(values).to_numpy())
     if idx.size == 0:
         uniq = obs[cfg.subset_column].unique()
-        raise ValueError(f"no rows match obs['{cfg.subset_column}']=='{cfg.subset_value}'. "
+        raise ValueError(f"no rows match obs['{cfg.subset_column}'] in {values}. "
                          f"Available: {', '.join(map(str, uniq[:50]))}")
 
-    # contiguous [start,end) runs of matched rows (== 1 run on a store sorted by this column)
+    # contiguous [start,end) runs of matched rows (== 1 run per value on a sorted store)
     breaks = np.flatnonzero(np.diff(idx) > 1) + 1
     starts, ends = np.concatenate(([0], breaks)), np.concatenate((breaks, [idx.size]))
     spans = [(int(idx[s]), int(idx[e - 1]) + 1) for s, e in zip(starts, ends)]
@@ -422,9 +425,14 @@ def _subset_rows(X_dask, obs, cfg: Config):
     parts = [X_dask[s:e] for s, e in spans]     # each a contiguous slice, known chunks
     X_dask = parts[0] if len(parts) == 1 else da.concatenate(parts, axis=0)
     obs = obs.iloc[idx].copy()
-    kind = "1 span (contiguous)" if len(spans) == 1 else \
-        f"{len(spans)} spans (store not sorted by this column)"
-    print(f"  subset: obs['{cfg.subset_column}']=='{cfg.subset_value}' -> {idx.size} rows, {kind}")
+    # drop categories with no cells left: harmony sizes batches from cat.categories, so a
+    # stale category would enter the model as a phantom empty batch
+    for c in obs.select_dtypes("category").columns:
+        obs[c] = obs[c].cat.remove_unused_categories()
+    kind = "1 span (contiguous)" if len(spans) == 1 else (
+        f"{len(spans)} spans (contiguous per value)" if len(spans) <= len(values)
+        else f"{len(spans)} spans (store not sorted by this column)")
+    print(f"  subset: obs['{cfg.subset_column}'] in {values} -> {idx.size} rows, {kind}")
     return X_dask, obs
 
 # ── harmony managed-memory workaround ───────────────────────────────────────────
