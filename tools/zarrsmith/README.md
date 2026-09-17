@@ -30,14 +30,16 @@ pixi run zarrsmith rechunk --store in.zarr --output out.zarr --array X --x-row-c
 pixi run zarrsmith sort --store in.zarr --output sorted.zarr --by AIFI_L1 batch_id
 
 # append the cells of another zarr store, in place (strict var/obs/dtype match)
-pixi run zarrsmith append --store store.zarr --cells new_cells.zarr [--drop-derived]
+pixi run zarrsmith append --store store.zarr --cells new_cells.zarr [--drop-derived] [--extend-layers]
 ```
 
 `add-expr` and `append` mutate the store in place (one commit with `--icechunk`); `rechunk` and
 `sort` always write a new store. `append` extends X and obs only: derived obs-aligned elements
 on the store (obsm embeddings, obsp graphs, layers) are invalidated by new cells and need
 `--drop-derived` (dropped; re-derive layers with `add-expr`), and a previously sorted store
-should be re-sorted. obs extends per column in place (schema, dtypes, and categorical
+should be re-sorted. `--extend-layers` keeps CSR layers made by `add-expr` (recorded
+target_sum, X's sparsity) by extending them in place — the lognorm runs on the appended cells
+only, old chunks are never rewritten; other layers still drop. obs extends per column in place (schema, dtypes, and categorical
 categories must match exactly), so append memory scales with the appended cells, not the
 store. `sort` re-derives a lone `layers/gexp` on the sorted output automatically.
 

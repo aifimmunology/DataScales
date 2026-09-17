@@ -21,12 +21,15 @@ def append_cells(
     *,
     drop_derived: bool = False,
     assume_yes: bool = False,
+    extend_layers: bool = False,
 ) -> list[str]:
     """Append the cells of another zarr store onto this one, in place.
 
     Extends X and obs only. Derived obs-aligned elements on the store (obsm embeddings,
     obsp graphs, layers) are invalidated by new cells and are dropped with consent
-    (``drop_derived``); re-derive layers afterwards with add-expr."""
+    (``drop_derived``); re-derive layers afterwards with add-expr. With ``extend_layers``,
+    CSR layers created by add-expr (recorded target_sum, X's exact sparsity) are extended
+    in place instead — the lognorm transform runs on the appended cells only."""
     import numpy as np
     from anndata.io import read_elem
 
@@ -70,15 +73,22 @@ def append_cells(
     indptr_t = np.asarray(x_t["indptr"][:], dtype=np.int64)
     indptr_s = np.asarray(x_s["indptr"][:], dtype=np.int64)
 
+    ext_layers, bad_layers = [], []
+    if extend_layers and layer_keys:
+        ext_layers, bad_layers = _extendable_layers(root["layers"], layer_keys, indptr_t)
+    drop_layers = [k for k in layer_keys if k not in ext_layers]
+
     has_dup_names = _has_duplicate_names(root["obs"], src["obs"], n_t)
 
     plan = []
     derived = [
         f"{g} {keys}"
-        for g, keys in (("obsm", obsm_keys), ("obsp", obsp_keys), ("layers", layer_keys))
+        for g, keys in (("obsm", obsm_keys), ("obsp", obsp_keys), ("layers", drop_layers))
         if keys
     ]
-    layer_hint = "; re-derive layers with add-expr" if layer_keys else ""
+    layer_hint = "; re-derive layers with add-expr" if drop_layers else ""
+    if bad_layers:
+        layer_hint += f" (layers {bad_layers}: sparsity differs from X, cannot extend)"
     if derived:
         plan.append((
             "drop derived elements (invalidated by appended cells): "
@@ -100,7 +110,7 @@ def append_cells(
     # mutations start here; order keeps the store readable as its old self until
     # indptr/shape flip (plain zarr has no rollback — icechunk discards on failure)
     try:
-        for group_key, keys in (("obsm", obsm_keys), ("obsp", obsp_keys), ("layers", layer_keys)):
+        for group_key, keys in (("obsm", obsm_keys), ("obsp", obsp_keys), ("layers", drop_layers)):
             for k in keys:
                 del root[group_key][k]
         if derived:
@@ -109,6 +119,12 @@ def append_cells(
                 + f" (invalidated by appended cells{layer_hint})."
             )
         _append_arrays(root, src, x_t, x_s, indptr_t, indptr_s, n_t, n_s, n_vars, cfg)
+        if ext_layers:
+            _extend_lognorm_layers(root, x_s, ext_layers, indptr_t, indptr_s, n_t + n_s, n_vars, cfg)
+            warnings.append(
+                f"extended layers {ext_layers} in place (lognorm applied to the appended "
+                "cells at each layer's recorded target_sum)."
+            )
     except ConversionError:
         raise
     except Exception as e:
@@ -199,39 +215,97 @@ def _has_duplicate_names(obs_t, obs_s, n_t: int) -> bool:
 
 
 def _append_arrays(root, src, x_t, x_s, indptr_t, indptr_s, n_t, n_s, n_vars, cfg):
-    import numpy as np
-
     nnz_t, nnz_s = int(indptr_t[-1]), int(indptr_s[-1])
-    nnz_new = nnz_t + nnz_s
     n_new = n_t + n_s
 
     with _stage(f"Appending X ({n_s} cells, nnz={nnz_s})"):
         for name in ("data", "indices"):
-            dst_a, src_a = x_t[name], x_s[name]
-            dst_a.resize((nnz_new,))
-            # after the seam, cut on dst chunk multiples: disjoint whole-chunk
-            # writes, so segments can run threaded with no RMW
-            chunk0 = dst_a.chunks[0]
-            step = max(chunk0, (_SEG_BYTES // max(1, chunk0 * dst_a.dtype.itemsize)) * chunk0)
-            cuts = [0]
-            seam = (-nnz_t) % chunk0
-            if 0 < seam < nnz_s:
-                cuts.append(seam)
-            while cuts[-1] < nnz_s:
-                cuts.append(min(nnz_s, cuts[-1] + step))
-            jobs = [(src_a, dst_a, cuts[i], cuts[i + 1], nnz_t) for i in range(len(cuts) - 1)]
-            _run_parallel_threads(_copy_shifted, jobs, cfg.chunks.cpus)
-        indptr_dtype = np.int64 if nnz_new > np.iinfo(np.int32).max else x_t["indptr"].dtype
-        del x_t["indptr"]
-        ip = x_t.require_array(
-            "indptr", shape=(n_new + 1,), dtype=indptr_dtype, chunks=(n_new + 1,), overwrite=True
-        )
-        ip.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
-        ip[:] = np.concatenate([indptr_t, indptr_s[1:] + nnz_t]).astype(indptr_dtype)
+            _extend_flat(x_t[name], x_s[name], nnz_t, nnz_s, cfg.chunks.cpus)
+        _rewrite_indptr(x_t, indptr_t, indptr_s, n_new)
         x_t.attrs["shape"] = [n_new, n_vars]
 
     with _stage(f"Appending obs ({n_s} cells)"):
         _append_obs(root["obs"], src["obs"], n_t, n_new)
+
+
+def _extend_flat(dst_a, src_a, off, n_src, cpus):
+    """Resize dst by n_src and copy src[:n_src] to dst[off:]. After the seam, cuts land
+    on dst chunk multiples: disjoint whole-chunk writes, so segments run threaded with
+    no RMW."""
+    dst_a.resize((off + n_src,))
+    chunk0 = dst_a.chunks[0]
+    step = max(chunk0, (_SEG_BYTES // max(1, chunk0 * dst_a.dtype.itemsize)) * chunk0)
+    cuts = [0]
+    seam = (-off) % chunk0
+    if 0 < seam < n_src:
+        cuts.append(seam)
+    while cuts[-1] < n_src:
+        cuts.append(min(n_src, cuts[-1] + step))
+    jobs = [(src_a, dst_a, cuts[i], cuts[i + 1], off) for i in range(len(cuts) - 1)]
+    _run_parallel_threads(_copy_shifted, jobs, cpus)
+
+
+def _rewrite_indptr(parent, indptr_t, indptr_s, n_new):
+    import numpy as np
+
+    nnz_t = int(indptr_t[-1])
+    nnz_new = nnz_t + int(indptr_s[-1])
+    indptr_dtype = np.int64 if nnz_new > np.iinfo(np.int32).max else parent["indptr"].dtype
+    del parent["indptr"]
+    ip = parent.require_array(
+        "indptr", shape=(n_new + 1,), dtype=indptr_dtype, chunks=(n_new + 1,), overwrite=True
+    )
+    ip.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
+    ip[:] = np.concatenate([indptr_t, indptr_s[1:] + nnz_t]).astype(indptr_dtype)
+
+
+def _extendable_layers(layers, keys, indptr_t):
+    """Split layer keys into (extendable, mismatched). Extendable: CSR with add-expr's
+    recorded target_sum and X's exact sparsity (indptr identical), so extension is a
+    shifted copy of X's new indices + the lognorm transform on the new cells' data.
+    Mismatched carry the attr but a different sparsity — extending would corrupt them."""
+    import numpy as np
+
+    ext, bad = [], []
+    for k in keys:
+        node = layers[k]
+        if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") != "csr_matrix":
+            continue
+        if node.attrs.get("zarrsmith_target_sum") is None:
+            continue
+        lp = np.asarray(node["indptr"][:], dtype=np.int64)
+        if len(lp) != len(indptr_t) or not (lp == indptr_t).all():
+            bad.append(k)
+            continue
+        ext.append(k)
+    return ext, bad
+
+
+def _extend_lognorm_layers(root, x_s, keys, indptr_t, indptr_s, n_new, n_vars, cfg):
+    """Extend add-expr CSR layers in place: indices shift-copy from the cells store's X
+    (identical sparsity), indptr is value-identical to X's appended indptr, and data gets
+    the lognorm transform over the new cells only — no old row is read or rewritten."""
+    import numpy as np
+
+    from .expr import _lognorm_band
+
+    nnz_t, nnz_s = int(indptr_t[-1]), int(indptr_s[-1])
+    row_nnz_s = np.diff(indptr_s)
+    n_s = len(row_nnz_s)
+    row_step = max(1_000, min(200_000, _SEG_BYTES // (max(1, nnz_s // max(1, n_s)) * 12)))
+    for k in keys:
+        g = root["layers"][k]
+        target_sum = float(g.attrs["zarrsmith_target_sum"])
+        with _stage(f"Extending layers/{k} ({n_s} cells, nnz={nnz_s})"):
+            _extend_flat(g["indices"], x_s["indices"], nnz_t, nnz_s, cfg.chunks.cpus)
+            data = g["data"]
+            data.resize((nnz_t + nnz_s,))
+            for b0 in range(0, n_s, row_step):
+                b1 = min(b0 + row_step, n_s)
+                s0, s1, vals = _lognorm_band(x_s["data"], indptr_s, row_nnz_s, target_sum, b0, b1)
+                data[nnz_t + s0:nnz_t + s1] = vals
+            _rewrite_indptr(g, indptr_t, indptr_s, n_new)
+            g.attrs["shape"] = [n_new, n_vars]
 
 
 def _append_obs(obs_t, obs_s, n_t: int, n_new: int) -> None:
