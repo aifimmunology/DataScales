@@ -43,16 +43,22 @@ on demand and stops itself when idle.
 
 ## Phase 1 — app moves onto the GPU VM (this alone ends daily reauth)
 
+Code side done (this branch); on-VM install + verify remain. One published port: nginx
+serves UI + `/api` on **8000** — the tunnel target.
+
 - [ ] docker + compose on the VM; build images there
-- [ ] systemd unit: `docker compose up -d` at boot, `DATA_DIR` read from instance metadata
-- [ ] `gpu.py`: drop `_ssh_cmd`/`_ship` + the probe section; dispatch = write job json (already done)
-      and let the watcher pick it up
-- [ ] host job watcher (systemd service): poll `jobs/submitted/`, run `gpu_job.sh` in the pixi env
-- [ ] compose: remove the `~/.config/gcloud` / `~/.ssh` mounts and `entrypoint.sh` copy — ADC
+- [x] systemd unit: `docker compose up -d` at boot, `DATA_DIR` read from instance metadata
+      (`deploy/datavis-app.service` + `deploy/write-env.sh`; metadata wins, repo `.env` fallback)
+- [x] `gpu.py`: drop `_ssh_cmd`/`_ship` + the ssh probe; dispatch = write job json (id/slug
+      embedded) and poll `jobs/status/`; health = SA store access + watcher heartbeat
+      (`jobs/watcher.json`)
+- [x] host job watcher (systemd service): poll `jobs/submitted/`, run `gpu_job.sh` in the pixi env
+      (`gpu/job_watcher.sh` + `deploy/datavis-watcher.service`)
+- [x] compose: remove the `~/.config/gcloud` / `~/.ssh` mounts and `entrypoint.sh` copy — ADC
       comes from the metadata server
 - [ ] verify: store proxy, labels, views, job round-trip, all via SA only
-- [ ] document the tunnel command for users:
-      `gcloud compute start-iap-tunnel $GPU_INSTANCE 8000 --local-host-port=localhost:8000 --zone=$GPU_ZONE`
+- [x] document the tunnel command for users: `deploy/tunnel.sh` (IAP tunnel to 8000; `--ssh`
+      fallback forwards over IAP ssh when there's no firewall rule for the IAP range → 8000)
 
 ## Phase 2 — lifecycle
 

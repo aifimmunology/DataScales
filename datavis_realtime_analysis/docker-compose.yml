@@ -2,7 +2,7 @@ services:
   frontend:
     build: .
     ports:
-      - "3000:80"
+      - "8000:80"  # the single app port — the IAP tunnel targets VM:8000 (UI + /api via nginx)
     depends_on:
       - backend
 
@@ -10,23 +10,14 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
-    ports:
-      - "8000:8000"
-    # values come from .env (auto-loaded, gitignored); pipeline args live in
-    # ./gpu/rerun_umap_on_selection.py
+    # No published port (nginx proxies /api) and no credential mounts: on the
+    # GPU VM, GCS auth comes from the metadata server (the VM's service account).
     environment:
       DATA_DIR: ${DATA_DIR}
-      GPU_INSTANCE: ${GPU_INSTANCE:-}
-      GPU_ZONE: ${GPU_ZONE:-}
-      GPU_PIXI_DIR: ${GPU_PIXI_DIR:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
-    volumes:
-      - ~/.config/gcloud:/gcloud-ro:ro
-      # whole dir, not the key files: they may not exist yet — the first in-container
-      # gcloud ssh generates a keypair itself when IAM allows
-      - ~/.ssh:/ssh-ro:ro
-      # the directory, not the files: file mounts pin inodes and serve stale
-      # content after an edit replaces the file
-      - ./gpu:/app/gpu:ro
-      # local store instead of GCS: uncomment and run with DATA_DIR=/data
-      # - ./data/soundlife-other-tiny.zarr:/data:ro
+      # laptop debugging (no metadata server): uncomment here + the ADC mount below
+      # GOOGLE_APPLICATION_CREDENTIALS: /adc.json
+    # volumes:
+    #   - ~/.config/gcloud/application_default_credentials.json:/adc.json:ro
+    #   # local store instead of GCS: mount it and run with DATA_DIR=/data
+    #   - ./data/soundlife-other-tiny.zarr:/data:ro
