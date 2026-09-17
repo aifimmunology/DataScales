@@ -22,6 +22,11 @@ config/storage/encoding layer).
   space, graphs and layers go shape-inconsistent — so one `--drop-derived` flag drops them
   with consent; layers are re-derived separately with add-expr (the per-append full-matrix
   refresh was O(store) each time).
+- Append `--extend-layers` (2026-09): CSR add-expr layers share X's sparsity exactly, so they
+  extend in place — indices shift-copy from the cells store's X, indptr reuses X's appended
+  values, data gets the lognorm (recorded target_sum) over the new cells only. O(appended nnz),
+  old chunks untouched (icechunk snapshots keep sharing them). A marked layer whose indptr
+  differs from X falls back to the drop plan; csc/dense layers still drop.
 - Icechunk storage targets: local path or `s3://bucket/prefix` (env credentials). GCS
   scaffolding dropped. Icechunk repos auto-detected for inputs AND in-place targets.
 - Build order: restructure → add-expr → rechunk → sort (standalone) → append.

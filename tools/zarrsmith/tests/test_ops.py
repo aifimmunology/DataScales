@@ -312,6 +312,63 @@ def test_append_drop_derived(tmp_path):
     )
 
 
+def test_append_extend_layers(tmp_path):
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    add_expr_layer(str(sa), _cfg(), fmt="csr", chunk_elems=32, target_sum=1e6)
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_derived=True, extend_layers=True)
+    assert any("extended layers ['gexp']" in w for w in warnings)
+    g = zarr.open_group(str(sa), mode="r")["layers/gexp"]
+    assert g.attrs["zarrsmith_target_sum"] == 1e6
+    assert list(g.attrs["shape"]) == [42, 6]
+    got = ad.read_zarr(str(sa))
+    np.testing.assert_allclose(
+        got.layers["gexp"].toarray(),
+        _expected_gexp(sp.vstack([a.X, b.X]), target_sum=1e6),
+        rtol=1e-5,
+    )
+
+
+def test_append_extend_layers_ineligible(tmp_path):
+    # csc layers cannot extend in place (column-major); with the flag they drop as today
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    add_expr_layer(str(sa), _cfg(), fmt="csc", chunk_elems=32)
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_derived=True, extend_layers=True)
+    assert any("dropped" in w and "gexp" in w for w in warnings)
+    assert "gexp" not in ad.read_zarr(str(sa)).layers
+
+
+def test_append_extend_layers_sparsity_mismatch(tmp_path):
+    # a marked layer whose indptr no longer matches X falls back to being dropped
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    add_expr_layer(str(sa), _cfg(), fmt="csr", chunk_elems=32)
+    ip_arr = zarr.open_group(str(sa), mode="r+")["layers/gexp/indptr"]
+    ip_arr[1] = int(ip_arr[1]) + 1
+    warnings = append_cells(str(sa), str(sb), _cfg(), drop_derived=True, extend_layers=True)
+    assert any("sparsity differs from X" in w for w in warnings)
+    assert "gexp" not in ad.read_zarr(str(sa)).layers
+
+
+def test_cli_append_extend_layers(tmp_path):
+    from zarrsmith.cli import run
+
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    add_expr_layer(str(sa), _cfg(), fmt="csr", chunk_elems=32)
+    assert run(["append", "--store", str(sa), "--cells", str(sb),
+                "--extend-layers", "--drop-derived"]) == 0
+    got = ad.read_zarr(str(sa))
+    np.testing.assert_allclose(
+        got.layers["gexp"].toarray(), _expected_gexp(sp.vstack([a.X, b.X])), rtol=1e-5
+    )
+
+
 def test_add_expr_multiband(tmp_path, monkeypatch):
     # tiny band budget → many column bands + multiple row batches, exercising the
     # bucket cursors and band-edge math the default 256 MB budget never hits in tests

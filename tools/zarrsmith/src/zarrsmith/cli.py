@@ -73,6 +73,10 @@ def _build_parser() -> argparse.ArgumentParser:
     append.add_argument("--drop-derived", action="store_true",
                         help="Pre-approve dropping obs-aligned derived elements (obsm, obsp, "
                              "layers) invalidated by the append; re-derive layers with add-expr")
+    append.add_argument("--extend-layers", action="store_true",
+                        help="Extend CSR lognorm layers made by add-expr (recorded target_sum, "
+                             "X's sparsity) in place instead of dropping them; other layers "
+                             "still drop")
     append.add_argument("--yes", action="store_true",
                         help="Approve the printed loss plan non-interactively")
     append.add_argument("--icechunk", action="store_true", help="Store is an Icechunk repository")
@@ -107,6 +111,7 @@ def _run_store_op(args) -> tuple[list[str], str]:
     return append_cells(
         args.store, args.cells, config,
         drop_derived=args.drop_derived, assume_yes=args.yes,
+        extend_layers=args.extend_layers,
     ), args.store
 
 

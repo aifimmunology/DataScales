@@ -59,17 +59,8 @@ def add_expr_layer(
     bytes_per_row = max(1, nnz // max(1, n_obs)) * 12
     row_step = max(1_000, min(200_000, _BAND_BYTES // bytes_per_row))
 
-    # factors are row-local, so they fuse into the transform: one pass over X data
     def _band(b0: int, b1: int):
-        s0, s1 = int(indptr[b0]), int(indptr[b1])
-        seg = np.asarray(data_arr[s0:s1], dtype=np.float64)
-        cs = np.concatenate(([0.0], np.cumsum(seg)))
-        sums = cs[indptr[b0 + 1:b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
-        factors = np.zeros(b1 - b0)
-        nz = sums > 0
-        factors[nz] = target_sum / sums[nz]
-        vals = np.log1p(seg * np.repeat(factors, row_nnz[b0:b1])).astype(np.float32)
-        return s0, s1, vals
+        return _lognorm_band(data_arr, indptr, row_nnz, target_sum, b0, b1)
 
     indptr_dtype = np.int64 if nnz > np.iinfo(np.int32).max else np.int32
 
@@ -185,6 +176,22 @@ def add_expr_layer(
 
     finalize()
     return []
+
+
+def _lognorm_band(data_arr, indptr, row_nnz, target_sum, b0, b1):
+    """Lognorm one row band of CSR data. Factors are row-local, so they fuse into the
+    transform: one pass over the band's data. Also used by append --extend-layers."""
+    import numpy as np
+
+    s0, s1 = int(indptr[b0]), int(indptr[b1])
+    seg = np.asarray(data_arr[s0:s1], dtype=np.float64)
+    cs = np.concatenate(([0.0], np.cumsum(seg)))
+    sums = cs[indptr[b0 + 1:b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
+    factors = np.zeros(b1 - b0)
+    nz = sums > 0
+    factors[nz] = target_sum / sums[nz]
+    vals = np.log1p(seg * np.repeat(factors, row_nnz[b0:b1])).astype(np.float32)
+    return s0, s1, vals
 
 
 def _introspect_gexp(node) -> tuple[str, int, float | None]:
