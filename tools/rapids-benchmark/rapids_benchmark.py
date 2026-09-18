@@ -528,8 +528,11 @@ def run_pipeline(cfg: Config) -> None:
         with step("harmony"):
             _patch_harmony_empty_joint_arrays()
             adata.obs[cfg.batch_key] = adata.obs[cfg.batch_key].astype("category")
+            # cap, not a fixed count — breaks early on convergence; default 10 rarely
+            # converges at atlas-scale batch counts
             rsc.pp.harmony_integrate(adata, key=cfg.batch_key, basis="X_pca",
-                                     adjusted_basis="X_pca_harmony")
+                                     adjusted_basis="X_pca_harmony",
+                                     max_iter_harmony=30)
 
     with step("neighbors"):
         rsc.pp.neighbors(adata, n_neighbors=cfg.n_neighbors, n_pcs=cfg.n_comps,
