@@ -158,3 +158,27 @@ read-config sweep mostly moves preprocessing/HVG: `--zarr-max-workers 1` starves
 not fetch concurrency, are the lever. Cost of the extra GPUs is host RAM: ~50–60 GB peak
 (4 GPU, 16 workers) vs ~18–40 GB single-GPU, and ~48 GB VRAM spread over 4 devices vs ~15 GB
 on one.
+
+---
+
+## Dask chunk size: `chunk_rows` sweep (single GPU)
+
+Raw runs in [`results/dask_chunk_results.txt`](results/dask_chunk_results.txt): three stores
+(3M subset megazarr, 13M Soundlife, ~30M megazarr) each run at `chunk_rows` = 6k / 12k /
+24k (default) / 48k — the rows per **dask block** streamed from the store. Store row chunks:
+13M Soundlife every **50M nnz** (~28k rows); 3M subset and ~30M megazarr every **9M nnz**.
+
+Total wall by `chunk_rows`:
+
+| Dataset | 6k | 12k | 24k (default) | 48k |
+|---|---:|---:|---:|---:|
+| 3M subset megazarr | 233 s | 223 s | 212 s | 207 s |
+| 13M Soundlife | 39.9 min | 29.0 min | 23.7 min | 21.4 min |
+| ~30M megazarr | 50.0 min | 43.3 min | 43.1 min | 40.1 min |
+
+- **Chunk size only moves the streamed front half.** Preprocessing + HVG absorb the spread
+  (13M preprocessing: 817 s → 257 s); neighbors / UMAP / Leiden are flat at every size.
+- **Bigger blocks trade memory for wall.** Peak host rises with chunk size (3M: 7.9 →
+  19.5 GB), and at 3M the 48k blocks set the GPU peak (15.1 GB vs ~9.6 GB).
+- **Small chunks are the real hazard.** 6k costs up to **1.9× total** (13M); the 24k default
+  is the sweet spot, 48k buys another ~7–10% for a few GB of host RAM.

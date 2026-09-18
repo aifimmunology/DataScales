@@ -28,9 +28,13 @@ Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM
 `--preset capacity|speed`, `--rmm-mode managed|pool`, `--zarr-concurrency`/
 `--zarr-max-workers` (applied on *every* worker), `--chunk-rows`, and the pipeline params
 (`--n-top-genes`, `--n-comps`, `--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to
-skip harmony). By default the final step writes the UMAP embedding (`obsm/X_umap`) and
-leiden labels (`obs/leiden`) back **into the input store** as an anndata-readable layer — no
-h5ad, no X rematerialization; `--results-store` retargets it, `--no-write-results` skips it.
+skip harmony). `--subset-column`/`--subset-value` (comma-separated for multiple values,
+e.g. `BR1,BR2,UP1`) run the whole pipeline on just the matching cells by slicing their
+contiguous row spans from the sorted store. By default the final step writes the UMAP
+embedding (`obsm/X_umap`) and leiden labels (`obs/leiden`) back **into the input store** as
+an anndata-readable layer — no h5ad, no X rematerialization; a **subset** run instead writes
+a self-contained no-X store at `<store>/subsets/<name>` (`--subset-dir-name` overrides the
+name); `--no-write-results` skips the write.
 Each run appends a per-step summary to `results/Run_results.txt` headed by the date, store,
 GPUs, and any cfg options left off their defaults. See the module docstring and `--help` for
 the rest.

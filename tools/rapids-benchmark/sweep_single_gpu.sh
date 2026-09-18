@@ -10,14 +10,13 @@ OUTDIR="${OUTDIR:-$HERE/results}"
 DATASETS=(
   #"/mnt/5M_sparse_sorted_9.zarr"
   "/mnt/subset3M_megazarr_v1.0.zarr",
-  "/mnt"
 )
 
 RMM=(managed) #pool)
-CHUNK_ROWS=(48000 24000)
+CHUNK_ROWS=(24000 48000 6000)
 
 THREAD_SPLITS=(12:12) #12:12)
-ZARR_CONCURRENCY=12
+ZARR_CONCURRENCY=(12)
 
 
 #------------RUN LOOP
@@ -25,10 +24,11 @@ for data in "${DATASETS[@]}"; do
   dtag="$(basename "$data" .zarr)"
   for rmm in "${RMM[@]}"; do
     for ck in "${CHUNK_ROWS[@]}"; do
+      for zarr_c in "${ZARR_CONCURRENCY[@]}"; do
         for split in "${THREAD_SPLITS[@]}"; do
           tpw="${split%%:*}"; zmw="${split##*:}"   # threads_per_worker : zarr_max_workers
           label="${dtag}_g0_${rmm}_ck${ck}"
-          label="${label}_t${tpw}x${zmw}"
+          label="${label}_t${tpw}x${zmw}c${zarr_c}"
           args=(--data-path "$data" --gpus 0 --protocol tcp --rmm-mode "$rmm"
                 --chunk-rows "$ck" --neighbors-algorithm ivfflat --batch-key ""
                 --threads-per-worker "$tpw" --zarr-max-workers "$zmw"
@@ -38,6 +38,7 @@ for data in "${DATASETS[@]}"; do
           pixi run python "$BENCH" "${args[@]}" \
             || echo "# -> FAILED ($label), continuing"
         done
+      done
     done
   done
 done
