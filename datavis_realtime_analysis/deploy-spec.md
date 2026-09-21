@@ -10,10 +10,12 @@ on demand and stops itself when idle.
 ## Layout
 
 - **GPU VM** (`$GPU_INSTANCE` / `$GPU_ZONE`, values in `.env`) — everything runs here: the
-  frontend + backend containers (compose, up at boot), and the job watcher on the host
-  running `gpu_job.sh` in the rapids pixi env. All GCS access rides the VM's service account.
-- **Store** (the team bucket, per-zarr prefix) — data, labels, views, and the `jobs/` queue live in
-  the zarr's prefix; the app only touches the prefix it was booted with.
+  frontend + backend containers (compose, up at boot). The backend container has the GPU
+  (nvidia-container-toolkit) and runs the pipeline itself via a warm worker process; the
+  job queue lives in backend memory. All GCS access rides the VM's service account.
+- **Store** (the team bucket, per-zarr prefix) — data, labels, views, and per-job
+  `jobs/history/` records live in the zarr's prefix; the app only touches the prefix it
+  was booted with.
 - **Access** — IAP TCP tunnel from the user's laptop to the VM (`localhost:8000`).
   Team-wide browser access via Cloudflare/Tailscale is parked for later.
 - **Launcher** (phase 2) — small always-on Cloud Run service: starts the VM with the chosen
@@ -26,7 +28,10 @@ on demand and stops itself when idle.
 - SA grant on the team bucket for the VM SA: approved; all zarrs live in this bucket.
 - App exposure is scoped to the booted `DATA_DIR` prefix — already enforced (every
   read/write goes through `storage.key()`); bucket-wide SA is acceptable inside one team bucket.
-- rapids pixi env stays on the VM host; jobs run there via a queue watcher, not in-container.
+- ~~rapids pixi env stays on the VM host; jobs run there via a queue watcher~~ — superseded:
+  the env is baked into the backend image (`server/pixi.toml`, NVIDIA cu13 wheels) and jobs
+  run in-container through a warm worker (`gpu/worker.py`, idle exit after 15 min). The
+  store-side queue existed for remote submitters; with the app VM-only it moved in-process.
 - Cold start gets a "warming up" page from the launcher; no pretending it's instant.
 - Image freshness: build on the VM for now; CI → Artifact Registry later.
 - **Access: option A (IAP tunnel) now.** Team access later via Cloudflare Tunnel + Access or
@@ -43,16 +48,25 @@ on demand and stops itself when idle.
 
 ## Phase 1 — app moves onto the GPU VM (this alone ends daily reauth)
 
-- [ ] docker + compose on the VM; build images there
-- [ ] systemd unit: `docker compose up -d` at boot, `DATA_DIR` read from instance metadata
-- [ ] `gpu.py`: drop `_ssh_cmd`/`_ship` + the probe section; dispatch = write job json (already done)
-      and let the watcher pick it up
-- [ ] host job watcher (systemd service): poll `jobs/submitted/`, run `gpu_job.sh` in the pixi env
-- [ ] compose: remove the `~/.config/gcloud` / `~/.ssh` mounts and `entrypoint.sh` copy — ADC
-      comes from the metadata server
-- [ ] verify: store proxy, labels, views, job round-trip, all via SA only
-- [ ] document the tunnel command for users:
-      `gcloud compute start-iap-tunnel $GPU_INSTANCE 8000 --local-host-port=localhost:8000 --zone=$GPU_ZONE`
+Code side done (this branch); on-VM install + verify remain. One published port: nginx
+serves UI + `/api` on **8000** — the tunnel target.
+
+- [ ] docker + compose + nvidia-container-toolkit on the VM; build images there
+      (first backend build pulls the rapids env — slow once, cached after)
+- [x] systemd unit: `docker compose up -d` at boot, `DATA_DIR` read from instance metadata
+      (`deploy/datavis-app.service` + `deploy/write-env.sh`; metadata wins, repo `.env` fallback)
+- [x] `gpu.py`: drop ssh + the store-side queue; in-memory queue dispatches to a warm worker
+      (`gpu/worker.py` — imports + CUDA once, idle exit at 15 min), stages stream over stdout,
+      one `jobs/history/<id>.json` record per job; health = SA store access + GPU visible;
+      cancel via `DELETE /api/jobs/<id>`
+- [x] backend image: pixi-built GPU env (`server/pixi.toml` + committed lock, rapids cu13
+      wheels); compose grants the GPU, no credential mounts — ADC from the metadata server
+- [x] pipeline: importable `run()` (view written straight to `gs://`, cluster closed per run);
+      standalone `RERUN_*` entry kept
+- [ ] verify on the VM: store proxy, labels, views, submit round-trip (eager + dask paths),
+      warm second submit, idle exit, all via SA only
+- [x] document the tunnel command for users: `deploy/tunnel.sh` (IAP tunnel to 8000; `--ssh`
+      fallback forwards over IAP ssh when there's no firewall rule for the IAP range → 8000)
 
 ## Phase 2 — lifecycle
 

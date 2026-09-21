@@ -1,0 +1,20 @@
+# App stack at boot (nginx frontend + FastAPI backend via docker compose).
+# Install from the repo checkout on the VM:
+#   sudo cp deploy/datavis-app.service /etc/systemd/system/
+# Edit the three paths below if the checkout is not /opt/datavis/datavis_realtime_analysis.
+[Unit]
+Description=datavis app stack (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/datavis/datavis_realtime_analysis
+ExecStartPre=/opt/datavis/datavis_realtime_analysis/deploy/write-env.sh
+ExecStart=/usr/bin/docker compose --env-file /etc/datavis.env up -d
+ExecStop=/usr/bin/docker compose --env-file /etc/datavis.env down
+
+[Install]
+WantedBy=multi-user.target

@@ -24,23 +24,16 @@ Download and install Docker Desktop for your platform from https://docs.docker.c
 
 ## Data
 
-`DATA_DIR` points at the root of an AnnData zarr v3 store — the directory (or GCS prefix) containing `zarr.json`. It can be a local path (`./data/soundlife-other-tiny.zarr`) or a private GCS store (`gs://my-bucket/path/store.zarr`, read with your Google credentials — see [Docker deployment](#docker-deployment-gcs)).
+`DATA_DIR` points at the root of an AnnData zarr v3 store — the directory (or GCS prefix) containing `zarr.json`. It can be a local path (`./data/soundlife-other-tiny.zarr`) or a private GCS store (`gs://my-bucket/path/store.zarr`, read with the VM's service account — see [Deploy on the GPU VM](#deploy-on-the-gpu-vm)).
 
 One store serves everything:
 
 - `obsm/X_umap` — the coordinates the viewer renders (`(n_obs, 2)`, scanpy layout)
 - `X/` (best if csr) — what the GPU pipeline consumes
 - `layers/gexp` (csc or dense; `zarrsmith add-expr` creates it) — gene-expression highlighting, resolved in order `layers/gexp` → dense `X` → CSC `X`
-- `umap_views/`, `groups.json`, `jobs/` — written by the app: returned views, the view listing, and the GPU job queue + status objects
+- `umap_views/`, `groups.json`, `jobs/history/` — written by the app: returned views, the view listing, and one record per finished GPU job
 
-In the app: lasso a cell selection, name it, and hit "Generate New UMAP". The backend writes the job to `jobs/submitted/<id>.json` in the store, then dispatches one **cold run** on the GPU box over `gcloud compute ssh`: `gpu/gpu_job.sh` sets up the pixi env fresh, runs `gpu/rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕).
-
-GPU runs require `GPU_INSTANCE`, `GPU_ZONE`, and `GPU_PIXI_DIR` (the pixi project on the box) in `.env` — submits error if any is unset. Works in docker (the backend image ships gcloud + your mounted credentials/ssh keys) and in dev mode. One-time per bucket: grant the GPU instance's service account storage access so jobs on the box can read/write the store no matter who sshs in:
-
-```bash
-gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
-  --member="serviceAccount:<instance-service-account>" --role="roles/storage.objectAdmin"
-```
+In the app: lasso a cell selection, name it, and hit "Generate New UMAP". The backend queues the job in memory and runs it in its own GPU container: a **warm pipeline process** (`gpu/worker.py`) does the heavy imports + CUDA init once, runs `gpu/rerun_umap_on_selection.py`'s pipeline per job, and writes the view straight to `umap_views/<slug>` in the store. Stage updates stream over the worker's stdout into the runs panel (live timer + stage); the view goes ready in the View picker — no auto-switch. The worker exits after 15 min idle (GPU memory frees) and respawns on the next submit. Views are deletable from the picker (✕); running jobs are cancellable via `DELETE /api/jobs/<id>`.
 
 ---
 
@@ -74,64 +67,54 @@ DATA_DIR=./data/soundlife-other-tiny.zarr uvicorn server.main:app --reload
 
 ---
 
-## Docker deployment (GCS)
+## Deploy on the GPU VM
 
-Two services via compose: nginx serves the built frontend and proxies `/api`; the FastAPI backend reads the store from GCS.
+Everything runs on the GPU VM ([deploy-spec.md](deploy-spec.md) phase 1): nginx serves the built frontend and proxies `/api` to the FastAPI backend (compose, one published port — **8000**). The backend container has the GPU and runs the rapids pipeline itself — env baked into the image from `server/pixi.toml`. The VM's service account is the only credential — no `gcloud auth login` anywhere.
 
-**gcloud and docker need to be installed locally for the steps below**
+### 0. One-time bucket grant
 
-### 1. Configure `.env`
-
-Create `.env` in the repo
+Grant the VM's service account access to the team bucket (views, labels, and job records all ride it):
 
 ```bash
-DATA_DIR=gs://MY_BUCKET/store.zarr
-GPU_INSTANCE=my-gpu-instance
-GPU_ZONE=us-central1-c
-GPU_PIXI_DIR=/path/on/box/to/pixi-project
+gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
+  --member="serviceAccount:<vm-service-account>" --role="roles/storage.objectAdmin"
 ```
 
-- `DATA_DIR` — the zarr store everything runs against (a `gs://` prefix, or a local path for dev).
-- `GPU_INSTANCE` — the GCE instance name GPU jobs are dispatched to over `gcloud compute ssh`.
-- `GPU_ZONE` — that instance's compute zone.
-- `GPU_PIXI_DIR` — the pixi project directory on the instance whose env the pipeline runs in.
+### 1. VM setup
 
-
-### 2. Authenticate (once per machine)
+Install docker + the compose plugin, plus the NVIDIA container toolkit (once):
 
 ```bash
-gcloud auth login                       # CLI credential — GPU dispatch (compute ssh/scp)
-gcloud auth application-default login   # ADC — the fastAPI backend's GCS reads/writes
-gcloud config set project MY_PROJECT
+sudo apt install nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
 ```
 
-Credentials land under `~/.config/gcloud`, which compose mounts read-only into the backend container. Your account needs `roles/storage.objectAdmin` on the bucket; GPU runs also need instance SSH rights (`roles/compute.osLogin` or `instanceAdmin.v1`) plus `roles/iam.serviceAccountUser` on the instance's service account.
+Clone the repo, then from `datavis_realtime_analysis/`:
 
-test GPU access (also generates the ssh key compose mounts in):
-```bash
-gcloud compute ssh MY_GPU_INSTANCE --zone=MY_ZONE --command='echo ok'
-```
-
-
-### 3. Build and run
+- **Config** — set `DATA_DIR` as instance metadata:
+  `gcloud compute instances add-metadata $VM --zone=$ZONE --metadata=DATA_DIR=gs://...`
+  — or put it in `.env` in the repo. Metadata wins at boot (`deploy/write-env.sh`).
+- **Build** — `docker compose build` (first build downloads the rapids env — expect a while and a large image)
+- **systemd unit** —
 
 ```bash
-docker compose up --build -d
+sudo cp deploy/datavis-app.service /etc/systemd/system/
+# edit the paths to your checkout
+sudo systemctl daemon-reload
+sudo systemctl enable --now datavis-app
 ```
 
-App: http://localhost:3000
-
-### 4. Verify & monitor
+### 2. Access from your laptop
 
 ```bash
-docker compose logs -f backend       
+deploy/tunnel.sh          # IAP TCP tunnel → http://localhost:8000
+deploy/tunnel.sh --ssh    # fallback: forward over IAP ssh — needs only ssh access
 ```
 
-### Troubleshooting
+The direct tunnel needs `roles/iap.tunnelResourceAccessor` on the VM plus a firewall rule allowing `35.235.240.0/20 → tcp:8000`; if you can't get the firewall rule, the `--ssh` fallback rides the existing ssh rule (port 22).
 
-- The app probes the GPU permission chain on load (backend GCS creds → ssh to the box → store write from the box); a problem turns the **GPU runs** rail badge red, and the tab shows the failing step with fix commands — hit *Re-check* after fixing. Temporary until dispatch moves off ssh to an HPC-style queue.
-- `Reauthentication required/failed` on GPU submit — the org session policy expires user credentials (~weekly). Re-run both `gcloud auth` commands on the **host**, then `docker compose restart backend` (credentials are copied in at container start). With the instance-SA bucket grant in place (see [Data](#data)), the GPU box never needs reauth. If that grant hasn't been made, box-side gcloud runs as a user account instead: ssh in and re-run both `gcloud auth` commands with `--no-launch-browser` when jobs die with `ssh exited rc=1` and the box log shows a reauth error.
-- `503 GCS auth failed` — re-run step 1 on the host; confirm `~/.config/gcloud/application_default_credentials.json` exists.
-- `port is already allocated` — something else is publishing 3000/8000; `docker ps`, then stop it.
+### 3. Verify & troubleshoot
 
-`docker compose down` stops the stack. For a local store instead of GCS, uncomment the data volume in `docker-compose.yml` and run with `DATA_DIR=/data`.
+- A red **GPU runs** rail badge → the tab shows the failing step with fix commands: bucket access (SA grant missing) or the container can't see the GPU (toolkit/compose device reservation). Hit *Re-check* after fixing.
+- Everything logs in one place: `docker compose logs -f backend` (submits, pipeline stages, worker stderr).
+- `sudo systemctl stop datavis-app` (or `docker compose down`) stops the stack. For a local store instead of GCS, mount it into the backend and run with `DATA_DIR=/data`.

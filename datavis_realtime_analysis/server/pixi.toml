@@ -1,0 +1,31 @@
+# Backend env. linux-64 (the GPU image) gets the rapids pipeline via NVIDIA
+# cu13 wheels — same setup as tools/rapids-benchmark; osx-arm64 is the CPU-only
+# backend for local dev.
+[workspace]
+channels = ["conda-forge"]
+name = "datavis-backend"
+platforms = ["linux-64", "osx-arm64"]
+version = "0.1.0"
+
+[dependencies]
+python = ">=3.12,<3.13"
+pip = ">=24"
+fastapi = ">=0.115"
+uvicorn = ">=0.30"
+google-cloud-storage = ">=2.18"
+zarr = ">=3.3,<4"
+anndata = ">=0.12.14,<0.13"
+numpy = "<2.5"
+gcsfs = ">=2026.8.0,<2027"
+
+[target.linux-64.pypi-dependencies]
+dask-cuda = "*"
+rapids-singlecell-cu13 = "*"
+cudf-cu13 = "*"
+cuml-cu13 = "*"
+cugraph-cu13 = "*"
+cuvs-cu13 = "*"
+rmm-cu13 = "*"
+
+[pypi-options]
+extra-index-urls = ["https://pypi.nvidia.com"]
