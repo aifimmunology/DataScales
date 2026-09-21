@@ -1,12 +1,13 @@
-FROM python:3.12-slim
+FROM ghcr.io/prefix-dev/pixi:0.67.0
 
 WORKDIR /app
 
-COPY server/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY server/pixi.toml server/pixi.lock ./
+RUN pixi install --locked
 
 COPY server ./server
+COPY gpu ./gpu
 
 EXPOSE 8000
 
-CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["pixi", "run", "uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]

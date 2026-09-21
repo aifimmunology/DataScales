@@ -1,5 +1,4 @@
-"""Backend configuration: the single store, env-driven. GPU job settings
-(GPU_PIXI_DIR) belong to the host-side watcher, not the backend."""
+"""Backend configuration: the single store, env-driven."""
 
 import os
 

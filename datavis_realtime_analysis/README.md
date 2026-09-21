@@ -31,9 +31,9 @@ One store serves everything:
 - `obsm/X_umap` — the coordinates the viewer renders (`(n_obs, 2)`, scanpy layout)
 - `X/` (best if csr) — what the GPU pipeline consumes
 - `layers/gexp` (csc or dense; `zarrsmith add-expr` creates it) — gene-expression highlighting, resolved in order `layers/gexp` → dense `X` → CSC `X`
-- `umap_views/`, `groups.json`, `jobs/` — written by the app: returned views, the view listing, and the GPU job queue + status objects
+- `umap_views/`, `groups.json`, `jobs/history/` — written by the app: returned views, the view listing, and one record per finished GPU job
 
-In the app: lasso a cell selection, name it, and hit "Generate New UMAP". The backend writes the job to `jobs/submitted/<id>.json` in the store; the watcher on the GPU host (`gpu/job_watcher.sh`) claims it and runs one **cold run** — `gpu/gpu_job.sh` sets up the pixi env fresh, runs `gpu/rerun_umap_on_selection.py` against the store, and uploads the view to `umap_views/<slug>`. The script reports each stage to `jobs/status/<id>.json`; the runs panel polls it (live timer + stage) and marks the view ready in the View picker — no auto-switch. Views are deletable from the picker (✕). No ssh anywhere: the app and the watcher talk only through the store, using the VM's service account.
+In the app: lasso a cell selection, name it, and hit "Generate New UMAP". The backend queues the job in memory and runs it in its own GPU container: a **warm pipeline process** (`gpu/worker.py`) does the heavy imports + CUDA init once, runs `gpu/rerun_umap_on_selection.py`'s pipeline per job, and writes the view straight to `umap_views/<slug>` in the store. Stage updates stream over the worker's stdout into the runs panel (live timer + stage); the view goes ready in the View picker — no auto-switch. The worker exits after 15 min idle (GPU memory frees) and respawns on the next submit. Views are deletable from the picker (✕); running jobs are cancellable via `DELETE /api/jobs/<id>`.
 
 ---
 
@@ -69,11 +69,11 @@ DATA_DIR=./data/soundlife-other-tiny.zarr uvicorn server.main:app --reload
 
 ## Deploy on the GPU VM
 
-Everything runs on the GPU VM ([deploy-spec.md](deploy-spec.md) phase 1): nginx serves the built frontend and proxies `/api` to the FastAPI backend (compose, one published port — **8000**), and a host-side watcher runs GPU jobs in the rapids pixi env. The VM's service account is the only credential — no `gcloud auth login` anywhere.
+Everything runs on the GPU VM ([deploy-spec.md](deploy-spec.md) phase 1): nginx serves the built frontend and proxies `/api` to the FastAPI backend (compose, one published port — **8000**). The backend container has the GPU and runs the rapids pipeline itself — env baked into the image from `server/pixi.toml`. The VM's service account is the only credential — no `gcloud auth login` anywhere.
 
 ### 0. One-time bucket grant
 
-Grant the VM's service account access to the team bucket (jobs, views, and labels all ride it):
+Grant the VM's service account access to the team bucket (views, labels, and job records all ride it):
 
 ```bash
 gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
@@ -82,19 +82,26 @@ gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
 
 ### 1. VM setup
 
-Install docker + the compose plugin, clone the repo, then from `datavis_realtime_analysis/`:
-
-- **Config** — set `DATA_DIR` (and optionally `GPU_PIXI_DIR`) as instance metadata:
-  `gcloud compute instances add-metadata $VM --zone=$ZONE --metadata=DATA_DIR=gs://...`
-  — or put them in `.env` in the repo. Metadata wins at boot (`deploy/write-env.sh`).
-- **Build** — `docker compose build`
-- **systemd units** —
+Install docker + the compose plugin, plus the NVIDIA container toolkit (once):
 
 ```bash
-sudo cp deploy/datavis-app.service deploy/datavis-watcher.service /etc/systemd/system/
-# edit both: paths to your checkout; watcher User= to the account whose pixi env runs jobs
+sudo apt install nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+```
+
+Clone the repo, then from `datavis_realtime_analysis/`:
+
+- **Config** — set `DATA_DIR` as instance metadata:
+  `gcloud compute instances add-metadata $VM --zone=$ZONE --metadata=DATA_DIR=gs://...`
+  — or put it in `.env` in the repo. Metadata wins at boot (`deploy/write-env.sh`).
+- **Build** — `docker compose build` (first build downloads the rapids env — expect a while and a large image)
+- **systemd unit** —
+
+```bash
+sudo cp deploy/datavis-app.service /etc/systemd/system/
+# edit the paths to your checkout
 sudo systemctl daemon-reload
-sudo systemctl enable --now datavis-app datavis-watcher
+sudo systemctl enable --now datavis-app
 ```
 
 ### 2. Access from your laptop
@@ -108,6 +115,6 @@ The direct tunnel needs `roles/iap.tunnelResourceAccessor` on the VM plus a fire
 
 ### 3. Verify & troubleshoot
 
-- A red **GPU runs** rail badge → the tab shows the failing step with fix commands: bucket access (SA grant missing) or the job watcher (not running / stale heartbeat at `jobs/watcher.json`). Hit *Re-check* after fixing.
-- On the VM: `sudo systemctl status datavis-app datavis-watcher`, `journalctl -u datavis-watcher -f`, `docker compose logs -f backend`; per-job logs land in `/tmp/datavis_job_<id>.log`.
-- `sudo systemctl stop datavis-app` (or `docker compose down`) stops the stack. For a local store instead of GCS, uncomment the data volume in `docker-compose.yml` and run with `DATA_DIR=/data`.
+- A red **GPU runs** rail badge → the tab shows the failing step with fix commands: bucket access (SA grant missing) or the container can't see the GPU (toolkit/compose device reservation). Hit *Re-check* after fixing.
+- Everything logs in one place: `docker compose logs -f backend` (submits, pipeline stages, worker stderr).
+- `sudo systemctl stop datavis-app` (or `docker compose down`) stops the stack. For a local store instead of GCS, mount it into the backend and run with `DATA_DIR=/data`.

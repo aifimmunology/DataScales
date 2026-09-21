@@ -10,14 +10,17 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
-    # No published port (nginx proxies /api) and no credential mounts: on the
-    # GPU VM, GCS auth comes from the metadata server (the VM's service account).
+    # GCS auth comes from the VM metadata server (the VM's service account).
     environment:
       DATA_DIR: ${DATA_DIR}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
-      # laptop debugging (no metadata server): uncomment here + the ADC mount below
-      # GOOGLE_APPLICATION_CREDENTIALS: /adc.json
-    # volumes:
-    #   - ~/.config/gcloud/application_default_credentials.json:/adc.json:ro
-    #   # local store instead of GCS: mount it and run with DATA_DIR=/data
-    #   - ./data/soundlife-other-tiny.zarr:/data:ro
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./gpu:/app/gpu:ro  # pipeline edits without an image rebuild
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

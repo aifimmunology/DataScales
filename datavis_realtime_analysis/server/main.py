@@ -42,6 +42,11 @@ def jobs():
     return gpu.list_jobs()
 
 
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str):
+    return gpu.cancel(job_id)
+
+
 @app.get("/api/gpu/health")
 def gpu_health(refresh: bool = False):
     return gpu.health(refresh)
