@@ -13,6 +13,7 @@ pip = ">=24"
 ipykernel = ">=7.2.0,<8"
 anndata = ">=0.12.14,<0.13"
 numpy = "<2.5"
+gcsfs = ">=2026.8.0,<2027"
 
 [pypi-dependencies]
 dask-cuda = "*"
