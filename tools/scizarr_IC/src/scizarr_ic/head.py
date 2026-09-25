@@ -4,10 +4,9 @@ HEAD is a scizarr-ic concept — icechunk itself has no notion of a current bran
 so it is stored locally, like git's ``.git/HEAD``:
 
 * a **writable local repo** keeps a ``scizarr_head`` file at its root (moves with the dir);
-* anything else — a read-only mount, an ``s3://``/``gs://`` URI — uses a per-user
+* anything else — a read-only path, an ``s3://``/``gs://`` URI — uses a per-user
   sidecar under ``$SCIZARR_IC_HOME/heads/`` (default ``~/.cache/scizarr_ic``), keyed
-  by the repo's canonical location so a mount and the remote origin it resolves to
-  share one HEAD. Nothing is ever written into a read-only repo.
+  by the repo's canonical location. Nothing is ever written into a read-only repo.
 """
 from __future__ import annotations
 

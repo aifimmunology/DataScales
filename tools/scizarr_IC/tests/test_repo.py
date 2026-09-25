@@ -141,3 +141,23 @@ def test_tree_lists_all_branches(src_zarr, repo_path):
     tree = repo.tree()
     assert set(tree) == {"main", "b1", "b2"}
     assert all(len(v) >= 1 for v in tree.values())
+
+
+def test_create_empty_repo_and_exists(tmp_path):
+    out = tmp_path / "empty.icechunk"
+    assert not Repo.exists(out) and not out.exists()
+    repo = Repo.create(out)
+    assert Repo.exists(out) and repo.branch == "main"
+    assert [s.message for s in repo.log()] == ["Repository initialized"]
+    with pytest.raises(ScizarrError, match="not empty"):
+        Repo.create(out)
+
+
+def test_session_is_shared_with_writable_and_commit(src_zarr, repo_path):
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path)
+    ws = repo.session(writable=True)
+    repo.writable().attrs["k"] = 1
+    assert ws is repo.session(writable=True) and ws.has_uncommitted_changes
+    repo.commit("one commit for both")
+    assert repo.session().read_only and repo.root().attrs["k"] == 1

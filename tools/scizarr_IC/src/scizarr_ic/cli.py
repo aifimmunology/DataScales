@@ -1,15 +1,11 @@
 """argparse CLI for scizarr-ic (``scizarr-ic`` / ``scz``).
 
 Subcommands mirror git: ``init``, ``log``, ``tree``, ``checkout``, ``cherrypick``, plus
-``origin`` (where writes go) and ``copy`` (clone a repo to a writable location). Every non-init command takes the repo path (``-C``/``--repo``,
-default ``.``) and an optional ``--origin URL`` override for the writable location.
-Errors print to stderr and exit 1; normal output stays on stdout for piping.
-
-A read-only mount such as a Code Ocean data asset (``-C /data/<asset>``) is read in
-place. On a *linked* (S3-backed) asset, writes (``checkout -b``, ``cherrypick``,
-``origin URL``) go to the ``s3://`` origin stamped in the repo metadata, with credentials
-from the environment. A *frozen* internal asset (EFS copy) refuses writes; ``copy`` takes
-a fully writable clone instead (e.g. into ``/results``).
+``copy`` (clone a repo to a new location). Every non-init command takes the repo path
+(``-C``/``--repo``, default ``.``) and an optional ``--origin URL``: where writes go when
+the repo path itself is read-only (e.g. the ``s3://`` prefix behind a read-only mirror;
+``SCIZARR_IC_ORIGIN`` does the same). Errors print to stderr and exit 1; normal output
+stays on stdout for piping.
 
 ``commit`` is intentionally Python-API only (``Repo.commit``): icechunk stages
 edits in a session's memory, so there is nothing for a fresh CLI process to commit.
@@ -22,7 +18,6 @@ import sys
 
 from .errors import ScizarrError
 from .repo import Repo
-from . import storage
 
 
 def _quiet_icechunk_logs() -> None:
@@ -113,29 +108,6 @@ def _cmd_copy(args) -> int:
     return 0
 
 
-def _cmd_origin(args) -> int:
-    repo = _open(args)
-    if args.url:
-        _note_resolved(repo)
-        repo.set_origin(args.url)
-        print(f"Stamped origin_url = {args.url}")
-        return 0
-    kind = "writable"
-    if repo.frozen:
-        kind = f"read-only, frozen copy ({storage.mount_fstype(repo.path)} mount)"
-    elif repo.readonly_path:
-        kind = "read-only"
-    print(f"path:    {repo.path}  ({kind})")
-    print(f"stamped: {repo.origin_url() or '-'}")
-    if repo.frozen and repo.origin is None:
-        print(f"writes:  unavailable — frozen copy; take one: scizarr-ic copy -C {repo.path} DEST")
-    elif repo.origin is None:
-        print("writes:  unavailable — no origin known (see 'scizarr-ic origin --help')")
-    else:
-        print(f"writes:  {repo.origin}" + ("  (resolved)" if repo.resolved else ""))
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scizarr-ic", description="Git-like version control for Zarr stores (Icechunk)."
@@ -150,8 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
             "--origin",
             default=None,
             metavar="URL",
-            help="Writable location to use instead of the stamped origin_url "
-            "(e.g. s3://bucket/prefix behind a read-only /data mount)",
+            help="Where writes go when the repo path is read-only "
+            "(e.g. the s3://bucket/prefix behind a read-only mirror)",
         )
 
     p_init = sub.add_parser("init", help="Create a repo from an existing zarr store")
@@ -191,14 +163,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_arg(p_cp)
     p_cp.add_argument("dest", help="Destination path/URI (local dir or s3://bucket/prefix)")
     p_cp.set_defaults(func=_cmd_copy)
-
-    p_or = sub.add_parser(
-        "origin",
-        help="Show where writes go for this repo; with URL, stamp it as the repo's origin_url",
-    )
-    add_repo_arg(p_or)
-    p_or.add_argument("url", nargs="?", help="Writable location to stamp (e.g. s3://bucket/prefix)")
-    p_or.set_defaults(func=_cmd_origin)
 
     return parser
 

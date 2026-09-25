@@ -8,12 +8,11 @@ Python API entry point is :class:`Repo`::
     repo.checkout("experiment", create=True)           # branch
     for snap in repo.log(): print(snap.id, snap.message)
 
-    # a read-only linked data asset reads in place; writes resolve to its s3:// origin
-    repo = Repo("/data/sample_linked_icechunk"); print(repo.origin)
-    mine = repo.copy("/results/my_store")             # a frozen (EFS) asset: take a writable clone
+    # a read-only local mirror: read it in place, write to the bucket behind it
+    repo = Repo("/mnt/store", origin="s3://bucket/store")
 
 The command line (``scizarr-ic`` / ``scz``) exposes ``init``, ``log``, ``tree``,
-``checkout``, ``cherrypick``, ``origin`` and ``copy``; ``commit`` is Python-API only.
+``checkout``, ``cherrypick`` and ``copy``; ``commit`` is Python-API only.
 """
 from .errors import ScizarrError
 from .repo import DEFAULT_BRANCH, Repo

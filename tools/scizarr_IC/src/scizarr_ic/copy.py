@@ -6,8 +6,7 @@
   chunk-grid-aligned bands along axis 0 so memory stays bounded.
 * :func:`copy_repo` — replicate a whole icechunk repo (every branch and snapshot) to a
   new location byte for byte. Icechunk's object tree is content-addressed, so a plain
-  file copy is a faithful clone. Used by ``Repo.copy`` to take a writable copy of a
-  read-only data asset.
+  file copy is a faithful clone. Used by ``Repo.copy``.
 """
 from __future__ import annotations
 
