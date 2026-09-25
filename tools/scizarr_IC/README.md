@@ -4,17 +4,17 @@ Git-like version control for Zarr stores, backed by [Icechunk](https://icechunk.
 
 Point it at an existing zarr store and it becomes a versioned Icechunk repository:
 commit changes, branch, inspect history, and reset the store to any past snapshot —
-with a CLI that reads like `git` and a small Python API for scripted edits. Repos live
+with a CLI that reads similar to git and a small Python API for scripted edits. Repos live
 in a local directory or an object store (`s3://bucket/prefix`, `gs://bucket/prefix`).
 
 ## Install
 
 ```bash
-cd tools/scizarr_IC
-pixi install -e dev          # dev env includes pytest
-pixi run -e dev pytest       # hermetic suite (no network, no credentials)
-pip install 'scizarr-ic[s3]' # adds boto3, only needed for `copy` to/from s3://
+pip install .            # from tools/scizarr_IC; gives the `scizarr-ic` / `scz` commands
+pip install '.[s3]'      # adds boto3, only needed for `copy` to/from s3://
 ```
+
+Needs Python 3.10–3.12, Icechunk 2.1.2+ and Zarr v3 (pulled in automatically).
 
 ## CLI
 
@@ -27,13 +27,46 @@ scizarr-ic cherrypick -C OUT.icechunk SNAPSHOT_ID           # reset current bran
 scizarr-ic copy    -C OUT.icechunk DEST                      # clone (all branches, ids intact)
 ```
 
-`scz` is a shorter alias for `scizarr-ic`. The current branch is remembered per repo,
+The current branch is remembered per repo,
 so `-C` is all you need between commands. Repo paths may be local directories or
 `s3://` / `gs://` URIs; object-store credentials come from the environment (`AWS_*`
 variables, a profile, or an instance/container role).
 
 `commit` is **Python-API only** — Icechunk stages edits in a session's memory, so there
 is nothing for a fresh CLI process to commit.
+
+## Python API
+
+```python
+from scizarr_ic import Repo
+
+repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store (one commit on main)
+repo = Repo.create("s3://bucket/empty")          # or start an empty repo (pipelines fill it)
+repo = Repo('s3://bucket/store')
+#repo = Repo("/mnt/store", origin="s3://bucket/store")   #Special case when writing to repo is different from reading
+
+Repo.exists("s3://bucket/empty")                 # True or false
+
+z = repo.writable()                              # returns zarr editable object for this repo/branch
+z.attrs["step"] = "lognorm"                      # ... edit like any zarr group ...
+repo.commit("normalize")                         # stage - durable snapshot
+
+repo.checkout("experiment", create=True)         # branch off the current tip
+z = repo.writable(); z["X"][:] *= 2
+repo.commit("scaled X... other comments here for commit"). #commit to branch, for others to see, and be tracked
+
+for snap in repo.log():                          # show commits log of repo
+    print(snap.id, snap.message)
+
+repo.cherrypick(some_snapshot_id)                # reset current branch to a snapshot
+root = repo.root()                               # read-only zarr.Group at the branch tip
+
+mine = repo.copy("/work/store")                  # or clone it somewhere writable
+```
+
+Batch writes into **few, large commits** — a commit per chunk/row-batch is pathological
+for Icechunk. `writable()` reuses one open session until you `commit()` or `discard()`.
+
 
 ### Read here, write there
 
@@ -56,36 +89,6 @@ HEAD lives locally, like git's: a `scizarr_head` file inside a *writable* local 
 otherwise a per-user sidecar under `$SCIZARR_IC_HOME` (default `~/.cache/scizarr_ic`),
 keyed by the repo's origin. Nothing is ever written into a read-only repo.
 
-## Python API
-
-```python
-from scizarr_ic import Repo
-
-repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store (one commit on main)
-repo = Repo.create("s3://bucket/empty")          # or start an empty repo (pipelines fill it)
-Repo.exists("s3://bucket/empty")                 # True; never creates anything
-
-g = repo.writable()                              # zarr.Group on a writable session
-g.attrs["step"] = "lognorm"                      # ... edit like any zarr group ...
-repo.commit("normalize")                         # stage → durable snapshot
-
-repo.checkout("experiment", create=True)         # branch off the current tip
-g = repo.writable(); g["X"][:] *= 2
-repo.commit("scale X")
-
-for snap in repo.log():                          # newest first
-    print(snap.id, snap.message)
-
-repo.cherrypick(some_snapshot_id)                # reset current branch to a snapshot
-root = repo.root()                               # read-only zarr.Group at the branch tip
-session = repo.session(writable=True)            # the raw icechunk session when a group is not enough
-
-repo = Repo("/mnt/store", origin="s3://bucket/store")   # read the mirror, write to S3
-mine = repo.copy("/work/store")                         # or clone it somewhere writable
-```
-
-Batch writes into **few, large commits** — a commit per chunk/row-batch is pathological
-for Icechunk. `writable()` reuses one open session until you `commit()` or `discard()`.
 
 ## Notes
 

@@ -219,7 +219,7 @@ class Repo:
         if snapshot_id is not None:
             session = self._repo.readonly_session(snapshot_id=snapshot_id)
         else:
-            session = self.session()
+            session = self._repo.readonly_session(branch=self._branch)
         return zarr.open_group(store=session.store, mode="r")
 
     def writable(self) -> "zarr.Group":
@@ -229,20 +229,9 @@ class Repo:
         """
         import zarr
 
-        return zarr.open_group(store=self.session(writable=True).store, mode="a")
-
-    def session(self, *, writable: bool = False):
-        """The underlying icechunk session, for callers that need more than a zarr group.
-
-        ``writable=True`` returns the one open writable session (shared with
-        :meth:`writable`, committed by :meth:`commit`); otherwise a fresh read-only
-        session at the current branch tip.
-        """
-        if not writable:
-            return self._repo.readonly_session(branch=self._branch)
         if self._session is None or self._session.read_only:
             self._session = self._writer_repo().writable_session(self._branch)
-        return self._session
+        return zarr.open_group(store=self._session.store, mode="a")
 
     def commit(
         self,

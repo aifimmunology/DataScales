@@ -153,11 +153,11 @@ def test_create_empty_repo_and_exists(tmp_path):
         Repo.create(out)
 
 
-def test_session_is_shared_with_writable_and_commit(src_zarr, repo_path):
+def test_writable_reuses_one_session_until_commit(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
-    ws = repo.session(writable=True)
     repo.writable().attrs["k"] = 1
-    assert ws is repo.session(writable=True) and ws.has_uncommitted_changes
+    repo.writable().attrs["j"] = 2          # same staged session, not a second one
+    assert repo._session.has_uncommitted_changes
     repo.commit("one commit for both")
-    assert repo.session().read_only and repo.root().attrs["k"] == 1
+    assert repo._session is None and repo.root().attrs["k"] == 1 and repo.root().attrs["j"] == 2
