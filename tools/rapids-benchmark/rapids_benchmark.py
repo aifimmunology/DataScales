@@ -1,72 +1,6 @@
 #!/usr/bin/env python
-"""Configurable per-step benchmark for the rapids-singlecell GPU pipeline.
+#GPU configuration, will not run on CPU box.
 
-Measures wall-clock + peak host RSS (process tree) + peak GPU VRAM (device-wide,
-NVML) for each stage of an out-of-core, multi-GPU single-cell pipeline reading a
-Zarr store lazily via Dask-CUDA.
-
-Steps measured:
-  1. load_zarr      lazy zarr -> AnnData (X = dask array of sparse blocks)
-  2. h2d_transfer   anndata_to_GPU (block structure preserved; one block/GPU)
-  3. preprocessing  calculate_qc_metrics + normalize_total + log1p
-  4. hvg            highly_variable_genes + subset + rechunk/persist
-  5. scaling        (optional float64 cast) + scale
-  6. pca            pca + materialize X_pca to host
-  7. harmony        harmony_integrate -> X_pca_harmony  (only if --batch-key set)
-  8. neighbors      neighbors
-  9. umap           umap
- 10. leiden         leiden
- 11. write_results  (default on) persist the UMAP embedding (obsm/X_umap) + leiden
-                    labels (obs/leiden), anndata-readable, no X rematerialization. Full
-                    run: appended onto the master root. Subset run: a self-contained no-X
-                    store under data_path/subsets/<name> (--subset-dir-name). Skip with
-                    --no-write-results.
-
-Everything that was hardcoded is now a knob: GPUs, zarr read concurrency/threads,
-dask-cuda threads/protocol/RMM, chunk size, data path, and the pipeline params.
-Defaults live in the `Config` dataclass; every field has a matching `--flag`, so
-you can script a sweep of near-identical runs without editing source:
-
-    # 4-GPU baseline, capacity preset (tcp + managed memory)
-    pixi run python rapids_benchmark.py \
-        --data-path /home/workspace/temp/2M_50M.zarr --gpus 0,1,2,3 \
-        --label 2M_4gpu
-
-    # same store, single GPU, smaller chunk, more zarr read threads per worker
-    pixi run python rapids_benchmark.py \
-        --data-path /home/workspace/temp/2M_50M.zarr --gpus 0 \
-        --chunk-rows 12000 --zarr-max-workers 8 --label 2M_1gpu
-
-    # speed preset (ucx + rmm pool) with a hard protocol override
-    pixi run python rapids_benchmark.py --gpus 0,1,2,3 --preset speed \
-        --protocol tcp --rmm-pool-size 0.7
-
-    # subset: run the whole pipeline on just one cell type (store sorted by that column,
-    # so the match is a contiguous X[start:end] slice). Results land in a no-X store under
-    # data_path/subsets/<name> (name defaults to a slug of the column/value; override below).
-    pixi run python rapids_benchmark.py --gpus 0 \
-        --data-path /path/to/sorted.zarr \
-        --subset-column cell_type --subset-value "T cell" --subset-dir-name tcell
-
-Key correctness notes (see CLAUDE.md):
-  * ZARR CONFIG REACHES THE WORKERS. `zarr.config` is a *runtime* (donfig) setting,
-    not an env var, so setting it in the client process does NOT propagate to the
-    dask-cuda worker processes — and the lazy chunk reads happen ON the workers.
-    We apply it on every worker via `client.run(_set_zarr_config, ...)` (and on the
-    client too). Env-var thread pins (OMP/BLAS below) DO inherit, because workers
-    are spawned as child processes.
-  * THREADS MULTIPLY. host decode budget ≈ n_gpus × threads_per_worker ×
-    zarr.threading.max_workers. The out-of-core doc recommends threads_per_worker=1
-    for GPU work (more threads spike VRAM); we log the effective product.
-  * GPU SELECTION IS SINGLE-SOURCED. `--gpus` is a list of PHYSICAL device ids.
-    NVML enumerates physical devices (ignores CUDA_VISIBLE_DEVICES), so it uses the
-    physical ids directly; the cluster and client-RMM use the same list. Keeping the
-    client unrestricted (it sees all GPUs) is what keeps the three consistent.
-
-Environment: GPU/CUDA-only (rapids-singlecell, dask-cuda, cupy, rmm). Not runnable
-on a CPU box; run it in the GPU node's pixi env. `--help` works anywhere (heavy
-deps are imported lazily inside functions).
-"""
 from __future__ import annotations
 
 import argparse
@@ -110,9 +44,9 @@ class Config:
     data_path: str = "/mnt/external_megazarr_v1.0.zarr"
     chunk_rows: int = 24_000           # row block for read (multiple of the store's row chunk)
 
-    # -- optional obs subset (run the whole pipeline on cells matching one metadata value) --
+    # -- optional obs subset (run the whole pipeline on cells matching metadata value(s)) --
     subset_column: str = ""   # obs column to filter on; "" = no subset (run on the whole store)
-    subset_value: str = ""    # value in subset_column to keep (string compare, categorical-safe)
+    subset_value: str = ""    # value(s) in subset_column to keep, comma-separated for multiple
 
     # -- result write-back (UMAP embedding + leiden labels, no h5ad) --
     write_results: bool = True         # final step (full run: onto master root; subset: a data_path/subsets/ store)
@@ -457,16 +391,18 @@ def _write_subset(adata, cfg: Config) -> None:
           f"{subset.n_obs} cells, no X")
 
 
-# ── optional obs subset (filter by one metadata value, by SLICING) ──────────────
+# ── optional obs subset (filter by metadata value(s), by SLICING) ───────────────
 def _subset_rows(X_dask, obs, cfg: Config):
-    """Subset the lazy X + obs to rows where obs[subset_column] == subset_value, by SLICING.
+    """Subset the lazy X + obs to rows where obs[subset_column] is in subset_value
+    (comma-separated for multiple values), by SLICING.
 
-    On a store sorted by subset_column the matched rows are one contiguous block, so this is
-    a single X[start:end]: dask reads only the chunks that span it, decodes them, and trims to
-    the rows — the common 'filter then fetch' access, same path as zarr-query-bench celltype
-    mode. If the value spans a few runs (store sorted by a different key) each run is sliced and
-    the slices concatenated lazily — still slicing, never a scattered per-row gather. The slice
-    keeps known chunk sizes, so no compute_chunk_sizes() is needed before the pipeline.
+    On a store sorted by subset_column the matched rows are one contiguous block per value,
+    so this is one X[start:end] per value: dask reads only the chunks that span it, decodes
+    them, and trims to the rows — the common 'filter then fetch' access, same path as
+    zarr-query-bench celltype mode. If a value spans a few runs (store sorted by a different
+    key) each run is sliced and the slices concatenated lazily — still slicing, never a
+    scattered per-row gather. The slices keep known chunk sizes, so no compute_chunk_sizes()
+    is needed before the pipeline.
     """
     import numpy as np
     import dask.array as da
@@ -474,13 +410,14 @@ def _subset_rows(X_dask, obs, cfg: Config):
     if cfg.subset_column not in obs.columns:
         raise KeyError(f"subset column '{cfg.subset_column}' not in obs. "
                        f"Available: {', '.join(map(str, obs.columns))}")
-    idx = np.flatnonzero((obs[cfg.subset_column] == cfg.subset_value).to_numpy())
+    values = [v.strip() for v in str(cfg.subset_value).split(",") if v.strip()]
+    idx = np.flatnonzero(obs[cfg.subset_column].isin(values).to_numpy())
     if idx.size == 0:
         uniq = obs[cfg.subset_column].unique()
-        raise ValueError(f"no rows match obs['{cfg.subset_column}']=='{cfg.subset_value}'. "
+        raise ValueError(f"no rows match obs['{cfg.subset_column}'] in {values}. "
                          f"Available: {', '.join(map(str, uniq[:50]))}")
 
-    # contiguous [start,end) runs of matched rows (== 1 run on a store sorted by this column)
+    # contiguous [start,end) runs of matched rows (== 1 run per value on a sorted store)
     breaks = np.flatnonzero(np.diff(idx) > 1) + 1
     starts, ends = np.concatenate(([0], breaks)), np.concatenate((breaks, [idx.size]))
     spans = [(int(idx[s]), int(idx[e - 1]) + 1) for s, e in zip(starts, ends)]
@@ -488,9 +425,14 @@ def _subset_rows(X_dask, obs, cfg: Config):
     parts = [X_dask[s:e] for s, e in spans]     # each a contiguous slice, known chunks
     X_dask = parts[0] if len(parts) == 1 else da.concatenate(parts, axis=0)
     obs = obs.iloc[idx].copy()
-    kind = "1 span (contiguous)" if len(spans) == 1 else \
-        f"{len(spans)} spans (store not sorted by this column)"
-    print(f"  subset: obs['{cfg.subset_column}']=='{cfg.subset_value}' -> {idx.size} rows, {kind}")
+    # drop categories with no cells left: harmony sizes batches from cat.categories, so a
+    # stale category would enter the model as a phantom empty batch
+    for c in obs.select_dtypes("category").columns:
+        obs[c] = obs[c].cat.remove_unused_categories()
+    kind = "1 span (contiguous)" if len(spans) == 1 else (
+        f"{len(spans)} spans (contiguous per value)" if len(spans) <= len(values)
+        else f"{len(spans)} spans (store not sorted by this column)")
+    print(f"  subset: obs['{cfg.subset_column}'] in {values} -> {idx.size} rows, {kind}")
     return X_dask, obs
 
 # ── harmony managed-memory workaround ───────────────────────────────────────────
@@ -586,8 +528,11 @@ def run_pipeline(cfg: Config) -> None:
         with step("harmony"):
             _patch_harmony_empty_joint_arrays()
             adata.obs[cfg.batch_key] = adata.obs[cfg.batch_key].astype("category")
+            # cap, not a fixed count — breaks early on convergence; default 10 rarely
+            # converges at atlas-scale batch counts
             rsc.pp.harmony_integrate(adata, key=cfg.batch_key, basis="X_pca",
-                                     adjusted_basis="X_pca_harmony")
+                                     adjusted_basis="X_pca_harmony",
+                                     max_iter_harmony=30)
 
     with step("neighbors"):
         rsc.pp.neighbors(adata, n_neighbors=cfg.n_neighbors, n_pcs=cfg.n_comps,
