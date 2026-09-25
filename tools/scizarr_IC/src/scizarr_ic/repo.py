@@ -44,6 +44,36 @@ if TYPE_CHECKING:
 DEFAULT_BRANCH = "main"
 
 
+def _origin_for(location: str) -> str:
+    """What to stamp as ``origin_url`` for a repo created at ``location``."""
+    return location if is_remote(location) else os.path.abspath(location)
+
+
+def _fresh_destination(location: str | Path) -> str:
+    """Validate a location a new repo will be written to; return it as ``str``.
+
+    Rejects read-only paths (mounted data assets), non-empty local dirs and remote
+    prefixes that already hold a repo; creates the local parent directory.
+    """
+    import icechunk
+
+    out = str(location)
+    if is_readonly_path(out):
+        raise ScizarrError(
+            f"Destination '{out}' is read-only (a mounted data asset?) — "
+            "use a writable location, e.g. /results/..., /scratch/... or s3://bucket/prefix."
+        )
+    if is_remote(out):
+        if icechunk.Repository.exists(storage_for(out)):
+            raise ScizarrError(f"Destination already holds an icechunk repo: {out}")
+        return out
+    p = Path(out)
+    if p.exists() and any(p.iterdir()):
+        raise ScizarrError(f"Destination already exists and is not empty: {out}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 class Repo:
     """Open an existing repo; use :meth:`init` to create one from a zarr store."""
 
@@ -105,17 +135,7 @@ class Repo:
 
         from .copy import copy_group
 
-        out = str(out_path)
-        if is_readonly_path(out):
-            raise ScizarrError(
-                f"Output path '{out}' is read-only (a mounted data asset?) — "
-                "create the repo at its writable location, e.g. s3://bucket/prefix."
-            )
-        if not is_remote(out):
-            p = Path(out)
-            if p.exists() and any(p.iterdir()):
-                raise ScizarrError(f"Output path already exists and is not empty: {out}")
-            p.parent.mkdir(parents=True, exist_ok=True)
+        out = _fresh_destination(out_path)
         try:
             src = zarr.open_group(str(zarr_path), mode="r")
         except Exception as exc:
@@ -125,8 +145,7 @@ class Repo:
         except Exception as exc:
             raise ScizarrError(f"Could not create icechunk repository at '{out}': {exc}") from exc
 
-        origin = out if is_remote(out) else os.path.abspath(out)
-        ic_repo.set_metadata({ORIGIN_KEY: origin})
+        ic_repo.set_metadata({ORIGIN_KEY: _origin_for(out)})
 
         session = ic_repo.writable_session(DEFAULT_BRANCH)
         dst = zarr.open_group(store=session.store, mode="w")
@@ -135,6 +154,30 @@ class Repo:
 
         repo = cls(out)
         repo._head.save(repo._branch)
+        return repo
+
+    def copy(self, dest: str | Path) -> "Repo":
+        """Copy this repo — every branch and snapshot, ids intact — to a fresh ``dest``.
+
+        This is the escape hatch for a read-only asset you cannot (or should not)
+        write back to: the copy is stamped as its own origin, so it is fully writable
+        wherever it lands (local dir or ``s3://`` prefix). Reads come from ``path`` as
+        given; nothing is written into the source. The current branch carries over.
+        """
+        import icechunk
+
+        from .copy import check_copyable, copy_repo
+
+        dest = str(dest)
+        check_copyable(self.path, dest)
+        dest = _fresh_destination(dest)
+        copy_repo(self.path, dest)
+        icechunk.Repository.open(storage_for(dest)).update_metadata({ORIGIN_KEY: _origin_for(dest)})
+        repo = type(self)(dest)
+        if self._branch in repo.branches():  # a stale mount may lack a branch HEAD names
+            repo.checkout(self._branch)
+        else:
+            repo._head.save(repo._branch)
         return repo
 
     # -- location ------------------------------------------------------------

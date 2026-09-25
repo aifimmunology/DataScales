@@ -38,15 +38,22 @@ def is_readonly_path(path: str) -> bool:
     """True for a LOCAL path this process cannot write to.
 
     Uses ``os.access(W_OK)`` (which reports ``False`` on read-only mounts even for
-    root) plus the ``SCIZARR_IC_READONLY_PREFIXES`` override. Remote URIs and paths
-    that don't exist yet are never read-only.
+    root) plus the ``SCIZARR_IC_READONLY_PREFIXES`` override. A path that doesn't
+    exist yet is judged by its nearest existing ancestor — the directory it would be
+    created in. Remote URIs are never read-only.
     """
     if is_remote(path):
         return False
     p = os.path.abspath(str(path))
     if any(p == pre or p.startswith(pre + os.sep) for pre in _readonly_prefixes()):
         return True
-    return os.path.exists(p) and not os.access(p, os.W_OK)
+    probe = p
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return False
+        probe = parent
+    return not os.access(probe, os.W_OK)
 
 
 def origin_of(ic_repo) -> str | None:

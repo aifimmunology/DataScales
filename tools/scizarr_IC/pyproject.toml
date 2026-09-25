@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scizarr-ic"
-version = "0.1.0"
+version = "0.2.0"
 description = "Git-like version control for Zarr stores, backed by Icechunk"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -13,11 +13,10 @@ authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 dependencies = [
   "icechunk>=2.1.2,<3",
   "zarr>=3.3.0,<4",
-  "numpy>=1.24.0,<2.5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "numpy>=1.24.0,<2.5"]
 
 [project.scripts]
 scizarr-ic = "scizarr_ic.cli:main"

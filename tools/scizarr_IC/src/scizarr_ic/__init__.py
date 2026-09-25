@@ -10,12 +10,13 @@ Python API entry point is :class:`Repo`::
 
     # a read-only data-asset mount reads in place; writes resolve to its s3:// origin
     repo = Repo("/data/my_store"); print(repo.origin)
+    mine = repo.copy("/results/my_store")             # or take a writable clone
 
 The command line (``scizarr-ic`` / ``scz``) exposes ``init``, ``log``, ``tree``,
-``checkout``, ``cherrypick`` and ``origin``; ``commit`` is Python-API only.
+``checkout``, ``cherrypick``, ``origin`` and ``copy``; ``commit`` is Python-API only.
 """
 from .errors import ScizarrError
 from .repo import DEFAULT_BRANCH, Repo
 
 __all__ = ["Repo", "ScizarrError", "DEFAULT_BRANCH"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

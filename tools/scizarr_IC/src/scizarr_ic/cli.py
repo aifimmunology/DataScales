@@ -1,13 +1,14 @@
 """argparse CLI for scizarr-ic (``scizarr-ic`` / ``scz``).
 
 Subcommands mirror git: ``init``, ``log``, ``tree``, ``checkout``, ``cherrypick``, plus
-``origin`` (where writes go). Every non-init command takes the repo path (``-C``/``--repo``,
+``origin`` (where writes go) and ``copy`` (clone a repo to a writable location). Every non-init command takes the repo path (``-C``/``--repo``,
 default ``.``) and an optional ``--origin URL`` override for the writable location.
 Errors print to stderr and exit 1; normal output stays on stdout for piping.
 
 A read-only mount such as a Code Ocean data asset (``-C /data/<asset>``) is read in
 place; writes (``checkout -b``, ``cherrypick``, ``origin URL``) go to the ``s3://`` origin
-stamped in the repo metadata, with credentials from the environment.
+stamped in the repo metadata, with credentials from the environment. ``copy`` takes a
+fully writable clone instead (e.g. into ``/results``) when there is no origin to write to.
 
 ``commit`` is intentionally Python-API only (``Repo.commit``): icechunk stages
 edits in a session's memory, so there is nothing for a fresh CLI process to commit.
@@ -104,6 +105,12 @@ def _cmd_cherrypick(args) -> int:
     return 0
 
 
+def _cmd_copy(args) -> int:
+    repo = _open(args).copy(args.dest)
+    print(f"Copied {args.repo} -> {repo.path} (branch '{repo.branch}')")
+    return 0
+
+
 def _cmd_origin(args) -> int:
     repo = _open(args)
     if args.url:
@@ -169,6 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_arg(p_cp)
     p_cp.add_argument("snapshot", help="Snapshot id to point the branch at")
     p_cp.set_defaults(func=_cmd_cherrypick)
+
+    p_cp = sub.add_parser(
+        "copy", help="Copy the repo (all branches and snapshots) to a fresh writable location"
+    )
+    add_repo_arg(p_cp)
+    p_cp.add_argument("dest", help="Destination path/URI (local dir or s3://bucket/prefix)")
+    p_cp.set_defaults(func=_cmd_copy)
 
     p_or = sub.add_parser(
         "origin",

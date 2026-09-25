@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 
 ENV_HOME = "SCIZARR_IC_HOME"
-_HEAD_FILE = "scizarr_head"
+HEAD_FILE = "scizarr_head"
 
 
 def home_dir() -> Path:
@@ -36,7 +36,7 @@ class HeadStore:
 
     def __init__(self, *, key: str, in_repo_dir: str | None = None) -> None:
         self.key = key
-        self._in_repo = Path(in_repo_dir) / _HEAD_FILE if in_repo_dir is not None else None
+        self._in_repo = Path(in_repo_dir) / HEAD_FILE if in_repo_dir is not None else None
 
     @property
     def path(self) -> Path:
@@ -59,6 +59,3 @@ class HeadStore:
         p = self.path
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(branch + "\n")
-        if self.is_sidecar:
-            # sibling note so a human can tell which repo a hashed sidecar belongs to
-            p.with_suffix(".path").write_text(self.key + "\n")

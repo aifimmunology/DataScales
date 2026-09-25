@@ -1,5 +1,14 @@
-"""Shared fixtures: tiny anndata-style zarr stores built in tmp_path (hermetic)."""
+"""Shared fixtures: tiny anndata-style zarr stores and a simulated read-only mount.
+
+Everything is hermetic (tmp_path). The "mount" imitates a Code Ocean data asset: a
+plain copy of an origin repo that SCIZARR_IC_READONLY_PREFIXES marks read-only (tests
+run as root, so chmod can't). The copy never sees the origin's later writes, so it also
+doubles as a *stale* mount. ``test_live_codeocean.py`` exercises the real thing.
+"""
 from __future__ import annotations
+
+import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -43,3 +52,29 @@ def src_zarr(tmp_path):
 @pytest.fixture
 def repo_path(tmp_path):
     return tmp_path / "store.icechunk"
+
+
+def snapshot_tree(root: Path) -> dict[str, int]:
+    """{relative file: mtime_ns} — to prove a read-only location was not touched."""
+    return {
+        str(p.relative_to(root)): p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file()
+    }
+
+
+@pytest.fixture
+def mounted(src_zarr, tmp_path, monkeypatch):
+    """(mount_path, origin_path, mount_tree_before) with HEAD sidecars in tmp_path/home."""
+    from scizarr_ic import Repo
+
+    path, _ = src_zarr
+    origin = tmp_path / "origin.icechunk"
+    Repo.init(path, origin, message="import")
+    (origin / "scizarr_head").unlink()  # the copy must not carry the origin's HEAD file
+
+    mount_root = tmp_path / "mount"
+    mount = mount_root / "store"
+    shutil.copytree(origin, mount)
+    monkeypatch.setenv("SCIZARR_IC_READONLY_PREFIXES", str(mount_root))
+    monkeypatch.setenv("SCIZARR_IC_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("SCIZARR_IC_ORIGIN", raising=False)
+    return mount, origin, snapshot_tree(mount)

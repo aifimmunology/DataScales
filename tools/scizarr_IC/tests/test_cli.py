@@ -1,7 +1,6 @@
 """End-to-end CLI coverage (init/log/tree/checkout/cherrypick)."""
 from __future__ import annotations
 
-import pytest
 
 from scizarr_ic import Repo
 from scizarr_ic.cli import main

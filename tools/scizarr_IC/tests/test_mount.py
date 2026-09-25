@@ -1,15 +1,10 @@
 """Read-only mount -> stamped origin: reads stay on the mount, writes land at the origin.
 
-Simulates a Code Ocean data asset hermetically: the origin repo is a writable local
-dir, the "mount" is a plain copy of it that SCIZARR_IC_READONLY_PREFIXES marks as
-read-only (tests run as root, so chmod can't). Because the copy never sees the origin's
-later writes, it also doubles as a *stale* mount for the fallback tests.
+See ``conftest.mounted`` for how a Code Ocean data asset is simulated hermetically.
 """
 from __future__ import annotations
 
 import os
-import shutil
-from pathlib import Path
 
 import pytest
 
@@ -17,28 +12,7 @@ from scizarr_ic import Repo, ScizarrError
 from scizarr_ic.cli import main
 from scizarr_ic.storage import ORIGIN_KEY
 
-
-def _snapshot_tree(root: Path) -> dict[str, int]:
-    return {
-        str(p.relative_to(root)): p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file()
-    }
-
-
-@pytest.fixture
-def mounted(src_zarr, tmp_path, monkeypatch):
-    """(mount_path, origin_path, mount_tree_before) with HEAD sidecars in tmp_path/home."""
-    path, _ = src_zarr
-    origin = tmp_path / "origin.icechunk"
-    Repo.init(path, origin, message="import")
-    (origin / "scizarr_head").unlink()  # the copy must not carry the origin's HEAD file
-
-    mount_root = tmp_path / "mount"
-    mount = mount_root / "store"
-    shutil.copytree(origin, mount)
-    monkeypatch.setenv("SCIZARR_IC_READONLY_PREFIXES", str(mount_root))
-    monkeypatch.setenv("SCIZARR_IC_HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("SCIZARR_IC_ORIGIN", raising=False)
-    return mount, origin, _snapshot_tree(mount)
+from conftest import snapshot_tree as _snapshot_tree
 
 
 def test_init_stamps_origin(src_zarr, repo_path):

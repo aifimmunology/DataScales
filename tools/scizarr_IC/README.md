@@ -11,7 +11,11 @@ with a CLI that reads like `git` and a small Python API for scripted edits.
 ```bash
 cd tools/scizarr_IC
 pixi install -e dev          # dev env includes pytest
-pixi run -e dev pytest       # run the test suite
+pixi run -e dev pytest       # hermetic suite (no network, no credentials)
+
+# live checks against a real read-only mount (Code Ocean data asset):
+SCIZARR_IC_LIVE_REPO=/data/my_store pixi run -e dev pytest tests/test_live_codeocean.py
+SCIZARR_IC_LIVE_WRITE=1 ...  # also round-trips a scratch branch at the s3:// origin
 ```
 
 ## CLI
@@ -23,6 +27,7 @@ scizarr-ic tree    -C OUT.icechunk                           # every branch + it
 scizarr-ic checkout -C OUT.icechunk BRANCH [-b]              # switch branch (-b to create)
 scizarr-ic cherrypick -C OUT.icechunk SNAPSHOT_ID           # reset current branch to a snapshot
 scizarr-ic origin  -C OUT.icechunk [URL]                    # show (or stamp) where writes go
+scizarr-ic copy    -C SRC.icechunk DEST                     # writable clone, full history
 ```
 
 `scz` is a shorter alias for `scizarr-ic`. The current branch is remembered per repo,
@@ -51,6 +56,21 @@ HEAD lives locally, like git's: a `scizarr_head` file inside a *writable* local 
 otherwise a per-user sidecar under `$SCIZARR_IC_HOME` (default `~/.cache/scizarr_ic`),
 keyed by the repo's origin. Nothing is ever written into a read-only repo.
 
+**Two kinds of data asset.** A *linked* (external S3) asset is a live view of its
+bucket prefix, so writes to the stamped origin show up in the mount shortly after. An
+*internal* asset is a frozen copy on EFS: its stamped origin may still be writable, but
+the mount will never reflect those writes. When you cannot write back — no AWS secret,
+or a frozen asset — take a copy instead:
+
+```bash
+scizarr-ic copy -C /data/my_store /results/my_store     # or s3://bucket/prefix (uses `aws s3 sync`)
+scizarr-ic checkout -C /results/my_store analysis -b    # the copy is its own origin
+```
+
+`copy` replicates the repo's object tree byte for byte, so every branch and snapshot id
+is preserved, then stamps the copy as its own `origin_url` and carries the current
+branch over. The destination must be empty (or a prefix holding no repo).
+
 `commit` is **Python-API only** — Icechunk stages edits in a session's memory, so there
 is nothing for a fresh CLI process to commit.
 
@@ -74,6 +94,8 @@ for snap in repo.log():                          # newest first
 
 repo.cherrypick(some_snapshot_id)                # reset current branch to a snapshot
 root = repo.root()                               # read-only zarr.Group at the branch tip
+
+mine = Repo("/data/my_store").copy("/results/my_store")   # writable clone of a read-only asset
 ```
 
 Batch writes into **few, large commits** — a commit per chunk/row-batch is pathological
