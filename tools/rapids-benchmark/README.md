@@ -39,5 +39,5 @@ Each run appends a per-step summary to `results/Run_results.txt` headed by the d
 GPUs, and any cfg options left off their defaults. See the module docstring and `--help` for
 the rest.
 
-[`sweep_single_gpu.sh`](sweep_single_gpu.sh) loops the benchmark over datasets × RMM modes ×
-chunk-rows × thread splits (edit the CONFIG block; `OUTDIR` env overrides the results dir).
+[`submit_runs.sh`](submit_runs.sh) loops the benchmark over datasets × RMM modes ×
+chunk-rows × thread splits (edit the CONFIG block)
