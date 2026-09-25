@@ -1,23 +1,27 @@
-"""DataScale: AnnData conversion tools."""
+"""convert-to-zarr: convert and concatenate single-cell data into AnnData zarr stores."""
+
+from .engine import _pin_blas
+
+_pin_blas()  # before .ops pulls in numpy — BLAS pools read these env vars at library load
 
 from .config import AppConfig, GroupingConfig, load_config
-from .converter import (
-    ConversionError,
+from .errors import ConversionError
+from .ops import (
     convert_10x_h5_to_zarr,
+    convert_adata_to_zarr,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
 )
 from .validation import ValidationError, validate_single_cell_anndata
 
-# Exportable Library API
 __all__ = [
     "AppConfig",
     "GroupingConfig",
     "load_config",
     "ConversionError",
     "ValidationError",
+    "convert_adata_to_zarr",
     "convert_h5ad_to_zarr",
     "convert_h5ads_to_zarr",
     "convert_10x_h5_to_zarr",
-    "validate_single_cell_anndata",
 ]

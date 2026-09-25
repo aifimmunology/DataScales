@@ -186,7 +186,7 @@ def convert_icechunk(inp: Path, out: Path, workers: int) -> None:
 def convert_datascale(inp: Path, out: Path, workers: int) -> None:
     # Tuned: backed streaming + process parallelism (bounded RAM per worker).
     from convert_to_zarr.config import load_config, apply_cli_overrides
-    from convert_to_zarr.converter import convert_h5ad_to_zarr
+    from convert_to_zarr import convert_h5ad_to_zarr
 
     cfg = load_config(None)  # defaults: sparse-csr, zarr backend
     # Always backed so this row is ALWAYS the streaming/bounded CSR->CSR path

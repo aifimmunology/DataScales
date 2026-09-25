@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from importlib.resources import path
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,7 +14,6 @@ except Exception:  # pragma: no cover
 
 XStorageMode = Literal["sparse-csr", "sparse-csc", "dense"]
 BackendMode = Literal["zarr", "icechunk"]
-IcechunkStorageMode = Literal["local", "gcs"]
 
 
 @dataclass(frozen=True)
@@ -26,11 +24,8 @@ class IOConfig:
     backed: bool = False  # load h5ad in backed (HDF5-streamed) mode; opt-in only
     # Storage backend for the output store. "zarr" writes a plain on-disk zarr; "icechunk"
     # writes through a transactional, versioned Icechunk repository (one commit per convert).
+    # Icechunk targets are a local path or an s3://bucket/prefix URL (env credentials).
     backend: BackendMode = "zarr"
-    icechunk_storage: IcechunkStorageMode = "local"
-    # GCS scaffolding — not wired into a working path yet (local only for now).
-    gcs_bucket: str | None = None
-    gcs_prefix: str = ""
 
 
 @dataclass(frozen=True)
@@ -40,7 +35,7 @@ class ChunkConfig:
     sparse_flat_chunk: int = 1_000_000
     cpus: int = 1  # workers for parallel matrix chunk writes; threads in-memory, processes when backed; raise on HPC
     # Pack dense X inner chunks into shards of (x_row_chunk, x_col_chunk) * factor.
-    # 1 = no sharding. Dense X only (sparse output ignores it). See converter._dense_shards.
+    # 1 = no sharding. Dense X only (sparse output ignores it). See layout._dense_shards.
     x_shard_factor: int = 1
 
 
@@ -253,3 +248,30 @@ def apply_cli_overrides(
     return _validate_config(
         replace(config, io=io_cfg, chunks=chunk_cfg, grouping=grouping_cfg, concat=concat_cfg)
     )
+
+
+def _resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
+    """Validate + adapt config for the chosen storage backend.
+
+    Icechunk supports multi-threaded writes against one shared session (single commit),
+    so in-process threaded paths keep cpus. Only the backed-input writers are rejected:
+    they fan out to worker processes that reopen the store by filesystem path, which an
+    icechunk session can't provide (Session.fork() is the future path).
+    """
+    import sys
+
+    from .errors import ConversionError
+
+    if cfg.chunks.x_shard_factor > 1 and cfg.io.x_storage != "dense":
+        print(
+            f"→ x_shard_factor={cfg.chunks.x_shard_factor} only applies to dense X; "
+            f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored.",
+            flush=True, file=sys.stderr,
+        )
+    if cfg.io.backend == "icechunk" and cfg.io.backed:
+        raise ConversionError(
+            "backend='icechunk' does not support --backed input yet (backed writers use "
+            "worker processes that reopen the store by path; the icechunk session is "
+            "in-process only). Convert eagerly (omit --backed), or use backend='zarr'."
+        )
+    return cfg

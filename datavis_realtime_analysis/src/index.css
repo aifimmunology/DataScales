@@ -1,0 +1,85 @@
+/* Allen Institute Plus Text — single family mapped across weights/styles
+   (Medium/500 intentionally absent: the source file was corrupt). */
+@font-face {
+  font-family: 'AllenInstitutePlusText';
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+  src: url('./assets/fonts/AllenInstitutePlusText-Light.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'AllenInstitutePlusText';
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  src: url('./assets/fonts/AllenInstitutePlusText-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'AllenInstitutePlusText';
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+  src: url('./assets/fonts/AllenInstitutePlusText-Italic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'AllenInstitutePlusText';
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+  src: url('./assets/fonts/AllenInstitutePlusText-Semibold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'AllenInstitutePlusText';
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+  src: url('./assets/fonts/AllenInstitutePlusText-Bold.woff2') format('woff2');
+}
+
+/* default body margin makes a 100vh app overflow the viewport by 16px */
+html, body, #root {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'AllenInstitutePlusText', -apple-system, BlinkMacSystemFont,
+    'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button, input, select {
+  font-family: inherit;
+}
+
+@keyframes datavis-bar {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+
+/* Header title accent: slow loop through the ALLEN_COLORS brand palette
+   (same effect as the spatial-data-explorer's PulsingText). */
+@keyframes allen-pulse {
+  0%   { color: rgb(255, 255, 255); }
+  10%  { color: rgb(130, 70, 255); }
+  20%  { color: rgb(255, 235, 35); }
+  30%  { color: rgb(0, 165, 155); }
+  40%  { color: rgb(255, 110, 0); }
+  50%  { color: rgb(205, 15, 85); }
+  60%  { color: rgb(205, 235, 5); }
+  70%  { color: rgb(100, 100, 255); }
+  80%  { color: rgb(255, 0, 255); }
+  90%  { color: rgb(220, 150, 0); }
+  100% { color: rgb(255, 255, 255); }
+}
+
+.allen-pulse {
+  font-weight: 700;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .allen-pulse {
+    animation: allen-pulse 30s linear infinite;
+  }
+}

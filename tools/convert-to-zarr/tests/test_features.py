@@ -15,7 +15,7 @@ from convert_to_zarr.config import (
     IOConfig,
     ValidationConfig,
 )
-from convert_to_zarr.converter import (
+from convert_to_zarr import (
     ConversionError,
     convert_h5ad_to_zarr,
     convert_h5ads_to_zarr,
@@ -64,7 +64,7 @@ def _id_set(X) -> set[int]:
 
 def _self_serve_subset(g, **keys):
     """Read rows matching ``keys`` from a sorted store using ONLY stock anndata/zarr — no
-    convert_to_zarr, no convert_to_zarr index. Because the store is physically sorted by the keys, the
+    zarrsmith, no zarrsmith index. Because the store is physically sorted by the keys, the
     matching rows form contiguous span(s); we find them by masking the (sorted) obs column(s)
     and splitting the matched row indices into contiguous runs. Returns (X, obs)."""
     from anndata.io import read_elem, sparse_dataset
@@ -150,8 +150,8 @@ def test_sort_writes_valid_anndata_no_index(tmp_path: Path) -> None:
     # obsm is reordered consistently with the row permutation (coords col0 was 0,2,4,6,8,10).
     assert list(adata.obsm["coords"][:, 0].astype(int)) == [2, 8, 4, 6, 0, 10]
 
-    # NO convert_to_zarr-specific index is written — the store is a plain sorted AnnData.
-    assert "convert_to_zarr_sort_index" not in adata.uns
+    # NO zarrsmith-specific index is written — the store is a plain sorted AnnData.
+    assert "zarrsmith_sort_index" not in adata.uns
 
 
 def test_sorted_store_self_serve_contiguous_block(tmp_path: Path) -> None:
@@ -185,7 +185,7 @@ def test_sorted_store_self_serve_crosscut(tmp_path: Path) -> None:
 def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
     """Dense X supports --sort-by: rows are physically sorted so each key tuple is a
     contiguous run derivable from the sorted obs and read directly via X[start:end]
-    (stock zarr, no convert_to_zarr, no index)."""
+    (stock zarr, no zarrsmith, no index)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted_dense.zarr"
     cfg = AppConfig(
@@ -259,7 +259,7 @@ def test_sort_backed_streamed_matches_eager(tmp_path: Path) -> None:
     assert np.array_equal(np.asarray(a_backed.X.todense()), np.asarray(a_eager.X.todense()))
     assert list(a_backed.obs["cell_type"]) == list(a_eager.obs["cell_type"])
     assert np.array_equal(a_backed.obsm["coords"], a_eager.obsm["coords"])
-    assert "convert_to_zarr_sort_index" not in a_backed.uns
+    assert "zarrsmith_sort_index" not in a_backed.uns
 
     # Self-serve subset reads (stock anndata/zarr) work on the backed-sorted store too.
     g = open_input_group(str(out_backed))
@@ -433,7 +433,7 @@ def test_inmem_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
 
 @pytest.mark.parametrize("x_storage", ["dense", "sparse-csr"])
 def test_concat_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
-    """concat-h5ads at cpus>1 writes each file at a misaligned row offset, so the file-seam
+    """concat at cpus>1 writes each file at a misaligned row offset, so the file-seam
     chunk is read-modify-written. That path MUST keep the da.store lock (row counts here are
     deliberately not multiples of the row chunk) — with lock=False concurrent RMW corrupts X."""
     # 200 + 300 rows at row_chunk 64 puts the second file at a misaligned offset (200 % 64 != 0);

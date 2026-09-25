@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "convert-to-zarr"
-version = "0.1.0"
-description = "Configurable AnnData to Zarr converter with strong validation"
+version = "0.3.0"
+description = "Convert and concatenate single-cell data (.h5ad, 10x .h5) into AnnData zarr stores"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = "MIT"
@@ -17,7 +17,7 @@ dependencies = [
   "scipy>=1.10.0",
   "PyYAML>=6.0",
   "scanpy>=1.9.0",
-  "dask[array]>=2023.1.0",
+  "dask[array]>=2026.3",
   "icechunk>=2.0.6",
 ]
 
