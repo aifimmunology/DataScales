@@ -1,8 +1,13 @@
 """argparse CLI for scizarr-ic (``scizarr-ic`` / ``scz``).
 
-Subcommands mirror git: ``init``, ``log``, ``tree``, ``checkout``, ``cherrypick``.
-Every non-init command takes the repo path (``-C``/``--repo``, default ``.``).
+Subcommands mirror git: ``init``, ``log``, ``tree``, ``checkout``, ``cherrypick``, plus
+``origin`` (where writes go). Every non-init command takes the repo path (``-C``/``--repo``,
+default ``.``) and an optional ``--origin URL`` override for the writable location.
 Errors print to stderr and exit 1; normal output stays on stdout for piping.
+
+A read-only mount such as a Code Ocean data asset (``-C /data/<asset>``) is read in
+place; writes (``checkout -b``, ``cherrypick``, ``origin URL``) go to the ``s3://`` origin
+stamped in the repo metadata, with credentials from the environment.
 
 ``commit`` is intentionally Python-API only (``Repo.commit``): icechunk stages
 edits in a session's memory, so there is nothing for a fresh CLI process to commit.
@@ -37,6 +42,16 @@ def _fmt_when(dt) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _open(args) -> Repo:
+    return Repo(args.repo, origin=getattr(args, "origin", None))
+
+
+def _note_resolved(repo: Repo) -> None:
+    """Tell the user when a write is going somewhere other than the path they passed."""
+    if repo.resolved:
+        print(f"note: writing to {repo.origin} (resolved from {repo.path})", file=sys.stderr)
+
+
 def _cmd_init(args) -> int:
     repo = Repo.init(args.zarr, args.out, message=args.message)
     print(f"Initialized icechunk repo at {repo.path} (branch '{repo.branch}')")
@@ -44,7 +59,7 @@ def _cmd_init(args) -> int:
 
 
 def _cmd_log(args) -> int:
-    repo = Repo(args.repo)
+    repo = _open(args)
     for snap in repo.log(branch=args.branch):
         if args.oneline:
             print(f"{_short(snap.id)} {snap.message}")
@@ -56,7 +71,7 @@ def _cmd_log(args) -> int:
 
 
 def _cmd_tree(args) -> int:
-    repo = Repo(args.repo)
+    repo = _open(args)
     current = repo.branch
     tree = repo.tree()
     for i, (branch, snaps) in enumerate(sorted(tree.items())):
@@ -71,17 +86,38 @@ def _cmd_tree(args) -> int:
 
 
 def _cmd_checkout(args) -> int:
-    repo = Repo(args.repo)
+    repo = _open(args)
+    creating = args.create and args.branch not in repo.branches()
+    if creating:
+        _note_resolved(repo)
     tip = repo.checkout(args.branch, create=args.create)
-    verb = "Created and switched to" if args.create else "Switched to"
+    verb = "Created and switched to" if creating else "Switched to"
     print(f"{verb} branch '{args.branch}' (tip {_short(tip)})")
     return 0
 
 
 def _cmd_cherrypick(args) -> int:
-    repo = Repo(args.repo)
+    repo = _open(args)
+    _note_resolved(repo)
     resolved = repo.cherrypick(args.snapshot)
     print(f"Branch '{repo.branch}' now at {_short(resolved)}")
+    return 0
+
+
+def _cmd_origin(args) -> int:
+    repo = _open(args)
+    if args.url:
+        _note_resolved(repo)
+        repo.set_origin(args.url)
+        print(f"Stamped origin_url = {args.url}")
+        return 0
+    kind = "read-only" if repo.readonly_path else "writable"
+    print(f"path:    {repo.path}  ({kind})")
+    print(f"stamped: {repo.origin_url() or '-'}")
+    if repo.origin is None:
+        print("writes:  unavailable — no origin known (see 'scizarr-ic origin --help')")
+    else:
+        print(f"writes:  {repo.origin}" + ("  (resolved)" if repo.resolved else ""))
     return 0
 
 
@@ -94,6 +130,13 @@ def build_parser() -> argparse.ArgumentParser:
     def add_repo_arg(p):
         p.add_argument(
             "-C", "--repo", default=".", help="Path/URI of the icechunk repo (default: .)"
+        )
+        p.add_argument(
+            "--origin",
+            default=None,
+            metavar="URL",
+            help="Writable location to use instead of the stamped origin_url "
+            "(e.g. s3://bucket/prefix behind a read-only /data mount)",
         )
 
     p_init = sub.add_parser("init", help="Create a repo from an existing zarr store")
@@ -126,6 +169,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_arg(p_cp)
     p_cp.add_argument("snapshot", help="Snapshot id to point the branch at")
     p_cp.set_defaults(func=_cmd_cherrypick)
+
+    p_or = sub.add_parser(
+        "origin",
+        help="Show where writes go for this repo; with URL, stamp it as the repo's origin_url",
+    )
+    add_repo_arg(p_or)
+    p_or.add_argument("url", nargs="?", help="Writable location to stamp (e.g. s3://bucket/prefix)")
+    p_or.set_defaults(func=_cmd_origin)
 
     return parser
 

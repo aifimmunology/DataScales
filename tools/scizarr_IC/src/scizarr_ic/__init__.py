@@ -8,8 +8,11 @@ Python API entry point is :class:`Repo`::
     repo.checkout("experiment", create=True)           # branch
     for snap in repo.log(): print(snap.id, snap.message)
 
-The command line (``scizarr-ic`` / ``scz``) exposes ``init``, ``commit``, ``log``,
-``tree``, ``checkout`` and ``cherrypick``.
+    # a read-only data-asset mount reads in place; writes resolve to its s3:// origin
+    repo = Repo("/data/my_store"); print(repo.origin)
+
+The command line (``scizarr-ic`` / ``scz``) exposes ``init``, ``log``, ``tree``,
+``checkout``, ``cherrypick`` and ``origin``; ``commit`` is Python-API only.
 """
 from .errors import ScizarrError
 from .repo import DEFAULT_BRANCH, Repo

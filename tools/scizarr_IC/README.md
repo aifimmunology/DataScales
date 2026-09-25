@@ -22,12 +22,34 @@ scizarr-ic log     -C OUT.icechunk [--oneline] [-b BRANCH]   # history of a bran
 scizarr-ic tree    -C OUT.icechunk                           # every branch + its commits
 scizarr-ic checkout -C OUT.icechunk BRANCH [-b]              # switch branch (-b to create)
 scizarr-ic cherrypick -C OUT.icechunk SNAPSHOT_ID           # reset current branch to a snapshot
+scizarr-ic origin  -C OUT.icechunk [URL]                    # show (or stamp) where writes go
 ```
 
-`scz` is a shorter alias for `scizarr-ic`. The current branch is remembered per repo
-(a `scizarr_head` file), so `-C` is all you need between commands. Repo paths may be
-local directories or `s3://bucket/prefix` / `gs://bucket/prefix` URIs (object-store
-credentials read from the environment).
+`scz` is a shorter alias for `scizarr-ic`. The current branch is remembered per repo,
+so `-C` is all you need between commands. Repo paths may be local directories or
+`s3://bucket/prefix` / `gs://bucket/prefix` URIs (object-store credentials read from
+the environment).
+
+### Read-only mounts (Code Ocean data assets)
+
+A data asset mounts read-only under `/data`, but the S3 prefix behind it is writable.
+`init` stamps the repo's writable location into its metadata (`origin_url`), so:
+
+```bash
+scizarr-ic origin   -C /data/my_store            # path (read-only) / stamped origin / where writes go
+scizarr-ic log      -C /data/my_store            # reads: straight from the mount, no credentials
+scizarr-ic checkout -C /data/my_store dev -b     # writes: go to the s3:// origin (env credentials)
+scizarr-ic origin   -C s3://bucket/prefix s3://bucket/prefix   # retro-stamp an older repo
+```
+
+`--origin URL` (or `SCIZARR_IC_ORIGIN`) overrides the stamped origin. Once a write has
+opened the origin, the same process reads from it too (a mount can lag behind fresh
+writes); a fresh process that finds its HEAD branch missing from the mount also checks
+the origin before giving up.
+
+HEAD lives locally, like git's: a `scizarr_head` file inside a *writable* local repo,
+otherwise a per-user sidecar under `$SCIZARR_IC_HOME` (default `~/.cache/scizarr_ic`),
+keyed by the repo's origin. Nothing is ever written into a read-only repo.
 
 `commit` is **Python-API only** — Icechunk stages edits in a session's memory, so there
 is nothing for a fresh CLI process to commit.
