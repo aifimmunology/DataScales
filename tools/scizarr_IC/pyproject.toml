@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scizarr-ic"
+version = "0.2.0"
+description = "Git-like version control for Zarr stores, backed by Icechunk"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "MIT"
+authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
+dependencies = [
+  "icechunk>=2.1.2,<3",
+  "zarr>=3.3.0,<4",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.28"]                      # `copy` to/from s3:// (icechunk itself needs no boto3)
+dev = ["pytest>=8.0", "numpy>=1.24.0,<2.5", "boto3>=1.28"]
+
+[project.scripts]
+scizarr-ic = "scizarr_ic.cli:main"
+scz = "scizarr_ic.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["scizarr_ic*"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+scizarr-ic = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.dependencies]
+python = ">=3.10,<3.13"
