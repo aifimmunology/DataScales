@@ -14,8 +14,9 @@ pixi install -e dev          # dev env includes pytest
 pixi run -e dev pytest       # hermetic suite (no network, no credentials)
 
 # live checks against a real read-only mount (Code Ocean data asset):
-SCIZARR_IC_LIVE_REPO=/data/my_store pixi run -e dev pytest tests/test_live_codeocean.py
-SCIZARR_IC_LIVE_WRITE=1 ...  # also round-trips a scratch branch at the s3:// origin
+SCIZARR_IC_LIVE_REPO=/data/sample_linked_icechunk pixi run -e dev pytest tests/test_live_codeocean.py
+SCIZARR_IC_LIVE_WRITE=1 ...                      # also round-trips a scratch branch at the s3:// origin
+SCIZARR_IC_LIVE_S3_SCRATCH=s3://bucket/prefix ... # also copies the repo to S3 and back, then cleans up
 ```
 
 ## CLI
@@ -37,14 +38,15 @@ the environment).
 
 ### Read-only mounts (Code Ocean data assets)
 
-A data asset mounts read-only under `/data`, but the S3 prefix behind it is writable.
-`init` stamps the repo's writable location into its metadata (`origin_url`), so:
+A *linked* (external S3) data asset mounts read-only under `/data`, but the S3 prefix
+behind it is writable and the mount tracks it. `init`/`create` stamp the repo's
+writable location into its metadata (`origin_url`), so:
 
 ```bash
-scizarr-ic origin   -C /data/my_store            # path (read-only) / stamped origin / where writes go
-scizarr-ic log      -C /data/my_store            # reads: straight from the mount, no credentials
-scizarr-ic checkout -C /data/my_store dev -b     # writes: go to the s3:// origin (env credentials)
-scizarr-ic origin   -C s3://bucket/prefix s3://bucket/prefix   # retro-stamp an older repo
+scizarr-ic origin   -C /data/sample_linked_icechunk          # path (read-only) / stamped origin / where writes go
+scizarr-ic log      -C /data/sample_linked_icechunk          # reads: straight from the mount, no credentials
+scizarr-ic checkout -C /data/sample_linked_icechunk dev -b   # writes: go to the s3:// origin (env credentials)
+scizarr-ic origin   -C s3://bucket/prefix s3://bucket/prefix # retro-stamp an older repo
 ```
 
 `--origin URL` (or `SCIZARR_IC_ORIGIN`) overrides the stamped origin. Once a write has
@@ -56,20 +58,22 @@ HEAD lives locally, like git's: a `scizarr_head` file inside a *writable* local 
 otherwise a per-user sidecar under `$SCIZARR_IC_HOME` (default `~/.cache/scizarr_ic`),
 keyed by the repo's origin. Nothing is ever written into a read-only repo.
 
-**Two kinds of data asset.** A *linked* (external S3) asset is a live view of its
-bucket prefix, so writes to the stamped origin show up in the mount shortly after. An
-*internal* asset is a frozen copy on EFS: its stamped origin may still be writable, but
-the mount will never reflect those writes. When you cannot write back — no AWS secret,
-or a frozen asset — take a copy instead:
+**Frozen copies.** An *internal* data asset is a one-time copy onto EFS (a read-only
+NFS mount): its `origin_url` stamp came along from S3 but is not connected to the mount,
+so writes there would never show up. scizarr-ic detects this from the mount type
+(`storage.FROZEN_FSTYPES`), ignores the stamp, and refuses writes (`origin` says
+"frozen copy"). Take a copy instead — also the answer when there is no AWS secret:
 
 ```bash
-scizarr-ic copy -C /data/my_store /results/my_store     # or s3://bucket/prefix (uses `aws s3 sync`)
-scizarr-ic checkout -C /results/my_store analysis -b    # the copy is its own origin
+scizarr-ic copy -C /data/sample_icechunk /results/my_store   # or s3://bucket/prefix (boto3)
+scizarr-ic checkout -C /results/my_store analysis -b         # the copy is its own origin
 ```
 
 `copy` replicates the repo's object tree byte for byte, so every branch and snapshot id
 is preserved, then stamps the copy as its own `origin_url` and carries the current
-branch over. The destination must be empty (or a prefix holding no repo).
+branch over. The destination must be empty (or a prefix holding no repo). Copies that
+touch `s3://` need `boto3` (`pip install 'scizarr-ic[s3]'`); `--origin URL` still forces
+writes from a frozen mount to a location you name.
 
 `commit` is **Python-API only** — Icechunk stages edits in a session's memory, so there
 is nothing for a fresh CLI process to commit.
@@ -80,6 +84,8 @@ is nothing for a fresh CLI process to commit.
 from scizarr_ic import Repo
 
 repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store (one commit on main)
+repo = Repo.create("s3://bucket/empty")          # or start an empty repo (pipelines fill it)
+Repo.exists("s3://bucket/empty")                 # True; never creates anything
 
 g = repo.writable()                              # zarr.Group on a writable session
 g.attrs["step"] = "lognorm"                      # ... edit like any zarr group ...
@@ -95,7 +101,8 @@ for snap in repo.log():                          # newest first
 repo.cherrypick(some_snapshot_id)                # reset current branch to a snapshot
 root = repo.root()                               # read-only zarr.Group at the branch tip
 
-mine = Repo("/data/my_store").copy("/results/my_store")   # writable clone of a read-only asset
+mine = Repo("/data/sample_icechunk").copy("/results/my_store")  # writable clone of a frozen asset
+session = repo.session(writable=True)            # the raw icechunk session when a group is not enough
 ```
 
 Batch writes into **few, large commits** — a commit per chunk/row-batch is pathological

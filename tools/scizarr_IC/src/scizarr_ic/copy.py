@@ -11,9 +11,11 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import math
 import shutil
-import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -29,25 +31,65 @@ def check_copyable(src: str, dst: str) -> None:
     for loc in (src, dst):
         if is_remote(loc) and urlparse(loc).scheme != "s3":
             raise ScizarrError(f"copy supports local paths and s3:// only, got '{loc}'")
-    if (is_remote(src) or is_remote(dst)) and shutil.which("aws") is None:
-        raise ScizarrError("Copying to/from s3:// needs the AWS CLI ('aws') on PATH")
+    if (is_remote(src) or is_remote(dst)) and importlib.util.find_spec("boto3") is None:
+        raise ScizarrError("Copying to/from s3:// needs boto3 (pip install 'scizarr-ic[s3]')")
 
 
-def copy_repo(src: str, dst: str) -> None:
+def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
     """Copy the repo object tree at ``src`` to ``dst`` (local dirs and/or ``s3://``).
 
-    Local→local uses ``shutil``; anything involving ``s3://`` shells out to
-    ``aws s3 sync`` (credentials from the environment). The local HEAD file is never
-    copied. Callers run :func:`check_copyable` and make sure ``dst`` is a fresh location.
+    Local→local uses ``shutil``; anything involving ``s3://`` goes through boto3 with
+    credentials from the environment, ``workers`` objects in flight at a time. The
+    local HEAD file is never copied. Callers run :func:`check_copyable` and make sure
+    ``dst`` is a fresh location.
     """
     if not (is_remote(src) or is_remote(dst)):
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns(HEAD_FILE), dirs_exist_ok=True)
         return
-    cmd = ["aws", "s3", "sync", "--only-show-errors", "--exclude", HEAD_FILE,
-           src.rstrip("/"), dst.rstrip("/")]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise ScizarrError(f"aws s3 sync failed ({proc.returncode}): {proc.stderr.strip()}")
+
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    s3 = boto3.client("s3")
+
+    def s3_parts(uri: str) -> tuple[str, str]:
+        u = urlparse(uri)
+        return u.netloc, u.path.strip("/")
+
+    def s3_keys(bucket: str, prefix: str):
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/"):
+            for obj in page.get("Contents", []):
+                yield obj["Key"]
+
+    jobs = []
+    if is_remote(src):
+        sb, sp = s3_parts(src)
+        if is_remote(dst):
+            db, dp = s3_parts(dst)
+            jobs = [
+                (lambda k=k: s3.copy({"Bucket": sb, "Key": k}, db, f"{dp}/{k[len(sp) + 1:]}"))
+                for k in s3_keys(sb, sp)
+            ]
+        else:
+            def download(k: str) -> None:
+                local = Path(dst) / k[len(sp) + 1:]
+                local.parent.mkdir(parents=True, exist_ok=True)
+                s3.download_file(sb, k, str(local))
+
+            jobs = [(lambda k=k: download(k)) for k in s3_keys(sb, sp)]
+    else:
+        db, dp = s3_parts(dst)
+        root = Path(src)
+        jobs = [
+            (lambda f=f: s3.upload_file(str(f), db, f"{dp}/{f.relative_to(root).as_posix()}"))
+            for f in root.rglob("*")
+            if f.is_file() and f.name != HEAD_FILE
+        ]
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda job: job(), jobs))
+    except (BotoCoreError, ClientError) as exc:
+        raise ScizarrError(f"S3 copy {src} -> {dst} failed: {exc}") from exc
 
 
 def copy_group(src: Any, dst: Any, *, band_bytes: int = BAND_BYTES) -> int:

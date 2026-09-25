@@ -6,9 +6,10 @@ default ``.``) and an optional ``--origin URL`` override for the writable locati
 Errors print to stderr and exit 1; normal output stays on stdout for piping.
 
 A read-only mount such as a Code Ocean data asset (``-C /data/<asset>``) is read in
-place; writes (``checkout -b``, ``cherrypick``, ``origin URL``) go to the ``s3://`` origin
-stamped in the repo metadata, with credentials from the environment. ``copy`` takes a
-fully writable clone instead (e.g. into ``/results``) when there is no origin to write to.
+place. On a *linked* (S3-backed) asset, writes (``checkout -b``, ``cherrypick``,
+``origin URL``) go to the ``s3://`` origin stamped in the repo metadata, with credentials
+from the environment. A *frozen* internal asset (EFS copy) refuses writes; ``copy`` takes
+a fully writable clone instead (e.g. into ``/results``).
 
 ``commit`` is intentionally Python-API only (``Repo.commit``): icechunk stages
 edits in a session's memory, so there is nothing for a fresh CLI process to commit.
@@ -21,6 +22,7 @@ import sys
 
 from .errors import ScizarrError
 from .repo import Repo
+from . import storage
 
 
 def _quiet_icechunk_logs() -> None:
@@ -118,10 +120,16 @@ def _cmd_origin(args) -> int:
         repo.set_origin(args.url)
         print(f"Stamped origin_url = {args.url}")
         return 0
-    kind = "read-only" if repo.readonly_path else "writable"
+    kind = "writable"
+    if repo.frozen:
+        kind = f"read-only, frozen copy ({storage.mount_fstype(repo.path)} mount)"
+    elif repo.readonly_path:
+        kind = "read-only"
     print(f"path:    {repo.path}  ({kind})")
     print(f"stamped: {repo.origin_url() or '-'}")
-    if repo.origin is None:
+    if repo.frozen and repo.origin is None:
+        print(f"writes:  unavailable — frozen copy; take one: scizarr-ic copy -C {repo.path} DEST")
+    elif repo.origin is None:
         print("writes:  unavailable — no origin known (see 'scizarr-ic origin --help')")
     else:
         print(f"writes:  {repo.origin}" + ("  (resolved)" if repo.resolved else ""))

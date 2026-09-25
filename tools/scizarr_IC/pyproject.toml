@@ -16,7 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "numpy>=1.24.0,<2.5"]
+s3 = ["boto3>=1.28"]                      # `copy` to/from s3:// (icechunk itself needs no boto3)
+dev = ["pytest>=8.0", "numpy>=1.24.0,<2.5", "boto3>=1.28"]
 
 [project.scripts]
 scizarr-ic = "scizarr_ic.cli:main"

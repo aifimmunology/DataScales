@@ -4,11 +4,15 @@ One ``Repo`` == one icechunk repository (local dir or s3://—gs:// URI).
 
 **Read/write split.** Reads (``log``, ``tree``, ``root``...) go through ``path`` as
 given. Writes go to the repo's *origin*: the same location for a writable local dir or
-a remote URI, but for a READ-ONLY local mount — e.g. a Code Ocean data asset under
-``/data`` that mirrors an S3 prefix — the origin is the ``s3://`` URL stamped in the
-repo's metadata (``origin_url``; see ``Repo.init``), opened lazily on the first write
-with credentials from the environment. Once the origin has been opened it also serves
-reads in this process, since a mount can lag behind fresh writes.
+a remote URI, but for a READ-ONLY local mount — e.g. a Code Ocean *linked* data asset
+under ``/data`` that mirrors an S3 prefix — the origin is the ``s3://`` URL stamped in
+the repo's metadata (``origin_url``; see ``Repo.init``), opened lazily on the first
+write with credentials from the environment. Once the origin has been opened it also
+serves reads in this process, since a mount can lag behind fresh writes.
+
+A read-only mount that is a *frozen copy* of its source (Code Ocean's internal EFS
+assets; see ``storage.is_frozen_mount``) has no usable origin: writes are refused and
+``copy`` is the way forward. ``--origin`` / ``SCIZARR_IC_ORIGIN`` still force one.
 
 **HEAD.** The current branch persists across CLI invocations locally (never inside a
 read-only repo): a ``scizarr_head`` file for writable local repos, a per-user sidecar
@@ -31,8 +35,10 @@ from .storage import (
     ENV_ORIGIN,
     ORIGIN_KEY,
     canonical_location,
+    is_frozen_mount,
     is_readonly_path,
     is_remote,
+    mount_fstype,
     origin_of,
     storage_for,
 )
@@ -95,6 +101,7 @@ class Repo:
         self._session: Any = None
 
         self.readonly_path = is_readonly_path(self.path)
+        self.frozen = is_frozen_mount(self.path)
         self.origin = self._resolve_origin(origin)
         self._head = HeadStore(
             key=canonical_location(self.origin or self.path),
@@ -121,40 +128,58 @@ class Repo:
             raise ScizarrError(f"No '{DEFAULT_BRANCH}' branch in '{self.path}'")
 
     @classmethod
+    def create(cls, out_path: str | Path) -> "Repo":
+        """Create an EMPTY repo at a fresh, writable ``out_path`` (local dir or URI).
+
+        The repo starts with icechunk's "Repository initialized" snapshot on ``main``
+        and its writable location stamped into the metadata (``origin_url``) so a
+        read-only mount of it later (a data asset) can still resolve where writes go.
+        """
+        import icechunk
+
+        out = _fresh_destination(out_path)
+        try:
+            ic_repo = icechunk.Repository.create(storage_for(out))
+        except Exception as exc:
+            raise ScizarrError(f"Could not create icechunk repository at '{out}': {exc}") from exc
+        ic_repo.set_metadata({ORIGIN_KEY: _origin_for(out)})
+        repo = cls(out)
+        repo._head.save(repo._branch)
+        return repo
+
+    @classmethod
     def init(
         cls, zarr_path: str | Path, out_path: str | Path, *, message: str | None = None
     ) -> "Repo":
         """Create a repo at ``out_path`` seeded from the zarr store at ``zarr_path``.
 
-        The whole store is imported as a single commit on ``main``. The repo's writable
-        location is stamped into its metadata (``origin_url``) so a read-only mount of
-        it later (a data asset) can still resolve where writes go.
+        The whole store is imported as a single commit on ``main`` (see :meth:`create`).
         """
-        import icechunk
         import zarr
 
         from .copy import copy_group
 
-        out = _fresh_destination(out_path)
         try:
             src = zarr.open_group(str(zarr_path), mode="r")
         except Exception as exc:
             raise ScizarrError(f"Could not open source zarr '{zarr_path}': {exc}") from exc
-        try:
-            ic_repo = icechunk.Repository.create(storage_for(out))
-        except Exception as exc:
-            raise ScizarrError(f"Could not create icechunk repository at '{out}': {exc}") from exc
-
-        ic_repo.set_metadata({ORIGIN_KEY: _origin_for(out)})
-
-        session = ic_repo.writable_session(DEFAULT_BRANCH)
-        dst = zarr.open_group(store=session.store, mode="w")
-        copy_group(src, dst)
-        session.commit(message or f"init from {zarr_path}")
-
-        repo = cls(out)
-        repo._head.save(repo._branch)
+        repo = cls.create(out_path)
+        copy_group(src, repo.writable())
+        repo.commit(message or f"init from {zarr_path}")
         return repo
+
+    @classmethod
+    def exists(cls, path: str | Path) -> bool:
+        """Does an icechunk repo exist at ``path``? Never creates anything."""
+        import icechunk
+
+        p = str(path)
+        if not is_remote(p) and not os.path.exists(p):
+            return False
+        try:
+            return bool(icechunk.Repository.exists(storage_for(p)))
+        except Exception as exc:
+            raise ScizarrError(f"Could not check for a repository at '{p}': {exc}") from exc
 
     def copy(self, dest: str | Path) -> "Repo":
         """Copy this repo — every branch and snapshot, ids intact — to a fresh ``dest``.
@@ -191,7 +216,7 @@ class Repo:
 
     @property
     def read_only(self) -> bool:
-        """True when ``path`` can't be written and no origin is known — reads only."""
+        """True when ``path`` can't be written and no origin is known (or usable) — reads only."""
         return self.readonly_path and self.origin is None
 
     def origin_url(self) -> str | None:
@@ -247,9 +272,20 @@ class Repo:
         """
         import zarr
 
+        return zarr.open_group(store=self.session(writable=True).store, mode="a")
+
+    def session(self, *, writable: bool = False):
+        """The underlying icechunk session, for callers that need more than a zarr group.
+
+        ``writable=True`` returns the one open writable session (shared with
+        :meth:`writable`, committed by :meth:`commit`); otherwise a fresh read-only
+        session at the current branch tip.
+        """
+        if not writable:
+            return self._repo.readonly_session(branch=self._branch)
         if self._session is None or self._session.read_only:
             self._session = self._writer_repo().writable_session(self._branch)
-        return zarr.open_group(store=self._session.store, mode="a")
+        return self._session
 
     def commit(
         self,
@@ -312,6 +348,8 @@ class Repo:
         env = os.environ.get(ENV_ORIGIN)
         if env:
             return env
+        if self.frozen:
+            return None  # a copy, not a view: the stamped origin is disconnected
         if self.readonly_path:
             return origin_of(self._reader)
         return self.path
@@ -320,6 +358,15 @@ class Repo:
         """Repository at the writable origin, opened on first use."""
         if self._writer is not None:
             return self._writer
+        if self.origin is None and self.frozen:
+            raise ScizarrError(
+                f"'{self.path}' is a frozen copy (read-only {mount_fstype(self.path)} mount — "
+                f"an internal data asset): its stamped origin "
+                f"'{self.origin_url() or '-'}' is not connected to this mount, so writes "
+                "there would never show up here. Take a writable copy instead: "
+                f"scizarr-ic copy -C {self.path} DEST (Repo.copy). To force an origin "
+                f"anyway pass origin=... (CLI: --origin URL, or {ENV_ORIGIN})."
+            )
         if self.origin is None:
             raise ScizarrError(
                 f"'{self.path}' is read-only (a mounted data asset?) and has no "

@@ -8,9 +8,9 @@ Python API entry point is :class:`Repo`::
     repo.checkout("experiment", create=True)           # branch
     for snap in repo.log(): print(snap.id, snap.message)
 
-    # a read-only data-asset mount reads in place; writes resolve to its s3:// origin
-    repo = Repo("/data/my_store"); print(repo.origin)
-    mine = repo.copy("/results/my_store")             # or take a writable clone
+    # a read-only linked data asset reads in place; writes resolve to its s3:// origin
+    repo = Repo("/data/sample_linked_icechunk"); print(repo.origin)
+    mine = repo.copy("/results/my_store")             # a frozen (EFS) asset: take a writable clone
 
 The command line (``scizarr-ic`` / ``scz``) exposes ``init``, ``log``, ``tree``,
 ``checkout``, ``cherrypick``, ``origin`` and ``copy``; ``commit`` is Python-API only.

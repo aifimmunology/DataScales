@@ -63,10 +63,9 @@ def test_copy_refuses_bad_destinations(mounted, tmp_path, monkeypatch):
         repo.copy(origin)
     with pytest.raises(ScizarrError, match="s3:// only"):
         repo.copy("gs://bucket/prefix")
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    monkeypatch.setattr("icechunk.Repository.exists", classmethod(lambda cls, storage: False))
-    with pytest.raises(ScizarrError, match="AWS CLI"):
-        repo.copy("s3://bucket/prefix")
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    with pytest.raises(ScizarrError, match="boto3"):
+        repo.copy("s3://bucket/prefix")  # checked before any network I/O
     assert snapshot_tree(mount) == before
 
 
