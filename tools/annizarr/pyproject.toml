@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "annizarr"
+dynamic = ["version"]
+description = "AnnData zarr stores: convert, edit, and version with Icechunk"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
+dependencies = [
+  "anndata>=0.12.10,<0.13",   # <0.13: phantom None layer key breaks the layer writer (issue link TBD)
+  "zarr>=3.3,<4",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "h5py>=3.8",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+icechunk = ["icechunk>=2.1.2,<3"]
+s3 = ["boto3>=1.28"]
+all = ["annizarr[icechunk,s3]"]
+dev = [
+  "pytest>=8",
+  "pytest-cov",
+  "hypothesis",
+  "ruff",
+  "mypy",
+  "types-PyYAML",
+  "moto[s3]>=5",
+  "scanpy>=1.10",
+  "build",
+  "twine",
+  "pre-commit",
+]
+
+[project.scripts]
+annizarr = "annizarr._cli:main"
+anz = "annizarr._cli:main"
+
+[tool.hatch.version]
+path = "src/annizarr/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/annizarr"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "TID", "RUF", "D"]
+ignore = ["D100", "D104", "D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"src/annizarr/**/_*.py" = ["D"]
+"src/annizarr/_*.py" = ["D"]
+"tests/**" = ["D"]
+
+[tool.mypy]
+strict = true
+files = ["src/annizarr"]
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow' --cov=annizarr --cov-report=term-missing:skip-covered"
+markers = ["slow: large synthetic store, run with -m slow"]
+
+[tool.coverage.run]
+source = ["annizarr"]
+omit = ["src/annizarr/_cli/*", "src/annizarr/__main__.py"]

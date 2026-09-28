@@ -1,0 +1,38 @@
+[workspace]
+name = "annizarr"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+python = ">=3.12,<3.14"
+anndata = ">=0.12.10,<0.13"
+zarr = "3.3.*"           # Phase 4 lifts: vendored ground truth is 3.3.0; keeps Phase 1-3 golden bytes comparable
+numpy = "<2.5"          # Phase 4 lifts this once the suite passes on the resolved latest
+scipy = ">=1.10"
+h5py = ">=3.8"
+pyyaml = ">=6"
+
+[pypi-dependencies]
+annizarr = { path = ".", editable = true }
+
+[feature.test.dependencies]
+pytest = ">=8"
+pytest-cov = "*"
+hypothesis = "*"
+
+[feature.dev.dependencies]
+ruff = "*"
+mypy = "*"
+types-pyyaml = "*"
+moto = ">=5"
+boto3 = ">=1.28"
+icechunk = "2.1.*"      # Phase 4 lifts: vendored ground truth is 2.1.2
+scanpy = ">=1.12.1,<2"  # Phase 2 removes: moved 10x reader still wraps scanpy
+dask = ">=2026.3,<2027" # Phase 3 removes: moved writers still use dask
+python-build = "*"
+twine = "*"
+pre-commit = "*"
+
+[environments]
+default = { features = ["dev", "test"], solve-group = "default" }
+core = { features = ["test"], solve-group = "core" }
