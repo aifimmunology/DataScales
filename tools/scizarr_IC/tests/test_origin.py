@@ -28,16 +28,16 @@ def test_reads_stay_on_path_writes_land_at_origin(mirror, tmp_path, monkeypatch)
     monkeypatch.setattr(icechunk.Repository, "open", staticmethod(guarded))
     repo = Repo(mirror_path, origin=str(origin))
     assert repo.resolved and not repo.readonly_path
-    assert repo.log()[0].message == "import" and repo.root()["X"].shape == (12, 5)
+    assert repo.log()[0].message == "import" and repo.open_zarr("r")["X"].shape == (12, 5)
     monkeypatch.setattr(icechunk.Repository, "open", staticmethod(real_open))
 
     repo.checkout("dev", create=True)
-    repo.writable().attrs["note"] = "via mirror"
+    repo.open_zarr("w").attrs["note"] = "via mirror"
     snap = repo.commit("edit")
 
     origin_repo = Repo(origin, branch="dev")
-    assert origin_repo.log()[0].id == snap and origin_repo.root().attrs["note"] == "via mirror"
-    assert repo.root().attrs["note"] == "via mirror"       # origin is authoritative once opened
+    assert origin_repo.log()[0].id == snap and origin_repo.open_zarr("r").attrs["note"] == "via mirror"
+    assert repo.open_zarr("r").attrs["note"] == "via mirror"       # origin is authoritative once opened
     assert snapshot_tree(mirror_path) == before             # nothing written into the mirror
     assert not (mirror_path / HEAD_FILE).exists()           # HEAD went to the sidecar
     assert repo._head.is_sidecar and Repo(mirror_path, origin=str(origin)).branch == "dev"
@@ -73,8 +73,8 @@ def test_readonly_path_without_origin_reads_only(mirror, monkeypatch):
     monkeypatch.setattr(os, "access", lambda p, m: False if str(p).startswith(str(mirror_path)) else real_access(p, m))
     repo = Repo(mirror_path)
     assert repo.readonly_path and repo.origin is None and not repo.resolved
-    assert repo.log() and repo.root()["X"].shape == (12, 5)
-    for op in (repo.writable, lambda: repo.checkout("x", create=True),
+    assert repo.log() and repo.open_zarr("r")["X"].shape == (12, 5)
+    for op in (lambda: repo.open_zarr("w"), lambda: repo.checkout("x", create=True),
                lambda: repo.cherrypick(repo.log()[0].id)):
         with pytest.raises(ScizarrError, match="--origin.*scizarr-ic copy"):
             op()
@@ -86,4 +86,4 @@ def test_unreachable_origin_explains(mirror, tmp_path):
     repo = Repo(mirror_path, origin=str(tmp_path / "gone.icechunk"))
     assert repo.log()                                       # reads unaffected
     with pytest.raises(ScizarrError, match="Cannot open the writable origin"):
-        repo.writable()
+        repo.open_zarr("w")

@@ -4,7 +4,7 @@ Python API entry point is :class:`Repo`::
 
     from scizarr_ic import Repo
     repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store
-    g = repo.writable(); ...; repo.commit("edit obs")  # stage + commit
+    g = repo.open_zarr("w"); ...; repo.commit("edit obs")  # stage + commit
     repo.checkout("experiment", create=True)           # branch
     for snap in repo.log(): print(snap.id, snap.message)
 

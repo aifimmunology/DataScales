@@ -35,37 +35,42 @@ variables, a profile, or an instance/container role).
 `commit` is **Python-API only** — Icechunk stages edits in a session's memory, so there
 is nothing for a fresh CLI process to commit.
 
+
 ## Python API
+
+Writes land on the **current branch** (shared with the CLI via a persisted HEAD) — in a
+script, pin it up front: `Repo(path, branch="MY_BRANCH")` opens there or errors.
 
 ```python
 from scizarr_ic import Repo
 
 repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store (one commit on main)
-repo = Repo.create("s3://bucket/empty")          # or start an empty repo (pipelines fill it)
-repo = Repo('s3://bucket/store')
-#repo = Repo("/mnt/store", origin="s3://bucket/store")   #Special case when writing to repo is different from reading
+repo = Repo.create("s3://bucket/empty") 
+repo = Repo('s3://bucket/store', branch='MY_BRANCH/main')     # open previous store
+#repo = Repo("/mnt/store", origin="s3://bucket/store")   #Special case when writing location to repo is different from reading
 
 Repo.exists("s3://bucket/empty")                 # True or false
 
-z = repo.writable()                              # returns zarr editable object for this repo/branch
-z.attrs["step"] = "lognorm"                      # ... edit like any zarr group ...
-repo.commit("normalize")                         # stage - durable snapshot
+z = repo.open_zarr("w")                          # writable zarr.Group for this repo/branch
+z.attrs["step"] = "lognorm"                      # edit like any zarr group ...
+repo.commit("created and normalized branch for l3 labels") 
 
 repo.checkout("experiment", create=True)         # branch off the current tip
-z = repo.writable(); z["X"][:] *= 2
+z = repo.open_zarr("w"); z["X"][:] *= 2
 repo.commit("scaled X... other comments here for commit"). #commit to branch, for others to see, and be tracked
 
 for snap in repo.log():                          # show commits log of repo
     print(snap.id, snap.message)
 
 repo.cherrypick(some_snapshot_id)                # reset current branch to a snapshot
-root = repo.root()                               # read-only zarr.Group at the branch tip
+root = repo.open_zarr("r")                        # read-only zarr.Group at the branch tip
+old  = repo.open_zarr("r", snapshot_id=some_id)   # ... or read a past snapshot (r only)
 
 mine = repo.copy("/work/store")                  # or clone it somewhere writable
 ```
 
 Batch writes into **few, large commits** — a commit per chunk/row-batch is pathological
-for Icechunk. `writable()` reuses one open session until you `commit()` or `discard()`.
+for Icechunk. `open_zarr("w")` reuses one open session until you `commit()` or `discard()`.
 
 
 ### Read here, write there

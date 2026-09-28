@@ -34,13 +34,13 @@ def test_cli_cherrypick(src_zarr, repo_path, capsys):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
     base = repo.log()[0].id
-    repo.writable().attrs["x"] = 1
+    repo.open_zarr("w").attrs["x"] = 1
     repo.commit("second")
     capsys.readouterr()
 
     assert main(["cherrypick", "-C", str(repo_path), base]) == 0
     assert base[:12] in capsys.readouterr().out
-    assert "x" not in Repo(repo_path).root().attrs
+    assert "x" not in Repo(repo_path).open_zarr("r").attrs
 
 
 def test_cli_error_exit_code(tmp_path, capsys):

@@ -35,7 +35,7 @@ def test_copy_repo_is_faithful_and_independent(src_zarr, repo_path, tmp_path):
     path, _ = src_zarr
     a = Repo.init(path, repo_path)
     a.checkout("dev", create=True)
-    a.writable().attrs["on_dev"] = True
+    a.open_zarr("w").attrs["on_dev"] = True
     a.commit("dev work")
     before = snapshot_tree(repo_path)
 
@@ -46,7 +46,7 @@ def test_copy_repo_is_faithful_and_independent(src_zarr, repo_path, tmp_path):
         assert [s.id for s in b.log(branch=br)] == [s.id for s in a.log(branch=br)]
     assert (tmp_path / "b.icechunk" / HEAD_FILE).is_file()
     b.checkout("feature", create=True)
-    b.writable().attrs["mine"] = 1
+    b.open_zarr("w").attrs["mine"] = 1
     b.commit("edit the copy")
     assert "feature" not in a.branches()
     assert snapshot_tree(repo_path) == before

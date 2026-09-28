@@ -9,7 +9,7 @@ extending or merging scizarr-ic into another DataScales tool.
 A thin git-like layer over Icechunk for single-cell Zarr stores: `init` (import a zarr
 store), `create` (empty repo), `log`, `tree`, `checkout [-b]`, `cherrypick` (branch
 reset to a snapshot), `copy` (clone a whole repo), plus a Python `Repo` with
-`writable()` / `commit()` / `discard()` / `root()`. It must stay generic:
+`open_zarr("r"|"w")` / `commit()` / `discard()`. It must stay generic:
 local directories and `s3://` / `gs://` URIs, credentials from the environment, nothing
 tied to one deployment. Keep it small; every command should map to one Icechunk idea.
 
@@ -39,7 +39,7 @@ a writable local repo, otherwise a per-user sidecar under `$SCIZARR_IC_HOME`
   Code Ocean tests inside the package.
 - **`aws s3 sync` for `copy`**; replaced by boto3 (optional extra `scizarr-ic[s3]`).
 - **`Repo.session()`** exposing the raw icechunk session. Everything callers needed was
-  the zarr group (`writable()`, `root()`) and `commit()`; the ingest was refactored to
+  the zarr group (`open_zarr("r"|"w")`) and `commit()`; the ingest was refactored to
   pass the `Repo` around instead. Keep the icechunk session private.
 
 ## How Icechunk behaves (verified, drives the API shape)
@@ -78,10 +78,12 @@ Capsule `icechunk_ingest` (code at `code/icechunk_ingest`, this package vendored
   asset's S3 prefix; `SCIZARR_IC_HOME=/scratch/scizarr_ic` keeps HEAD out of
   `/data`. `/scratch` is emptied after every Reproducible Run.
 - The ingest pipeline's `store_utils.py` imports `scizarr_ic` (`Repo.exists`,
-  `Repo.create`, `Repo(path, branch="main").writable()` / `.commit()`); its earlier
+  `Repo.create`, `Repo(path, branch="main").open_zarr("w")` / `.commit()`); its earlier
   private helpers `icechunk_tools.py` and `scizarr.py` were deleted so there is one
   implementation. Its pixi manifest tracks the `icechunk_helper_clean` branch of
   DataScales; after changing this package, push and run `pixi lock` there.
+  NOTE: `writable()` / `root()` were merged into `open_zarr("r"|"w")`; that capsule
+  still calls the old `.writable()` and must be updated in lockstep with this bump.
 - The Python env with icechunk lives at `/scratch/pixi-envs/icechunk_ingest-*/envs/
   default`; there is no `/opt/pipeline/activate.sh`. Tests run with
   `PYTHONPATH=src <that python> -m pytest`.

@@ -2,7 +2,7 @@
 
 One ``Repo`` == one icechunk repository (local dir or s3://—gs:// URI).
 
-**Read/write split.** Reads (``log``, ``tree``, ``root``...) go through ``path`` as
+**Read/write split.** Reads (``log``, ``tree``, ``open_zarr("r")``...) go through ``path`` as
 given. Writes go to ``origin`` when one is given (``Repo(path, origin=...)``, CLI
 ``--origin``, or ``SCIZARR_IC_ORIGIN``) — e.g. the ``s3://`` prefix behind a read-only
 local mirror — and to ``path`` otherwise. The origin is opened lazily on the first
@@ -14,7 +14,7 @@ origin is reads-only.
 ``scizarr_head`` file for writable local repos, a per-user sidecar under
 ``$SCIZARR_IC_HOME`` otherwise (see ``head.py``).
 
-Icechunk sessions stage changes in memory: ``writable()`` opens a session on the
+Icechunk sessions stage changes in memory: ``open_zarr("w")`` opens a session on the
 current branch, and ``commit()`` makes the staged changes durable as one snapshot.
 Batch writes into few, large commits.
 """
@@ -138,7 +138,7 @@ class Repo:
         except Exception as exc:
             raise ScizarrError(f"Could not open source zarr '{zarr_path}': {exc}") from exc
         repo = cls.create(out_path)
-        copy_group(src, repo.writable())
+        copy_group(src, repo.open_zarr("w"))
         repo.commit(message or f"init from {zarr_path}")
         return repo
 
@@ -212,26 +212,38 @@ class Repo:
 
     # -- reading & writing ---------------------------------------------------
 
-    def root(self, *, snapshot_id: str | None = None) -> "zarr.Group":
-        """Read-only zarr group at the current branch tip (or a specific snapshot)."""
-        import zarr
+    def open_zarr(self, mode: str, *, snapshot_id: str | None = None) -> "zarr.Group":
+        """Open the store's zarr group — ``mode="r"`` (read) or ``mode="w"`` (write).
 
-        if snapshot_id is not None:
-            session = self._repo.readonly_session(snapshot_id=snapshot_id)
-        else:
-            session = self._repo.readonly_session(branch=self._branch)
-        return zarr.open_group(store=session.store, mode="r")
-
-    def writable(self) -> "zarr.Group":
-        """Zarr group on a writable session at the current branch tip.
-
-        Changes stage in memory until :meth:`commit`; repeated calls reuse the open session.
+        ``"r"`` returns a read-only group at the current branch tip, or at
+        ``snapshot_id`` when given (time-travel to a past commit). ``"w"`` returns a
+        writable group on a session at the branch tip: edits stage in memory until
+        :meth:`commit`, and repeated ``"w"`` calls reuse the one open session. Writes
+        only ever go to the branch tip, so ``snapshot_id`` is rejected with ``"w"`` —
+        read a past snapshot with ``"r"``, or :meth:`cherrypick` to reset the branch
+        there first. (``"w"`` opens an *editable* session, like zarr ``mode="a"``; it
+        never truncates the store.)
         """
         import zarr
 
-        if self._session is None or self._session.read_only:
-            self._session = self._writer_repo().writable_session(self._branch)
-        return zarr.open_group(store=self._session.store, mode="a")
+        if mode == "r":
+            session = (
+                self._repo.readonly_session(snapshot_id=snapshot_id)
+                if snapshot_id is not None
+                else self._repo.readonly_session(branch=self._branch)
+            )
+            return zarr.open_group(store=session.store, mode="r")
+        if mode == "w":
+            if snapshot_id is not None:
+                raise ScizarrError(
+                    'snapshot_id is read-only — writes go to the branch tip, not a past '
+                    'snapshot. Read it with open_zarr("r", snapshot_id=...), or cherrypick() '
+                    "to reset the branch there first."
+                )
+            if self._session is None or self._session.read_only:
+                self._session = self._writer_repo().writable_session(self._branch)
+            return zarr.open_group(store=self._session.store, mode="a")
+        raise ScizarrError(f"open_zarr mode must be 'r' or 'w', got {mode!r}")
 
     def commit(
         self,
@@ -242,7 +254,7 @@ class Repo:
     ) -> str:
         """Commit the open writable session to the current branch; return the snapshot id."""
         if self._session is None or self._session.read_only:
-            raise ScizarrError("No writable session — call writable() and make changes first")
+            raise ScizarrError('No writable session — call open_zarr("w") and make changes first')
         try:
             snapshot_id = self._session.commit(message, metadata, allow_empty=allow_empty)
         except Exception as exc:
