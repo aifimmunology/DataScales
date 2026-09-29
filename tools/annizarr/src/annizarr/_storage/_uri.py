@@ -48,7 +48,7 @@ def is_readonly_path(path: PathLike) -> bool:
 
 def store_name(path: PathLike) -> str:
     # tail component of a local path or URI, for commit messages
-    return str(path).rstrip("/").rsplit("/", 1)[-1]
+    return str(path).rstrip("/").rsplit("/", 1)[-1] or str(path)
 
 
 def prepare_output_path(output_path: PathLike, overwrite: bool) -> None:
