@@ -332,6 +332,10 @@ def write_transposed_sparse(
                 continue
             order = np.argsort(np.asarray(buckets[bi]["tgt"][:m]), kind="stable")
             o0, o1 = int(target_indptr[edges[bi]]), int(target_indptr[edges[bi + 1]])
+            # o0/o1 are nnz-derived, not flat_chunk-aligned, so a boundary chunk can get a
+            # read-modify-write from each of its two adjacent bands; this loop is serial (no
+            # concurrent writers), so that RMW is a perf cost bounded to one chunk per band,
+            # never a correctness risk.
             data_arr[o0:o1] = np.asarray(buckets[bi]["val"][:m])[order]
             indices_arr[o0:o1] = np.asarray(buckets[bi]["src"][:m])[order].astype(indices_dtype)
     finally:

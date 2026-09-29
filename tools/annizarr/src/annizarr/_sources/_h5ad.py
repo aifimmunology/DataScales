@@ -19,6 +19,8 @@ def _peek_x_nbytes(path: Path) -> int:
     import h5py
 
     with h5py.File(path, "r") as f:
+        if "X" not in f:
+            raise ConversionError(f"{path} has no X.")
         x = f["X"]
         if isinstance(x, h5py.Dataset):
             return int(x.nbytes)

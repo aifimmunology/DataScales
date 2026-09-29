@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import anndata as ad
@@ -10,6 +11,7 @@ import pytest
 from _builders import make_adata, make_h5ad, make_store
 from annizarr._ops import convert_h5ad, sort
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
+from annizarr.errors import ConversionError
 
 _CHUNKS = ChunkConfig(x_row_chunk=16, x_col_chunk=4, sparse_flat_chunk=64)
 
@@ -20,6 +22,28 @@ def _cfg(**io) -> AppConfig:
 
 def _boom(*_a: object, **_kw: object) -> None:
     raise RuntimeError("boom")
+
+
+def _fail_open_store_replace_on_call(monkeypatch: pytest.MonkeyPatch, n: int) -> None:
+    # zarr's own LocalStore writes go through os.replace per chunk (atomic .partial-file
+    # renames), so patching the os module directly would count those too; instead swap out
+    # just the `os` name inside annizarr._storage._open, where the atomic-swap calls happen,
+    # so only THOSE calls are counted/faked (the n-th one raises without performing the
+    # rename; every other call goes through the real os.replace).
+    import types
+
+    import annizarr._storage._open as _open_mod
+
+    real_replace = os.replace
+    calls = {"count": 0}
+
+    def _fake(src: object, dst: object) -> None:
+        calls["count"] += 1
+        if calls["count"] == n:
+            raise OSError("boom-replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(_open_mod, "os", types.SimpleNamespace(replace=_fake))
 
 
 def test_convert_failure_leaves_no_target_and_no_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,6 +107,46 @@ def test_convert_overwrite_successful_rerun_replaces_store(tmp_path: Path) -> No
 
     assert ad.read_zarr(str(out)).n_obs == 7
     assert not list(tmp_path.glob("out.zarr.tmp-*"))
+
+
+def test_convert_overwrite_os_replace_fails_on_second_call_restores_old_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 2nd os.replace is tmp -> target (the 1st moved the old store aside): failing here must
+    # put the old store back at target and leave no .tmp-*/.old-* siblings behind.
+    h5_a = make_h5ad(tmp_path, "a.h5ad", adata=make_adata(n_obs=10, seed=0))
+    out = tmp_path / "out.zarr"
+    convert_h5ad(str(h5_a), output=str(out), cfg=_cfg())
+    old_n_obs = ad.read_zarr(str(out)).n_obs
+
+    h5_b = make_h5ad(tmp_path, "b.h5ad", adata=make_adata(n_obs=7, seed=1))
+    _fail_open_store_replace_on_call(monkeypatch, 2)
+    with pytest.raises(ConversionError, match="boom-replace"):
+        convert_h5ad(str(h5_b), output=str(out), cfg=_cfg(overwrite=True))
+
+    assert out.exists()
+    assert ad.read_zarr(str(out)).n_obs == old_n_obs
+    assert {p.name for p in tmp_path.iterdir()} == {"a.h5ad", "b.h5ad", "out.zarr"}
+
+
+def test_convert_overwrite_os_replace_fails_on_first_call_leaves_old_store_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1st os.replace is target -> aside: failing here means the swap never began, so the
+    # old store must be untouched (never even moved) and no siblings remain.
+    h5_a = make_h5ad(tmp_path, "a.h5ad", adata=make_adata(n_obs=10, seed=0))
+    out = tmp_path / "out.zarr"
+    convert_h5ad(str(h5_a), output=str(out), cfg=_cfg())
+    old_n_obs = ad.read_zarr(str(out)).n_obs
+
+    h5_b = make_h5ad(tmp_path, "b.h5ad", adata=make_adata(n_obs=7, seed=1))
+    _fail_open_store_replace_on_call(monkeypatch, 1)
+    with pytest.raises(ConversionError, match="boom-replace"):
+        convert_h5ad(str(h5_b), output=str(out), cfg=_cfg(overwrite=True))
+
+    assert out.exists()
+    assert ad.read_zarr(str(out)).n_obs == old_n_obs
+    assert {p.name for p in tmp_path.iterdir()} == {"a.h5ad", "b.h5ad", "out.zarr"}
 
 
 def test_convert_success_leaves_only_the_target(tmp_path: Path) -> None:

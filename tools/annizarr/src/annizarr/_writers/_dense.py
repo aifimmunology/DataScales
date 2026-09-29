@@ -7,6 +7,7 @@ import numpy as np
 from annizarr._layout import band_plan, dense_shards, x_compressors
 from annizarr._runtime import progress, run_parallel
 from annizarr._sources._matrix import is_backed
+from annizarr._writers._concat import _is_thread_unsafe
 from annizarr._writers._encoding import set_array_attrs
 from annizarr._writers._workers import _densify_band_segment
 
@@ -42,10 +43,11 @@ def _densify_row_band(
 
 def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
     # densifies without ever materialising the full matrix: row bands are block_row tall,
-    # densified in block_col-wide tiles matching the zarr write grid. In-memory CSR is
-    # thread-pooled over row bands; backed _CSRDataset is densified by row band in parallel
-    # processes (each opens its own h5py handle — h5py is not thread-safe, but independent
-    # read-only file handles across processes are).
+    # densified in block_col-wide tiles matching the zarr write grid. In-memory CSR, and a
+    # zarr-backed CSR (e.g. write_matrix's backed-CSC-to-dense temp store), are thread-pooled
+    # over row bands (zarr is thread-safe); an h5py-backed _CSRDataset is densified by row
+    # band in parallel processes instead (each opens its own h5py handle — h5py is not
+    # thread-safe, but independent read-only file handles across processes are).
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
@@ -65,7 +67,7 @@ def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
     set_array_attrs(zarr_arr)
 
     block_row, block_col = layout.block
-    if is_backed(matrix):
+    if _is_thread_unsafe(matrix):
         from zarr.storage import LocalStore
 
         # Bands are block_row tall and densified in block_col-wide tiles so each write

@@ -49,12 +49,36 @@ def get_indptr(matrix: Any) -> NDArray[np.int64]:
     raise ConversionError(f"Cannot locate indptr on sparse input of type {type(matrix).__name__}")
 
 
-def ensure_csr(matrix: Any, label: str) -> tuple[Any, str | None]:
-    # (csr_matrix, optional warning); accepts CSR or CSC (in-memory or backed)
+def ensure_csr(matrix: Any, label: str, *, eager_max_bytes: int | None = None) -> tuple[Any, str | None]:
+    """(csr_matrix, optional warning); accepts CSR or CSC (in-memory or backed).
+
+    Parameters
+    ----------
+    eager_max_bytes
+        For a backed CSC input, refuse (instead of silently loading it) when its on-disk
+        size exceeds this. ``None`` skips the check (matches the pre-existing, unbounded
+        behavior) — concat is the only caller that has a budget to enforce.
+    """
     fmt = matrix_format(matrix)
     if fmt == "csr":
         return matrix, None
     if fmt == "csc":
-        converted = matrix[:].tocsr() if is_backed(matrix) else matrix.tocsr()
+        if is_backed(matrix):
+            if eager_max_bytes is not None:
+                nbytes = _backed_csc_nbytes(matrix)
+                if nbytes > eager_max_bytes:
+                    raise ConversionError(
+                        f"[{label}] backed CSC X is {nbytes} bytes on disk, over eager_max_bytes "
+                        f"({eager_max_bytes}); loading it whole for concat would blow the memory "
+                        f"bound. Run `annizarr convert --x-storage csr` on that input first."
+                    )
+            converted = matrix[:].tocsr()
+        else:
+            converted = matrix.tocsr()
         return converted, f"[{label}] adata.X was CSC and converted to CSR in memory."
     raise ConversionError(f"[{label}] adata.X must be CSR or CSC; got {type(matrix).__name__}")
+
+
+def _backed_csc_nbytes(matrix: Any) -> int:
+    g = matrix.group
+    return int(g["data"].nbytes) + int(g["indices"].nbytes) + int(g["indptr"].nbytes)

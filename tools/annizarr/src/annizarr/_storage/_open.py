@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -20,6 +21,52 @@ if TYPE_CHECKING:
     import zarr
 
 logger = logging.getLogger(__name__)
+
+
+class _SwapState(enum.Enum):
+    """Lifecycle of a plain-zarr output's atomic swap (see `OutputStore.finalize`)."""
+
+    OPEN = "open"  # tmp store being written; target (if any) untouched
+    SWAPPING = "swapping"  # mid-swap; target may momentarily be missing
+    DONE = "done"  # swap complete; tmp no longer exists at its tmp path
+    ABORTED = "aborted"  # writer gave up; tmp cleaned up (or never existed)
+
+
+def check_output_target(output_path: PathLike, cfg: AppConfig) -> None:
+    """Fail fast if ``output_path`` already exists and ``cfg.io.overwrite`` isn't set.
+
+    Call this before any expensive load (h5ad parse, multi-file read, sort bucketing)
+    so a doomed run fails before the work instead of after. :func:`open_output_store`
+    repeats the same check right before writing — the two are independent (TOCTOU is
+    inherent to a two-step check-then-write regardless).
+
+    Parameters
+    ----------
+    output_path
+        Destination store path or URI.
+    cfg
+        Resolved configuration (consults ``cfg.io.backend``, ``cfg.io.overwrite``).
+
+    Raises
+    ------
+    StorageError
+        The plain-zarr target already exists, or an Icechunk repo already exists at
+        ``output_path``, and ``cfg.io.overwrite`` is not set.
+    """
+    if cfg.io.backend == "icechunk":
+        from annizarr._ic import Repo
+
+        if Repo.exists(str(output_path)) and not cfg.io.overwrite:
+            raise StorageError(
+                f"Icechunk repo already exists at '{output_path}'. Use overwrite=true in "
+                "config or --overwrite to replace its contents."
+            )
+        return
+    if is_remote(output_path):
+        return  # rejected later by open_output_store (remote requires the icechunk backend)
+    target = Path(output_path)
+    if target.exists() and not cfg.io.overwrite:
+        raise StorageError(f"Output path already exists: {target}. Use overwrite=true in config or --overwrite flag.")
 
 
 @dataclass
@@ -83,15 +130,12 @@ def open_output_store(
     """
     import zarr
 
+    check_output_target(output_path, cfg)
+
     if cfg.io.backend == "icechunk":
         from annizarr._ic import Repo
 
         exists = Repo.exists(str(output_path))
-        if exists and not cfg.io.overwrite:
-            raise StorageError(
-                f"Icechunk repo already exists at '{output_path}'. Use overwrite=true in "
-                "config or --overwrite to replace its contents."
-            )
         if not exists and not is_remote(output_path):
             # clears any stale non-repo directory (e.g. a leftover plain-zarr store) so
             # Repo.create's empty-destination check doesn't trip on it
@@ -123,38 +167,62 @@ def open_output_store(
             "(or set io.backend='icechunk' in config)."
         )
 
-    # Plain on-disk zarr: fail fast on a pre-existing target (nothing removed yet), write
-    # into a sibling temp directory (same filesystem, so the final swap is a plain rename),
-    # and only replace the target once finalize() has verified the temp store.
+    # Plain on-disk zarr: fail fast on a pre-existing target (nothing removed yet, see
+    # check_output_target above), write into a sibling temp directory (same filesystem, so
+    # the swap below is a plain rename), and only replace the target once finalize() has
+    # verified the temp store. The swap itself never deletes the old store outright: it is
+    # moved aside first and only removed after the new store is in place, so a crash or an
+    # interrupt mid-swap can always restore it (see the `state` machine below).
     target = Path(output_path)
-    if target.exists() and not cfg.io.overwrite:
-        raise StorageError(f"Output path already exists: {target}. Use overwrite=true in config or --overwrite flag.")
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.parent / f"{target.name}.tmp-{uuid4().hex[:8]}"
     root = zarr.open_group(str(tmp_path), mode="w")
-    finalized = False
+    state = _SwapState.OPEN
 
     def finalize() -> str | None:
-        nonlocal finalized
-        if finalized:
+        nonlocal state
+        if state is _SwapState.DONE:
             return None
+        if state is not _SwapState.OPEN:
+            return None  # a previous finalize() already failed and cleaned up; nothing to redo
         _verify_new_store(tmp_path)
         if cfg.io.consolidate_metadata:
             zarr.consolidate_metadata(str(tmp_path))
+
+        aside: Path | None = None
         if target.exists():
             if not cfg.io.overwrite:
                 raise StorageError(f"Output path already exists: {target}.")
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-        os.replace(tmp_path, target)
-        finalized = True
+            aside = target.parent / f".{target.name}.old-{uuid4().hex[:8]}"
+
+        state = _SwapState.SWAPPING
+        try:
+            if aside is not None:
+                os.replace(target, aside)
+            os.replace(tmp_path, target)
+        except BaseException:
+            # target missing but the old store is still at `aside`: put it back so the
+            # target is never left empty or gone.
+            if aside is not None and not target.exists() and aside.exists():
+                os.replace(aside, target)
+            shutil.rmtree(tmp_path, ignore_errors=True)
+            state = _SwapState.ABORTED
+            raise
+
+        if aside is not None:
+            shutil.rmtree(aside, ignore_errors=True)
+        state = _SwapState.DONE
         return None
 
     def abort() -> None:
-        if tmp_path.exists():
+        nonlocal state
+        if state is _SwapState.DONE or state is _SwapState.ABORTED:
+            return  # safe to call after finalize(), or after finalize() already cleaned up
+        if state is _SwapState.OPEN:
             shutil.rmtree(tmp_path, ignore_errors=True)
+        # SWAPPING never escapes finalize() uncaught in practice — its own except block
+        # always resolves to DONE or ABORTED before propagating — but stays defensive here.
+        state = _SwapState.ABORTED
 
     return OutputStore(root, finalize, abort)
 

@@ -319,6 +319,33 @@ def test_sort_backed_rejects_dense(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_backed_sort_default_commit_message_names_sort_columns(tmp_path: Path) -> None:
+    """_write_sorted_backed's default commit message names the sort columns (item 9), so a
+    sorted convert is distinguishable in `ic log`. Exercised directly against an icechunk
+    cfg, since --backed + backend=icechunk is otherwise rejected upstream (icechunk never
+    supports backed input) before it would reach this code path."""
+    pytest.importorskip("icechunk")
+    from annizarr._ic import Repo
+    from annizarr._sorting import _write_sorted_backed
+
+    _labelled_h5ad(tmp_path / "in.h5ad")
+    adata = ad.read_h5ad(tmp_path / "in.h5ad", backed="r")
+    out = tmp_path / "repo.icechunk"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, backed=True, x_storage="csr", backend="icechunk"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
+    )
+    try:
+        _write_sorted_backed(adata, out, cfg)
+    finally:
+        adata.file.close()
+
+    repo = Repo(str(out))
+    assert repo.log(branch="main")[0].message == "annizarr convert (sorted by cell_type,demographic) → repo.icechunk"
+
+
 def test_sort_through_icechunk_and_read(tmp_path: Path) -> None:
     pytest.importorskip("icechunk")
     _labelled_h5ad(tmp_path / "in.h5ad")
@@ -485,6 +512,26 @@ def test_concat_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None
     )
     concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(out), cfg=cfg)
     assert np.array_equal(_read_X(out), np.vstack([a, b]))
+
+
+def test_concat_backed_csc_input_above_eager_max_bytes_raises(tmp_path: Path) -> None:
+    """concat's ensure_csr refuses a backed CSC input whose on-disk X is bigger than
+    io.eager_max_bytes (item 5) instead of silently loading it whole into memory; the error
+    hints at converting that input to csr first."""
+    _rand_h5ad(tmp_path / "a.h5ad", n_obs=50, n_vars=40, seed=1)
+    _rand_h5ad(tmp_path / "b.h5ad", n_obs=50, n_vars=40, seed=2)
+    b_adata = ad.read_h5ad(tmp_path / "b.h5ad")
+    b_adata.X = sp.csc_matrix(b_adata.X)  # b's X is CSC on disk; a stays CSR
+    b_adata.write_h5ad(tmp_path / "b.h5ad")
+
+    out = tmp_path / "out.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="csr", backed=True, eager_max_bytes=64),
+        chunks=ChunkConfig(x_row_chunk=16, x_col_chunk=40, sparse_flat_chunk=500),
+        validation=ValidationConfig(),
+    )
+    with pytest.raises(ConversionError, match="annizarr convert --x-storage csr"):
+        concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(out), cfg=cfg)
 
 
 # ---------------------------------------------------------------------------

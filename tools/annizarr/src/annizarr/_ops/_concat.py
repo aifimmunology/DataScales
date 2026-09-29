@@ -11,7 +11,7 @@ from annizarr._config import AppConfig, load_config, resolve_backend_cfg
 from annizarr._ops._result import OpResult
 from annizarr._runtime import configure_runtime, stage
 from annizarr._sources import close_backed_if_needed, ensure_csr, load_h5ad
-from annizarr._storage import open_output_store
+from annizarr._storage import check_output_target, open_output_store
 from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers import _write_concatenated_csr, _write_concatenated_dense
 from annizarr._writers._encoding import set_anndata_root_attrs, write_elem
@@ -91,10 +91,7 @@ def concat(
     output_path = Path(output)
     # Fail fast on a pre-existing output before the (expensive) multi-file load; the actual
     # prepare/overwrite happens in open_output_store below.
-    if output_path.exists() and not cfg.io.overwrite:
-        raise ConversionError(
-            f"Output path already exists: {output_path}. Use overwrite=true in config or --overwrite flag."
-        )
+    check_output_target(output_path, cfg)
     ad.settings.zarr_write_format = 3
 
     adatas: list[ad.AnnData] = []
@@ -175,7 +172,7 @@ def concat(
         x_matrices: list[Any] = []
         x_dtype = None
         for i, a in enumerate(adatas):
-            x, warn = ensure_csr(a.X, inputs[i].name)
+            x, warn = ensure_csr(a.X, inputs[i].name, eager_max_bytes=cfg.io.eager_max_bytes)
             if warn:
                 logger.warning(warn)
             if x_dtype is None:

@@ -164,6 +164,19 @@ def test_open_source_h5ad_auto_selects_backed_above_threshold(tmp_path: Path, ca
     src.close()
 
 
+def test_load_h5ad_no_x_raises_conversion_error(tmp_path: Path) -> None:
+    """load_h5ad's auto-select peek (_peek_x_nbytes) raises ConversionError, not a bare
+    KeyError, for an h5ad-shaped file with no X."""
+    from annizarr._sources._h5ad import load_h5ad
+
+    p = tmp_path / "no_x.h5ad"
+    with h5py.File(p, "w") as f:
+        f.create_group("obs")
+        f.create_group("var")
+    with pytest.raises(ConversionError, match="has no X"):
+        load_h5ad(p, _cfg(backed=None, eager_max_bytes=2 * 1024**3))
+
+
 def test_open_source_10x(tmp_path: Path) -> None:
     p = tmp_path / "matrix.h5"
     _make_10x_v3(p)

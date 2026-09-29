@@ -23,6 +23,8 @@ from annizarr._zarr import get_array
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from annizarr._config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -123,6 +125,7 @@ def _write_sorted_backed(
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
     for w in validation_result.warnings:
         logger.warning(w)
+    sort_by = cfg.grouping.sort_by
     snapshot_id = stream_sorted_store(
         x,
         adata.obs,
@@ -133,8 +136,8 @@ def _write_sorted_backed(
         dict(adata.varp),
         output_path,
         cfg,
-        sort_by=cfg.grouping.sort_by,
-        commit_message=message or f"annizarr convert → {output_path.name}",
+        sort_by=sort_by,
+        commit_message=message or f"annizarr convert (sorted by {','.join(sort_by)}) → {output_path.name}",
         branch=branch,
     )
     return snapshot_id
@@ -154,18 +157,19 @@ def stream_sorted_store(
     sort_by: tuple[str, ...],
     commit_message: str | None = None,
     branch: str | None = None,
+    after_write: Callable[[zarr.Group], None] | None = None,
 ) -> str | None:
     # buckets rows into temp per-group CSR stores, then concats them in sorted order;
-    # returns the icechunk snapshot id, or None for a plain zarr store
+    # returns the icechunk snapshot id, or None for a plain zarr store. after_write, if
+    # given, runs on the still-open output root before the single finalize() below — e.g.
+    # sort's own re-derivation of a lone gexp layer, so it lands in the same commit as the
+    # sort itself instead of a second one.
     from anndata.io import sparse_dataset
 
     from annizarr import _layout
 
-    # fail fast before the expensive bucketing pass (mirrors the concat path)
-    if cfg.io.backend != "icechunk" and output_path.exists() and not cfg.io.overwrite:
-        raise ConversionError(
-            f"Output path already exists: {output_path}. Use overwrite=true in config or --overwrite flag."
-        )
+    # the target-exists check happens in each caller (sort op / convert's --backed
+    # --sort-by dispatch) before their own expensive work, via check_output_target
     configure_runtime(cfg.chunks.cpus)
 
     n_obs, n_vars = x.shape
@@ -277,6 +281,8 @@ def stream_sorted_store(
             temp_mats = [sparse_dataset(tg) for tg in temp_groups]
             with stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, csr, concat {n_groups} groups)"):
                 _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
+            if after_write is not None:
+                after_write(store)
             snapshot_id = out.finalize()
         except BaseException:
             out.abort()

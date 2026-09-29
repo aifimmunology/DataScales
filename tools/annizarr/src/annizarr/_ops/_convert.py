@@ -18,7 +18,7 @@ from annizarr._runtime import configure_runtime
 from annizarr._sorting import _write_sorted_backed, maybe_sort_adata
 from annizarr._sources import close_backed_if_needed, detect_format, load_10x_h5, load_h5ad, open_source
 from annizarr._sources._matrix import is_backed, matrix_format
-from annizarr._storage import open_output_store, store_name
+from annizarr._storage import check_output_target, open_output_store, store_name
 from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers import write_adata
 from annizarr.errors import AnzError, ConversionError
@@ -76,7 +76,10 @@ def write_adata_to_store(
         if np.ma.isMaskedArray(x):
             raise ConversionError(f"adata.X must be CSR, CSC, or dense. Got: {type(x).__name__}")
         if fmt == "csc":
-            x_for_write = x[:].tocsr() if is_backed(x) else x.tocsr()
+            if not is_backed(x):
+                x_for_write = x.tocsr()
+            # backed: left as the raw CSC dataset; write_matrix streams it instead (no in-memory
+            # .tocsr() — anndata's backed _CSCDataset doesn't have one anyway).
             logger.warning("adata.X was CSC and has been converted to CSR in memory before zarr conversion.")
         elif fmt == "dense":
             if cfg.io.x_storage == "dense":
@@ -143,8 +146,11 @@ def convert_adata(
     """
     if cfg is None:
         cfg = load_config()
+    # pure config check first: no icechunk import needed to reject this, unlike
+    # check_output_target's icechunk-backend branch (Repo.exists()).
     if cfg.io.backed:
         raise ConversionError("convert_adata takes an in-memory AnnData; io.backed does not apply.")
+    check_output_target(output, cfg)
     return write_adata_to_store(adata, output, cfg, allow_grouping=True, branch=branch, message=message)
 
 
@@ -168,9 +174,11 @@ def convert_h5ad(
     """
     if cfg is None:
         cfg = load_config()
-    # icechunk never supports backed input, so resolve an unset (auto-select) backed to
-    # eager *before* load_h5ad's file-size peek ever runs.
+    # resolve_backend_cfg's backed+icechunk validation first: it's a pure config check (no
+    # icechunk import), so it must fail before check_output_target's Repo.exists() would
+    # otherwise require icechunk to be installed just to reach that same error.
     cfg = resolve_backend_cfg(cfg)
+    check_output_target(output, cfg)
     adata = None
     try:
         adata, load_warnings = load_h5ad(Path(path), cfg)
@@ -211,6 +219,7 @@ def convert_10x_h5(
     """
     if cfg is None:
         cfg = load_config()
+    check_output_target(output, cfg)
     try:
         adata = load_10x_h5(path)
     except AnzError:

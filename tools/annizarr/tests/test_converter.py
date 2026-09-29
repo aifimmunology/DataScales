@@ -13,7 +13,7 @@ import zarr
 import annizarr._layout as _layout
 from annizarr._ops import convert_10x_h5, convert_adata, convert_h5ad
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
-from annizarr.errors import ConversionError
+from annizarr.errors import ConversionError, StorageError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -210,6 +210,42 @@ def test_h5ad_backed_csc_x_converts_to_csr_with_warning(tmp_path: Path, caplog) 
     assert any("adata.X was CSC and has been converted to CSR in memory" in m for m in _messages(caplog))
 
 
+def _make_300x200_h5ad(path: Path, *, x_csc: bool) -> None:
+    """A 300x200 h5ad; X is CSC when ``x_csc``, else CSR with a CSC 'cnt' layer either way —
+    both exercise the backed-CSC-to-dense path (anndata's backed _CSCDataset has no .tocsr())."""
+    rng = np.random.default_rng(7)
+    dense = rng.random((300, 200)).astype(np.float32)
+    dense[dense < 0.7] = 0.0  # ~30% density
+    X = sp.csc_matrix(dense) if x_csc else sp.csr_matrix(dense)
+    adata = ad.AnnData(X=X)
+    adata.layers["cnt"] = sp.csc_matrix(dense * 2.0)
+    adata.write_h5ad(path)
+
+
+@pytest.mark.parametrize("x_csc", [False, True])
+def test_h5ad_backed_csc_to_dense_matches_eager_no_tmp_dir_left(tmp_path: Path, x_csc: bool) -> None:
+    """A backed CSC source (X, or the 'cnt' layer) converted with x_storage='dense' streams
+    through a temporary CSC->CSR transpose (never materialising the whole matrix) and matches
+    the eager (in-memory) conversion byte-for-byte; the temp dir is cleaned up either way."""
+    # chunks sized for the 300x200 fixture (not the module _cfg's 2x2, which would tile it
+    # into thousands of tiny writes)
+    chunks = ChunkConfig(x_row_chunk=64, x_col_chunk=64)
+    cfg_eager = AppConfig(io=IOConfig(x_storage="dense"), chunks=chunks, validation=ValidationConfig())
+    cfg_backed = replace(cfg_eager, io=replace(cfg_eager.io, backed=True))
+
+    _make_300x200_h5ad(tmp_path / "input.h5ad", x_csc=x_csc)
+    out_eager = tmp_path / "eager.zarr"
+    out_backed = tmp_path / "backed.zarr"
+    convert_h5ad(str(tmp_path / "input.h5ad"), output=str(out_eager), cfg=cfg_eager)
+    convert_h5ad(str(tmp_path / "input.h5ad"), output=str(out_backed), cfg=cfg_backed)
+
+    got_eager = ad.read_zarr(str(out_eager))
+    got_backed = ad.read_zarr(str(out_backed))
+    np.testing.assert_array_equal(np.asarray(got_backed.X), np.asarray(got_eager.X))
+    np.testing.assert_array_equal(np.asarray(got_backed.layers["cnt"]), np.asarray(got_eager.layers["cnt"]))
+    assert not list(tmp_path.rglob("annizarr_csc2csr_*"))
+
+
 # ---------------------------------------------------------------------------
 # In-memory loading (10x h5 → zarr)
 # scanpy.read_10x_h5 always returns an in-memory CSR matrix, exercising the
@@ -247,6 +283,22 @@ def test_10x_rejects_wrong_extension(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Flat chunk sizing for sparse output
 # ---------------------------------------------------------------------------
+
+
+def test_convert_h5ad_existing_target_fails_before_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_output_target fails fast, before load_h5ad ever runs (no wasted parse)."""
+    _make_h5ad(tmp_path / "input.h5ad")
+    out = tmp_path / "out.zarr"
+    out.mkdir()  # a pre-existing target, overwrite not set
+
+    import annizarr._ops._convert as _convert_mod
+
+    def _fail_loudly(*_a, **_kw):
+        raise AssertionError("load_h5ad should not run when the target already exists and overwrite is unset")
+
+    monkeypatch.setattr(_convert_mod, "load_h5ad", _fail_loudly)
+    with pytest.raises(StorageError, match="already exists"):
+        convert_h5ad(str(tmp_path / "input.h5ad"), output=str(out), cfg=_cfg("csr"))
 
 
 def test_flat_chunk_applied_csr(tmp_path: Path) -> None:
@@ -398,6 +450,39 @@ def test_h5ad_backed_csr_to_csc_streamed_matches_eager_bytes(tmp_path: Path, mon
     _assert_byte_identical(out_eager, out_backed)
     got = ad.read_zarr(str(out_backed))
     assert sp.isspmatrix_csc(got.X)
+    np.testing.assert_allclose(got.X.toarray(), dense.astype(np.float32))
+
+
+def test_h5ad_backed_csc_x_to_csr_streamed_matches_eager_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backed CSC X targeted at csr output (item 5): convert no longer eagerly materialises
+    it via .tocsr() first (anndata's backed _CSCDataset has no .tocsr() anyway) — write_matrix
+    streams it through write_transposed_sparse instead, matching the eager conversion
+    byte-for-byte."""
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 2048)
+
+    rng = np.random.default_rng(9)
+    n_obs, n_vars = 300, 200
+    dense = rng.random((n_obs, n_vars))
+    dense[dense < 0.85] = 0.0  # ~15% density, ~9000 nnz
+    X = sp.csc_matrix(dense.astype(np.float32))
+    h5 = tmp_path / "in.h5ad"
+    ad.AnnData(X=X).write_h5ad(h5)
+
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="csr"),
+        chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=48, sparse_flat_chunk=37),
+        validation=ValidationConfig(),
+    )
+    cfg_backed = replace(cfg, io=replace(cfg.io, backed=True))
+
+    out_eager = tmp_path / "eager.zarr"
+    out_backed = tmp_path / "backed.zarr"
+    convert_h5ad(str(h5), output=str(out_eager), cfg=cfg)
+    convert_h5ad(str(h5), output=str(out_backed), cfg=cfg_backed)
+
+    _assert_byte_identical(out_eager, out_backed)
+    got = ad.read_zarr(str(out_backed))
+    assert sp.isspmatrix_csr(got.X)
     np.testing.assert_allclose(got.X.toarray(), dense.astype(np.float32))
 
 

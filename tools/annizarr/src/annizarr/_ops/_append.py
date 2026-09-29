@@ -285,22 +285,31 @@ def _check_obs_schema(obs_t: zarr.Group, obs_s: zarr.Group) -> None:
 
 
 def _count_duplicate_names(obs_t: zarr.Group, obs_s: zarr.Group, n_t: int) -> int:
-    # counts appended (cells) obs names that already occur in the merged (store + cells)
-    # index: collisions with the store's existing names (streamed over the store index in
-    # chunk-aligned slices, so memory stays O(cells store)), plus repeats within the cells
-    # store's own index (each beyond the first). n_duplicate_names == n_new means every
-    # appended cell is already present — plan_append raises on that.
+    # a cells-store row is a duplicate if its name already occurs in the target OR it
+    # repeats an earlier row of the cells store — counted once per row (not once per
+    # colliding pair), so a name that is both already in the target AND repeated within
+    # the cells store isn't counted twice. n_duplicate_names == n_new means every appended
+    # cell is already present — plan_append raises on that.
     idx_s = np.asarray(get_array(obs_s, str_attr(obs_s, "_index"))[:])
-    _, counts = np.unique(idx_s, return_counts=True)
-    internal_dupes = int(np.clip(counts - 1, 0, None).sum())
+
+    # stable sort groups equal names together in original-position order, so within each
+    # group every position but the first (in the group) repeats an earlier cells-store row.
+    order = np.argsort(idx_s, kind="stable")
+    repeats_earlier = np.zeros(len(idx_s), dtype=bool)
+    if len(idx_s) > 1:
+        sorted_idx = idx_s[order]
+        is_repeat_sorted = np.empty(len(idx_s), dtype=bool)
+        is_repeat_sorted[0] = False
+        is_repeat_sorted[1:] = sorted_idx[1:] == sorted_idx[:-1]
+        repeats_earlier[order] = is_repeat_sorted
 
     t_arr = get_array(obs_t, str_attr(obs_t, "_index"))
     chunk0 = t_arr.chunks[0]
     step = max(chunk0, (_INDEX_SCAN_ROWS // max(1, chunk0)) * chunk0)
-    seen_in_target = np.zeros(len(idx_s), dtype=bool)
+    in_target = np.zeros(len(idx_s), dtype=bool)
     for i0 in range(0, n_t, step):
-        seen_in_target |= np.isin(idx_s, np.asarray(t_arr[i0 : min(i0 + step, n_t)]))
-    return int(seen_in_target.sum()) + internal_dupes
+        in_target |= np.isin(idx_s, np.asarray(t_arr[i0 : min(i0 + step, n_t)]))
+    return int((in_target | repeats_earlier).sum())
 
 
 def _append_arrays(

@@ -58,6 +58,28 @@ def test_icechunk_lifecycle_one_commit_per_op(tmp_path: Path) -> None:
     assert "annizarr sort by cell_type" in sorted_log[0].message
 
 
+def test_icechunk_sort_re_deriving_lone_gexp_layer_is_one_commit(tmp_path: Path) -> None:
+    """sort's own re-derivation of a lone gexp layer (via write_expr_layer, on the still-open
+    sorted output) must not add a second commit on top of the sort's own — regression test
+    for the double-commit bug where sort called add_expr, which opened its own session."""
+    pytest.importorskip("icechunk")
+    repo_path = tmp_path / "repo.icechunk"
+    h5 = make_h5ad(tmp_path, adata=make_adata(n_obs=20, seed=0))
+    convert_h5ad(str(h5), output=str(repo_path), cfg=_ic_cfg())
+    add_expr(str(repo_path), fmt="csr", cfg=_ic_cfg())
+
+    sorted_path = tmp_path / "sorted_gexp.icechunk"
+    r_sort = sort(str(repo_path), output=str(sorted_path), by=("cell_type",), cfg=_ic_cfg())
+
+    sorted_repo = Repo(str(sorted_path))
+    sorted_log = sorted_repo.log(branch="main")
+    assert len(sorted_log) == 2  # exactly one new commit (the sort, gexp included) + init
+    assert sorted_log[0].id == r_sort.snapshot_id
+
+    out_root = open_input_group(str(sorted_path))
+    assert "gexp" in list(out_root["layers"])
+
+
 def test_branch_dev_created_on_existing_repo_leaves_main_unchanged(tmp_path: Path) -> None:
     pytest.importorskip("icechunk")
     repo_path = tmp_path / "repo.icechunk"

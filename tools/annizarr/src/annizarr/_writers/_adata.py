@@ -9,7 +9,7 @@ from annizarr._runtime import stage
 from annizarr._sources._matrix import is_backed, matrix_format
 from annizarr._writers._dense import _write_dense_streaming, _write_sparse_as_dense
 from annizarr._writers._encoding import set_anndata_root_attrs, set_raw_group_attrs, write_elem
-from annizarr._writers._sparse import _write_sparse_streaming, write_transposed_sparse
+from annizarr._writers._sparse import _local_tmp_dir, _write_sparse_streaming, write_transposed_sparse
 from annizarr._zarr import get_group
 
 if TYPE_CHECKING:
@@ -22,18 +22,23 @@ if TYPE_CHECKING:
 def write_matrix(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
     # input may be any format (CSR, CSC, dense ndarray, backed SparseDataset) — adata.X is
     # guaranteed CSR by the caller, but other layers and raw.X may not be. Dispatches on
-    # cfg.io.x_storage: dense -> row-chunked streaming write (CSC converted to CSR first for
-    # row slicing); csr/csc -> ensure that format, stream row/col-batches over a thread pool
-    # (parallel for in-memory input; a process pool for backed input).
+    # cfg.io.x_storage: dense -> row-chunked streaming write (an in-memory CSC is converted
+    # to CSR first for row slicing; a backed CSC has no in-memory .tocsr(), so it goes
+    # through a temporary streamed CSC->CSR transpose instead — never materialised whole);
+    # csr/csc -> ensure that format, stream row/col-batches over a thread pool (parallel for
+    # in-memory input; a process pool for h5py-backed input).
     mode = cfg.io.x_storage
     fmt = matrix_format(matrix)
     backed = is_backed(matrix)
 
     if mode == "dense":
-        if fmt in ("csr", "csc"):
-            if fmt != "csr":
-                matrix = matrix.tocsr()  # backed CSC: load into memory and convert; in-memory: direct
+        if fmt == "csr":
             _write_sparse_as_dense(group, matrix, key, cfg)
+        elif fmt == "csc":
+            if backed:
+                _write_backed_csc_as_dense(group, matrix, key, cfg)
+            else:
+                _write_sparse_as_dense(group, matrix.tocsr(), key, cfg)
         else:  # already dense
             _write_dense_streaming(group, matrix, key, cfg)
         return
@@ -56,6 +61,26 @@ def write_matrix(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> No
         matrix = matrix.tocsr() if mode == "csr" else matrix.tocsc()
 
     _write_sparse_streaming(group, matrix, key, cfg, csr=(mode == "csr"))
+
+
+def _write_backed_csc_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
+    # anndata's backed _CSCDataset has no .tocsr(); stream-transpose it into a temporary
+    # zarr CSR store instead (never materialising the whole matrix), then densify from that
+    # — zarr-backed, so thread-safe — CSR the same way as a native CSR source.
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import zarr
+    from anndata.io import sparse_dataset
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="annizarr_csc2csr_", dir=_local_tmp_dir(group)))
+    try:
+        tmp_root = zarr.open_group(str(tmp_dir), mode="w")
+        tmp_group = write_transposed_sparse(tmp_root, "X", matrix, cfg, target="csr")
+        _write_sparse_as_dense(group, sparse_dataset(tmp_group), key, cfg)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def write_adata(adata: ad.AnnData, store: zarr.Group, cfg: AppConfig, x_override: Any | None = None) -> None:

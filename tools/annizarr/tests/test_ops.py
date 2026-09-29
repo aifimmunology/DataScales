@@ -13,7 +13,7 @@ import zarr
 from _readable import assert_anndata_readable
 from annizarr._ops import add_expr, append, convert_h5ad, rechunk, sort
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
-from annizarr.errors import ConversionError
+from annizarr.errors import ConversionError, StorageError
 
 
 def _cfg(**io):
@@ -78,6 +78,17 @@ def test_add_expr_all_formats(tmp_path, fmt):
         vals = got.layers["gexp"].toarray()
     np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
     np.testing.assert_allclose(got.X.toarray(), adata.X.toarray())
+
+    if fmt == "csc":
+        # csc's per-row factors are computed up front in the same row_step bands the csr
+        # path's fused per-band transform uses (_ops/_expr.py's "bit-identical factors"
+        # comment) — verify that claim directly against a csr layer on the same store,
+        # not just both against the separately-computed _expected_gexp reference above.
+        # toarray() already places values at their canonical column position per row, so
+        # sorting is a no-op safety net here, not load-bearing.
+        add_expr(str(out), fmt="csr", layer="gexp_csr_ref", chunk_elems=80, cfg=_cfg())
+        csr_vals = ad.read_zarr(str(out)).layers["gexp_csr_ref"].toarray()
+        assert np.array_equal(np.sort(vals, axis=1), np.sort(csr_vals, axis=1))
 
 
 def test_add_expr_existing_layer(tmp_path):
@@ -316,6 +327,32 @@ def test_append_partial_duplicate_names_warns(tmp_path, caplog):
     assert any("2 duplicate" in m for m in _messages(caplog))
 
 
+def test_append_cells_store_internal_duplicate_also_in_target_raises(tmp_path):
+    # `b` has 2 rows sharing the SAME obs name, and that name is already in `a` — every
+    # appended row is a duplicate (by target-collision, counted once each, not twice for
+    # also repeating each other). Regression test for double-counting a position that is
+    # both in-target and an internal repeat, which used to let n_duplicate_names overshoot
+    # n_new and silently skip the "already appended" error.
+    a = _adata(n=20, seed=0)
+    sa = _store(tmp_path, a, "a.zarr")
+    b = _adata(n=2, seed=1)
+    b.obs_names = [a.obs_names[0], a.obs_names[0]]
+    sb = _store(tmp_path, b, "b.zarr")
+    with pytest.raises(ConversionError, match="already"):
+        append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+
+
+def test_append_three_rows_two_duplicate_names_warns(tmp_path, caplog):
+    # 3 rows in `b`, only 2 of which collide with `a` — not every appended cell is already
+    # present, so this stays a warning.
+    a, b = _adata(n=20, seed=0), _adata(n=3, seed=1)
+    b.obs_names = [a.obs_names[0], a.obs_names[1], b.obs_names[2]]
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
+    append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+    assert any("2 duplicate" in m for m in _messages(caplog))
+
+
 def test_append_drop_derived(tmp_path, caplog):
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
@@ -493,10 +530,12 @@ def test_lifecycle_icechunk(tmp_path):
 
 
 def test_sort_store_output_exists(tmp_path):
+    # StorageError, not ConversionError: sort's target-exists check now goes through the
+    # shared check_output_target (item 6) instead of an ad-hoc raise in _sorting.
     out = _store(tmp_path, _adata())
     out2 = tmp_path / "sorted.zarr"
     out2.mkdir()
-    with pytest.raises(ConversionError, match="already exists"):
+    with pytest.raises(StorageError, match="already exists"):
         sort(str(out), output=str(out2), by=("cell_type",), cfg=_cfg())
 
 

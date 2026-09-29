@@ -14,13 +14,14 @@ from annizarr._config import load_config
 from annizarr._layout import x_compressors
 from annizarr._ops._result import OpResult
 from annizarr._runtime import configure_runtime, stage
-from annizarr._storage import is_remote, open_store_rw
+from annizarr._storage import open_store_rw
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs
-from annizarr._writers._sparse import write_transposed_sparse
+from annizarr._writers._sparse import _local_tmp_dir, write_transposed_sparse
 from annizarr._zarr import get_array, get_group, shape_attr
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
+    import zarr
     from numpy.typing import NDArray
 
     from annizarr._config import AppConfig
@@ -85,14 +86,44 @@ def add_expr(
     """
     if cfg is None:
         cfg = load_config()
-    if fmt not in ("csc", "dense", "csr"):
-        raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
-
     configure_runtime(cfg.chunks.cpus)
     commit_message = message or f"annizarr add-expr {fmt} → layers/{layer}"
     root, finalize = open_store_rw(store, cfg, commit_message=commit_message, branch=branch)
+    write_expr_layer(
+        root, cfg, fmt=fmt, layer=layer, chunk_elems=chunk_elems, target_sum=target_sum, overwrite=overwrite
+    )
+    n_obs, n_vars = shape_attr(get_group(root, "X"))
+    snapshot_id = finalize()
+    return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
+
+
+def write_expr_layer(
+    root: zarr.Group,
+    cfg: AppConfig,
+    *,
+    fmt: XStorage = "csc",
+    layer: str = "gexp",
+    chunk_elems: int = 1_000_000,
+    target_sum: float = 1e4,
+    overwrite: bool = False,
+) -> None:
+    """Write ``layers/<layer>`` (log-normalized, derived from CSR X) into an already-open
+    store root; does not finalize it — the caller owns opening/finalizing the store (this
+    is what lets :func:`~annizarr._ops._sort.sort` re-derive a lone ``gexp`` layer on its
+    freshly-sorted output in the same commit as the sort itself).
+
+    Parameters mirror :func:`add_expr`.
+
+    Raises
+    ------
+    ConversionError
+        ``root`` has no CSR X, ``layers/<layer>`` already exists and ``overwrite`` is not
+        set, or ``fmt`` is not one of ``"csr"``, ``"csc"``, ``"dense"``.
+    """
+    if fmt not in ("csc", "dense", "csr"):
+        raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
     if "X" not in root:
-        raise ConversionError(f"no X in {store} — not an AnnData zarr store?")
+        raise ConversionError("no X in store — not an AnnData zarr store?")
     x = get_group(root, "X")
     if x.attrs.get("encoding-type") != "csr_matrix":
         raise ConversionError(f"add-expr requires CSR X; got encoding {x.attrs.get('encoding-type')!r}.")
@@ -132,8 +163,7 @@ def add_expr(
                 s0, s1, vals = _band(b0, b1)
                 g["data"][s0:s1] = vals
                 g["indices"][s0:s1] = idx_arr[s0:s1]
-        snapshot_id = finalize()
-        return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
+        return
 
     if fmt == "csc":
         # Factors are computed up front, in the same row_step bands lognorm_band uses,
@@ -145,8 +175,7 @@ def add_expr(
         with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
             g = write_transposed_sparse(layers, layer, x, layer_cfg, row_scale=factors, target="csc")
         g.attrs[_TARGET_SUM_ATTR] = float(target_sum)
-        snapshot_id = finalize()
-        return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
+        return
 
     # fmt == "dense": pass 1 counts nnz per column; pass 2 buckets entries into column
     # bands (disk-backed, so RAM stays one band); each band then scatters into its slice
@@ -166,9 +195,8 @@ def add_expr(
     n_bands = len(edges) - 1
     band_nnz = [int(csc_indptr[edges[i + 1]] - csc_indptr[edges[i]]) for i in range(n_bands)]
 
-    # bucket temp files sit next to a local store (same filesystem); system tmp for a remote one
-    tmp_dir = None if is_remote(store) else str(Path(store).parent)
-    tmp_root = Path(tempfile.mkdtemp(prefix="annizarr_expr_", dir=tmp_dir))
+    # bucket temp files sit next to a local store (same filesystem); system tmp otherwise
+    tmp_root = Path(tempfile.mkdtemp(prefix="annizarr_expr_", dir=_local_tmp_dir(root)))
     try:
         buckets: list[dict[str, NDArray[Any]]] = []
         for i, m in enumerate(band_nnz):
@@ -225,9 +253,6 @@ def add_expr(
                 arr[:, c0:c1] = block
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
-
-    snapshot_id = finalize()
-    return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
 
 
 def lognorm_band(

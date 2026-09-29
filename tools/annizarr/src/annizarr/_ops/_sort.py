@@ -7,14 +7,16 @@ from typing import TYPE_CHECKING, Any
 from annizarr._config import AppConfig, load_config, resolve_backend_cfg
 from annizarr._ops._result import OpResult
 from annizarr._sorting import stream_sorted_store
-from annizarr._storage import is_remote, open_input_group, store_name
+from annizarr._storage import check_output_target, is_remote, open_input_group, store_name
 from annizarr._zarr import get_group
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from annizarr.typing import PathLike
+    import zarr
+
+    from annizarr.typing import PathLike, XStorage
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ def sort(
     """
     from anndata.io import read_elem, sparse_dataset
 
-    from annizarr._ops._expr import add_expr, introspect_gexp
+    from annizarr._ops._expr import introspect_gexp, write_expr_layer
 
     if cfg is None:
         cfg = load_config()
@@ -72,6 +74,7 @@ def sort(
         raise ConversionError("sort requires by=[OBS_COLUMN, ...].")
     if cfg.io.x_storage != "csr":
         raise ConversionError(f"sort supports x_storage='csr' only (got '{cfg.io.x_storage}').")
+    check_output_target(output, cfg)
 
     src = open_input_group(store)
     if "X" not in src:
@@ -95,6 +98,23 @@ def sort(
     x = sparse_dataset(src["X"])
     n_obs, n_vars = x.shape
     commit_message = message or f"annizarr sort by {','.join(by)} → {store_name(output)}"
+
+    after_write = None
+    if gexp_params is not None:
+        fmt, chunk_elems, target_sum = gexp_params
+        if target_sum is None:
+            logger.warning("layers/gexp has no recorded target_sum; re-deriving at 1e4.")
+            target_sum = 1e4
+
+        def after_write(
+            root: zarr.Group, fmt: XStorage = fmt, chunk_elems: int = chunk_elems, target_sum: float = target_sum
+        ) -> None:
+            # runs on the sorted output's still-open root, before stream_sorted_store's one
+            # finalize() — re-deriving gexp here (instead of a separate add_expr call after
+            # the fact) keeps this to a single commit for an icechunk output.
+            write_expr_layer(root, cfg, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum)
+            logger.warning(f"layers/gexp re-derived ({fmt}) on the sorted store.")
+
     snapshot_id = stream_sorted_store(
         x,
         read_elem(src["obs"]),
@@ -108,12 +128,6 @@ def sort(
         sort_by=by,
         commit_message=commit_message,
         branch=branch,
+        after_write=after_write,
     )
-    if gexp_params is not None:
-        fmt, chunk_elems, target_sum = gexp_params
-        if target_sum is None:
-            logger.warning("layers/gexp has no recorded target_sum; re-deriving at 1e4.")
-            target_sum = 1e4
-        add_expr(output, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum, cfg=cfg, branch=branch)
-        logger.warning(f"layers/gexp re-derived ({fmt}) on the sorted store.")
     return OpResult(path=str(output), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)

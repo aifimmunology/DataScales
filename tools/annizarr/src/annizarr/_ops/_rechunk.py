@@ -8,7 +8,7 @@ from annizarr._config import AppConfig, load_config, resolve_backend_cfg
 from annizarr._layout import dense_shards
 from annizarr._ops._result import OpResult
 from annizarr._runtime import configure_runtime, run_parallel, stage
-from annizarr._storage import open_input_group, open_output_store, store_name
+from annizarr._storage import check_output_target, open_input_group, open_output_store, store_name
 from annizarr._zarr import get_group, shape_attr
 from annizarr.errors import ConversionError
 
@@ -62,6 +62,7 @@ def rechunk(
     if cfg is None:
         cfg = load_config()
     cfg = resolve_backend_cfg(cfg)
+    check_output_target(output, cfg)
     configure_runtime(cfg.chunks.cpus)
     src = open_input_group(store)
 
