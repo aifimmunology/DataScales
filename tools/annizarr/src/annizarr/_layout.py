@@ -1,13 +1,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import zarr
 
 # Target bytes per streamed write/copy batch. Shared by every band/segment loop across
 # _ops/_append.py, _ops/_rechunk.py, _ops/_expr.py, _writers/*, and _sorting.py — read as
 # `_layout.BATCH_BYTES` (module attribute, not a `from`-import) so tests can monkeypatch it.
 BATCH_BYTES = 256 * 1024 * 1024
 
-__all__ = ["BATCH_BYTES", "DenseLayout", "band_plan", "dense_shards", "x_compressors"]
+__all__ = ["BATCH_BYTES", "DenseLayout", "band_plan", "dense_shards", "write_grid", "x_compressors"]
+
+
+def write_grid(arr: zarr.Array[Any]) -> tuple[int, ...]:
+    """Return the array's write-partition grid: its shard shape if sharded, else its chunks.
+
+    Every concurrent or process-pool writer must partition its write blocks/segments along
+    this grid, taken from the array **as actually created** (not recomputed from config) —
+    writing a partial shard makes zarr's sharding codec read-modify-write the whole shard, so
+    two tasks writing into the same shard would race. Safe for any array, sharded or not,
+    however it came to be sharded (an explicit ``x_shard_factor``, or ``shards="auto"``).
+
+    Parameters
+    ----------
+    arr
+        The zarr array to partition writes against.
+
+    Returns
+    -------
+    tuple[int, ...]
+        ``arr.shards`` when sharded, else ``arr.chunks``.
+    """
+    return arr.shards if arr.shards is not None else arr.chunks
 
 
 def x_compressors() -> tuple[object, ...]:

@@ -4,6 +4,7 @@ import argparse
 import logging
 
 from annizarr._cli._args import (
+    add_autoshard_arg,
     add_branch_arg,
     add_chunk_args,
     add_config_arg,
@@ -51,6 +52,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     p.add_argument("--x-storage", choices=("csr", "csc", "dense"), help="output X layout")
     add_cpus_arg(p)
     add_chunk_args(p)
+    add_autoshard_arg(p)
     p.add_argument(
         "--sort-by",
         dest="sort_by",

@@ -18,7 +18,7 @@ from annizarr._sources._matrix import get_indptr
 from annizarr._storage import open_output_store
 from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers._concat import _write_concatenated_csr
-from annizarr._writers._encoding import make_sparse_group, set_array_attrs, write_elem
+from annizarr._writers._encoding import autoshard_setting, make_sparse_group, set_array_attrs, write_elem
 from annizarr._zarr import get_array
 from annizarr.errors import ConversionError
 
@@ -226,8 +226,12 @@ def stream_sorted_store(
             ip[:] = indptr_each[gi]
             temp_groups.append(tg)
 
-        # Single sequential pass over X: bucket each row-batch into its groups.
-        # Batch to ~256 MB of nnz like the other streaming writers.
+        # Single sequential pass over X: bucket each row-batch into its groups. Writes land at
+        # per-group nnz cursors, not aligned to the temp arrays' write grid — a perf-only cost
+        # (never a correctness risk: this pass is serial, one writer, like the transposition
+        # engine's serial writes), and the temp groups are scratch (chunks="auto", never
+        # sharded) deleted once the final concat below has read them. Batch to ~256 MB of nnz
+        # like the other streaming writers.
         nnz_total = int(row_nnz.sum())
         bpm = max(1, nnz_total // max(1, n_obs)) * (np.dtype(x_dtype).itemsize + np.dtype(indices_dtype).itemsize)
         batch_size = max(1_000, min(200_000, _layout.BATCH_BYTES // bpm))
@@ -267,22 +271,23 @@ def stream_sorted_store(
             store = out.root
             store.attrs["encoding-type"] = "anndata"
             store.attrs["encoding-version"] = "0.1.0"
-            with stage("Writing metadata (sorted obs/obsm; var/varm/varp/uns as-is)"):
-                write_elem(store, "obs", obs.iloc[perm])
-                write_elem(store, "var", var)
-                write_elem(store, "uns", dict(uns))
-                write_elem(
-                    store, "obsm", {k: (v.iloc[perm] if hasattr(v, "iloc") else v[perm]) for k, v in obsm.items()}
-                )
-                write_elem(store, "varm", dict(varm))
-                write_elem(store, "obsp", {})  # empty (non-empty obsp is rejected by callers)
-                write_elem(store, "varp", dict(varp))
+            with autoshard_setting(cfg.chunks.auto_shard):
+                with stage("Writing metadata (sorted obs/obsm; var/varm/varp/uns as-is)"):
+                    write_elem(store, "obs", obs.iloc[perm])
+                    write_elem(store, "var", var)
+                    write_elem(store, "uns", dict(uns))
+                    write_elem(
+                        store, "obsm", {k: (v.iloc[perm] if hasattr(v, "iloc") else v[perm]) for k, v in obsm.items()}
+                    )
+                    write_elem(store, "varm", dict(varm))
+                    write_elem(store, "obsp", {})  # empty (non-empty obsp is rejected by callers)
+                    write_elem(store, "varp", dict(varp))
 
-            temp_mats = [sparse_dataset(tg) for tg in temp_groups]
-            with stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, csr, concat {n_groups} groups)"):
-                _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
-            if after_write is not None:
-                after_write(store)
+                temp_mats = [sparse_dataset(tg) for tg in temp_groups]
+                with stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, csr, concat {n_groups} groups)"):
+                    _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
+                if after_write is not None:
+                    after_write(store)
             snapshot_id = out.finalize()
         except BaseException:
             out.abort()

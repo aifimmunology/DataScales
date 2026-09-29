@@ -8,7 +8,7 @@ import scipy.sparse as sp
 from annizarr._runtime import stage
 from annizarr._sources._matrix import is_backed, matrix_format
 from annizarr._writers._dense import _write_dense_streaming, _write_sparse_as_dense
-from annizarr._writers._encoding import set_anndata_root_attrs, set_raw_group_attrs, write_elem
+from annizarr._writers._encoding import autoshard_setting, set_anndata_root_attrs, set_raw_group_attrs, write_elem
 from annizarr._writers._sparse import _local_tmp_dir, _write_sparse_streaming, write_transposed_sparse
 from annizarr._zarr import get_group
 
@@ -89,7 +89,7 @@ def write_adata(adata: ad.AnnData, store: zarr.Group, cfg: AppConfig, x_override
     # the store and finalising it (consolidate / icechunk commit).
     set_anndata_root_attrs(store)
 
-    with stage("Writing metadata (obs/var/uns/obsm/varm/obsp/varp)"):
+    with autoshard_setting(cfg.chunks.auto_shard), stage("Writing metadata (obs/var/uns/obsm/varm/obsp/varp)"):
         write_elem(store, "obs", adata.obs)
         write_elem(store, "var", adata.var)
         write_elem(store, "uns", dict(adata.uns))
@@ -108,7 +108,8 @@ def write_adata(adata: ad.AnnData, store: zarr.Group, cfg: AppConfig, x_override
         write_matrix(store, x_matrix, "X", cfg)
 
     if adata.layers:
-        write_elem(store, "layers", {})
+        with autoshard_setting(cfg.chunks.auto_shard):
+            write_elem(store, "layers", {})
         layers_group = get_group(store, "layers")
         for name, data in adata.layers.items():
             with stage(f"Writing layers/{name} (shape={data.shape})"):
@@ -117,7 +118,8 @@ def write_adata(adata: ad.AnnData, store: zarr.Group, cfg: AppConfig, x_override
     if adata.raw is not None:
         raw_group = store.require_group("raw")
         set_raw_group_attrs(raw_group)
-        write_elem(raw_group, "var", adata.raw.var)
-        write_elem(raw_group, "varm", dict(adata.raw.varm))
+        with autoshard_setting(cfg.chunks.auto_shard):
+            write_elem(raw_group, "var", adata.raw.var)
+            write_elem(raw_group, "varm", dict(adata.raw.varm))
         with stage(f"Writing raw/X (shape={adata.raw.X.shape})"):
             write_matrix(raw_group, adata.raw.X, "X", cfg)

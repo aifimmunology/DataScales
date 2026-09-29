@@ -1,22 +1,23 @@
-"""Regenerate ``tests/golden/*.tar.gz`` golden fixtures using the OLD ``convert-to-zarr`` CLI.
+"""Regenerate ``tests/golden/*.tar.gz`` golden fixtures using the CURRENT ``annizarr`` API.
 
-Standalone script — stdlib + numpy/scipy/anndata only (no ``annizarr`` import: this must run
-in the OLD tool's pixi env, which doesn't have annizarr installed). It builds tiny,
-deterministic 100 x 50 AnnData fixtures, converts each with the old CLI via ``subprocess``,
-then packs ``input/*.h5ad`` + ``expected/<out>.zarr`` + ``case.json`` (the new-style
-``annizarr.convert`` parameters) into one tarball per case.
+Goldens are self-snapshots: this builds tiny, deterministic 100 x 50 AnnData fixtures,
+converts each with `annizarr.convert(..., cfg=...)` (no subprocess, no old converter, no git
+worktree — just the annizarr package installed in this env), then packs `input/*.h5ad` +
+`expected/<out>.zarr` + `case.json` (the `apply_cli_overrides`-style parameters) into one
+tarball per case. `tests/test_golden_writers.py` extracts a tarball, re-runs
+`annizarr.convert` with the packed parameters, and asserts the result is byte-identical to
+`expected/` — so a refactor that silently changes on-disk layout (chunking, codec, encoding
+attrs, sharding math, …) fails loudly.
 
 Regenerate with (see ../../tests/golden/README.md for the policy):
 
-    cd tools/convert-to-zarr && pixi run -e dev python \
-        ../annizarr/tests/golden/generate.py
+    cd tools/annizarr && pixi run -e default python tests/golden/generate.py
 """
 
 from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -27,13 +28,13 @@ import pandas as pd
 import scipy.sparse as sp
 from anndata import AnnData
 
+import annizarr
+from annizarr.config import apply_cli_overrides, load_config
+
 GOLDEN_DIR = Path(__file__).resolve().parent
 N_OBS, N_VARS = 100, 50
 CELL_TYPES = ("B", "D", "A", "C")  # deliberately non-alphabetical + unsorted assignment
 BATCHES = ("batch1", "batch0")
-
-# convert-to-zarr's x_storage spelling -> annizarr's (see final_buildspec.md §8 unit 3.0)
-_X_STORAGE_OLD = {"csr": "sparse-csr", "csc": "sparse-csc", "dense": "dense"}
 
 
 def _var(n_vars: int = N_VARS) -> pd.DataFrame:
@@ -114,35 +115,14 @@ def build_inputs(input_dir: Path) -> dict[str, Path]:
     return paths
 
 
-def _old_cli_args(case: dict[str, Any], input_paths: list[Path], output: Path) -> list[str]:
-    """Translate a case's NEW-style params dict into OLD `convert-to-zarr` CLI flags."""
-    args: list[str] = ["convert-to-zarr"]
-    if len(input_paths) > 1:
-        args += ["concat-h5ads", "--inputs", *[str(p) for p in input_paths]]
-    else:
-        args += ["convert-h5ad", "--input", str(input_paths[0])]
-    args += ["--output", str(output)]
-    args += ["--x-storage", _X_STORAGE_OLD[case["x_storage"]]]
-    if case.get("backed"):
-        args.append("--backed")
-    if case.get("cpus") is not None:
-        args += ["--cpus", str(case["cpus"])]
-    if case.get("x_row_chunk") is not None:
-        args += ["--x-row-chunk", str(case["x_row_chunk"])]
-    if case.get("x_col_chunk") is not None:
-        args += ["--x-col-chunk", str(case["x_col_chunk"])]
-    if case.get("sparse_flat_chunk") is not None:
-        args += ["--sparse-flat-chunk", str(case["sparse_flat_chunk"])]
-    if case.get("x_shard_factor") is not None:
-        args += ["--x-shard-factor", str(case["x_shard_factor"])]
-    if case.get("sort_by"):
-        args += ["--sort-by", *case["sort_by"]]
-    return args
-
-
 # Each case: `inputs` names the h5ad fixture(s) (see build_inputs); the rest are
-# annizarr-style `apply_cli_overrides` kwargs, packed verbatim into case.json for unit 3.1's
-# test to feed straight into `annizarr.convert(..., cfg=...)`.
+# `apply_cli_overrides`-style kwargs, packed verbatim into case.json for
+# tests/test_golden_writers.py to feed straight into `annizarr.convert(..., cfg=...)`.
+# The 16 cases through `csr_cpus2` predate autosharding (`auto_shard=False`, unchanged
+# on-disk layout); the six `*_autoshard` cases exercise `auto_shard=True` — a small
+# `sparse_flat_chunk` on the sparse ones so nnz spans more than the 8 chunks zarr's
+# `shards="auto"` heuristic requires before it actually shards (see CLAUDE.md's "Zarr v3
+# performance & parallelism" and `_layout.write_grid`).
 CASES: dict[str, dict[str, Any]] = {
     "csr_eager": {"inputs": ["a"], "x_storage": "csr"},
     "csr_backed": {"inputs": ["a"], "x_storage": "csr", "backed": True},
@@ -176,7 +156,41 @@ CASES: dict[str, dict[str, Any]] = {
     "csr_layers_raw_obsm": {"inputs": ["layers_raw"], "x_storage": "csr"},
     "csr_int_counts": {"inputs": ["int_counts"], "x_storage": "csr"},
     "csr_cpus2": {"inputs": ["a"], "x_storage": "csr", "cpus": 2},
+    "csr_eager_autoshard": {"inputs": ["a"], "x_storage": "csr", "sparse_flat_chunk": 100, "auto_shard": True},
+    "csc_eager_autoshard": {"inputs": ["a"], "x_storage": "csc", "sparse_flat_chunk": 100, "auto_shard": True},
+    "csr_layers_raw_obsm_autoshard": {
+        "inputs": ["layers_raw"],
+        "x_storage": "csr",
+        "sparse_flat_chunk": 100,
+        "auto_shard": True,
+    },
+    "concat_csr_autoshard": {"inputs": ["a", "b"], "x_storage": "csr", "sparse_flat_chunk": 100, "auto_shard": True},
+    "sorted_eager_autoshard": {
+        "inputs": ["a"],
+        "x_storage": "csr",
+        "sort_by": ["cell_type", "batch"],
+        "sparse_flat_chunk": 100,
+        "auto_shard": True,
+    },
+    # dense X stays unsharded (x_shard_factor defaults to 1, never "auto"); only the
+    # anndata-written elements (obs/var/obsm) are auto-sharded here.
+    "dense_from_sparse_eager_autoshard": {"inputs": ["a"], "x_storage": "dense", "auto_shard": True},
 }
+
+
+def _build_cfg(case: dict[str, Any]) -> Any:
+    return apply_cli_overrides(
+        load_config(),
+        x_storage=case["x_storage"],
+        backed=case.get("backed", False),
+        cpus=case.get("cpus"),
+        x_row_chunk=case.get("x_row_chunk"),
+        x_col_chunk=case.get("x_col_chunk"),
+        sparse_flat_chunk=case.get("sparse_flat_chunk"),
+        x_shard_factor=case.get("x_shard_factor"),
+        auto_shard=case.get("auto_shard", False),
+        sort_by=case.get("sort_by"),
+    )
 
 
 def _run_case(name: str, case: dict[str, Any], fixture_paths: dict[str, Path], work: Path) -> Path:
@@ -196,12 +210,9 @@ def _run_case(name: str, case: dict[str, Any], fixture_paths: dict[str, Path], w
 
     out_name = f"{name}.zarr"
     output_path = expected_dir / out_name
-    cli_args = _old_cli_args(case, local_inputs, output_path)
-    result = subprocess.run(cli_args, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"case {name!r} failed ({' '.join(cli_args)}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
+    inputs = str(local_inputs[0]) if len(local_inputs) == 1 else [str(p) for p in local_inputs]
+    cfg = _build_cfg(case)
+    annizarr.convert(inputs, output=output_path, cfg=cfg)
 
     case_json = {
         "x_storage": case["x_storage"],
@@ -211,6 +222,7 @@ def _run_case(name: str, case: dict[str, Any], fixture_paths: dict[str, Path], w
         "x_col_chunk": case.get("x_col_chunk"),
         "sparse_flat_chunk": case.get("sparse_flat_chunk"),
         "x_shard_factor": case.get("x_shard_factor"),
+        "auto_shard": case.get("auto_shard", False),
         "sort_by": case.get("sort_by"),
         "inputs": [p.name for p in local_inputs],
         "output": out_name,

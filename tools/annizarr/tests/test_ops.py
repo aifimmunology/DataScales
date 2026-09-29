@@ -153,6 +153,7 @@ def test_rechunk_copies_layers(tmp_path):
     rechunk(str(out), output=str(out2), cfg=AppConfig(chunks=ChunkConfig(sparse_flat_chunk=16)))
     g = zarr.open_group(str(out2), mode="r")
     assert g["layers/gexp/data"].chunks == (32,)  # non-target layer keeps its chunks
+    assert g["layers/gexp/data"].shards is None  # copy-as-is preserves "unsharded" too
     got = ad.read_zarr(str(out2))
     np.testing.assert_allclose(got.layers["gexp"].toarray(), _expected_gexp(adata.X), rtol=1e-5)
 

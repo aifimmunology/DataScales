@@ -12,6 +12,7 @@ import logging
 import math
 import threading
 import time
+import warnings
 from pathlib import Path
 
 import anndata as ad
@@ -23,7 +24,7 @@ import zarr
 
 import annizarr._layout as _layout
 from _readable import assert_anndata_readable
-from annizarr._ops import concat, convert_adata, convert_h5ad
+from annizarr._ops import append, concat, convert_adata, convert_h5ad, rechunk
 from annizarr._runtime import progress, run_parallel
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 
@@ -95,6 +96,25 @@ def _n_shard_objects(store: Path, array: str = "X") -> int:
 
 def _expected_shard_count(n_rows: int, n_cols: int, shards: tuple[int, int]) -> int:
     return math.ceil(n_rows / shards[0]) * math.ceil(n_cols / shards[1])
+
+
+def _n_flat_shard_objects(store: Path, path: str) -> int:
+    """Count shard objects on disk for a 1-D sparse array (e.g. ``path="X/data"``)."""
+    return sum(1 for p in (store / path / "c").rglob("*") if p.is_file())
+
+
+def _forced_autoshard(flat_chunk: int, itemsize: int, chunks_per_shard: int):
+    """Context manager pinning zarr's ``shards="auto"`` heuristic to an exact, known shard
+    multiple of ``flat_chunk`` (rather than relying on its size-derived default), so a forced-
+    sharding test gets a shard several chunks wide while ``cfg.chunks.sparse_flat_chunk`` stays
+    small. See ``zarr.core.chunk_grids._guess_num_chunks_per_axis_shard``: with
+    ``target_shard_size_bytes`` set, chunks accumulate into a shard while
+    ``bytes_per_chunk * (k+1) <= target``; sizing the target to exactly
+    ``chunks_per_shard * bytes_per_chunk`` stops the loop at ``chunks_per_shard``.
+    """
+    bytes_per_chunk = flat_chunk * itemsize
+    target = bytes_per_chunk * chunks_per_shard
+    return zarr.config.set({"array.target_shard_size_bytes": target})
 
 
 @pytest.mark.parametrize(
@@ -184,6 +204,133 @@ def test_sharded_dense_concat_seam_inside_shard_cpus1_matches_cpus4(
         assert zarr.open_group(str(out), mode="r")["X"].shards == EXPECTED_SHARDS
         assert _n_shard_objects(out) == expected_count
         outs[cpus] = out
+
+    _assert_byte_identical(outs[1], outs[4])
+
+
+# Forced-sharding: flat_chunk stays small (500) but data/indices are pinned to a shard exactly
+# 4 chunks wide (2000 elements), several chunks per shard on a nnz that spans dozens of chunks —
+# proving flat_segments/_extend_flat/_copy_flat align writes to the SHARD, not the chunk, grid.
+AUTOSHARD_FLAT_CHUNK = 500
+AUTOSHARD_CHUNKS_PER_SHARD = 4
+AUTOSHARD_ITEMSIZE = 4  # float32 data / int32 indices — same itemsize, same shard shape
+
+
+def _autoshard_cfg(*, cpus: int) -> AppConfig:
+    return AppConfig(
+        io=IOConfig(overwrite=True, x_storage="csr"),
+        chunks=ChunkConfig(sparse_flat_chunk=AUTOSHARD_FLAT_CHUNK, cpus=cpus, auto_shard=True),
+        validation=ValidationConfig(),
+    )
+
+
+def test_forced_autoshard_sparse_write_cpus1_matches_cpus4(tmp_path: Path) -> None:
+    """auto_shard=True with sparse_flat_chunk pinned small; zarr's shard-size heuristic is
+    pinned (via target_shard_size_bytes) to exactly 4 chunks/shard, so data/indices land on a
+    shard grid several chunks wide while cfg still asks for small chunks. cpus=1 vs cpus=4 must
+    still write byte-identical stores, with one shard object per shard on disk (no RMW)."""
+    dense = _rand_dense(N_OBS, N_VARS, seed=11, density=0.25)
+    adata = _adata(dense, sparse=True, seed=11)
+    nnz = adata.X.nnz
+    expected_shard = (AUTOSHARD_FLAT_CHUNK * AUTOSHARD_CHUNKS_PER_SHARD,)
+    expected_count = math.ceil(nnz / expected_shard[0])
+
+    outs: dict[int, Path] = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # our own shards="auto" creation must not warn
+        with _forced_autoshard(AUTOSHARD_FLAT_CHUNK, AUTOSHARD_ITEMSIZE, AUTOSHARD_CHUNKS_PER_SHARD):
+            for cpus in (1, 4):
+                out = tmp_path / f"out_cpus{cpus}.zarr"
+                convert_adata(adata, output=out, cfg=_autoshard_cfg(cpus=cpus))
+                outs[cpus] = out
+
+    for out in outs.values():
+        np.testing.assert_array_equal(_read_x(out), dense)
+        assert_anndata_readable(out)
+        root = zarr.open_group(str(out), mode="r")
+        assert root["X"]["data"].shards == expected_shard
+        assert root["X"]["indices"].shards == expected_shard
+        assert _n_flat_shard_objects(out, "X/data") == expected_count
+        assert _n_flat_shard_objects(out, "X/indices") == expected_count
+
+    _assert_byte_identical(outs[1], outs[4])
+
+
+def test_autoshard_no_warnings_and_setting_not_leaked(tmp_path: Path) -> None:
+    """auto_shard=True must not raise anndata's "will be the default" warning (we set
+    ad.settings.auto_shard_zarr_v3 explicitly around every write_elem call) nor zarr's
+    "experimental" shard-inference warning (suppressed around our own shards="auto"
+    creations); ad.settings.auto_shard_zarr_v3 must be restored afterward, not leaked."""
+    previous = ad.settings.auto_shard_zarr_v3
+    dense = _rand_dense(60, 40, seed=99, density=0.3)
+    adata = _adata(dense, sparse=True, seed=99)
+    out = tmp_path / "out.zarr"
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="csr"),
+        chunks=ChunkConfig(sparse_flat_chunk=50, cpus=1, auto_shard=True),
+        validation=ValidationConfig(),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        convert_adata(adata, output=out, cfg=cfg)
+    assert ad.settings.auto_shard_zarr_v3 is previous
+
+
+def test_append_extends_sharded_data_array(tmp_path: Path) -> None:
+    """append extends an existing store's X (already sharded from a forced-autoshard convert)
+    in place; _extend_flat must cut its copy segments on the array's write grid (the shard,
+    not the chunk), so cpus=1 vs cpus=4 stay byte-identical and the shard stays intact."""
+    base_dense = _rand_dense(120, N_VARS, seed=21, density=0.25)
+    more_dense = _rand_dense(40, N_VARS, seed=22, density=0.25)
+    base = _adata(base_dense, sparse=True, seed=21)
+    more = _adata(more_dense, sparse=True, seed=22)
+    expected = np.vstack([base_dense, more_dense])
+
+    with _forced_autoshard(AUTOSHARD_FLAT_CHUNK, AUTOSHARD_ITEMSIZE, AUTOSHARD_CHUNKS_PER_SHARD):
+        cells_path = tmp_path / "cells.zarr"
+        convert_adata(more, output=cells_path, cfg=_autoshard_cfg(cpus=1))
+
+        outs: dict[int, Path] = {}
+        for cpus in (1, 4):
+            out = tmp_path / f"base_cpus{cpus}.zarr"
+            convert_adata(base, output=out, cfg=_autoshard_cfg(cpus=cpus))
+            append(out, cells=cells_path, cfg=AppConfig(chunks=ChunkConfig(cpus=cpus)))
+            outs[cpus] = out
+
+    for out in outs.values():
+        np.testing.assert_array_equal(_read_x(out), expected)
+        assert_anndata_readable(out)
+        root = zarr.open_group(str(out), mode="r")
+        assert root["X"]["data"].shards is not None  # still sharded after the in-place extend
+
+    _assert_byte_identical(outs[1], outs[4])
+
+
+def test_rechunk_recreates_sharded_sparse_array(tmp_path: Path) -> None:
+    """rechunk's own sparse copy path (rechunk=True) creates a fresh data/indices array under
+    auto_shard, and must partition its copy segments on the NEW array's write grid. cpus=1 vs
+    cpus=4 must write byte-identical output, with the expected shard shape and object count."""
+    dense = _rand_dense(N_OBS, N_VARS, seed=31, density=0.25)
+    adata = _adata(dense, sparse=True, seed=31)
+    src = tmp_path / "src.zarr"
+    convert_adata(adata, output=src, cfg=_cfg("csr", cpus=1, flat_chunk=64))  # unsharded source
+    nnz = adata.X.nnz
+    expected_shard = (AUTOSHARD_FLAT_CHUNK * AUTOSHARD_CHUNKS_PER_SHARD,)
+    expected_count = math.ceil(nnz / expected_shard[0])
+
+    outs: dict[int, Path] = {}
+    with _forced_autoshard(AUTOSHARD_FLAT_CHUNK, AUTOSHARD_ITEMSIZE, AUTOSHARD_CHUNKS_PER_SHARD):
+        for cpus in (1, 4):
+            out = tmp_path / f"out_cpus{cpus}.zarr"
+            rechunk(src, output=out, array="X", cfg=_autoshard_cfg(cpus=cpus))
+            outs[cpus] = out
+
+    for out in outs.values():
+        np.testing.assert_array_equal(_read_x(out), dense)
+        assert_anndata_readable(out)
+        root = zarr.open_group(str(out), mode="r")
+        assert root["X"]["data"].shards == expected_shard
+        assert _n_flat_shard_objects(out, "X/data") == expected_count
 
     _assert_byte_identical(outs[1], outs[4])
 

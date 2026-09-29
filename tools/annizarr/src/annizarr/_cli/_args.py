@@ -60,6 +60,25 @@ def add_chunk_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--x-shard-factor", type=int, help="pack this many chunks per shard (dense X only)")
 
 
+def add_autoshard_arg(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--auto-shard",
+        dest="auto_shard",
+        action="store_true",
+        default=None,
+        help="shard our own 1-D sparse data/indices arrays with zarr's shards='auto', and "
+        "auto-shard anndata's own writes (obs/var/obsm/uns); dense X is unaffected",
+    )
+    group.add_argument(
+        "--no-auto-shard",
+        dest="auto_shard",
+        action="store_false",
+        default=None,
+        help="disable auto-sharding (default; see --auto-shard)",
+    )
+
+
 def build_config(args: argparse.Namespace) -> AppConfig:
     # resolves from --config plus whichever override flags the calling subcommand's
     # parser defined; flags absent from args are simply skipped
@@ -73,6 +92,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         x_col_chunk=getattr(args, "x_col_chunk", None),
         sparse_flat_chunk=getattr(args, "sparse_flat_chunk", None),
         x_shard_factor=getattr(args, "x_shard_factor", None),
+        auto_shard=getattr(args, "auto_shard", None),
         cpus=getattr(args, "cpus", None),
         backed=getattr(args, "backed", None),
         backend=("icechunk" if getattr(args, "ic", False) else None),

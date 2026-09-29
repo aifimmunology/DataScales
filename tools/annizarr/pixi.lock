@@ -1933,7 +1933,7 @@ packages:
 - pypi: ./
   name: annizarr
   version: 0.1.0
-  sha256: 6f9c7168b174a0b1bcf75731fe832c0e6fce830bc0dd8697a84c0b534481e98d
+  sha256: be66b2b00be47c382ad69358c32fd10674d26f1a525fa83b9eb5013e7b34f3ed
   requires_dist:
   - anndata>=0.12.10,<0.13
   - h5py>=3.8

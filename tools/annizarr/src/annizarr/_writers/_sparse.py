@@ -10,10 +10,10 @@ import scipy.sparse as sp
 import zarr
 
 from annizarr import _layout
-from annizarr._layout import x_compressors
+from annizarr._layout import write_grid, x_compressors
 from annizarr._runtime import progress, run_parallel
 from annizarr._sources._matrix import get_indptr, is_backed
-from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._workers import _copy_sparse_segment
 from annizarr._zarr import get_array, shape_attr
 from annizarr.errors import ConversionError
@@ -27,16 +27,19 @@ if TYPE_CHECKING:
     from annizarr._config import AppConfig
 
 
-def flat_segments(nnz_total: int, flat_chunk: int, bytes_per_nnz: int) -> list[tuple[int, int]]:
-    """Split ``[0, nnz_total)`` into ``flat_chunk``-aligned segments (the last one ragged).
+def flat_segments(nnz_total: int, step: int, bytes_per_nnz: int) -> list[tuple[int, int]]:
+    """Split ``[0, nnz_total)`` into ``step``-aligned segments (the last one ragged).
 
-    Segment size is ``k * flat_chunk`` with ``k`` chosen so each segment holds about
-    ``_layout.BATCH_BYTES``. Every segment covers whole output chunks, so parallel writers
-    never share a chunk and no read-modify-write happens.
+    ``step`` must be the output arrays' write grid (:func:`~annizarr._layout.write_grid`:
+    the shard length when sharded, else the chunk length) — not the raw configured chunk
+    size, which would under-align a sharded array and let two tasks share a shard. Segment
+    size is ``k * step`` with ``k`` chosen so each segment holds about ``_layout.BATCH_BYTES``.
+    Every segment covers whole write-grid steps, so parallel writers never share one and no
+    read-modify-write happens.
     """
     if nnz_total <= 0:
         return []
-    seg = max(1, _layout.BATCH_BYTES // max(1, flat_chunk * bytes_per_nnz)) * flat_chunk
+    seg = max(1, _layout.BATCH_BYTES // max(1, step * bytes_per_nnz)) * step
     return [(s, min(s + seg, nnz_total)) for s in range(0, nnz_total, seg)]
 
 
@@ -89,22 +92,26 @@ def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCo
     sp_group = make_sparse_group(group, key, csr=csr, shape=(n_rows, n_cols))
 
     flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
-    data_arr = sp_group.require_array(
-        "data",
-        shape=(nnz_total,),
-        dtype=matrix.dtype,
-        chunks=(flat_chunk,),
-        compressors=x_compressors(),
-        overwrite=True,
-    )
-    indices_arr = sp_group.require_array(
-        "indices",
-        shape=(nnz_total,),
-        dtype=indices_dtype,
-        chunks=(flat_chunk,),
-        compressors=x_compressors(),
-        overwrite=True,
-    )
+    shards = sparse_shards(cfg.chunks.auto_shard)
+    with suppress_autoshard_warning(cfg.chunks.auto_shard):
+        data_arr = sp_group.require_array(
+            "data",
+            shape=(nnz_total,),
+            dtype=matrix.dtype,
+            chunks=(flat_chunk,),
+            shards=shards,
+            compressors=x_compressors(),
+            overwrite=True,
+        )
+        indices_arr = sp_group.require_array(
+            "indices",
+            shape=(nnz_total,),
+            dtype=indices_dtype,
+            chunks=(flat_chunk,),
+            shards=shards,
+            compressors=x_compressors(),
+            overwrite=True,
+        )
     indptr_arr = sp_group.require_array(
         "indptr",
         shape=(n_major + 1,),
@@ -119,12 +126,14 @@ def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCo
     indptr_arr[:] = indptr_full
 
     bytes_per_nnz = np.dtype(matrix.dtype).itemsize + np.dtype(indices_dtype).itemsize
+    # aligned to the arrays' write grid: shards if auto-sharded, else chunks
+    step = write_grid(data_arr)[0]
 
     if backed:
         from zarr.storage import LocalStore
 
-        # Flat-copy chunk-aligned nnz segments in parallel processes. Segments are
-        # multiples of flat_chunk, so each zarr chunk is owned by exactly one worker.
+        # Flat-copy write-grid-aligned nnz segments in parallel processes. Segments are
+        # multiples of the write grid step, so each shard/chunk is owned by exactly one worker.
         src = matrix.group
         store = data_arr.store_path.store
         # the process-pool workers re-open the store by filesystem path (see _workers.py)
@@ -141,12 +150,12 @@ def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCo
                 s1,
                 indices_dtype,
             )
-            for s0, s1 in flat_segments(nnz_total, flat_chunk, bytes_per_nnz)
+            for s0, s1 in flat_segments(nnz_total, step, bytes_per_nnz)
         ]
         run_parallel(_copy_sparse_segment, jobs, cfg.chunks.cpus, mode="processes")
         return
 
-    segments = flat_segments(nnz_total, flat_chunk, bytes_per_nnz)
+    segments = flat_segments(nnz_total, step, bytes_per_nnz)
     tick = progress(len(segments), f"Writing {key}")
     thread_jobs = [
         (data_arr, indices_arr, matrix.data, matrix.indices, s0, s1, indices_dtype, tick) for s0, s1 in segments
@@ -308,17 +317,26 @@ def write_transposed_sparse(
 
         sp_group = make_sparse_group(group, key, csr=(target == "csr"), shape=(n_rows, n_cols))
         flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz))
-        data_arr = sp_group.require_array(
-            "data", shape=(nnz,), dtype=value_dtype, chunks=(flat_chunk,), compressors=x_compressors(), overwrite=True
-        )
-        indices_arr = sp_group.require_array(
-            "indices",
-            shape=(nnz,),
-            dtype=indices_dtype,
-            chunks=(flat_chunk,),
-            compressors=x_compressors(),
-            overwrite=True,
-        )
+        shards = sparse_shards(cfg.chunks.auto_shard)
+        with suppress_autoshard_warning(cfg.chunks.auto_shard):
+            data_arr = sp_group.require_array(
+                "data",
+                shape=(nnz,),
+                dtype=value_dtype,
+                chunks=(flat_chunk,),
+                shards=shards,
+                compressors=x_compressors(),
+                overwrite=True,
+            )
+            indices_arr = sp_group.require_array(
+                "indices",
+                shape=(nnz,),
+                dtype=indices_dtype,
+                chunks=(flat_chunk,),
+                shards=shards,
+                compressors=x_compressors(),
+                overwrite=True,
+            )
         indptr_arr = sp_group.require_array(
             "indptr", shape=(n_target_major + 1,), dtype=indptr_dtype, chunks=(n_target_major + 1,), overwrite=True
         )
@@ -332,10 +350,10 @@ def write_transposed_sparse(
                 continue
             order = np.argsort(np.asarray(buckets[bi]["tgt"][:m]), kind="stable")
             o0, o1 = int(target_indptr[edges[bi]]), int(target_indptr[edges[bi + 1]])
-            # o0/o1 are nnz-derived, not flat_chunk-aligned, so a boundary chunk can get a
-            # read-modify-write from each of its two adjacent bands; this loop is serial (no
-            # concurrent writers), so that RMW is a perf cost bounded to one chunk per band,
-            # never a correctness risk.
+            # o0/o1 are nnz-derived, not aligned to the write grid (shard or chunk), so a
+            # boundary shard/chunk can get a read-modify-write from each of its two adjacent
+            # bands; this loop is serial (no concurrent writers), so that RMW is a perf cost
+            # bounded to one write-grid step per band, never a correctness risk.
             data_arr[o0:o1] = np.asarray(buckets[bi]["val"][:m])[order]
             indices_arr[o0:o1] = np.asarray(buckets[bi]["src"][:m])[order].astype(indices_dtype)
     finally:

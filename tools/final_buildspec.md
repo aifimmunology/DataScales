@@ -34,6 +34,7 @@ sweep that brings the existing implementation up to them.
 | Errors | One hierarchy rooted at `AnzError`; children `ConversionError`, `StorageError`, `ValidationError`, `RepoError`. CLI catches `AnzError` only. |
 | Output of ops | *Assumption:* every op returns a frozen `OpResult(path, n_obs, n_vars, snapshot_id)`; warnings go through `logging`, not return values. |
 | Mutation policy | Additive ops (`append`, `add-expr`) write in place; `convert`, `rechunk`, `sort` write a new store to `OUT.tmp-<uuid>`, verify, rename. One commit per op on an Icechunk repo, through `Repo`. |
+| Autosharding (added 2026-09-29) | Writers partition concurrent writes from the **created array's** grid (`_layout.write_grid(arr)` = shards if sharded else chunks), never from config, so any sharding decision by zarr or anndata keeps writes aligned. `ChunkConfig.auto_shard` (CLI `--auto-shard/--no-auto-shard`) opts anndata-written elements and our 1-D sparse arrays into `shards="auto"`; **default `False`**: measured on a 100k × 2k CSR store, zarr's heuristic (2 chunks per shard) cut objects by 32% but slowed row reads 15–36% (`benchmarking_results/autoshard/`). Goldens are self-snapshots of annizarr's own output, 16 unsharded + 6 autoshard cases. |
 | Memory | Every op has a streaming path and works on a store larger than RAM. The eager path is an optimisation used only below a documented threshold (`io.eager_max_bytes`, default 2 GiB, *assumption*). |
 
 ---
@@ -428,7 +429,7 @@ output; re-running `add-expr` errors without `--overwrite`; slow test passes und
 ## 11. Budget and agent protocol
 
 - Target: under $200 total (raised by Alex 2026-09-28); warn and pause when close.
-- **Actuals (Sonnet subagent tokens):** surveys 0.25M · Phase 1 2.83M (1a 0.51M, 1b 0.68M, 1c 1.03M, R1+fix 0.57M) · Phase 2 0.17M · Phase 3 0.9M (goldens 0.19M, props 0.10M, writers ≈0.4M, R3+fix 0.25M, bench 0.15M) · Phase 4 0.31M · Phase 5 1.44M (5.1+5.2 0.33M, 5.3 0.42M, R5+fix 0.69M) · Phase 6 0.22M. **Total ≈ 6.4M Sonnet tokens; all six phases complete 2026-09-29** (commits a4adde0 → 5cd143e on `AnniZarr`).
+- **Actuals (Sonnet subagent tokens):** surveys 0.25M · Phase 1 2.83M (1a 0.51M, 1b 0.68M, 1c 1.03M, R1+fix 0.57M) · Phase 2 0.17M · Phase 3 0.9M (goldens 0.19M, props 0.10M, writers ≈0.4M, R3+fix 0.25M, bench 0.15M) · Phase 4 0.31M · Phase 5 1.44M (5.1+5.2 0.33M, 5.3 0.42M, R5+fix 0.69M) · Phase 6 0.22M · autosharding follow-up 0.57M (unit 0.43M, review 0.14M). **Total ≈ 7.0M Sonnet tokens; all six phases + the autosharding follow-up complete 2026-09-29.**
 - Estimate (Sonnet tokens): Phase 1 ≈ 2.3M (1c sweep adds ≈ 0.8M), Phase 2 ≈ 0.2M, Phase 3 ≈
   1.0M, Phase 4 ≈ 0.2M, Phase 5 ≈ 0.8M, Phase 6 ≈ 0.3M, reviews ≈ 0.7M → ≈ 5.5M. Fable turns
   capped at about three per phase.

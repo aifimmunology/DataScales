@@ -6,10 +6,10 @@ import numpy as np
 import scipy.sparse as sp
 import zarr
 
-from annizarr._layout import band_plan, dense_shards, x_compressors
+from annizarr._layout import band_plan, dense_shards, write_grid, x_compressors
 from annizarr._runtime import progress, run_parallel
 from annizarr._sources._matrix import get_indptr, is_backed, matrix_format
-from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._sparse import flat_segments
 from annizarr.errors import ConversionError
 
@@ -99,7 +99,8 @@ def _write_concatenated_dense(
     )
     set_array_attrs(zarr_arr)
 
-    block_row, block_col = layout.block
+    # aligned to the array's write grid: shards if sharded, else chunks
+    block_row, block_col = write_grid(zarr_arr)
     offsets = tuple(int(v) for v in np.cumsum([0, *n_obs_each]))
     fmts = tuple(matrix_format(m) for m in matrices)
     matrices_t = tuple(matrices)
@@ -159,22 +160,26 @@ def _write_concatenated_csr(
     sp_group = make_sparse_group(group, key, csr=True, shape=(n_obs_total, n_vars))
 
     flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
-    data_arr = sp_group.require_array(
-        "data",
-        shape=(nnz_total,),
-        dtype=data_dtype,
-        chunks=(flat_chunk,),
-        compressors=x_compressors(),
-        overwrite=True,
-    )
-    indices_arr = sp_group.require_array(
-        "indices",
-        shape=(nnz_total,),
-        dtype=indices_dtype,
-        chunks=(flat_chunk,),
-        compressors=x_compressors(),
-        overwrite=True,
-    )
+    shards = sparse_shards(cfg.chunks.auto_shard)
+    with suppress_autoshard_warning(cfg.chunks.auto_shard):
+        data_arr = sp_group.require_array(
+            "data",
+            shape=(nnz_total,),
+            dtype=data_dtype,
+            chunks=(flat_chunk,),
+            shards=shards,
+            compressors=x_compressors(),
+            overwrite=True,
+        )
+        indices_arr = sp_group.require_array(
+            "indices",
+            shape=(nnz_total,),
+            dtype=indices_dtype,
+            chunks=(flat_chunk,),
+            shards=shards,
+            compressors=x_compressors(),
+            overwrite=True,
+        )
     indptr_arr = sp_group.require_array(
         "indptr",
         shape=(n_obs_total + 1,),
@@ -204,7 +209,8 @@ def _write_concatenated_csr(
     any_unsafe = any(_is_thread_unsafe(m) for m in matrices)
 
     bytes_per_nnz = np.dtype(data_dtype).itemsize + np.dtype(indices_dtype).itemsize
-    segments = flat_segments(nnz_total, flat_chunk, bytes_per_nnz)
+    # aligned to the arrays' write grid: shards if auto-sharded, else chunks
+    segments = flat_segments(nnz_total, write_grid(data_arr)[0], bytes_per_nnz)
     tick = progress(len(segments), f"Writing {key} (concat)")
     jobs = [
         (data_arr, indices_arr, flat_pairs, nnz_offsets, s0, s1, data_dtype, indices_dtype, tick) for s0, s1 in segments

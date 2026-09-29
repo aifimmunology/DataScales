@@ -102,6 +102,24 @@ def test_eager_flag_forces_eager_load(tmp_path: Path) -> None:
     assert "backed" not in mocked.call_args_list[0].kwargs
 
 
+def test_auto_shard_and_no_auto_shard_are_mutually_exclusive(tmp_path: Path) -> None:
+    h5 = make_h5ad(tmp_path, "in.h5ad")
+    with pytest.raises(SystemExit) as exc:
+        main(["convert", str(h5), "-o", str(tmp_path / "out.zarr"), "--auto-shard", "--no-auto-shard"])
+    assert exc.value.code == 2
+
+
+def test_convert_auto_shard_flag_shards_sparse_arrays(tmp_path: Path) -> None:
+    import zarr
+
+    h5 = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=30, n_vars=20))
+    out = tmp_path / "out.zarr"
+    assert main(["convert", str(h5), "-o", str(out), "--x-storage", "csr", "--auto-shard"]) == 0
+    assert_anndata_readable(out)
+    root = zarr.open_group(str(out), mode="r")
+    assert root["X"]["data"].shards is not None
+
+
 def test_overwrite_gating(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     h5 = make_h5ad(tmp_path, "in.h5ad")
     out = tmp_path / "out.zarr"

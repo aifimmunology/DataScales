@@ -20,6 +20,12 @@ cpus = 1
 # Pack dense X inner chunks into shards of (x_row_chunk, x_col_chunk) * factor. 1 = no sharding.
 # Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only).
 x_shard_factor = 1
+# Shard our own 1-D sparse arrays (data/indices of X, layers, raw.X, and the
+# add-expr/rechunk/sort-created ones) with zarr's shards="auto", and auto-shard anndata's own
+# writes (obs/var/obsm/uns/...) via ad.settings.auto_shard_zarr_v3. Dense X is unaffected (it
+# keeps the explicit x_shard_factor above). See benchmarking_results/autoshard/README.md for
+# the read-latency measurement behind this default.
+auto_shard = false
 
 [validation]
 reject_spatial = true

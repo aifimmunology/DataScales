@@ -5,10 +5,11 @@ from typing import TYPE_CHECKING, Any
 import zarr
 
 from annizarr._config import AppConfig, load_config, resolve_backend_cfg
-from annizarr._layout import dense_shards
+from annizarr._layout import dense_shards, write_grid
 from annizarr._ops._result import OpResult
 from annizarr._runtime import configure_runtime, run_parallel, stage
 from annizarr._storage import check_output_target, open_input_group, open_output_store, store_name
+from annizarr._writers._encoding import sparse_shards, suppress_autoshard_warning
 from annizarr._zarr import get_group, shape_attr
 from annizarr.errors import ConversionError
 
@@ -57,7 +58,7 @@ def rechunk(
     import anndata as ad
     from anndata.io import read_elem
 
-    from annizarr._writers._encoding import write_elem
+    from annizarr._writers._encoding import autoshard_setting, write_elem
 
     if cfg is None:
         cfg = load_config()
@@ -82,40 +83,44 @@ def rechunk(
         dst = out.root
         dst.attrs.update(dict(src.attrs))
 
-        with stage("Copying metadata elements"):
-            for key in _SMALL_ELEMS:
-                if key in src:
-                    write_elem(dst, key, read_elem(src[key]))
-            # obsm/obsp scale with n_obs — stream arrays and sparse groups, chunks preserved
-            for key in ("obsm", "obsp"):
-                if key not in src:
-                    continue
-                src_group = get_group(src, key)
-                g = dst.require_group(key)
-                g.attrs.update(dict(src_group.attrs))
-                for child in src_group:
-                    node = src_group[child]
-                    if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in ("csr_matrix", "csc_matrix"):
-                        _copy_matrix(node, dst, f"{key}/{child}", cfg, rechunk=False)
-                    else:
-                        write_elem(g, child, read_elem(node))
-            if "raw" in src:
-                src_raw = get_group(src, "raw")
-                raw = dst.require_group("raw")
-                raw.attrs.update(dict(src_raw.attrs))
-                for key in ("var", "varm"):
-                    if key in src_raw:
-                        write_elem(raw, key, read_elem(src_raw[key]))
+        with autoshard_setting(cfg.chunks.auto_shard):
+            with stage("Copying metadata elements"):
+                for key in _SMALL_ELEMS:
+                    if key in src:
+                        write_elem(dst, key, read_elem(src[key]))
+                # obsm/obsp scale with n_obs — stream arrays and sparse groups, chunks preserved
+                for key in ("obsm", "obsp"):
+                    if key not in src:
+                        continue
+                    src_group = get_group(src, key)
+                    g = dst.require_group(key)
+                    g.attrs.update(dict(src_group.attrs))
+                    for child in src_group:
+                        node = src_group[child]
+                        if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in (
+                            "csr_matrix",
+                            "csc_matrix",
+                        ):
+                            _copy_matrix(node, dst, f"{key}/{child}", cfg, rechunk=False)
+                        else:
+                            write_elem(g, child, read_elem(node))
+                if "raw" in src:
+                    src_raw = get_group(src, "raw")
+                    raw = dst.require_group("raw")
+                    raw.attrs.update(dict(src_raw.attrs))
+                    for key in ("var", "varm"):
+                        if key in src_raw:
+                            write_elem(raw, key, read_elem(src_raw[key]))
 
-        if "layers" in src:
-            src_layers = get_group(src, "layers")
-            layers = dst.require_group("layers")
-            layers.attrs.update(dict(src_layers.attrs))
+            if "layers" in src:
+                src_layers = get_group(src, "layers")
+                layers = dst.require_group("layers")
+                layers.attrs.update(dict(src_layers.attrs))
 
-        for key in matrix_keys:
-            rechunked = key == array
-            with stage(f"{'Rechunking' if rechunked else 'Copying'} {key}"):
-                _copy_matrix(src[key], dst, key, cfg, rechunk=rechunked)
+            for key in matrix_keys:
+                rechunked = key == array
+                with stage(f"{'Rechunking' if rechunked else 'Copying'} {key}"):
+                    _copy_matrix(src[key], dst, key, cfg, rechunk=rechunked)
 
         n_obs, n_vars = _matrix_shape(src["X"])
         snapshot_id = out.finalize()
@@ -144,12 +149,11 @@ def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk:
             row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
             col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
             layout = dense_shards(row_chunk, col_chunk, n_rows, n_cols, cfg.chunks.x_shard_factor)
-            out_chunks, shards, (block_row, block_col) = layout.chunks, layout.shards, layout.block
+            out_chunks, shards = layout.chunks, layout.shards
         else:
             out_chunks = (node.chunks[0], node.chunks[1])
             node_shards = node.shards
             shards = (node_shards[0], node_shards[1]) if node_shards is not None else None
-            block_row, block_col = shards or out_chunks
         out = parent.require_array(
             name,
             shape=node.shape,
@@ -160,6 +164,9 @@ def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk:
             overwrite=True,
         )
         out.attrs.update(dict(node.attrs))
+        # aligned to the array's write grid, read off `out` as created (not recomputed from
+        # config): shards if sharded, else chunks
+        block_row, block_col = write_grid(out)
         jobs = [
             (node, out, r0, min(r0 + block_row, n_rows), c0, min(c0 + block_col, n_cols))
             for r0 in range(0, n_rows, block_row)
@@ -177,19 +184,31 @@ def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk:
     g = parent.require_group(name)
     g.attrs.update(dict(node.attrs))
     nnz = int(node["data"].shape[0])
-    flat = min(cfg.chunks.sparse_flat_chunk, max(1, nnz)) if rechunk else node["data"].chunks[0]
+    # rechunk=True: a freshly-chosen flat chunk, auto-sharded per cfg like any array this op
+    # creates. rechunk=False (copy-as-is, e.g. obsm/obsp or an untouched matrix_key): preserve
+    # the source's own chunk AND shard shape exactly, so a copy never silently drops sharding.
+    if rechunk:
+        flat = min(cfg.chunks.sparse_flat_chunk, max(1, nnz))
+        out_shards = sparse_shards(cfg.chunks.auto_shard)
+    else:
+        flat = node["data"].chunks[0]
+        out_shards = node["data"].shards
     for arr_name in ("data", "indices"):
         src_a = node[arr_name]
-        out = g.require_array(
-            arr_name,
-            shape=src_a.shape,
-            dtype=src_a.dtype,
-            chunks=(flat,),
-            compressors=src_a.compressors,
-            overwrite=True,
-        )
+        with suppress_autoshard_warning(rechunk and cfg.chunks.auto_shard):
+            out = g.require_array(
+                arr_name,
+                shape=src_a.shape,
+                dtype=src_a.dtype,
+                chunks=(flat,),
+                shards=out_shards,
+                compressors=src_a.compressors,
+                overwrite=True,
+            )
         out.attrs.update(dict(src_a.attrs))
-        seg = max(1, _layout.BATCH_BYTES // (flat * src_a.dtype.itemsize)) * flat
+        # aligned to the OUTPUT array's write grid, read off `out` as created
+        step = write_grid(out)[0]
+        seg = max(1, _layout.BATCH_BYTES // (step * src_a.dtype.itemsize)) * step
         flat_jobs = [(src_a, out, s0, min(s0 + seg, nnz)) for s0 in range(0, nnz, seg)]
         run_parallel(_copy_flat, flat_jobs, cfg.chunks.cpus)
     ip = node["indptr"]

@@ -1,11 +1,10 @@
-"""Golden-file tests: the NEW writers must reproduce the OLD converter's on-disk bytes.
+"""Golden-file tests: annizarr's own writers must reproduce a pinned on-disk layout.
 
-Fixtures live in ``tests/golden/<case>.tar.gz`` (see ``tests/golden/README.md``), each built by
-``tests/golden/generate.py`` from the OLD ``tools/convert-to-zarr`` CLI. This test extracts a
-tarball, runs the current (still dask-based, Phase 1 restructure only) ``annizarr.convert``
-with the packed parameters, and asserts the result matches the packed ``expected/`` store
-file-for-file. It proves the harness now, before the Phase 3 dask-free rewrite has to prove it
-again against the same fixtures.
+Fixtures live in ``tests/golden/<case>.tar.gz`` (see ``tests/golden/README.md``), each a
+self-snapshot built by ``tests/golden/generate.py`` from the CURRENT ``annizarr`` package. This
+test extracts a tarball, re-runs ``annizarr.convert`` with the packed parameters, and asserts
+the result matches the packed ``expected/`` store file-for-file — so a refactor that silently
+changes chunking, codecs, encoding attrs, or sharding math fails loudly instead of drifting.
 """
 
 from __future__ import annotations
@@ -63,6 +62,7 @@ def _build_cfg(case: dict[str, Any]) -> Any:
         x_col_chunk=case.get("x_col_chunk"),
         sparse_flat_chunk=case.get("sparse_flat_chunk"),
         x_shard_factor=case.get("x_shard_factor"),
+        auto_shard=case.get("auto_shard", False),
         sort_by=case.get("sort_by"),
     )
 

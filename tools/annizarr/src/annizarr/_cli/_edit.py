@@ -5,6 +5,7 @@ import logging
 import sys
 
 from annizarr._cli._args import (
+    add_autoshard_arg,
     add_branch_arg,
     add_chunk_args,
     add_config_arg,
@@ -32,6 +33,7 @@ def add_add_expr_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     p.add_argument("--layer", default="gexp", help="layer name")
     p.add_argument("--chunk-elems", type=int, default=1_000_000, help="chunk size (elements) for the layer")
     p.add_argument("--target-sum", type=float, default=1e4, help="library-size normalization target")
+    add_autoshard_arg(p)
     add_overwrite_arg(p)
     add_branch_arg(p)
     add_message_arg(p)
@@ -66,6 +68,7 @@ def add_rechunk_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     p.add_argument("-o", "--output", required=True, help="output store path or URI")
     p.add_argument("--array", default="X", help="matrix element to rechunk (X, layers/<name>, raw/X)")
     add_chunk_args(p)
+    add_autoshard_arg(p)
     add_cpus_arg(p)
     add_overwrite_arg(p)
     add_consolidate_arg(p)
@@ -102,6 +105,7 @@ def add_sort_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
         help="obs column(s) to sort by, primary key first",
     )
     add_cpus_arg(p)
+    add_autoshard_arg(p)
     add_overwrite_arg(p)
     add_consolidate_arg(p)
     add_ic_arg(p)

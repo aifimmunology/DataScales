@@ -338,13 +338,14 @@ def _append_arrays(
 
 
 def _extend_flat(dst_a: Any, src_a: Any, off: int, n_src: int, cpus: int) -> None:
-    # resizes dst by n_src and copies src[:n_src] to dst[off:]; after the seam, cuts land
-    # on dst chunk multiples, so segments are disjoint whole-chunk writes (threaded, no RMW)
+    # resizes dst by n_src and copies src[:n_src] to dst[off:]; after the seam, cuts land on
+    # dst's write-grid multiples (shard if sharded, else chunk), so segments are disjoint
+    # whole-shard/chunk writes (threaded, no RMW)
     dst_a.resize((off + n_src,))
-    chunk0 = dst_a.chunks[0]
-    step = max(chunk0, (_layout.BATCH_BYTES // max(1, chunk0 * dst_a.dtype.itemsize)) * chunk0)
+    grid0 = _layout.write_grid(dst_a)[0]
+    step = max(grid0, (_layout.BATCH_BYTES // max(1, grid0 * dst_a.dtype.itemsize)) * grid0)
     cuts = [0]
-    seam = (-off) % chunk0
+    seam = (-off) % grid0
     if 0 < seam < n_src:
         cuts.append(seam)
     while cuts[-1] < n_src:

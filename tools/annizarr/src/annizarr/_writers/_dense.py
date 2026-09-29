@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from annizarr._layout import band_plan, dense_shards, x_compressors
+from annizarr._layout import band_plan, dense_shards, write_grid, x_compressors
 from annizarr._runtime import progress, run_parallel
 from annizarr._sources._matrix import is_backed
 from annizarr._writers._concat import _is_thread_unsafe
@@ -66,7 +66,8 @@ def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
     )
     set_array_attrs(zarr_arr)
 
-    block_row, block_col = layout.block
+    # aligned to the array's write grid: shards if sharded, else chunks
+    block_row, block_col = write_grid(zarr_arr)
     if _is_thread_unsafe(matrix):
         from zarr.storage import LocalStore
 
@@ -113,7 +114,7 @@ def _write_dense_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
 
     # Blocks match the write grid (shard shape when sharded, else chunk shape), so every
     # write covers a whole, disjoint block — no read-modify-write, no synchronisation needed.
-    block_row, block_col = layout.block
+    block_row, block_col = write_grid(zarr_arr)
     backed = is_backed(matrix)  # h5py-backed dense isn't thread-safe: force a serial pass
     blocks = [(r0, r1, c0, c1) for r0, r1 in band_plan(n_rows, block_row) for c0, c1 in band_plan(n_cols, block_col)]
     tick = progress(len(blocks), f"Writing {key}")

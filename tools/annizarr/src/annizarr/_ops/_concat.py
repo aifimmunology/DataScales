@@ -14,7 +14,7 @@ from annizarr._sources import close_backed_if_needed, ensure_csr, load_h5ad
 from annizarr._storage import check_output_target, open_output_store
 from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers import _write_concatenated_csr, _write_concatenated_dense
-from annizarr._writers._encoding import set_anndata_root_attrs, write_elem
+from annizarr._writers._encoding import autoshard_setting, set_anndata_root_attrs, write_elem
 from annizarr.errors import AnzError, ConversionError
 
 if TYPE_CHECKING:
@@ -209,20 +209,21 @@ def concat(
         try:
             set_anndata_root_attrs(out.root)
 
-            with stage("Writing metadata (obs, var, empty obsm/varm/uns/obsp/varp)"):
-                write_elem(out.root, "obs", obs_concat)
-                write_elem(out.root, "var", ref_var)
-                write_elem(out.root, "uns", {})
-                write_elem(out.root, "obsm", {})
-                write_elem(out.root, "varm", {})
-                write_elem(out.root, "obsp", {})
-                write_elem(out.root, "varp", {})
+            with autoshard_setting(cfg.chunks.auto_shard):
+                with stage("Writing metadata (obs, var, empty obsm/varm/uns/obsp/varp)"):
+                    write_elem(out.root, "obs", obs_concat)
+                    write_elem(out.root, "var", ref_var)
+                    write_elem(out.root, "uns", {})
+                    write_elem(out.root, "obsm", {})
+                    write_elem(out.root, "varm", {})
+                    write_elem(out.root, "obsp", {})
+                    write_elem(out.root, "varp", {})
 
-            with stage(f"Writing X (n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"):
-                if cfg.io.x_storage == "dense":
-                    _write_concatenated_dense(out.root, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
-                else:  # csr
-                    _write_concatenated_csr(out.root, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
+                with stage(f"Writing X (n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"):
+                    if cfg.io.x_storage == "dense":
+                        _write_concatenated_dense(out.root, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
+                    else:  # csr
+                        _write_concatenated_csr(out.root, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
 
             snapshot_id = out.finalize()
         except BaseException:

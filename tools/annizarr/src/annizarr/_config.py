@@ -87,6 +87,17 @@ class ChunkConfig:
     x_shard_factor
         Pack this many chunks per shard along each axis of dense X (``1`` = no
         sharding; sparse output ignores it). See :func:`annizarr._layout.dense_shards`.
+    auto_shard
+        Shard our own 1-D sparse arrays (``data``/``indices`` of X, layers, raw.X, and the
+        add-expr/rechunk/sort-created ones) with zarr's ``shards="auto"``, and set
+        ``ad.settings.auto_shard_zarr_v3`` around every ``write_elem`` call this op makes
+        (obs/var columns, obsm, uns, …), so anndata's own writes are auto-sharded too.
+        Cuts object/file count on remote or many-small-chunk stores at a small write-time
+        cost (see :func:`annizarr._writers._encoding.sparse_shards`). Dense X is unaffected
+        — it keeps the explicit ``x_shard_factor`` above, never ``shards="auto"``. Default
+        chosen from a read-latency benchmark (see
+        ``benchmarking_results/autoshard/README.md``); ``False`` reproduces the pre-autoshard
+        on-disk layout exactly.
     """
 
     x_row_chunk: int = 2048
@@ -94,6 +105,7 @@ class ChunkConfig:
     sparse_flat_chunk: int = 1_000_000
     cpus: int = 1
     x_shard_factor: int = 1
+    auto_shard: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +344,7 @@ def apply_cli_overrides(
     x_col_chunk: int | None = None,
     sparse_flat_chunk: int | None = None,
     x_shard_factor: int | None = None,
+    auto_shard: bool | None = None,
     cpus: int | None = None,
     backed: bool | None = None,
     backend: str | None = None,
@@ -345,7 +358,7 @@ def apply_cli_overrides(
     config
         Base configuration, typically from :func:`load_config`.
     overwrite, consolidate_metadata, x_storage, x_row_chunk, x_col_chunk,
-    sparse_flat_chunk, x_shard_factor, cpus, backed, backend, sort_by, obs_columns
+    sparse_flat_chunk, x_shard_factor, auto_shard, cpus, backed, backend, sort_by, obs_columns
         Per-field overrides; a value of ``None`` leaves the corresponding field
         untouched. ``sort_by`` also sets ``grouping.enabled = True``. ``backed`` is
         itself tri-state on :class:`IOConfig` (``None`` = auto-select); passing
@@ -380,6 +393,8 @@ def apply_cli_overrides(
         chunk_cfg = replace(chunk_cfg, sparse_flat_chunk=sparse_flat_chunk)
     if x_shard_factor is not None:
         chunk_cfg = replace(chunk_cfg, x_shard_factor=x_shard_factor)
+    if auto_shard is not None:
+        chunk_cfg = replace(chunk_cfg, auto_shard=auto_shard)
     if cpus is not None:
         chunk_cfg = replace(chunk_cfg, cpus=cpus)
     if sort_by is not None:

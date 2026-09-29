@@ -91,6 +91,13 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 addopts = "-m 'not slow' --cov=annizarr --cov-report=term-missing:skip-covered --cov-fail-under=85"
 markers = ["slow: large synthetic store, run with -m slow"]
+filterwarnings = [
+  # zarr v3 consolidated metadata isn't part of the spec yet — expected, exercised on purpose
+  # by tests/test_ops.py::test_ops_on_consolidated_store and tests/test_storage.py.
+  "ignore:Consolidated metadata is currently not part in the Zarr format 3 specification:UserWarning",
+  # fixtures deliberately build duplicate-obs-name stores to test append's overlap handling.
+  "ignore:Observation names are not unique:UserWarning",
+]
 
 [tool.coverage.run]
 source = ["annizarr"]

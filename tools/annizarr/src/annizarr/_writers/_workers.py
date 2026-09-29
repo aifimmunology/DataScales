@@ -6,8 +6,12 @@ from annizarr._zarr import get_array
 
 # These band workers run in separate processes (h5py is not thread-safe, but independent
 # read-only file handles across processes are). They are module-level so the process
-# pool can pickle them. Each worker writes a chunk-aligned region, so no two workers
-# ever touch the same zarr chunk and no lock is needed.
+# pool can pickle them. Each worker writes a region the caller already aligned to the
+# destination array's write grid (_layout.write_grid: shard shape if sharded, else chunk
+# shape — see the job lists built in _writers/_sparse.py and _writers/_dense.py), so no two
+# workers ever touch the same shard/chunk and no lock is needed. Workers receive the
+# resulting offsets as plain job args rather than re-deriving the grid themselves, since they
+# reopen the array by filesystem path in a fresh process (cheaper than a second zarr open).
 
 
 def _copy_sparse_segment(

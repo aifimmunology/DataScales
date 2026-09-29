@@ -12,6 +12,7 @@ def test_default_config() -> None:
     assert isinstance(cfg, AppConfig)
     assert cfg.chunks.x_row_chunk == 2048
     assert cfg.io.x_storage == "csr"
+    assert cfg.chunks.auto_shard is False
 
 
 def test_default_backed_is_auto() -> None:
@@ -84,6 +85,16 @@ def test_cli_override() -> None:
     assert cfg2.chunks.x_row_chunk == 128
     assert cfg2.io.overwrite is True
     assert cfg2.io.x_storage == "csr"
+
+
+def test_cli_override_auto_shard() -> None:
+    cfg = load_config(None)
+    assert cfg.chunks.auto_shard is False
+    cfg2 = apply_cli_overrides(cfg, auto_shard=True)
+    assert cfg2.chunks.auto_shard is True
+    # None means "don't touch it" (neither --auto-shard nor --no-auto-shard given)
+    cfg3 = apply_cli_overrides(cfg2, auto_shard=None)
+    assert cfg3.chunks.auto_shard is True
 
 
 def test_invalid_x_storage_rejected(tmp_path: Path) -> None:

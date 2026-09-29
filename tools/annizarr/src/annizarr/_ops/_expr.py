@@ -15,7 +15,7 @@ from annizarr._layout import x_compressors
 from annizarr._ops._result import OpResult
 from annizarr._runtime import configure_runtime, stage
 from annizarr._storage import open_store_rw
-from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._sparse import _local_tmp_dir, write_transposed_sparse
 from annizarr._zarr import get_array, get_group, shape_attr
 from annizarr.errors import ConversionError
@@ -154,9 +154,21 @@ def write_expr_layer(
 
     if fmt == "csr":
         g = _sparse_layer(
-            layers, layer, "csr_matrix", (n_obs, n_vars), nnz, idx_arr.dtype, indptr_dtype, chunk_elems, target_sum
+            layers,
+            layer,
+            "csr_matrix",
+            (n_obs, n_vars),
+            nnz,
+            idx_arr.dtype,
+            indptr_dtype,
+            chunk_elems,
+            target_sum,
+            cfg.chunks.auto_shard,
         )
         g["indptr"][:] = indptr.astype(indptr_dtype)
+        # row_step bands are nnz-derived, not aligned to the write grid (shard or chunk); this
+        # loop is serial (no concurrent writers), so a boundary write-grid step can get a
+        # read-modify-write, but only as a bounded perf cost, never a correctness risk.
         with stage(f"Writing layers/{layer} (csr, nnz={nnz})"):
             for b0 in range(0, n_obs, row_step):
                 b1 = min(b0 + row_step, n_obs)
@@ -316,15 +328,32 @@ def _sparse_layer(
     indptr_dtype: Any,
     chunk_elems: int,
     target_sum: float,
+    auto_shard: bool,
 ) -> Any:
     g = make_sparse_group(layers, name, csr=(enc == "csr_matrix"), shape=shape)
     g.attrs[_TARGET_SUM_ATTR] = float(target_sum)
     n_major = shape[0] if enc == "csr_matrix" else shape[1]
     flat = min(chunk_elems, max(1, nnz))
-    g.require_array("data", shape=(nnz,), dtype=np.float32, chunks=(flat,), compressors=x_compressors(), overwrite=True)
-    g.require_array(
-        "indices", shape=(nnz,), dtype=indices_dtype, chunks=(flat,), compressors=x_compressors(), overwrite=True
-    )
+    shards = sparse_shards(auto_shard)
+    with suppress_autoshard_warning(auto_shard):
+        g.require_array(
+            "data",
+            shape=(nnz,),
+            dtype=np.float32,
+            chunks=(flat,),
+            shards=shards,
+            compressors=x_compressors(),
+            overwrite=True,
+        )
+        g.require_array(
+            "indices",
+            shape=(nnz,),
+            dtype=indices_dtype,
+            chunks=(flat,),
+            shards=shards,
+            compressors=x_compressors(),
+            overwrite=True,
+        )
     g.require_array("indptr", shape=(n_major + 1,), dtype=indptr_dtype, chunks=(n_major + 1,), overwrite=True)
     for a in ("data", "indices", "indptr"):
         set_array_attrs(get_array(g, a))
