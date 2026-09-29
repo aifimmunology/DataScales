@@ -4,6 +4,7 @@ import importlib
 import logging
 from typing import TYPE_CHECKING
 
+from annizarr import config, errors, ic, sources, typing
 from annizarr._runtime import pin_blas
 from annizarr._version import __version__
 from annizarr.errors import AnzError, ConversionError, RepoError, StorageError, ValidationError
@@ -30,11 +31,16 @@ __all__ = [
     "__version__",
     "add_expr",
     "append",
+    "config",
     "convert",
+    "errors",
+    "ic",
     "load_config",
     "plan_append",
     "rechunk",
     "sort",
+    "sources",
+    "typing",
 ]
 
 _LAZY: dict[str, str] = {

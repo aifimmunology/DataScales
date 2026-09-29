@@ -3,7 +3,9 @@
 AnniZarr Phase 3 rewrote the h5ad→zarr writers off dask onto stdlib
 `ThreadPoolExecutor`/`ProcessPoolExecutor` pools (Phase 3a/3b). This compares the two CLI
 **engines** — `tools/convert-to-zarr` (old, dask) vs `tools/annizarr` (new, dask-free) — on
-identical inputs and CLI flags, so only the store engine varies.
+identical inputs and CLI flags, so only the store engine varies. `tools/convert-to-zarr` was
+retired in the monorepo merge; its source is preserved in history at `git show
+2dba863:tools/convert-to-zarr/`.
 
 **Instrument:**
 [`tools/annizarr/benchmarking/writer_engine_bench.py`](../../tools/annizarr/benchmarking/writer_engine_bench.py).

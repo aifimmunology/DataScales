@@ -16,11 +16,15 @@ parallel chunk writes are still deterministic).
 ## Regenerating
 
 Goldens are regenerated **only** on a deliberate, documented layout change (chunking, codec,
-encoding attrs, sharding math, …) — never to make a failing comparison pass. Regenerate with:
+encoding attrs, sharding math, …) — never to make a failing comparison pass. The old converter
+no longer lives in this checkout; check it out from history into a worktree and run
+`generate.py` against it:
 
 ```bash
-cd tools/convert-to-zarr && pixi run -e dev python \
-    ../annizarr/tests/golden/generate.py
+REPO=$(git rev-parse --show-toplevel)
+git worktree add /tmp/annizarr-old 2dba863
+cd /tmp/annizarr-old/tools/convert-to-zarr && pixi install -e dev
+pixi run -e dev python "$REPO/tools/annizarr/tests/golden/generate.py"
 ```
 
 This overwrites every `tests/golden/*.tar.gz` in place; review the diff before committing.

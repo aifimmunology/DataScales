@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
-import numpy as np
-import scipy.sparse as sp
-
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
+    import numpy as np
     from numpy.typing import NDArray
 
 __all__ = ["ensure_csr", "get_indptr", "is_backed", "matrix_format"]
@@ -18,6 +16,8 @@ def matrix_format(matrix: Any) -> Literal["csr", "csc", "dense"]:
     # via their .format attribute) as csr/csc; a plain 2-D array-like (ndarray, h5py-backed
     # dense) is "dense"; anything else (COO/LIL/DOK/BSR sparse, 1-D arrays, unknown objects)
     # is rejected outright rather than silently treated as dense
+    import scipy.sparse as sp
+
     if sp.isspmatrix_csr(matrix):
         return "csr"
     if sp.isspmatrix_csc(matrix):
@@ -36,10 +36,16 @@ def matrix_format(matrix: Any) -> Literal["csr", "csc", "dense"]:
 
 
 def is_backed(matrix: Any) -> bool:
+    import numpy as np
+    import scipy.sparse as sp
+
     return not sp.issparse(matrix) and not isinstance(matrix, np.ndarray)
 
 
 def get_indptr(matrix: Any) -> NDArray[np.int64]:
+    import numpy as np
+    import scipy.sparse as sp
+
     if sp.issparse(matrix):
         return np.asarray(matrix.indptr)
     if hasattr(matrix, "indptr"):

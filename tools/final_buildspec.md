@@ -98,7 +98,7 @@ tools/annizarr/
 | Old | New |
 |---|---|
 | `convert_to_zarr/errors.py`, `storage.StorageError`, `validation.ValidationError`, `scizarr_ic/errors.py` | `errors.py` |
-| `convert_to_zarr/config.py` | `_config.py` (+ `IOConfig.branch`, `IOConfig.eager_max_bytes`; `x_storage: XStorage`) |
+| `convert_to_zarr/config.py` | `_config.py` (+ `IOConfig.eager_max_bytes`, `backed: bool \| None` = auto; `x_storage: XStorage`). `branch`/`message` are per-op keyword arguments, not config fields. |
 | `convert_to_zarr/engine.py` | `_runtime.py`; worker fns → `_writers/_workers.py` |
 | `convert_to_zarr/layout.py` | `_layout.py` (+ plan dataclasses, single `BATCH_BYTES`) |
 | `convert_to_zarr/sources.py` | `_sources/{_h5ad,_matrix}.py` + registry |
@@ -427,7 +427,8 @@ output; re-running `add-expr` errors without `--overwrite`; slow test passes und
 
 ## 11. Budget and agent protocol
 
-- Target: under $200 total (raised by Alex 2026-09-28); warn and pause when close. Surveys so far ≈ 253k Sonnet tokens.
+- Target: under $200 total (raised by Alex 2026-09-28); warn and pause when close.
+- **Actuals (Sonnet subagent tokens):** surveys 0.25M · Phase 1 2.83M (1a 0.51M, 1b 0.68M, 1c 1.03M, R1+fix 0.57M) · Phase 2 0.17M · Phase 3 0.9M (goldens 0.19M, props 0.10M, writers ≈0.4M, R3+fix 0.25M, bench 0.15M) · Phase 4 0.31M · Phase 5 1.44M (5.1+5.2 0.33M, 5.3 0.42M, R5+fix 0.69M) · Phase 6 see commit. Total after Phase 5 ≈ 6.2M.
 - Estimate (Sonnet tokens): Phase 1 ≈ 2.3M (1c sweep adds ≈ 0.8M), Phase 2 ≈ 0.2M, Phase 3 ≈
   1.0M, Phase 4 ≈ 0.2M, Phase 5 ≈ 0.8M, Phase 6 ≈ 0.3M, reviews ≈ 0.7M → ≈ 5.5M. Fable turns
   capped at about three per phase.
