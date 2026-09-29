@@ -56,7 +56,8 @@ def run_parallel(
     *,
     mode: Literal["threads", "processes"] = "threads",
 ) -> None:
-    """Run ``worker(*job)`` for each job in ``jobs`` — in a pool when ``cpus > 1``, else inline.
+    """Run ``worker(*job)`` for each job in ``jobs`` in a pool (``cpus > 1``) or inline,
+    cancelling not-yet-started jobs and re-raising as soon as one worker fails.
 
     Parameters
     ----------
@@ -79,8 +80,15 @@ def run_parallel(
 
     executor_cls = ProcessPoolExecutor if mode == "processes" else ThreadPoolExecutor
     with executor_cls(max_workers=cpus) as ex:
-        for fut in [ex.submit(worker, *job) for job in jobs]:
-            fut.result()
+        futures = [ex.submit(worker, *job) for job in jobs]
+        try:
+            for fut in futures:
+                fut.result()
+        except BaseException:
+            # a worker already failed: drop every job that hasn't started instead of
+            # draining the whole queue first.
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
 
 
 def progress(total: int, label: str) -> Callable[[], None]:

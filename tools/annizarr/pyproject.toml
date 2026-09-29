@@ -65,6 +65,7 @@ ban-relative-imports = "all"
 "src/annizarr/**/_*.py" = ["D"]
 "src/annizarr/_*.py" = ["D"]
 "tests/**" = ["D"]
+"benchmarking/**" = ["D"]
 
 [tool.mypy]
 strict = true

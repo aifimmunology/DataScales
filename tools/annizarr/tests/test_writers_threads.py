@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import filecmp
 import logging
+import math
+import threading
+import time
 from pathlib import Path
 
 import anndata as ad
@@ -16,11 +19,12 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
+import zarr
 
 import annizarr._layout as _layout
 from _readable import assert_anndata_readable
 from annizarr._ops import concat, convert_adata, convert_h5ad
-from annizarr._runtime import progress
+from annizarr._runtime import progress, run_parallel
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 
 
@@ -37,10 +41,24 @@ def _adata(dense: np.ndarray, *, sparse: bool, seed: int) -> ad.AnnData:
     return ad.AnnData(X=x, obs=obs, var=var)
 
 
-def _cfg(x_storage: str, *, cpus: int, row_chunk: int = 64, col_chunk: int = 48, flat_chunk: int = 500) -> AppConfig:
+def _cfg(
+    x_storage: str,
+    *,
+    cpus: int,
+    row_chunk: int = 64,
+    col_chunk: int = 48,
+    flat_chunk: int = 500,
+    x_shard_factor: int = 1,
+) -> AppConfig:
     return AppConfig(
         io=IOConfig(overwrite=True, x_storage=x_storage),
-        chunks=ChunkConfig(x_row_chunk=row_chunk, x_col_chunk=col_chunk, sparse_flat_chunk=flat_chunk, cpus=cpus),
+        chunks=ChunkConfig(
+            x_row_chunk=row_chunk,
+            x_col_chunk=col_chunk,
+            sparse_flat_chunk=flat_chunk,
+            cpus=cpus,
+            x_shard_factor=x_shard_factor,
+        ),
         validation=ValidationConfig(),
     )
 
@@ -64,6 +82,19 @@ def _assert_byte_identical(a: Path, b: Path) -> None:
 # 300x200 with row_chunk=64 (4 full + a 44-row ragged last) and col_chunk=48 (4 full + an
 # 8-col ragged last) puts several blocks, with a ragged one, on each axis.
 N_OBS, N_VARS = 300, 200
+
+# row_chunk=32/col_chunk=48 with factor=2 -> shards (64, 96): 300 rows / 64 = 4 full shards +
+# a 44-row ragged last; 200 cols / 96 = 2 full shards + an 8-col ragged last.
+SHARD_ROW_CHUNK, SHARD_COL_CHUNK, SHARD_FACTOR = 32, 48, 2
+EXPECTED_SHARDS = (64, 96)
+
+
+def _n_shard_objects(store: Path, array: str = "X") -> int:
+    return sum(1 for p in (store / array / "c").rglob("*") if p.is_file())
+
+
+def _expected_shard_count(n_rows: int, n_cols: int, shards: tuple[int, int]) -> int:
+    return math.ceil(n_rows / shards[0]) * math.ceil(n_cols / shards[1])
 
 
 @pytest.mark.parametrize(
@@ -92,6 +123,87 @@ def test_inmemory_write_cpus1_matches_cpus4(
     _assert_byte_identical(out1, out4)
     np.testing.assert_array_equal(_read_x(out1), dense)
     assert_anndata_readable(out1)
+
+
+@pytest.mark.parametrize(
+    "sparse_source",
+    [pytest.param(False, id="dense_from_dense"), pytest.param(True, id="dense_from_sparse")],
+)
+def test_sharded_write_cpus1_matches_cpus4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sparse_source: bool
+) -> None:
+    """x_shard_factor=2 with chunks (32, 48) shards several ragged blocks per axis; cpus=1 vs
+    cpus=4 must still write byte-identical stores, with one chunk *object* per shard on disk."""
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 1)
+
+    dense = _rand_dense(N_OBS, N_VARS, seed=7, density=0.25)
+    adata = _adata(dense, sparse=sparse_source, seed=7)
+
+    out1 = tmp_path / "cpus1.zarr"
+    out4 = tmp_path / "cpus4.zarr"
+    cfg1 = _cfg("dense", cpus=1, row_chunk=SHARD_ROW_CHUNK, col_chunk=SHARD_COL_CHUNK, x_shard_factor=SHARD_FACTOR)
+    cfg4 = _cfg("dense", cpus=4, row_chunk=SHARD_ROW_CHUNK, col_chunk=SHARD_COL_CHUNK, x_shard_factor=SHARD_FACTOR)
+    convert_adata(adata, output=out1, cfg=cfg1)
+    convert_adata(adata, output=out4, cfg=cfg4)
+
+    _assert_byte_identical(out1, out4)
+    np.testing.assert_array_equal(_read_x(out1), dense)
+    assert_anndata_readable(out1)
+
+    expected_count = _expected_shard_count(N_OBS, N_VARS, EXPECTED_SHARDS)
+    for out in (out1, out4):
+        assert zarr.open_group(str(out), mode="r")["X"].shards == EXPECTED_SHARDS
+        assert _n_shard_objects(out) == expected_count
+
+
+def test_sharded_dense_concat_seam_inside_shard_cpus1_matches_cpus4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row shard is 64 (chunk 32 x factor 2); inputs of 70+130+100 rows seam at 70 and 200,
+    both strictly inside a shard ([64, 128) and [192, 256)) rather than at a shard boundary."""
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 1)
+    sizes = [70, 130, 100]
+    parts = [_rand_dense(n, N_VARS, seed=30 + i, density=0.3) for i, n in enumerate(sizes)]
+    paths = []
+    for i, part in enumerate(parts):
+        h5 = tmp_path / f"in{i}.h5ad"
+        _adata(part, sparse=True, seed=30 + i).write_h5ad(h5)
+        paths.append(str(h5))
+    expected = np.vstack(parts)
+
+    expected_count = _expected_shard_count(sum(sizes), N_VARS, EXPECTED_SHARDS)
+    outs: dict[int, Path] = {}
+    for cpus in (1, 4):
+        out = tmp_path / f"out_cpus{cpus}.zarr"
+        cfg = _cfg(
+            "dense", cpus=cpus, row_chunk=SHARD_ROW_CHUNK, col_chunk=SHARD_COL_CHUNK, x_shard_factor=SHARD_FACTOR
+        )
+        concat(paths, output=out, cfg=cfg)
+        np.testing.assert_array_equal(_read_x(out), expected)
+        assert_anndata_readable(out)
+        assert zarr.open_group(str(out), mode="r")["X"].shards == EXPECTED_SHARDS
+        assert _n_shard_objects(out) == expected_count
+        outs[cpus] = out
+
+    _assert_byte_identical(outs[1], outs[4])
+
+
+def test_run_parallel_fails_fast_and_cancels_pending_jobs() -> None:
+    ran: list[int] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        time.sleep(0.05)
+        if i == 3:
+            raise ValueError("boom")
+        with lock:
+            ran.append(i)
+
+    jobs = [(i,) for i in range(50)]
+    with pytest.raises(ValueError, match="boom"):
+        run_parallel(worker, jobs, cpus=4, mode="threads")
+
+    assert len(ran) < 50
 
 
 @pytest.mark.parametrize("x_storage", ["dense", "csr"])

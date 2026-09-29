@@ -80,7 +80,7 @@ import time
 from pathlib import Path
 
 # Pin BLAS/OpenMP threads to 1 so N worker processes don't each spawn N BLAS
-# threads (CLAUDE.md silent perf killer #1: N×N contention on a 64-core box).
+# threads (CLAUDE.md silent perf killer #1: NxN contention on a 64-core box).
 # Deliberate + recorded in provenance. Must run before any numpy/scipy import —
 # those are lazy (inside functions), so module top is early enough; child procs
 # re-import this module and inherit these into their own worker pools.
@@ -92,28 +92,31 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXP
 # ── measurement helpers ───────────────────────────────────────────────────────
 def peak_rss_gb() -> float:
     """Peak resident set of THIS process, in GB. ru_maxrss is bytes on macOS,
-    kilobytes on Linux — normalise so the number means the same on both."""
+    kilobytes on Linux — normalise so the number means the same on both.
+    """
     m = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return m / (1024 ** 3) if sys.platform == "darwin" else m / (1024 ** 2)
+    return m / (1024**3) if sys.platform == "darwin" else m / (1024**2)
 
 
 def child_peak_rss_gb() -> float:
     """Peak RSS of any WORKER children this process spawned (RUSAGE_CHILDREN), GB.
     Same unit rules as above. Reported alongside self for the process-pool methods
-    (h5py / datascale-backed) whose real memory lives in the workers."""
+    (h5py / datascale-backed) whose real memory lives in the workers.
+    """
     m = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    return m / (1024 ** 3) if sys.platform == "darwin" else m / (1024 ** 2)
+    return m / (1024**3) if sys.platform == "darwin" else m / (1024**2)
 
 
 def dir_size_gb(path: Path) -> float:
     total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-    return total / (1024 ** 3)
+    return total / (1024**3)
 
 
 # ── conversion methods (base impls, tuned to each tool's parallel/stream knob) ─
 def convert_anndata(inp: Path, out: Path, workers: int) -> None:
     # SERIAL by nature: no parallel-write knob in anndata's public API.
     import anndata as ad
+
     adata = ad.read_h5ad(inp)  # eager, full load
     adata.write_zarr(out)
 
@@ -124,7 +127,8 @@ def convert_h5py(inp: Path, out: Path, workers: int) -> None:
     process pool, no chunk-aligned fan-out, no block streaming. This is the
     "obvious" way someone hand-writes an h5ad->zarr copy, and the row datascale
     is meant to beat on time (serial) AND peak RAM (each big 1D CSR array is read
-    whole into memory). `workers` is ignored. zarr default codec/chunking."""
+    whole into memory). `workers` is ignored. zarr default codec/chunking.
+    """
     import h5py
     import numpy as np
     import zarr
@@ -157,7 +161,7 @@ def convert_h5py(inp: Path, out: Path, workers: int) -> None:
             z = zgrp.require_array(key, shape=item.shape, dtype=item.dtype)
             for k, v in item.attrs.items():
                 z.attrs[k] = attr(v)
-            z[...] = item[...]   # naive: read the whole dataset, then one assign
+            z[...] = item[...]  # naive: read the whole dataset, then one assign
 
     root = zarr.open_group(str(out), mode="w")
     with h5py.File(inp, "r") as f:
@@ -172,9 +176,7 @@ def convert_icechunk(inp: Path, out: Path, workers: int) -> None:
     from anndata._io.specs import write_elem  # private API (see anndata skill)
 
     adata = ad.read_h5ad(inp)  # eager
-    repo = icechunk.Repository.open_or_create(
-        icechunk.local_filesystem_storage(str(out))
-    )
+    repo = icechunk.Repository.open_or_create(icechunk.local_filesystem_storage(str(out)))
     session = repo.writable_session("main")
     # NB: ad.write_zarr() would append zarr.consolidate_metadata(), which raises on
     # an IcechunkStore (supports_consolidated_metadata is False). Write the AnnData
@@ -200,7 +202,8 @@ def convert_datascale(inp: Path, out: Path, workers: int) -> None:
 def convert_virtualizarr(inp: Path, out: Path, workers: int) -> None:
     """Zero-copy: byte-range reference manifest over the HDF5 arrays. NOT an
     anndata-readable store; lzf inputs need imagecodecs. ImportError if missing
-    deps -> reported as skipped by the runner."""
+    deps -> reported as skipped by the runner.
+    """
     from virtualizarr import open_virtual_dataset
 
     vds = open_virtual_dataset(str(inp))
@@ -245,9 +248,21 @@ def run_one(method: str, inp: Path, out: Path, workers: int) -> None:
 # ── parent: orchestrate subprocesses, collect + print ─────────────────────────
 def provenance(workers: int) -> dict:
     import importlib.metadata as md
+
     vers = {}
-    for pkg in ("anndata", "zarr", "numcodecs", "h5py", "icechunk", "dask",
-                "scipy", "numpy", "virtualizarr", "imagecodecs", "rechunker"):
+    for pkg in (
+        "anndata",
+        "zarr",
+        "numcodecs",
+        "h5py",
+        "icechunk",
+        "dask",
+        "scipy",
+        "numpy",
+        "virtualizarr",
+        "imagecodecs",
+        "rechunker",
+    ):
         try:
             vers[pkg] = md.version(pkg)
         except Exception:
@@ -272,12 +287,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", help="path to .h5ad")
     ap.add_argument("--outdir", default="/tmp/convbench", help="dir for output stores")
-    ap.add_argument("--methods", nargs="+", default=["anndata", "h5py", "icechunk", "datascale"],
-                    choices=list(METHODS))
+    ap.add_argument("--methods", nargs="+", default=["anndata", "h5py", "icechunk", "datascale"], choices=list(METHODS))
     ap.add_argument("--repeats", type=int, default=1)
-    ap.add_argument("--workers", type=int, default=os.cpu_count() or 1,
-                    help="parallelism for tools that support it (datascale cpus); "
-                         "ignored by the serial rows incl. the naive h5py baseline")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="parallelism for tools that support it (datascale cpus); "
+        "ignored by the serial rows incl. the naive h5py baseline",
+    )
     ap.add_argument("--json", help="write raw results here")
     ap.add_argument("--run", help=argparse.SUPPRESS)  # internal child invocation
     args = ap.parse_args()
@@ -298,25 +316,45 @@ def main() -> None:
     print(json.dumps(prov, indent=2))
     print(f"\n== input: {inp}  ({inp.stat().st_size / 1024**3:.1f} GB on disk) ==")
     print(f"== workers={args.workers}  (serial methods ignore it: {sorted(SERIAL_METHODS)}) ==")
-    print("NOTE: after method 1 the input is warm in page cache on a big box; "
-          "results mix cold(1st)/warm unless you drop caches between runs.\n")
+    print(
+        "NOTE: after method 1 the input is warm in page cache on a big box; "
+        "results mix cold(1st)/warm unless you drop caches between runs.\n"
+    )
 
     rows = []
     for method in args.methods:
         for rep in range(args.repeats):
             out = outdir / f"{method}.out"
-            cmd = [sys.executable, __file__, "--run", method, "--input", str(inp),
-                   "--outdir", str(outdir), "--workers", str(args.workers)]
+            cmd = [
+                sys.executable,
+                __file__,
+                "--run",
+                method,
+                "--input",
+                str(inp),
+                "--outdir",
+                str(outdir),
+                "--workers",
+                str(args.workers),
+            ]
             print(f"-> {method} (rep {rep + 1}/{args.repeats}) ...", flush=True)
             proc = subprocess.run(cmd, capture_output=True, text=True)
-            line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT_JSON:")), None)
+            line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT_JSON:")), None)
             if line is None:
                 print(f"   FAILED to get result. stderr tail:\n{proc.stderr[-2000:]}")
-                rows.append({"method": method, "seconds": None, "peak_rss_gb": None,
-                             "worker_peak_rss_gb": None, "out_size_gb": None,
-                             "workers": None, "error": "no result line"})
+                rows.append(
+                    {
+                        "method": method,
+                        "seconds": None,
+                        "peak_rss_gb": None,
+                        "worker_peak_rss_gb": None,
+                        "out_size_gb": None,
+                        "workers": None,
+                        "error": "no result line",
+                    }
+                )
                 continue
-            res = json.loads(line[len("RESULT_JSON:"):])
+            res = json.loads(line[len("RESULT_JSON:") :])
             manifest = Path(str(out) + ".json")
             if out.exists() and out.is_dir():
                 res["out_size_gb"] = round(dir_size_gb(out), 3)
@@ -326,7 +364,10 @@ def main() -> None:
                 res["out_size_gb"] = None
             rows.append(res)
             peak = max(res["peak_rss_gb"] or 0, res["worker_peak_rss_gb"] or 0)
-            tag = f"   {res['seconds']}s  peak {peak} GB (self {res['peak_rss_gb']} / workers {res['worker_peak_rss_gb']})  out {res['out_size_gb']} GB"
+            tag = (
+                f"   {res['seconds']}s  peak {peak} GB"
+                f" (self {res['peak_rss_gb']} / workers {res['worker_peak_rss_gb']})  out {res['out_size_gb']} GB"
+            )
             print(tag + (f"  ERROR {res['error']}" if res.get("error") else ""))
 
     # summary table
@@ -335,14 +376,18 @@ def main() -> None:
     print(hdr)
     for r in rows:
         note = r.get("error") or ("serial" if r["method"] in SERIAL_METHODS else "")
-        print(f"{r['method']:14s} {str(r.get('workers')):>7s} {str(r['seconds']):>10s} "
-              f"{str(r['peak_rss_gb']):>9s} {str(r.get('worker_peak_rss_gb')):>8s} "
-              f"{str(r['out_size_gb']):>9s}  {note}")
-    print("\nNOTE: out_gb mixes codec + format + index dtype (real-world defaults, NOT "
-          "held identical): datascale=Blosc-zstd-5+shuffle CSR; anndata=its own CSR "
-          "(may down-cast indices); naive h5py=raw copy w/ zarr default zstd-0. "
-          "peak_gb = max(self, workers); only datascale (backed+parallel) lives in "
-          "workers — the serial rows (anndata/icechunk/h5py) spike in self.")
+        print(
+            f"{r['method']:14s} {r.get('workers')!s:>7s} {r['seconds']!s:>10s} "
+            f"{r['peak_rss_gb']!s:>9s} {r.get('worker_peak_rss_gb')!s:>8s} "
+            f"{r['out_size_gb']!s:>9s}  {note}"
+        )
+    print(
+        "\nNOTE: out_gb mixes codec + format + index dtype (real-world defaults, NOT "
+        "held identical): datascale=Blosc-zstd-5+shuffle CSR; anndata=its own CSR "
+        "(may down-cast indices); naive h5py=raw copy w/ zarr default zstd-0. "
+        "peak_gb = max(self, workers); only datascale (backed+parallel) lives in "
+        "workers — the serial rows (anndata/icechunk/h5py) spike in self."
+    )
 
     if args.json:
         Path(args.json).write_text(json.dumps({"provenance": prov, "results": rows}, indent=2))
