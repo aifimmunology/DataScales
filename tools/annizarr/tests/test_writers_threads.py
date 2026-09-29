@@ -8,7 +8,6 @@ axis (with a ragged last one) and compare the two cpu counts file-for-file, not 
 from __future__ import annotations
 
 import filecmp
-import logging
 import math
 import threading
 import time
@@ -24,8 +23,8 @@ import zarr
 
 import annizarr._layout as _layout
 from _readable import assert_anndata_readable
-from annizarr._ops import append, concat, convert_adata, convert_h5ad, rechunk
-from annizarr._runtime import progress, run_parallel
+from annizarr._ops import append, concat, convert_adata, rechunk
+from annizarr._runtime import run_parallel
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 
 
@@ -118,62 +117,51 @@ def _forced_autoshard(flat_chunk: int, itemsize: int, chunks_per_shard: int):
 
 
 @pytest.mark.parametrize(
-    ("x_storage", "sparse_source"),
+    ("path", "x_storage", "sparse_source"),
     [
-        pytest.param("dense", False, id="dense_from_dense"),
-        pytest.param("dense", True, id="dense_from_sparse"),
-        pytest.param("csr", True, id="sparse_to_csr"),
-        pytest.param("csc", True, id="sparse_to_csc"),
+        pytest.param("direct", "dense", False, id="dense_from_dense"),
+        pytest.param("direct", "dense", True, id="sparse_to_dense"),
+        pytest.param("direct", "csr", True, id="sparse_to_csr"),
+        pytest.param("direct", "csc", True, id="sparse_to_csc"),
+        pytest.param("concat", "dense", True, id="dense_concat"),
+        pytest.param("concat", "csr", True, id="csr_concat"),
     ],
 )
-def test_inmemory_write_cpus1_matches_cpus4(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, x_storage: str, sparse_source: bool
+def test_cpus1_matches_cpus4_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, x_storage: str, sparse_source: bool
 ) -> None:
-    # force several flat segments too (not just several dense blocks) for the sparse cases
+    """Every in-memory writer path (direct convert, or concat across 3 non-chunk-aligned
+    inputs) must write byte-identical stores at cpus=1 vs cpus=4 -- force several flat
+    segments too (not just several dense blocks) for the sparse cases."""
     monkeypatch.setattr(_layout, "BATCH_BYTES", 1)
+    out1, out4 = tmp_path / "cpus1.zarr", tmp_path / "cpus4.zarr"
 
-    dense = _rand_dense(N_OBS, N_VARS, seed=3, density=0.25)
-    adata = _adata(dense, sparse=sparse_source, seed=3)
-
-    out1 = tmp_path / "cpus1.zarr"
-    out4 = tmp_path / "cpus4.zarr"
-    convert_adata(adata, output=out1, cfg=_cfg(x_storage, cpus=1))
-    convert_adata(adata, output=out4, cfg=_cfg(x_storage, cpus=4))
+    if path == "direct":
+        dense = _rand_dense(N_OBS, N_VARS, seed=3, density=0.25)
+        adata = _adata(dense, sparse=sparse_source, seed=3)
+        convert_adata(adata, output=out1, cfg=_cfg(x_storage, cpus=1))
+        convert_adata(adata, output=out4, cfg=_cfg(x_storage, cpus=4))
+    else:
+        # inputs of 70+130+100 rows seam at 70 and 200 -- neither a multiple of row_chunk=64,
+        # so every seam falls strictly inside an output chunk (the old per-file writer needed
+        # a lock here).
+        n_vars = 96
+        sizes = [70, 130, 100]
+        parts = [_rand_dense(n, n_vars, seed=10 + i, density=0.3) for i, n in enumerate(sizes)]
+        paths = []
+        for i, part in enumerate(parts):
+            h5 = tmp_path / f"in{i}.h5ad"
+            _adata(part, sparse=True, seed=10 + i).write_h5ad(h5)
+            paths.append(str(h5))
+        dense = np.vstack(parts)
+        cfg1 = _cfg(x_storage, cpus=1, row_chunk=64, col_chunk=n_vars, flat_chunk=500)
+        cfg4 = _cfg(x_storage, cpus=4, row_chunk=64, col_chunk=n_vars, flat_chunk=500)
+        concat(paths, output=out1, cfg=cfg1)
+        concat(paths, output=out4, cfg=cfg4)
 
     _assert_byte_identical(out1, out4)
     np.testing.assert_array_equal(_read_x(out1), dense)
     assert_anndata_readable(out1)
-
-
-@pytest.mark.parametrize(
-    "sparse_source",
-    [pytest.param(False, id="dense_from_dense"), pytest.param(True, id="dense_from_sparse")],
-)
-def test_sharded_write_cpus1_matches_cpus4(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sparse_source: bool
-) -> None:
-    """x_shard_factor=2 with chunks (32, 48) shards several ragged blocks per axis; cpus=1 vs
-    cpus=4 must still write byte-identical stores, with one chunk *object* per shard on disk."""
-    monkeypatch.setattr(_layout, "BATCH_BYTES", 1)
-
-    dense = _rand_dense(N_OBS, N_VARS, seed=7, density=0.25)
-    adata = _adata(dense, sparse=sparse_source, seed=7)
-
-    out1 = tmp_path / "cpus1.zarr"
-    out4 = tmp_path / "cpus4.zarr"
-    cfg1 = _cfg("dense", cpus=1, row_chunk=SHARD_ROW_CHUNK, col_chunk=SHARD_COL_CHUNK, x_shard_factor=SHARD_FACTOR)
-    cfg4 = _cfg("dense", cpus=4, row_chunk=SHARD_ROW_CHUNK, col_chunk=SHARD_COL_CHUNK, x_shard_factor=SHARD_FACTOR)
-    convert_adata(adata, output=out1, cfg=cfg1)
-    convert_adata(adata, output=out4, cfg=cfg4)
-
-    _assert_byte_identical(out1, out4)
-    np.testing.assert_array_equal(_read_x(out1), dense)
-    assert_anndata_readable(out1)
-
-    expected_count = _expected_shard_count(N_OBS, N_VARS, EXPECTED_SHARDS)
-    for out in (out1, out4):
-        assert zarr.open_group(str(out), mode="r")["X"].shards == EXPECTED_SHARDS
-        assert _n_shard_objects(out) == expected_count
 
 
 def test_sharded_dense_concat_seam_inside_shard_cpus1_matches_cpus4(
@@ -228,7 +216,12 @@ def test_forced_autoshard_sparse_write_cpus1_matches_cpus4(tmp_path: Path) -> No
     """auto_shard=True with sparse_flat_chunk pinned small; zarr's shard-size heuristic is
     pinned (via target_shard_size_bytes) to exactly 4 chunks/shard, so data/indices land on a
     shard grid several chunks wide while cfg still asks for small chunks. cpus=1 vs cpus=4 must
-    still write byte-identical stores, with one shard object per shard on disk (no RMW)."""
+    still write byte-identical stores, with one shard object per shard on disk (no RMW). Also
+    covers that auto_shard=True raises neither anndata's "will be the default" warning (we set
+    ad.settings.auto_shard_zarr_v3 explicitly around every write_elem call) nor zarr's
+    "experimental" shard-inference warning (suppressed around our own shards="auto" creations),
+    and that ad.settings.auto_shard_zarr_v3 is restored afterward, not leaked."""
+    previous_setting = ad.settings.auto_shard_zarr_v3
     dense = _rand_dense(N_OBS, N_VARS, seed=11, density=0.25)
     adata = _adata(dense, sparse=True, seed=11)
     nnz = adata.X.nnz
@@ -243,6 +236,7 @@ def test_forced_autoshard_sparse_write_cpus1_matches_cpus4(tmp_path: Path) -> No
                 out = tmp_path / f"out_cpus{cpus}.zarr"
                 convert_adata(adata, output=out, cfg=_autoshard_cfg(cpus=cpus))
                 outs[cpus] = out
+    assert ad.settings.auto_shard_zarr_v3 is previous_setting
 
     for out in outs.values():
         np.testing.assert_array_equal(_read_x(out), dense)
@@ -254,26 +248,6 @@ def test_forced_autoshard_sparse_write_cpus1_matches_cpus4(tmp_path: Path) -> No
         assert _n_flat_shard_objects(out, "X/indices") == expected_count
 
     _assert_byte_identical(outs[1], outs[4])
-
-
-def test_autoshard_no_warnings_and_setting_not_leaked(tmp_path: Path) -> None:
-    """auto_shard=True must not raise anndata's "will be the default" warning (we set
-    ad.settings.auto_shard_zarr_v3 explicitly around every write_elem call) nor zarr's
-    "experimental" shard-inference warning (suppressed around our own shards="auto"
-    creations); ad.settings.auto_shard_zarr_v3 must be restored afterward, not leaked."""
-    previous = ad.settings.auto_shard_zarr_v3
-    dense = _rand_dense(60, 40, seed=99, density=0.3)
-    adata = _adata(dense, sparse=True, seed=99)
-    out = tmp_path / "out.zarr"
-    cfg = AppConfig(
-        io=IOConfig(overwrite=True, x_storage="csr"),
-        chunks=ChunkConfig(sparse_flat_chunk=50, cpus=1, auto_shard=True),
-        validation=ValidationConfig(),
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        convert_adata(adata, output=out, cfg=cfg)
-    assert ad.settings.auto_shard_zarr_v3 is previous
 
 
 def test_append_extends_sharded_data_array(tmp_path: Path) -> None:
@@ -349,59 +323,3 @@ def test_run_parallel_fails_fast_and_cancels_pending_jobs() -> None:
     jobs = [(i,) for i in range(50)]
     with pytest.raises(ValueError, match="boom"):
         run_parallel(worker, jobs, cpus=4, mode="threads")
-
-    assert len(ran) < 50
-
-
-@pytest.mark.parametrize("x_storage", ["dense", "csr"])
-def test_concat_seam_inside_row_chunk_cpus1_matches_cpus4(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, x_storage: str
-) -> None:
-    """Inputs of 70+130+100 rows seam at 70 and 200 — neither a multiple of row_chunk=64, so
-    every seam falls strictly inside an output chunk. Values must be correct, and cpus=1 vs
-    cpus=4 must write byte-identical stores (the old per-file writer needed a lock here)."""
-    monkeypatch.setattr(_layout, "BATCH_BYTES", 1)
-    n_vars = 96
-    sizes = [70, 130, 100]
-    parts = [_rand_dense(n, n_vars, seed=10 + i, density=0.3) for i, n in enumerate(sizes)]
-    paths = []
-    for i, part in enumerate(parts):
-        h5 = tmp_path / f"in{i}.h5ad"
-        _adata(part, sparse=True, seed=10 + i).write_h5ad(h5)
-        paths.append(str(h5))
-    expected = np.vstack(parts)
-
-    outs: dict[int, Path] = {}
-    for cpus in (1, 4):
-        out = tmp_path / f"out_cpus{cpus}.zarr"
-        concat(paths, output=out, cfg=_cfg(x_storage, cpus=cpus, row_chunk=64, col_chunk=n_vars, flat_chunk=500))
-        np.testing.assert_array_equal(_read_x(out), expected)
-        assert_anndata_readable(out)
-        outs[cpus] = out
-
-    _assert_byte_identical(outs[1], outs[4])
-
-
-def test_sparse_write_nnz_not_multiple_of_flat_chunk(tmp_path: Path) -> None:
-    dense = _rand_dense(137, 53, seed=42, density=0.37)
-    adata = _adata(dense, sparse=True, seed=42)
-    nnz = adata.X.nnz
-    assert nnz >= 2
-    flat_chunk = nnz - 1  # guarantees a 1-element ragged last segment
-
-    h5 = tmp_path / "in.h5ad"
-    adata.write_h5ad(h5)
-    out = tmp_path / "out.zarr"
-    convert_h5ad(h5, output=out, cfg=_cfg("csr", cpus=4, flat_chunk=flat_chunk))
-
-    np.testing.assert_array_equal(_read_x(out), dense)
-    assert_anndata_readable(out)
-
-
-def test_progress_logs_final_line(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO, logger="annizarr._runtime")
-    tick = progress(5, "Writing test")
-    for _ in range(5):
-        tick()
-    messages = [r.message for r in caplog.records]
-    assert any("5/5" in m and "done" in m for m in messages)

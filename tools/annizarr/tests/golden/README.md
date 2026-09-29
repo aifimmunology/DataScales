@@ -10,17 +10,19 @@ is byte-identical to `expected/` — so a refactor that silently changes on-disk
 (chunking, codec, encoding attrs, sharding math, …) fails loudly instead of drifting unnoticed.
 Plain zarr only — Icechunk stores carry commit timestamps.
 
-Cases: `csr_eager`, `csr_backed`, `csc_eager`, `dense_from_sparse_eager`,
-`dense_from_sparse_backed`, `dense_from_dense_eager`, `dense_sharded`, `dense_small_chunks`,
-`csr_small_flat_chunk`, `concat_csr`, `concat_dense`, `sorted_eager`, `sorted_backed`,
-`csr_layers_raw_obsm`, `csr_int_counts`, `csr_cpus2` (in-memory thread path, tests that
-parallel chunk writes are still deterministic) — all `auto_shard=False`. Plus six
-`auto_shard=True` variants covering the same shapes: `csr_eager_autoshard`,
-`csc_eager_autoshard`, `csr_layers_raw_obsm_autoshard`, `concat_csr_autoshard`,
-`sorted_eager_autoshard` (a small `sparse_flat_chunk=100` on the sparse ones, so nnz spans more
-than the 8 chunks zarr's `shards="auto"` heuristic requires before it actually shards), and
-`dense_from_sparse_eager_autoshard` (dense X stays unsharded — only the anndata-written
-elements are auto-sharded).
+Nine cases, one per distinct writer code path:
+
+| Case | Path exercised |
+|---|---|
+| `csr_eager` | in-memory CSR -> CSR; input is the layers/raw/obsm fixture, pinning `write_adata`'s layers/raw paths |
+| `csr_backed_small_flat` | backed CSR -> CSR, `sparse_flat_chunk` far below nnz: process-pool flat copy, several chunks |
+| `csc_eager` | in-memory CSR -> CSC (`write_transposed_sparse`) |
+| `dense_from_sparse_backed_small_chunks` | backed CSR -> dense, small ragged row/col chunks: process-pool densify, several blocks per axis with a ragged tail |
+| `dense_sharded_cpus2` | in-memory CSR -> sharded dense, `x_shard_factor=2`, `cpus=2`: threaded whole-shard blocks |
+| `dense_from_dense_eager` | in-memory dense -> dense |
+| `concat_csr` | concat of two eager CSR inputs |
+| `sorted_backed` | backed input, `sort_by=["cell_type","batch"]`: streamed sorted bucketing |
+| `csr_autoshard` | `auto_shard=True`, `sparse_flat_chunk` small enough that the sparse arrays actually shard |
 
 ## Regenerating
 
@@ -35,8 +37,12 @@ cd tools/annizarr && pixi run -e default python tests/golden/generate.py
 
 This overwrites every `tests/golden/*.tar.gz` in place; review the diff before committing.
 
-**2026-09-29 regeneration** (autosharding): the 16 pre-existing cases were regenerated with the
-current package and diffed byte-for-byte against the previous tarballs before being
-overwritten — every `expected/*.zarr` store and `input/*.h5ad` fixture was unchanged; the only
-difference was the new `"auto_shard": false` key added to each `case.json`. The six
-`*_autoshard` cases above are new.
+**2026-09-29 regeneration** (pruned to 9 cases): `csc_eager`, `dense_from_dense_eager`,
+`concat_csr`, and `sorted_backed` kept the same parameters as before and were diffed
+byte-for-byte against the previous tarballs before being overwritten — unchanged.
+`csr_autoshard` (renamed from `csr_eager_autoshard`) also produced a byte-identical
+`expected/` store under its new name. `csr_eager` (now built from the layers/raw/obsm
+fixture instead of the plain one), `csr_backed_small_flat`,
+`dense_from_sparse_backed_small_chunks`, and `dense_sharded_cpus2` are new combinations of
+parameters and are new by definition. The other thirteen previous cases were folded into
+these nine or dropped as redundant with a library-level test.

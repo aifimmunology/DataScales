@@ -106,75 +106,53 @@ def build_inputs(input_dir: Path) -> dict[str, Path]:
     paths["layers_raw"] = input_dir / "layers_raw.h5ad"
     layered.write_h5ad(paths["layers_raw"])
 
-    # integer-counts variant.
-    int_counts = _base_adata(seed=4)
-    int_counts.X = _csr_int(N_OBS, N_VARS, seed=4)
-    paths["int_counts"] = input_dir / "int_counts.h5ad"
-    int_counts.write_h5ad(paths["int_counts"])
-
     return paths
 
 
 # Each case: `inputs` names the h5ad fixture(s) (see build_inputs); the rest are
 # `apply_cli_overrides`-style kwargs, packed verbatim into case.json for
 # tests/test_golden_writers.py to feed straight into `annizarr.convert(..., cfg=...)`.
-# The 16 cases through `csr_cpus2` predate autosharding (`auto_shard=False`, unchanged
-# on-disk layout); the six `*_autoshard` cases exercise `auto_shard=True` — a small
-# `sparse_flat_chunk` on the sparse ones so nnz spans more than the 8 chunks zarr's
-# `shards="auto"` heuristic requires before it actually shards (see CLAUDE.md's "Zarr v3
-# performance & parallelism" and `_layout.write_grid`).
+# One case per distinct writer code path (see tests/golden/README.md for which); only
+# `csr_autoshard` exercises `auto_shard=True` — a small `sparse_flat_chunk` so nnz spans
+# more than the 8 chunks zarr's `shards="auto"` heuristic requires before it actually shards
+# (see CLAUDE.md's "Zarr v3 performance & parallelism" and `_layout.write_grid`).
 CASES: dict[str, dict[str, Any]] = {
-    "csr_eager": {"inputs": ["a"], "x_storage": "csr"},
-    "csr_backed": {"inputs": ["a"], "x_storage": "csr", "backed": True},
+    # in-memory CSR -> CSR; layers/raw/obsm fixture pins write_adata's extra-element paths.
+    "csr_eager": {"inputs": ["layers_raw"], "x_storage": "csr"},
+    # backed CSR -> CSR, sparse_flat_chunk far below nnz: process-pool flat copy, several chunks.
+    "csr_backed_small_flat": {"inputs": ["a"], "x_storage": "csr", "backed": True, "sparse_flat_chunk": 100},
+    # in-memory CSR -> CSC (write_transposed_sparse).
     "csc_eager": {"inputs": ["a"], "x_storage": "csc"},
-    "dense_from_sparse_eager": {"inputs": ["a"], "x_storage": "dense"},
-    "dense_from_sparse_backed": {"inputs": ["a"], "x_storage": "dense", "backed": True},
-    "dense_from_dense_eager": {"inputs": ["dense"], "x_storage": "dense"},
-    "dense_sharded": {
+    # backed CSR -> dense, small ragged chunks: process-pool densify, several blocks per axis.
+    "dense_from_sparse_backed_small_chunks": {
+        "inputs": ["a"],
+        "x_storage": "dense",
+        "backed": True,
+        "x_row_chunk": 30,
+        "x_col_chunk": 20,
+    },
+    # in-memory CSR -> sharded dense, cpus=2: threaded whole-shard blocks.
+    "dense_sharded_cpus2": {
         "inputs": ["a"],
         "x_storage": "dense",
         "x_row_chunk": 20,
         "x_col_chunk": 10,
         "x_shard_factor": 2,
+        "cpus": 2,
     },
-    "dense_small_chunks": {
-        "inputs": ["a"],
-        "x_storage": "dense",
-        "x_row_chunk": 20,
-        "x_col_chunk": 10,
-    },
-    "csr_small_flat_chunk": {"inputs": ["a"], "x_storage": "csr", "sparse_flat_chunk": 200},
+    # in-memory dense -> dense.
+    "dense_from_dense_eager": {"inputs": ["dense"], "x_storage": "dense"},
+    # concat of two eager CSR inputs.
     "concat_csr": {"inputs": ["a", "b"], "x_storage": "csr"},
-    "concat_dense": {"inputs": ["a", "b"], "x_storage": "dense"},
-    "sorted_eager": {"inputs": ["a"], "x_storage": "csr", "sort_by": ["cell_type", "batch"]},
+    # backed input, sort_by streamed bucketing.
     "sorted_backed": {
         "inputs": ["a"],
         "x_storage": "csr",
         "sort_by": ["cell_type", "batch"],
         "backed": True,
     },
-    "csr_layers_raw_obsm": {"inputs": ["layers_raw"], "x_storage": "csr"},
-    "csr_int_counts": {"inputs": ["int_counts"], "x_storage": "csr"},
-    "csr_cpus2": {"inputs": ["a"], "x_storage": "csr", "cpus": 2},
-    "csr_eager_autoshard": {"inputs": ["a"], "x_storage": "csr", "sparse_flat_chunk": 100, "auto_shard": True},
-    "csc_eager_autoshard": {"inputs": ["a"], "x_storage": "csc", "sparse_flat_chunk": 100, "auto_shard": True},
-    "csr_layers_raw_obsm_autoshard": {
-        "inputs": ["layers_raw"],
-        "x_storage": "csr",
-        "sparse_flat_chunk": 100,
-        "auto_shard": True,
-    },
-    "concat_csr_autoshard": {"inputs": ["a", "b"], "x_storage": "csr", "sparse_flat_chunk": 100, "auto_shard": True},
-    "sorted_eager_autoshard": {
-        "inputs": ["a"],
-        "x_storage": "csr",
-        "sort_by": ["cell_type", "batch"],
-        "sparse_flat_chunk": 100,
-        "auto_shard": True,
-    },
-    # dense X stays unsharded (x_shard_factor defaults to 1, never "auto"); only the
-    # anndata-written elements (obs/var/obsm) are auto-sharded here.
-    "dense_from_sparse_eager_autoshard": {"inputs": ["a"], "x_storage": "dense", "auto_shard": True},
+    # auto_shard=True, sparse_flat_chunk small enough that the sparse arrays actually shard.
+    "csr_autoshard": {"inputs": ["a"], "x_storage": "csr", "sparse_flat_chunk": 100, "auto_shard": True},
 }
 
 

@@ -6,20 +6,13 @@ from annizarr._cli import main
 from annizarr._ic import Repo
 
 
-def test_cli_init_and_log(src_zarr, repo_path, capsys):
+def test_cli_init_log_checkout_tree(src_zarr, repo_path, capsys):
     path, _ = src_zarr
     assert main(["ic", "init", str(path), str(repo_path), "-m", "first import"]) == 0
     assert "Initialized icechunk repo" in capsys.readouterr().err
 
     assert main(["ic", "log", str(repo_path), "--oneline"]) == 0
-    out = capsys.readouterr().out
-    assert "first import" in out
-
-
-def test_cli_checkout_and_tree(src_zarr, repo_path, capsys):
-    path, _ = src_zarr
-    main(["ic", "init", str(path), str(repo_path)])
-    capsys.readouterr()
+    assert "first import" in capsys.readouterr().out
 
     assert main(["ic", "checkout", str(repo_path), "-b", "dev"]) == 0
     assert "dev" in capsys.readouterr().err

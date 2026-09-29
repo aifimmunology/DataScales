@@ -11,47 +11,21 @@ from annizarr._storage import (
     canonical_location,
     is_icechunk_repo,
     is_readonly_path,
-    is_remote,
     open_output_store,
     require_icechunk,
-    scheme,
-    store_name,
 )
 from annizarr.config import AppConfig, IOConfig
 from annizarr.errors import StorageError
 
-
-def test_scheme() -> None:
-    assert scheme("s3://bucket/prefix") == "s3"
-    assert scheme("gs://bucket") == "gs"
-    assert scheme("gcs://bucket/prefix") == "gcs"
-    assert scheme("/local/path") == ""
-    assert scheme("relative/path") == ""
-
-
-def test_is_remote() -> None:
-    assert is_remote("s3://bucket/prefix") is True
-    assert is_remote("gs://bucket") is True
-    assert is_remote("gcs://bucket/prefix") is True
-    assert is_remote("/local/path") is False
-    assert is_remote("relative/path") is False
-
-
-def test_bucket_prefix() -> None:
-    assert bucket_prefix("s3://bucket/prefix") == ("bucket", "prefix")
-    assert bucket_prefix("gs://bucket") == ("bucket", None)
-    assert bucket_prefix("gcs://bucket/a/b") == ("bucket", "a/b")
+# scheme/is_remote/bucket_prefix(happy path)/store_name are covered more thoroughly by the
+# hypothesis property tests in test_layout_props.py; bucket_prefix's error path has no
+# hypothesis coverage (its generator always draws a non-empty bucket segment), so it keeps
+# a fixed-example test here.
 
 
 def test_bucket_prefix_no_bucket_raises() -> None:
     with pytest.raises(StorageError, match="Missing bucket"):
         bucket_prefix("s3:///prefix")
-
-
-def test_store_name() -> None:
-    assert store_name("/a/b/c.zarr/") == "c.zarr"
-    assert store_name("/a/b/c.zarr") == "c.zarr"
-    assert store_name("s3://bucket/prefix/store.zarr") == "store.zarr"
 
 
 def test_is_readonly_path_and_canonical_location(tmp_path: Path) -> None:
@@ -65,6 +39,8 @@ def test_is_readonly_path_and_canonical_location(tmp_path: Path) -> None:
 
 
 def test_is_icechunk_repo(tmp_path: Path) -> None:
+    assert is_icechunk_repo(tmp_path / "does-not-exist") is False  # missing dir
+
     repo_dir = tmp_path / "repo.icechunk"
     repo_dir.mkdir()
     assert is_icechunk_repo(repo_dir) is False  # no snapshots/, no repo
@@ -77,24 +53,18 @@ def test_is_icechunk_repo(tmp_path: Path) -> None:
     assert is_icechunk_repo(repo_dir) is False  # zarr.json present -> plain zarr, not icechunk
 
 
-def test_is_icechunk_repo_missing_dir(tmp_path: Path) -> None:
-    assert is_icechunk_repo(tmp_path / "does-not-exist") is False
-
-
-def test_require_icechunk_returns_module() -> None:
+def test_require_icechunk_returns_module_or_raises_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("icechunk")
     icechunk = require_icechunk()
     assert icechunk.__name__ == "icechunk"
 
-
-def test_require_icechunk_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "icechunk", None)
     with pytest.raises(StorageError) as exc_info:
         require_icechunk()
     assert "annizarr[icechunk]" in str(exc_info.value)
 
 
-def test_open_output_store_finalize_is_idempotent_plain_zarr(tmp_path: Path) -> None:
+def test_open_output_store_finalize_is_idempotent(tmp_path: Path) -> None:
     target = tmp_path / "out.zarr"
     out = open_output_store(target, AppConfig(io=IOConfig(consolidate_metadata=True)))
     out.root.attrs["encoding-type"] = "anndata"
@@ -105,13 +75,11 @@ def test_open_output_store_finalize_is_idempotent_plain_zarr(tmp_path: Path) -> 
     assert target.exists()
     assert not list(tmp_path.glob("*.tmp-*"))  # temp dir renamed away, none left behind
 
-
-def test_open_output_store_finalize_is_idempotent_icechunk(tmp_path: Path) -> None:
     pytest.importorskip("icechunk")
-    out = open_output_store(tmp_path / "repo.icechunk", AppConfig(io=IOConfig(backend="icechunk")))
-    out.root.attrs["marker"] = 1
-    first = out.finalize()
-    second = out.finalize()
+    out_ic = open_output_store(tmp_path / "repo.icechunk", AppConfig(io=IOConfig(backend="icechunk")))
+    out_ic.root.attrs["marker"] = 1
+    first = out_ic.finalize()
+    second = out_ic.finalize()
     assert first is not None
     assert second == first  # cached, not a second (empty) commit
 

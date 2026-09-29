@@ -61,21 +61,13 @@ def add_chunk_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_autoshard_arg(parser: argparse.ArgumentParser) -> None:
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
+    parser.add_argument(
         "--auto-shard",
         dest="auto_shard",
         action="store_true",
-        default=None,
-        help="shard our own 1-D sparse data/indices arrays with zarr's shards='auto', and "
-        "auto-shard anndata's own writes (obs/var/obsm/uns); dense X is unaffected",
-    )
-    group.add_argument(
-        "--no-auto-shard",
-        dest="auto_shard",
-        action="store_false",
-        default=None,
-        help="disable auto-sharding (default; see --auto-shard)",
+        default=False,
+        help="shard the anndata-written elements and the 1-D sparse arrays with zarr's "
+        "automatic shard shape (default: unsharded)",
     )
 
 

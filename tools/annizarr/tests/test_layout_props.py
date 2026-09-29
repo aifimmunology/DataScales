@@ -4,7 +4,7 @@ import math
 from itertools import pairwise
 
 import pandas as pd
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from annizarr._layout import band_plan, dense_shards
@@ -13,7 +13,6 @@ from annizarr._storage._uri import bucket_prefix, canonical_location, is_remote,
 
 _DIM = st.integers(min_value=1, max_value=500)
 _CHUNK = st.integers(min_value=1, max_value=600)
-_FACTOR = st.integers(min_value=2, max_value=8)
 
 # path/URI text kept to characters that survive urlparse/realpath unambiguously (no "/",
 # "@", ":", "?", "#" — those are URL/netloc-meaningful and would break the round trip).
@@ -31,28 +30,30 @@ def _prefix_text(draw: st.DrawFn) -> str:
     return "/".join(segments)
 
 
+@st.composite
+def _remote_uri(draw: st.DrawFn) -> tuple[str, str, str]:
+    sch = draw(st.sampled_from(_REMOTE_SCHEMES))
+    bucket = draw(_SEGMENT)
+    prefix = draw(_prefix_text())
+    return sch, bucket, prefix
+
+
 # ---- dense_shards ----------------------------------------------------------------------
 
 
-@given(row_chunk=_CHUNK, col_chunk=_CHUNK, n_rows=_DIM, n_cols=_DIM, factor=st.integers(min_value=-5, max_value=1))
+@given(row_chunk=_CHUNK, col_chunk=_CHUNK, n_rows=_DIM, n_cols=_DIM, factor=st.integers(min_value=-5, max_value=8))
 @settings(max_examples=200, deadline=None)
-def test_dense_shards_factor_le_one_disables_sharding(
-    row_chunk: int, col_chunk: int, n_rows: int, n_cols: int, factor: int
-) -> None:
-    layout = dense_shards(row_chunk, col_chunk, n_rows, n_cols, factor)
-    assert layout.shards is None
-    assert layout.chunks == (row_chunk, col_chunk)
-    assert layout.block == layout.chunks
-
-
-@given(row_chunk=_CHUNK, col_chunk=_CHUNK, n_rows=_DIM, n_cols=_DIM, factor=_FACTOR)
-@settings(max_examples=200, deadline=None)
-def test_dense_shards_sharded_invariants(row_chunk: int, col_chunk: int, n_rows: int, n_cols: int, factor: int) -> None:
+def test_dense_shards_invariants(row_chunk: int, col_chunk: int, n_rows: int, n_cols: int, factor: int) -> None:
     layout = dense_shards(row_chunk, col_chunk, n_rows, n_cols, factor)
     assert layout.chunks == (row_chunk, col_chunk)
+
+    if factor <= 1:
+        assert layout.shards is None
+        assert layout.block == layout.chunks
+        return
+
     assert layout.shards is not None
     shard_row, shard_col = layout.shards
-
     # shard is always an integer multiple of the inner chunk (zarr's own requirement)
     assert shard_row % row_chunk == 0
     assert shard_col % col_chunk == 0
@@ -70,16 +71,9 @@ def test_dense_shards_sharded_invariants(row_chunk: int, col_chunk: int, n_rows:
     assert (shard_row == grid_row) == (factor >= n_row_chunks)
     assert (shard_col == grid_col) == (factor >= n_col_chunks)
 
-    # block is exactly one shard, so a block-aligned write can never straddle a shard
+    # block is exactly one shard, so a block-aligned write can never straddle a shard, and
+    # band_plan tiling the array by that block covers [0, n) exactly on both axes
     assert layout.block == layout.shards
-
-
-@given(row_chunk=_CHUNK, col_chunk=_CHUNK, n_rows=_DIM, n_cols=_DIM, factor=st.integers(min_value=1, max_value=8))
-@settings(max_examples=200, deadline=None)
-def test_dense_shards_block_tiles_cover_array_exactly(
-    row_chunk: int, col_chunk: int, n_rows: int, n_cols: int, factor: int
-) -> None:
-    layout = dense_shards(row_chunk, col_chunk, n_rows, n_cols, factor)
     block_row, block_col = layout.block
     row_bands = band_plan(n_rows, block_row)
     col_bands = band_plan(n_cols, block_col)
@@ -92,10 +86,16 @@ def test_dense_shards_block_tiles_cover_array_exactly(
 # ---- band_plan --------------------------------------------------------------------------
 
 
-@given(n_rows=st.integers(min_value=1, max_value=200_000), band_rows=st.integers(min_value=1, max_value=200_000))
+@given(
+    n_rows=st.integers(min_value=-1000, max_value=200_000), band_rows=st.integers(min_value=-1000, max_value=200_000)
+)
 @settings(max_examples=200, deadline=None)
-def test_band_plan_partitions_range_exactly(n_rows: int, band_rows: int) -> None:
+def test_band_plan_invariants(n_rows: int, band_rows: int) -> None:
     bands = band_plan(n_rows, band_rows)
+    if n_rows <= 0 or band_rows <= 0:
+        assert bands == ()
+        return
+
     assert bands
     assert bands[0][0] == 0
     assert bands[-1][1] == n_rows
@@ -108,18 +108,6 @@ def test_band_plan_partitions_range_exactly(n_rows: int, band_rows: int) -> None
     assert starts == sorted(starts)
 
 
-@given(n_rows=st.integers(min_value=-1000, max_value=0), band_rows=st.integers(min_value=1, max_value=1000))
-@settings(max_examples=200, deadline=None)
-def test_band_plan_empty_for_non_positive_n_rows(n_rows: int, band_rows: int) -> None:
-    assert band_plan(n_rows, band_rows) == ()
-
-
-@given(n_rows=st.integers(min_value=1, max_value=1000), band_rows=st.integers(min_value=-1000, max_value=0))
-@settings(max_examples=200, deadline=None)
-def test_band_plan_empty_for_non_positive_band_rows(n_rows: int, band_rows: int) -> None:
-    assert band_plan(n_rows, band_rows) == ()
-
-
 # ---- _uri ---------------------------------------------------------------------------------
 
 
@@ -129,18 +117,25 @@ def test_band_plan_empty_for_non_positive_band_rows(n_rows: int, band_rows: int)
     prefix=_prefix_text(),
 )
 @settings(max_examples=200, deadline=None)
-def test_is_remote_matches_scheme_membership(sch: str, bucket: str, prefix: str) -> None:
+def test_uri_scheme_and_bucket_prefix_roundtrip(sch: str, bucket: str, prefix: str) -> None:
     uri = f"{sch}://{bucket}/{prefix}" if prefix else f"{sch}://{bucket}/"
     assert is_remote(uri) == (scheme(uri) in {"s3", "gs", "gcs"})
+    if scheme(uri) in _REMOTE_SCHEMES:
+        got_bucket, got_prefix = bucket_prefix(uri)
+        assert got_bucket == bucket
+        assert got_prefix == (prefix or None)
 
 
-@given(sch=st.sampled_from(_REMOTE_SCHEMES), bucket=_SEGMENT, prefix=_prefix_text())
+@given(
+    local=st.lists(st.one_of(_SEGMENT, st.just("."), st.just("..")), min_size=1, max_size=6).map("/".join),
+    remote=_remote_uri(),
+)
 @settings(max_examples=200, deadline=None)
-def test_bucket_prefix_round_trips(sch: str, bucket: str, prefix: str) -> None:
-    uri = f"{sch}://{bucket}/{prefix}" if prefix else f"{sch}://{bucket}/"
-    got_bucket, got_prefix = bucket_prefix(uri)
-    assert got_bucket == bucket
-    assert got_prefix == (prefix or None)
+def test_canonical_location_idempotent(local: str, remote: tuple[str, str, str]) -> None:
+    for candidate in (local, "{}://{}/{}".format(*remote) if remote[2] else f"{remote[0]}://{remote[1]}/"):
+        once = canonical_location(candidate)
+        twice = canonical_location(once)
+        assert once == twice
 
 
 @st.composite
@@ -155,33 +150,18 @@ def _realistic_path(draw: st.DrawFn) -> tuple[str, str]:
 
 
 @given(data=_realistic_path())
+@example(data=("/", "/"))
+@example(data=("///", "///"))
 @settings(max_examples=200, deadline=None)
 def test_store_name_returns_tail_and_strips_trailing_slashes(data: tuple[str, str]) -> None:
     path, tail = data
+    # the two @example cases are all-slashes paths where store_name falls back to the input
+    # verbatim instead of an empty tail
+    if set(path) == {"/"}:
+        assert store_name(path) == path
+        return
     assert store_name(path) == tail
     assert store_name(path) != ""
-
-
-def test_store_name_all_slashes_falls_back_to_input() -> None:
-    assert store_name("/") == "/"
-    assert store_name("///") == "///"
-
-
-@given(local=st.lists(st.one_of(_SEGMENT, st.just("."), st.just("..")), min_size=1, max_size=6).map("/".join))
-@settings(max_examples=200, deadline=None)
-def test_canonical_location_idempotent_local(local: str) -> None:
-    once = canonical_location(local)
-    twice = canonical_location(once)
-    assert once == twice
-
-
-@given(sch=st.sampled_from(_REMOTE_SCHEMES), bucket=_SEGMENT, prefix=_prefix_text())
-@settings(max_examples=200, deadline=None)
-def test_canonical_location_idempotent_remote(sch: str, bucket: str, prefix: str) -> None:
-    uri = f"{sch}://{bucket}/{prefix}" if prefix else f"{sch}://{bucket}/"
-    once = canonical_location(uri)
-    twice = canonical_location(once)
-    assert once == twice
 
 
 # ---- compute_sort -------------------------------------------------------------------------

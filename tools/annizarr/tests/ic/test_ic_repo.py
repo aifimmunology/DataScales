@@ -24,21 +24,22 @@ def test_init_imports_store_faithfully(src_zarr, repo_path):
     assert set(root["obs"].array_keys()) == {"_index"}
 
 
-def test_init_rejects_nonempty_output(src_zarr, repo_path):
+def test_init_rejects_nonempty_output_and_open_rejects_missing_repo(src_zarr, repo_path, tmp_path):
     path, _ = src_zarr
     Repo.init(path, repo_path)
     with pytest.raises(RepoError):
         Repo.init(path, repo_path)
 
-
-def test_open_missing_repo_errors(tmp_path):
     with pytest.raises(RepoError):
         Repo(tmp_path / "nope.icechunk")
 
 
-def test_commit_records_snapshot(src_zarr, repo_path):
+def test_commit_records_snapshot_and_requires_a_staged_session(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
+
+    with pytest.raises(RepoError):
+        repo.commit("nothing staged")
 
     g = repo.open_zarr("w")
     g.attrs["note"] = "edited"
@@ -49,13 +50,6 @@ def test_commit_records_snapshot(src_zarr, repo_path):
     assert log[0].id == snapshot_id
     assert log[0].message == "add note"
     assert repo.open_zarr("r").attrs["note"] == "edited"
-
-
-def test_commit_without_session_errors(src_zarr, repo_path):
-    path, _ = src_zarr
-    repo = Repo.init(path, repo_path)
-    with pytest.raises(RepoError):
-        repo.commit("nothing staged")
 
 
 def test_log_newest_first(src_zarr, repo_path):
@@ -86,13 +80,6 @@ def test_checkout_create_branches_and_isolates_commits(src_zarr, repo_path):
     assert set(repo.branches()) == {"main", "experiment"}
 
 
-def test_checkout_missing_branch_errors(src_zarr, repo_path):
-    path, _ = src_zarr
-    repo = Repo.init(path, repo_path)
-    with pytest.raises(RepoError):
-        repo.checkout("ghost")
-
-
 def test_head_persists_across_reopen(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
@@ -102,7 +89,7 @@ def test_head_persists_across_reopen(src_zarr, repo_path):
     assert reopened.branch == "dev"
 
 
-def test_cherrypick_resets_branch_state(src_zarr, repo_path):
+def test_cherrypick_resets_branch_state_and_rejects_unknown_snapshot(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
     first = repo.log()[0].id
@@ -115,17 +102,16 @@ def test_cherrypick_resets_branch_state(src_zarr, repo_path):
     assert "v" not in repo.open_zarr("r").attrs
     assert repo.log()[0].id == first
 
-
-def test_cherrypick_unknown_snapshot_errors(src_zarr, repo_path):
-    path, _ = src_zarr
-    repo = Repo.init(path, repo_path)
     with pytest.raises(RepoError):
         repo.cherrypick("deadbeef")
 
 
-def test_uncommitted_changes_block_checkout(src_zarr, repo_path):
+def test_checkout_missing_branch_and_uncommitted_changes_both_block_checkout(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
+    with pytest.raises(RepoError):
+        repo.checkout("ghost")
+
     repo.open_zarr("w").attrs["dirty"] = True
     with pytest.raises(RepoError):
         repo.checkout("other", create=True)

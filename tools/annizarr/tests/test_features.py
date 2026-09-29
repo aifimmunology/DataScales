@@ -1,5 +1,6 @@
 """Tests for the icechunk backend (Feature A) and sort/partition (Feature B)."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import anndata as ad
@@ -94,8 +95,10 @@ def _self_serve_subset(g, **keys):
 # ---------------------------------------------------------------------------
 
 
-def test_icechunk_roundtrip_eager(tmp_path: Path) -> None:
+def test_icechunk_roundtrip_eager_and_op_result_snapshot_ids(tmp_path: Path) -> None:
     pytest.importorskip("icechunk")
+    from annizarr._ops import add_expr
+
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "repo.icechunk"
     cfg = AppConfig(
@@ -103,7 +106,8 @@ def test_icechunk_roundtrip_eager(tmp_path: Path) -> None:
         chunks=_chunks(),
         validation=ValidationConfig(),
     )
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=cfg)
+    ic_result = convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=cfg)
+    assert isinstance(ic_result.snapshot_id, str) and ic_result.snapshot_id
 
     # Reopen through an icechunk read-only session and check X round-trips.
     g = open_input_group(str(out), branch="main")
@@ -115,44 +119,20 @@ def test_icechunk_roundtrip_eager(tmp_path: Path) -> None:
     assert g.attrs["encoding-type"] == "anndata"
     assert list(read_elem(g["obs"])["cell_type"]) == ["B", "A", "A", "B", "A", "B"]
 
-
-def test_icechunk_rejects_backed(tmp_path: Path) -> None:
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    cfg = AppConfig(
-        io=IOConfig(overwrite=True, backend="icechunk", backed=True),
-        chunks=_chunks(),
-        validation=ValidationConfig(),
-    )
+    # icechunk never supports backed input
+    cfg_backed = replace(cfg, io=replace(cfg.io, backed=True))
     with pytest.raises(ConversionError, match="does not support --backed"):
-        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "repo.icechunk"), cfg=cfg)
+        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "repo2.icechunk"), cfg=cfg_backed)
 
-
-def test_op_result_snapshot_id_icechunk_vs_plain(tmp_path: Path) -> None:
-    pytest.importorskip("icechunk")
-    from annizarr._ops import add_expr
-
-    _labelled_h5ad(tmp_path / "in.h5ad")
-
+    # a plain-zarr OpResult carries no snapshot_id; an icechunk one always does, and each op
+    # gets its own distinct snapshot
     plain_cfg = AppConfig(io=IOConfig(overwrite=True), chunks=_chunks(), validation=ValidationConfig())
     plain_result = convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "plain.zarr"), cfg=plain_cfg)
     assert plain_result.snapshot_id is None
 
-    ic_cfg = AppConfig(io=IOConfig(overwrite=True, backend="icechunk"), chunks=_chunks(), validation=ValidationConfig())
-    ic_out = tmp_path / "repo.icechunk"
-    ic_result = convert_h5ad(str(tmp_path / "in.h5ad"), output=str(ic_out), cfg=ic_cfg)
-    assert isinstance(ic_result.snapshot_id, str) and ic_result.snapshot_id
-
-    expr_result = add_expr(str(ic_out), cfg=ic_cfg)
+    expr_result = add_expr(str(out), cfg=cfg)
     assert isinstance(expr_result.snapshot_id, str) and expr_result.snapshot_id
     assert expr_result.snapshot_id != ic_result.snapshot_id
-
-
-def test_convert_clean_input_emits_no_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    cfg = AppConfig(io=IOConfig(overwrite=True), chunks=_chunks(), validation=ValidationConfig())
-    with caplog.at_level("WARNING", logger="annizarr"):
-        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "out.zarr"), cfg=cfg)
-    assert [r.message for r in caplog.records if r.levelname == "WARNING"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +149,13 @@ def _sorted_cfg(backend: str = "zarr") -> AppConfig:
     )
 
 
-def test_sort_writes_valid_anndata_no_index(tmp_path: Path) -> None:
+def test_sort_writes_valid_anndata_and_self_serve_reads(tmp_path: Path) -> None:
+    """Convert-time --sort-by physically sorts rows (no annizarr-specific index written);
+    self-serve subset reads then use ONLY stock anndata/zarr. A whole-primary-key block
+    (cell_type="A") and a compound sub-range (cell_type="A", demographic="x") both span
+    contiguous run(s) — but a non-leading key alone (demographic="x") cuts across
+    primary-key blocks into several NON-adjacent spans, a genuinely different
+    span-reconstruction case worth checking separately."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted.zarr"
     convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=_sorted_cfg())
@@ -182,16 +168,8 @@ def test_sort_writes_valid_anndata_no_index(tmp_path: Path) -> None:
     assert list(np.asarray(adata.X[:, 0].todense()).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
     # obsm is reordered consistently with the row permutation (coords col0 was 0,2,4,6,8,10).
     assert list(adata.obsm["coords"][:, 0].astype(int)) == [2, 8, 4, 6, 0, 10]
-
     # NO annizarr-specific index is written — the store is a plain sorted AnnData.
     assert "zarrsmith_sort_index" not in adata.uns
-
-
-def test_sorted_store_self_serve_contiguous_block(tmp_path: Path) -> None:
-    """A whole-primary-key block spans contiguous range(s): read it with stock anndata/zarr."""
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    out = tmp_path / "sorted.zarr"
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=_sorted_cfg())
 
     g = open_input_group(str(out))
     X, obs = _self_serve_subset(g, cell_type="A")  # whole A block: ids 2,3,5
@@ -201,24 +179,17 @@ def test_sorted_store_self_serve_contiguous_block(tmp_path: Path) -> None:
     Xsub, _ = _self_serve_subset(g, cell_type="A", demographic="x")  # sub-range: ids 2,5
     assert _id_set(Xsub) == {2, 5}
 
-
-def test_sorted_store_self_serve_crosscut(tmp_path: Path) -> None:
-    """A non-leading key cuts across primary-key blocks into several non-adjacent spans;
-    gather them with stock anndata/zarr by masking the sorted obs column."""
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    out = tmp_path / "sorted.zarr"
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=_sorted_cfg())
-
-    g = open_input_group(str(out))
     # demographic="x" cuts across cell types A and B (non-adjacent spans): ids 2,5 (A/x) + 4 (B/x)
-    X, _ = _self_serve_subset(g, demographic="x")
-    assert _id_set(X) == {2, 4, 5}
+    Xcross, _ = _self_serve_subset(g, demographic="x")
+    assert _id_set(Xcross) == {2, 4, 5}
 
 
-def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
+def test_sort_dense_writes_contiguous_ranges_and_rejects_unsupported_x_storage(tmp_path: Path) -> None:
     """Dense X supports --sort-by: rows are physically sorted so each key tuple is a
     contiguous run derivable from the sorted obs and read directly via X[start:end]
-    (stock zarr, no annizarr, no index)."""
+    (stock zarr, no annizarr, no index). --sort-by also requires x_storage='csr' or 'dense'
+    in general, and further requires 'csr' specifically when combined with --backed
+    (streamed bucketing is csr-only; dense sort still works eagerly, as above)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted_dense.zarr"
     cfg = AppConfig(
@@ -252,17 +223,23 @@ def test_sort_dense_writes_contiguous_ranges(tmp_path: Path) -> None:
             assert (obs_full["cell_type"].to_numpy()[s:i] == keys[s][0]).all()
             s = i
 
-
-def test_sort_rejects_sparse_csc(tmp_path: Path) -> None:
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    cfg = AppConfig(
+    cfg_csc = AppConfig(
         io=IOConfig(overwrite=True, x_storage="csc"),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
     )
     with pytest.raises(ConversionError, match="requires x_storage='csr' or 'dense'"):
-        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o.zarr"), cfg=cfg)
+        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o1.zarr"), cfg=cfg_csc)
+
+    cfg_backed_dense = AppConfig(
+        io=IOConfig(overwrite=True, backed=True, x_storage="dense"),
+        chunks=_chunks(),
+        validation=ValidationConfig(),
+        grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
+    )
+    with pytest.raises(ConversionError, match="csr"):
+        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o2.zarr"), cfg=cfg_backed_dense)
 
 
 def _backed_sorted_cfg() -> AppConfig:
@@ -298,20 +275,6 @@ def test_sort_backed_streamed_matches_eager(tmp_path: Path) -> None:
     g = open_input_group(str(out_backed))
     assert _id_set(_self_serve_subset(g, cell_type="A")[0]) == {2, 3, 5}
     assert _id_set(_self_serve_subset(g, demographic="x")[0]) == {2, 4, 5}
-
-
-def test_sort_backed_rejects_dense(tmp_path: Path) -> None:
-    """Backed streamed sort is csr only; dense + --backed + --sort-by is rejected
-    (dense sort still works eagerly)."""
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    cfg = AppConfig(
-        io=IOConfig(overwrite=True, backed=True, x_storage="dense"),
-        chunks=_chunks(),
-        validation=ValidationConfig(),
-        grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
-    )
-    with pytest.raises(ConversionError, match="csr"):
-        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o.zarr"), cfg=cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -384,37 +347,27 @@ def _expected_dense(in_h5ad: Path) -> np.ndarray:
     return np.asarray(a.X.todense() if sp.issparse(a.X) else a.X)
 
 
-def test_dense_sharding_metadata_and_roundtrip(tmp_path: Path) -> None:
+def test_dense_sharding_metadata_roundtrip_and_object_count(tmp_path: Path) -> None:
     _labelled_h5ad(tmp_path / "in.h5ad")
-    out = tmp_path / "sharded.zarr"
+    sharded = tmp_path / "sharded.zarr"
+    plain = tmp_path / "plain.zarr"
     # 6x3 X, chunks 2x2, factor 2 -> shard 4x4 (capped at the array's chunk extent).
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=_dense_cfg(shard_factor=2))
+    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(sharded), cfg=_dense_cfg(shard_factor=2))
+    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(plain), cfg=_dense_cfg(shard_factor=1))
 
-    g = open_input_group(str(out))
+    g = open_input_group(str(sharded))
     xa = g["X"]
     assert xa.chunks == (2, 2)  # inner chunk = read granularity, unchanged
     assert xa.shards == (4, 4)  # shard = chunk * factor
     assert xa.attrs["encoding-type"] == "array"
 
-    # Still a valid, byte-identical anndata store.
-    got = np.asarray(ad.read_zarr(str(out)).X)
-    assert np.array_equal(got, _expected_dense(tmp_path / "in.h5ad"))
-
-
-def test_sharding_cuts_object_count(tmp_path: Path) -> None:
-    _labelled_h5ad(tmp_path / "in.h5ad")
-    sharded = tmp_path / "sharded.zarr"
-    plain = tmp_path / "plain.zarr"
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(sharded), cfg=_dense_cfg(shard_factor=2))
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(plain), cfg=_dense_cfg(shard_factor=1))
-
     # Same logical layout (chunks 2x2), but shards pack many inner chunks per object.
     assert _x_object_count(sharded) < _x_object_count(plain)
-    # ...and the data is identical between the two.
-    assert np.array_equal(
-        np.asarray(ad.read_zarr(str(sharded)).X),
-        np.asarray(ad.read_zarr(str(plain)).X),
-    )
+
+    # Still a valid, byte-identical anndata store, and identical data between the two.
+    expected = _expected_dense(tmp_path / "in.h5ad")
+    assert np.array_equal(np.asarray(ad.read_zarr(str(sharded)).X), expected)
+    assert np.array_equal(np.asarray(ad.read_zarr(str(plain)).X), expected)
 
 
 def test_sharding_backed_dense_parallel_roundtrip(tmp_path: Path) -> None:
@@ -478,40 +431,38 @@ def _read_X(out: Path) -> np.ndarray:
     return np.asarray(X.todense() if sp.issparse(X) else X)
 
 
-@pytest.mark.parametrize("x_storage", ["dense", "csr"])
-def test_inmem_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
-    """In-memory conversion at cpus>1 (threaded da.store) must round-trip bit-exact.
-    Rows span several row-chunks so multiple chunks are written concurrently — this is the
-    path that carries lock=False, so a lock/alignment regression would corrupt the output."""
-    src = _rand_h5ad(tmp_path / "in.h5ad", n_obs=300, n_vars=200, seed=1)
-    out = tmp_path / "out.zarr"
-    cfg = AppConfig(
-        io=IOConfig(overwrite=True, x_storage=x_storage),
-        chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=200, sparse_flat_chunk=500, cpus=4),
-        validation=ValidationConfig(),
-    )
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=cfg)
-    assert np.array_equal(_read_X(out), src)
+def test_parallel_write_roundtrip_inmem_and_concat_seam(tmp_path: Path) -> None:
+    """In-memory conversion at cpus>1 (threaded da.store) must round-trip bit-exact for both
+    dense and csr -- rows span several row-chunks so multiple chunks are written concurrently,
+    the path that carries lock=False (a lock/alignment regression would corrupt the output).
+    concat at cpus>1 writes each file at a misaligned row offset, so the file-seam chunk is
+    read-modify-written; that path MUST keep the da.store lock (row counts here are
+    deliberately not multiples of the row chunk) -- with lock=False concurrent RMW corrupts X
+    (200 + 300 rows at row_chunk 64 puts the second file at a misaligned offset, 200 % 64 != 0;
+    200 cols/chunk make the seam-chunk RMW window wide enough that lock=False corrupts
+    reliably, verified 6/6, so this is a real guard, not a coin flip)."""
+    for x_storage in ("dense", "csr"):
+        src = _rand_h5ad(tmp_path / f"in_{x_storage}.h5ad", n_obs=300, n_vars=200, seed=1)
+        out = tmp_path / f"out_{x_storage}.zarr"
+        cfg = AppConfig(
+            io=IOConfig(overwrite=True, x_storage=x_storage),
+            chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=200, sparse_flat_chunk=500, cpus=4),
+            validation=ValidationConfig(),
+        )
+        convert_h5ad(str(tmp_path / f"in_{x_storage}.h5ad"), output=str(out), cfg=cfg)
+        assert np.array_equal(_read_X(out), src)
 
-
-@pytest.mark.parametrize("x_storage", ["dense", "csr"])
-def test_concat_parallel_write_roundtrip(tmp_path: Path, x_storage: str) -> None:
-    """concat at cpus>1 writes each file at a misaligned row offset, so the file-seam
-    chunk is read-modify-written. That path MUST keep the da.store lock (row counts here are
-    deliberately not multiples of the row chunk) — with lock=False concurrent RMW corrupts X."""
-    # 200 + 300 rows at row_chunk 64 puts the second file at a misaligned offset (200 % 64 != 0);
-    # 200 cols/chunk make the seam-chunk RMW window wide enough that lock=False corrupts
-    # reliably (verified 6/6), so this is a real guard, not a coin flip.
-    a = _rand_h5ad(tmp_path / "a.h5ad", n_obs=200, n_vars=500, seed=1)
-    b = _rand_h5ad(tmp_path / "b.h5ad", n_obs=300, n_vars=500, seed=2)
-    out = tmp_path / "out.zarr"
-    cfg = AppConfig(
-        io=IOConfig(overwrite=True, x_storage=x_storage),
-        chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=500, sparse_flat_chunk=500, cpus=4),
-        validation=ValidationConfig(),
-    )
-    concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(out), cfg=cfg)
-    assert np.array_equal(_read_X(out), np.vstack([a, b]))
+    for x_storage in ("dense", "csr"):
+        a = _rand_h5ad(tmp_path / f"a_{x_storage}.h5ad", n_obs=200, n_vars=500, seed=1)
+        b = _rand_h5ad(tmp_path / f"b_{x_storage}.h5ad", n_obs=300, n_vars=500, seed=2)
+        out = tmp_path / f"concat_{x_storage}.zarr"
+        cfg = AppConfig(
+            io=IOConfig(overwrite=True, x_storage=x_storage),
+            chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=500, sparse_flat_chunk=500, cpus=4),
+            validation=ValidationConfig(),
+        )
+        concat([str(tmp_path / f"a_{x_storage}.h5ad"), str(tmp_path / f"b_{x_storage}.h5ad")], output=str(out), cfg=cfg)
+        assert np.array_equal(_read_X(out), np.vstack([a, b]))
 
 
 def test_concat_backed_csc_input_above_eager_max_bytes_raises(tmp_path: Path) -> None:
@@ -592,33 +543,31 @@ def test_concat_obs_columns_projects_and_warns(tmp_path: Path, caplog) -> None:
     assert any("score" in m and "coerced" in m for m in msgs)  # int + float -> float
 
 
-def test_concat_obs_columns_missing_raises(tmp_path: Path) -> None:
-    """A requested obs column absent from any input is a hard error."""
+def test_concat_obs_columns_missing_or_categorical_mismatch_raises(tmp_path: Path) -> None:
+    # a requested obs column absent from any input is a hard error
     _obs_cols_h5ad(tmp_path / "a.h5ad", 6, ["Tcell", "Bcell"], "qc_a")
     _obs_cols_h5ad(tmp_path / "b.h5ad", 4, ["Tcell", "Bcell"], "qc_b")
-    cfg = AppConfig(
+    cfg_missing = AppConfig(
         io=IOConfig(overwrite=True, x_storage="csr"),
         chunks=_chunks(),
         validation=ValidationConfig(),
         concat=ConcatConfig(obs_columns=("cell_type", "qc_a")),  # qc_a exists only in a.h5ad
     )
     with pytest.raises(ConversionError, match="obs columns not found"):
-        concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(tmp_path / "o.zarr"), cfg=cfg)
+        concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(tmp_path / "o1.zarr"), cfg=cfg_missing)
 
-
-def test_concat_obs_columns_categorical_mismatch_raises(tmp_path: Path) -> None:
-    """A selected categorical column with differing category sets across inputs is a hard
-    error — concat would degrade it to a (slow) string array, so we refuse."""
-    _obs_cols_h5ad(tmp_path / "a.h5ad", 6, ["Tcell", "Bcell"], "qc_a")
-    _obs_cols_h5ad(tmp_path / "b.h5ad", 4, ["Bcell", "NK"], "qc_b")  # different category set
-    cfg = AppConfig(
+    # a selected categorical column with differing category sets across inputs is a hard
+    # error too -- concat would degrade it to a (slow) string array, so we refuse
+    _obs_cols_h5ad(tmp_path / "c.h5ad", 6, ["Tcell", "Bcell"], "qc_c")
+    _obs_cols_h5ad(tmp_path / "d.h5ad", 4, ["Bcell", "NK"], "qc_d")  # different category set
+    cfg_mismatch = AppConfig(
         io=IOConfig(overwrite=True, x_storage="csr"),
         chunks=_chunks(),
         validation=ValidationConfig(),
         concat=ConcatConfig(obs_columns=("cell_type", "donor")),
     )
     with pytest.raises(ConversionError, match="mismatched categorical categories"):
-        concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(tmp_path / "o.zarr"), cfg=cfg)
+        concat([str(tmp_path / "c.h5ad"), str(tmp_path / "d.h5ad")], output=str(tmp_path / "o2.zarr"), cfg=cfg_mismatch)
 
 
 def test_concat_obs_columns_categorical_match_ok(tmp_path: Path) -> None:

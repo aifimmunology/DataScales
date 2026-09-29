@@ -90,78 +90,103 @@ def test_add_expr_all_formats(tmp_path, fmt):
         csr_vals = ad.read_zarr(str(out)).layers["gexp_csr_ref"].toarray()
         assert np.array_equal(np.sort(vals, axis=1), np.sort(csr_vals, axis=1))
 
+    if fmt == "dense":
+        # overwrite guard (was a standalone test): re-adding without overwrite=True
+        # raises; overwrite=True actually replaces the layer's format.
+        with pytest.raises(ConversionError, match="already exists"):
+            add_expr(str(out), fmt="dense", cfg=_cfg())
+        add_expr(str(out), fmt="csc", overwrite=True, cfg=_cfg())
+        assert not isinstance(zarr.open_group(str(out), mode="r")["layers/gexp"], zarr.Array)
 
-def test_add_expr_existing_layer(tmp_path):
-    out = _store(tmp_path, _adata())
-    add_expr(str(out), fmt="csc", cfg=_cfg())
-    with pytest.raises(ConversionError, match="already exists"):
-        add_expr(str(out), fmt="csc", cfg=_cfg())
-    add_expr(str(out), fmt="dense", overwrite=True, cfg=_cfg())
-    assert isinstance(zarr.open_group(str(out), mode="r")["layers/gexp"], zarr.Array)
+
+def test_add_expr_empty_rows_and_genes(tmp_path):
+    # zero-count cells at band boundaries (incl. the last row) once truncated the
+    # previous row's sum; an all-zero gene exercises empty csc columns
+    x = np.zeros((10, 5), dtype=np.float32)
+    x[1:9, [0, 1, 3, 4]] = np.arange(1, 33, dtype=np.float32).reshape(8, 4)
+    adata = ad.AnnData(
+        X=sp.csr_matrix(x),
+        obs=pd.DataFrame({"cell_type": pd.Categorical(["a"] * 10)}, index=[f"c{i}" for i in range(10)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+    )
+    for fmt in ("csr", "csc", "dense"):
+        out = _store(tmp_path, adata, f"empty-{fmt}.zarr")
+        add_expr(str(out), fmt=fmt, chunk_elems=16, cfg=_cfg())
+        got = ad.read_zarr(str(out))
+        vals = got.layers["gexp"]
+        vals = np.asarray(vals) if fmt == "dense" else vals.toarray()
+        np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
+        assert not vals[0].any() and not vals[-1].any() and not vals[:, 2].any()
+
+
+def test_add_expr_multiband(tmp_path, monkeypatch):
+    # tiny band budget → many column bands + multiple row batches, exercising the
+    # bucket cursors and band-edge math the default 256 MB budget never hits in tests
+    monkeypatch.setattr("annizarr._layout.BATCH_BYTES", 600)
+    adata = _adata(n=1200, v=12, seed=4)
+    for fmt in ("csc", "dense"):
+        out = _store(tmp_path, adata, f"mb-{fmt}.zarr")
+        add_expr(str(out), fmt=fmt, chunk_elems=80, cfg=_cfg())
+        got = ad.read_zarr(str(out))
+        vals = got.layers["gexp"]
+        vals = np.asarray(vals) if fmt == "dense" else vals.toarray()
+        np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
 
 
 # ── rechunk ──────────────────────────────────────────────────────────────────
 
 
-def test_rechunk_sparse(tmp_path):
-    adata = _adata()
-    out = _store(tmp_path, adata)
-    out2 = tmp_path / "rechunked.zarr"
-    rechunk(str(out), output=str(out2), cfg=AppConfig(chunks=ChunkConfig(sparse_flat_chunk=16)))
-    assert_anndata_readable(out2)
-    g = zarr.open_group(str(out2), mode="r")
-    assert g["X/data"].chunks == (16,)
-    got = ad.read_zarr(str(out2))
-    np.testing.assert_allclose(got.X.toarray(), adata.X.toarray())
-    assert list(got.obs["cell_type"]) == list(adata.obs["cell_type"])
-    np.testing.assert_allclose(got.obsm["X_umap"], adata.obsm["X_umap"])
-
-
-def test_rechunk_dense(tmp_path):
-    adata = _adata()
-    out = _store(tmp_path, adata, cfg=_cfg(x_storage="dense"))
-    out2 = tmp_path / "rechunked.zarr"
-    rechunk(str(out), output=str(out2), cfg=AppConfig(chunks=ChunkConfig(x_row_chunk=8, x_col_chunk=3, cpus=2)))
-    g = zarr.open_group(str(out2), mode="r")
-    assert g["X"].chunks == (8, 3)
-    got = ad.read_zarr(str(out2))
-    np.testing.assert_allclose(np.asarray(got.X), adata.X.toarray())
-
-
-@pytest.mark.parametrize("shard_factor", [1, 2])
-def test_rechunk_dense_shard_factor(tmp_path, shard_factor):
-    adata = _adata(n=64, v=8)
-    out = _store(tmp_path, adata, cfg=_cfg(x_storage="dense"))
-    out2 = tmp_path / "rechunked.zarr"
-    rechunk(
-        str(out),
-        output=str(out2),
-        cfg=AppConfig(chunks=ChunkConfig(x_row_chunk=8, x_col_chunk=4, x_shard_factor=shard_factor)),
-    )
-    g = zarr.open_group(str(out2), mode="r")
-    assert g["X"].chunks == (8, 4)
-    assert (g["X"].shards is None) == (shard_factor == 1)
-    got = ad.read_zarr(str(out2))
-    np.testing.assert_allclose(np.asarray(got.X), adata.X.toarray())
-
-
-def test_rechunk_copies_layers(tmp_path):
+def test_rechunk_sparse_and_dense(tmp_path):
     adata = _adata()
     out = _store(tmp_path, adata)
     add_expr(str(out), fmt="csc", chunk_elems=32, cfg=_cfg())
-    out2 = tmp_path / "rechunked.zarr"
-    rechunk(str(out), output=str(out2), cfg=AppConfig(chunks=ChunkConfig(sparse_flat_chunk=16)))
-    g = zarr.open_group(str(out2), mode="r")
+    out_sparse = tmp_path / "rechunked_sparse.zarr"
+    rechunk(str(out), output=str(out_sparse), cfg=AppConfig(chunks=ChunkConfig(sparse_flat_chunk=16)))
+    assert_anndata_readable(out_sparse)
+    g = zarr.open_group(str(out_sparse), mode="r")
+    assert g["X/data"].chunks == (16,)  # rechunk target
     assert g["layers/gexp/data"].chunks == (32,)  # non-target layer keeps its chunks
     assert g["layers/gexp/data"].shards is None  # copy-as-is preserves "unsharded" too
-    got = ad.read_zarr(str(out2))
+    got = ad.read_zarr(str(out_sparse))
+    np.testing.assert_allclose(got.X.toarray(), adata.X.toarray())
+    assert list(got.obs["cell_type"]) == list(adata.obs["cell_type"])
+    np.testing.assert_allclose(got.obsm["X_umap"], adata.obsm["X_umap"])
     np.testing.assert_allclose(got.layers["gexp"].toarray(), _expected_gexp(adata.X), rtol=1e-5)
+
+    out_dense_src = _store(tmp_path, adata, "dense_src.zarr", cfg=_cfg(x_storage="dense"))
+    out_dense = tmp_path / "rechunked_dense.zarr"
+    rechunk(
+        str(out_dense_src),
+        output=str(out_dense),
+        cfg=AppConfig(chunks=ChunkConfig(x_row_chunk=8, x_col_chunk=3, cpus=2)),
+    )
+    g_dense = zarr.open_group(str(out_dense), mode="r")
+    assert g_dense["X"].chunks == (8, 3)
+    got_dense = ad.read_zarr(str(out_dense))
+    np.testing.assert_allclose(np.asarray(got_dense.X), adata.X.toarray())
+
+
+def test_rechunk_dense_shard_factor(tmp_path):
+    adata = _adata(n=64, v=8)
+    out = _store(tmp_path, adata, cfg=_cfg(x_storage="dense"))
+    for shard_factor in (1, 2):
+        out2 = tmp_path / f"rechunked_sf{shard_factor}.zarr"
+        rechunk(
+            str(out),
+            output=str(out2),
+            cfg=AppConfig(chunks=ChunkConfig(x_row_chunk=8, x_col_chunk=4, x_shard_factor=shard_factor)),
+        )
+        g = zarr.open_group(str(out2), mode="r")
+        assert g["X"].chunks == (8, 4)
+        assert (g["X"].shards is None) == (shard_factor == 1)
+        got = ad.read_zarr(str(out2))
+        np.testing.assert_allclose(np.asarray(got.X), adata.X.toarray())
 
 
 # ── sort ─────────────────────────────────────────────────────────────────────
 
 
-def test_sort_store(tmp_path, caplog):
+def test_sort_store_and_guards(tmp_path, caplog):
     adata = _adata()
     out = _store(tmp_path, adata)
     out2 = tmp_path / "sorted.zarr"
@@ -178,102 +203,23 @@ def test_sort_store(tmp_path, caplog):
         np.testing.assert_allclose(got.X[i].toarray().ravel(), orig_x[n])
         np.testing.assert_allclose(got.obsm["X_umap"][i], orig_um[n])
 
-
-def test_sort_store_requires_by(tmp_path):
-    out = _store(tmp_path, _adata())
     with pytest.raises(ConversionError, match="by="):
         sort(str(out), output=str(tmp_path / "s.zarr"), by=(), cfg=_cfg())
+
+    # StorageError, not ConversionError: sort's target-exists check now goes through the
+    # shared check_output_target (item 6) instead of an ad-hoc raise in _sorting.
+    assert out2.exists()
+    with pytest.raises(StorageError, match="already exists"):
+        sort(str(out), output=str(out2), by=("cell_type",), cfg=_cfg())
 
 
 # ── append ───────────────────────────────────────────────────────────────────
 
 
 def test_append(tmp_path, caplog):
-    a, b = _adata(n=40, seed=0), _adata(n=15, seed=1)
-    sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
-    assert any("obsm" in m and "dropped" in m for m in _messages(caplog))
-    assert_anndata_readable(sa)
-    got = ad.read_zarr(str(sa))
-    assert got.n_obs == 55
-    np.testing.assert_allclose(got.X.toarray(), sp.vstack([a.X, b.X]).toarray())
-    assert list(got.obs_names) == list(a.obs_names) + list(b.obs_names)
-    assert list(got.obs["cell_type"]) == list(a.obs["cell_type"]) + list(b.obs["cell_type"])
-    assert len(got.obsm) == 0  # embeddings are invalidated, not extended
-
-
-def test_append_guards(tmp_path):
-    sa = _store(tmp_path, _adata(n=20, seed=0), "a.zarr")
-    sb_bad = _store(tmp_path, _adata(n=10, v=5, seed=1), "bad.zarr")
-    with pytest.raises(ConversionError, match="var mismatch"):
-        append(str(sa), cells=str(sb_bad), cfg=_cfg())
-
-    a2 = _adata(n=20, seed=2)
-    a2.obsp["conn"] = sp.eye(20, format="csr")
-    sa2 = _store(tmp_path, a2, "a2.zarr")
-    sb = _store(tmp_path, _adata(n=10, seed=3), "b.zarr")
-    with pytest.raises(ConversionError, match="obsp"):
-        append(str(sa2), cells=str(sb), cfg=_cfg())
-    append(str(sa2), cells=str(sb), drop_derived=True, cfg=_cfg())
-    got = ad.read_zarr(str(sa2))
-    assert got.n_obs == 30 and len(got.obsp) == 0
-
-
-@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
-def test_add_expr_empty_rows_and_genes(tmp_path, fmt):
-    # zero-count cells at band boundaries (incl. the last row) once truncated the
-    # previous row's sum; an all-zero gene exercises empty csc columns
-    x = np.zeros((10, 5), dtype=np.float32)
-    x[1:9, [0, 1, 3, 4]] = np.arange(1, 33, dtype=np.float32).reshape(8, 4)
-    adata = ad.AnnData(
-        X=sp.csr_matrix(x),
-        obs=pd.DataFrame({"cell_type": pd.Categorical(["a"] * 10)}, index=[f"c{i}" for i in range(10)]),
-        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
-    )
-    out = _store(tmp_path, adata)
-    add_expr(str(out), fmt=fmt, chunk_elems=16, cfg=_cfg())
-    got = ad.read_zarr(str(out))
-    vals = got.layers["gexp"]
-    vals = np.asarray(vals) if fmt == "dense" else vals.toarray()
-    np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
-    assert not vals[0].any() and not vals[-1].any() and not vals[:, 2].any()
-
-
-def test_ops_on_consolidated_store(tmp_path):
-    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
-    sa = _store(tmp_path, a, "a.zarr", cfg=_cfg(consolidate_metadata=True))
-    sb = _store(tmp_path, b, "b.zarr")
-    add_expr(str(sa), fmt="csc", chunk_elems=32, cfg=_cfg())
-    append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
-    add_expr(str(sa), fmt="csc", chunk_elems=32, cfg=_cfg())
-    got = ad.read_zarr(str(sa))  # reads via the re-consolidated metadata
-    assert got.n_obs == 42 and "gexp" in got.layers
-
-
-def test_append_failed_validation_mutates_nothing(tmp_path):
-    a = _adata(n=20, seed=0)
-    a.obsp["conn"] = sp.eye(20, format="csr")
-    sa = _store(tmp_path, a, "a.zarr")
-    sb_bad = _store(tmp_path, _adata(n=10, v=5, seed=1), "bad.zarr")
-    with pytest.raises(ConversionError, match="var mismatch"):
-        append(str(sa), cells=str(sb_bad), drop_derived=True, cfg=_cfg())
-    got = ad.read_zarr(str(sa))
-    assert got.n_obs == 20 and "conn" in got.obsp
-
-
-def test_append_categorical_order_mismatch(tmp_path):
-    a, b = _adata(n=20, seed=0), _adata(n=10, seed=1)
-    b.obs["cell_type"] = pd.Categorical(b.obs["cell_type"], categories=["a", "b", "c"], ordered=True)
-    sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    with pytest.raises(ConversionError, match="categorical dtype mismatch"):
-        append(str(sa), cells=str(sb), cfg=_cfg())
-
-
-def test_append_obs_column_types(tmp_path):
     # exercises every per-column append path: categorical (from _adata), plain numeric,
-    # string-array, and nullable-integer with an NA
+    # string-array, and nullable-integer with an NA — plus the basic X/obs extend and the
+    # auto-drop of invalidated obsm.
     def build(n, seed):
         adata = _adata(n=n, seed=seed)
         rng = np.random.default_rng(seed + 100)
@@ -287,70 +233,80 @@ def test_append_obs_column_types(tmp_path):
         adata.obs["qc_flag"] = qc
         return adata
 
-    a, b = build(25, 0), build(11, 1)
+    a, b = build(40, 0), build(15, 1)
     sa = _store(tmp_path, a, "a.zarr")
     sb = _store(tmp_path, b, "b.zarr")
     append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+    assert any("obsm" in m and "dropped" in m for m in _messages(caplog))
+    assert_anndata_readable(sa)
     got = ad.read_zarr(str(sa))
-    expected = pd.concat([a.obs, b.obs], axis=0)
-    pd.testing.assert_frame_equal(got.obs, expected, check_dtype=False)
+    assert got.n_obs == 55
+    np.testing.assert_allclose(got.X.toarray(), sp.vstack([a.X, b.X]).toarray())
+    assert list(got.obs_names) == list(a.obs_names) + list(b.obs_names)
+    assert len(got.obsm) == 0  # embeddings are invalidated, not extended
+    expected_obs = pd.concat([a.obs, b.obs], axis=0)
+    pd.testing.assert_frame_equal(got.obs, expected_obs, check_dtype=False)
 
 
-def test_append_obs_dtype_mismatch(tmp_path):
-    a, b = _adata(n=20, seed=0), _adata(n=10, seed=1)
-    a.obs["n_genes"] = np.arange(20, dtype=np.int64)
-    b.obs["n_genes"] = np.arange(10, dtype=np.float64)
+def test_append_validation_guards(tmp_path):
+    # var mismatch: raises AND mutates nothing (plain zarr cannot roll back, so the check
+    # must run in full before any write happens)
+    a = _adata(n=20, seed=0)
+    a.obsp["conn"] = sp.eye(20, format="csr")
     sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    # obs columns extend in place now, so dtypes must match exactly (no silent
-    # pandas-concat unification)
+    sb_bad = _store(tmp_path, _adata(n=10, v=5, seed=1), "bad.zarr")
+    with pytest.raises(ConversionError, match="var mismatch"):
+        append(str(sa), cells=str(sb_bad), drop_derived=True, cfg=_cfg())
+    got = ad.read_zarr(str(sa))
+    assert got.n_obs == 20 and "conn" in got.obsp
+
+    # categorical dtype/order mismatch
+    a2, b2 = _adata(n=20, seed=2), _adata(n=10, seed=3)
+    b2.obs["cell_type"] = pd.Categorical(b2.obs["cell_type"], categories=["a", "b", "c"], ordered=True)
+    sa2 = _store(tmp_path, a2, "a2.zarr")
+    sb2 = _store(tmp_path, b2, "b2.zarr")
+    with pytest.raises(ConversionError, match="categorical dtype mismatch"):
+        append(str(sa2), cells=str(sb2), cfg=_cfg())
+
+    # plain numeric obs column dtype mismatch — obs columns extend in place, so dtypes
+    # must match exactly (no silent pandas-concat unification)
+    a3, b3 = _adata(n=20, seed=4), _adata(n=10, seed=5)
+    a3.obs["n_genes"] = np.arange(20, dtype=np.int64)
+    b3.obs["n_genes"] = np.arange(10, dtype=np.float64)
+    sa3 = _store(tmp_path, a3, "a3.zarr")
+    sb3 = _store(tmp_path, b3, "b3.zarr")
     with pytest.raises(ConversionError, match="dtype mismatch"):
-        append(str(sa), cells=str(sb), cfg=_cfg())
+        append(str(sa3), cells=str(sb3), cfg=_cfg())
 
 
-def test_append_all_duplicate_names_raises(tmp_path):
+def test_append_duplicate_name_rules(tmp_path, caplog):
     # `b` has the identical obs index as `a` (same n, same seed) — every appended cell is
     # already present, so this looks like a re-run of the same append and is a hard error.
     sa = _store(tmp_path, _adata(n=20, seed=0), "a.zarr")
-    sb = _store(tmp_path, _adata(n=20, seed=0), "b.zarr")
+    sb_all = _store(tmp_path, _adata(n=20, seed=0), "b.zarr")
     with pytest.raises(ConversionError, match="already"):
-        append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+        append(str(sa), cells=str(sb_all), drop_derived=True, cfg=_cfg())
 
-
-def test_append_partial_duplicate_names_warns(tmp_path, caplog):
-    # only 2 of `b`'s 10 obs names collide with `a` — barcodes legitimately collide across
-    # samples, so this stays a warning, not a raise.
-    a, b = _adata(n=20, seed=0), _adata(n=10, seed=1)
-    b.obs_names = [a.obs_names[0], a.obs_names[1], *b.obs_names[2:]]
-    sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
-    assert any("2 duplicate" in m for m in _messages(caplog))
-
-
-def test_append_cells_store_internal_duplicate_also_in_target_raises(tmp_path):
     # `b` has 2 rows sharing the SAME obs name, and that name is already in `a` — every
     # appended row is a duplicate (by target-collision, counted once each, not twice for
     # also repeating each other). Regression test for double-counting a position that is
     # both in-target and an internal repeat, which used to let n_duplicate_names overshoot
     # n_new and silently skip the "already appended" error.
-    a = _adata(n=20, seed=0)
-    sa = _store(tmp_path, a, "a.zarr")
-    b = _adata(n=2, seed=1)
-    b.obs_names = [a.obs_names[0], a.obs_names[0]]
-    sb = _store(tmp_path, b, "b.zarr")
+    a2 = _adata(n=20, seed=1)
+    sa2 = _store(tmp_path, a2, "a2.zarr")
+    b2 = _adata(n=2, seed=2)
+    b2.obs_names = [a2.obs_names[0], a2.obs_names[0]]
+    sb2 = _store(tmp_path, b2, "b2.zarr")
     with pytest.raises(ConversionError, match="already"):
-        append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+        append(str(sa2), cells=str(sb2), drop_derived=True, cfg=_cfg())
 
-
-def test_append_three_rows_two_duplicate_names_warns(tmp_path, caplog):
-    # 3 rows in `b`, only 2 of which collide with `a` — not every appended cell is already
-    # present, so this stays a warning.
-    a, b = _adata(n=20, seed=0), _adata(n=3, seed=1)
-    b.obs_names = [a.obs_names[0], a.obs_names[1], b.obs_names[2]]
-    sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+    # only 2 of `b`'s 10 obs names collide with `a` — barcodes legitimately collide across
+    # samples, so a partial overlap stays a warning, not a raise.
+    a3, b3 = _adata(n=20, seed=3), _adata(n=10, seed=4)
+    b3.obs_names = [a3.obs_names[0], a3.obs_names[1], *b3.obs_names[2:]]
+    sa3 = _store(tmp_path, a3, "a3.zarr")
+    sb3 = _store(tmp_path, b3, "b3.zarr")
+    append(str(sa3), cells=str(sb3), drop_derived=True, cfg=_cfg())
     assert any("2 duplicate" in m for m in _messages(caplog))
 
 
@@ -394,7 +350,7 @@ def test_append_extend_layers(tmp_path, caplog):
     )
 
 
-def test_append_extend_layers_ineligible(tmp_path, caplog):
+def test_append_extend_layers_guards(tmp_path, caplog):
     # csc layers cannot extend in place (column-major); with the flag they drop as today
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")
@@ -404,42 +360,19 @@ def test_append_extend_layers_ineligible(tmp_path, caplog):
     assert any("dropped" in m and "gexp" in m for m in _messages(caplog))
     assert "gexp" not in ad.read_zarr(str(sa)).layers
 
-
-def test_append_extend_layers_sparsity_mismatch(tmp_path, caplog):
     # a marked layer whose indptr no longer matches X falls back to being dropped
-    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
-    sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    add_expr(str(sa), fmt="csr", chunk_elems=32, cfg=_cfg())
-    ip_arr = zarr.open_group(str(sa), mode="r+")["layers/gexp/indptr"]
+    a2, b2 = _adata(n=30, seed=2), _adata(n=12, seed=3)
+    sa2 = _store(tmp_path, a2, "a2.zarr")
+    sb2 = _store(tmp_path, b2, "b2.zarr")
+    add_expr(str(sa2), fmt="csr", chunk_elems=32, cfg=_cfg())
+    ip_arr = zarr.open_group(str(sa2), mode="r+")["layers/gexp/indptr"]
     ip_arr[1] = int(ip_arr[1]) + 1
-    append(str(sa), cells=str(sb), drop_derived=True, extend_layers=True, cfg=_cfg())
+    append(str(sa2), cells=str(sb2), drop_derived=True, extend_layers=True, cfg=_cfg())
     assert any("sparsity differs from X" in m for m in _messages(caplog))
-    assert "gexp" not in ad.read_zarr(str(sa)).layers
+    assert "gexp" not in ad.read_zarr(str(sa2)).layers
 
 
-def test_plan_append_reports_extendable_and_drops(tmp_path):
-    from annizarr._ops import plan_append
-
-    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
-    sa = _store(tmp_path, a, "a.zarr")
-    sb = _store(tmp_path, b, "b.zarr")
-    add_expr(str(sa), fmt="csr", chunk_elems=32, cfg=_cfg())
-
-    plan = plan_append(str(sa), cells=str(sb))
-    assert plan.n_new == 12
-    assert plan.extendable_layers == ("gexp",)
-    assert plan.drop_layers == ()
-    assert plan.drop_obsm == ("X_umap",)
-    assert plan.n_duplicate_names == 0
-
-    assert plan.drops() == ("obsm/X_umap", "layers/gexp")
-    assert plan.drops(extend_layers=True) == ("obsm/X_umap",)  # gexp extended, not dropped
-
-
-def test_gexp_legacy_zarrsmith_target_sum_key_still_recognised(tmp_path):
-    """A gexp layer written by pre-merge zarrsmith (attr key zarrsmith_target_sum, not
-    annizarr_target_sum) is still eligible for append --extend-layers and re-derivable."""
+def test_plan_append(tmp_path):
     from annizarr._ops import plan_append
     from annizarr._ops._expr import introspect_gexp
 
@@ -448,28 +381,38 @@ def test_gexp_legacy_zarrsmith_target_sum_key_still_recognised(tmp_path):
     sb = _store(tmp_path, b, "b.zarr")
     add_expr(str(sa), fmt="csr", chunk_elems=32, target_sum=1e6, cfg=_cfg())
 
+    plan = plan_append(str(sa), cells=str(sb))
+    assert plan.n_new == 12
+    assert plan.extendable_layers == ("gexp",)
+    assert plan.drop_layers == ()
+    assert plan.drop_obsm == ("X_umap",)
+    assert plan.n_duplicate_names == 0
+    assert plan.drops() == ("obsm/X_umap", "layers/gexp")
+    assert plan.drops(extend_layers=True) == ("obsm/X_umap",)  # gexp extended, not dropped
+
+    # A gexp layer written by pre-merge zarrsmith (attr key zarrsmith_target_sum, not
+    # annizarr_target_sum) is still eligible for append --extend-layers and re-derivable.
     g = zarr.open_group(str(sa), mode="r+")["layers/gexp"]
     g.attrs["zarrsmith_target_sum"] = g.attrs.pop("annizarr_target_sum")
-
-    plan = plan_append(str(sa), cells=str(sb))
-    assert plan.extendable_layers == ("gexp",)  # recognised despite the legacy attr key
+    legacy_plan = plan_append(str(sa), cells=str(sb))
+    assert legacy_plan.extendable_layers == ("gexp",)  # recognised despite the legacy attr key
 
     fmt, chunk_elems, target_sum = introspect_gexp(zarr.open_group(str(sa), mode="r")["layers/gexp"])
     assert (fmt, chunk_elems, target_sum) == ("csr", 32, 1e6)
 
 
-def test_add_expr_multiband(tmp_path, monkeypatch):
-    # tiny band budget → many column bands + multiple row batches, exercising the
-    # bucket cursors and band-edge math the default 256 MB budget never hits in tests
-    monkeypatch.setattr("annizarr._layout.BATCH_BYTES", 600)
-    adata = _adata(n=1200, v=12, seed=4)
-    for fmt in ("csc", "dense"):
-        out = _store(tmp_path, adata, f"mb-{fmt}.zarr")
-        add_expr(str(out), fmt=fmt, chunk_elems=80, cfg=_cfg())
-        got = ad.read_zarr(str(out))
-        vals = got.layers["gexp"]
-        vals = np.asarray(vals) if fmt == "dense" else vals.toarray()
-        np.testing.assert_allclose(vals, _expected_gexp(adata.X), rtol=1e-5)
+# ── consolidated store + full lifecycle ─────────────────────────────────────
+
+
+def test_ops_on_consolidated_store(tmp_path):
+    a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
+    sa = _store(tmp_path, a, "a.zarr", cfg=_cfg(consolidate_metadata=True))
+    sb = _store(tmp_path, b, "b.zarr")
+    add_expr(str(sa), fmt="csc", chunk_elems=32, cfg=_cfg())
+    append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+    add_expr(str(sa), fmt="csc", chunk_elems=32, cfg=_cfg())
+    got = ad.read_zarr(str(sa))  # reads via the re-consolidated metadata
+    assert got.n_obs == 42 and "gexp" in got.layers
 
 
 def test_lifecycle_plain(tmp_path, caplog):
@@ -528,16 +471,6 @@ def test_lifecycle_icechunk(tmp_path):
         np.testing.assert_allclose(x[i].toarray().ravel(), orig[n])
     gexp = sparse_dataset(root["layers/gexp"])[:]
     np.testing.assert_allclose(gexp.toarray(), _expected_gexp(x), rtol=1e-5)
-
-
-def test_sort_store_output_exists(tmp_path):
-    # StorageError, not ConversionError: sort's target-exists check now goes through the
-    # shared check_output_target (item 6) instead of an ad-hoc raise in _sorting.
-    out = _store(tmp_path, _adata())
-    out2 = tmp_path / "sorted.zarr"
-    out2.mkdir()
-    with pytest.raises(StorageError, match="already exists"):
-        sort(str(out), output=str(out2), by=("cell_type",), cfg=_cfg())
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

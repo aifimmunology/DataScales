@@ -411,6 +411,7 @@ output; re-running `add-expr` errors without `--overwrite`; slow test passes und
   `test_layout_props.py`, `test_import_guards.py`, `test_versioned_edits.py`, `test_atomic.py`,
   `test_large_store.py` (`-m slow`), moto s3 copy test, CLI subprocess test.
 - Full default suite under one minute; coverage gate 85 % on `src/`, CLI omitted.
+- **Pruned 2026-09-29 at Alex's request:** 164 tests (one per behaviour/invariant; parametrised only along axes that take different code paths) and 9 golden cases (one per writer path + one autoshard); coverage unchanged at 93.3 %. Under a minute without coverage.
 
 ---
 

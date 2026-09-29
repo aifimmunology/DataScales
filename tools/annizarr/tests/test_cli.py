@@ -9,6 +9,7 @@ import anndata as ad
 import h5py
 import numpy as np
 import pytest
+import zarr
 
 from _builders import make_adata, make_h5ad
 from _readable import assert_anndata_readable
@@ -36,88 +37,43 @@ def _make_10x_h5(base: Path) -> Path:
 # ── convert ──────────────────────────────────────────────────────────────────
 
 
-def test_convert_sniffs_h5ad_content_regardless_of_extension(tmp_path: Path) -> None:
-    # h5ad content under a non-.h5ad extension
-    h5 = make_h5ad(tmp_path, "in.h5", adata=make_adata(n_obs=4, n_vars=3))
-    out = tmp_path / "out.zarr"
-    assert main(["convert", str(h5), "-o", str(out)]) == 0
-    assert_anndata_readable(out)
-    assert ad.read_zarr(str(out)).n_obs == 4
+def test_convert_flag_mappings(tmp_path: Path) -> None:
+    """Each CLI flag maps to the right config/op kwarg. detect_format's own content-sniffing
+    is unit-tested at the library level in test_sources_detect.py; these cover only the CLI's
+    own argument mapping."""
+    # --from overrides content detection
+    h5_10x = _make_10x_h5(tmp_path)
+    out_from = tmp_path / "from.zarr"
+    assert main(["convert", str(h5_10x), "-o", str(out_from), "--from", "10x"]) == 0
+    assert ad.read_zarr(str(out_from)).n_vars == 3
 
-
-def test_convert_sniffs_10x_v3(tmp_path: Path) -> None:
-    h5 = _make_10x_h5(tmp_path)
-    out = tmp_path / "out.zarr"
-    assert main(["convert", str(h5), "-o", str(out)]) == 0
-    got = ad.read_zarr(str(out))
-    assert got.n_obs == 2 and got.n_vars == 3
-
-
-def test_convert_from_override(tmp_path: Path) -> None:
-    h5 = _make_10x_h5(tmp_path)
-    out = tmp_path / "out.zarr"
-    assert main(["convert", str(h5), "-o", str(out), "--from", "10x"]) == 0
-    assert ad.read_zarr(str(out)).n_vars == 3
-
-
-def test_convert_concatenates_multiple_inputs(tmp_path: Path) -> None:
-    a = make_h5ad(tmp_path, "a.h5ad", adata=make_adata(n_obs=4, seed=0))
-    b = make_h5ad(tmp_path, "b.h5ad", adata=make_adata(n_obs=3, seed=1))
-    out = tmp_path / "out.zarr"
-    assert main(["convert", str(a), str(b), "-o", str(out)]) == 0
-    assert ad.read_zarr(str(out)).n_obs == 7
-
-
-def test_obs_columns_requires_two_inputs(tmp_path: Path) -> None:
-    h5 = make_h5ad(tmp_path, "a.h5ad")
-    with pytest.raises(SystemExit) as exc:
-        main(
-            [
-                "convert",
-                str(h5),
-                "-o",
-                str(tmp_path / "out.zarr"),
-                "--obs-columns",
-                "cell_type",
-            ]
-        )
-    assert exc.value.code == 2
-
-
-def test_backed_and_eager_are_mutually_exclusive(tmp_path: Path) -> None:
-    h5 = make_h5ad(tmp_path, "in.h5ad")
-    with pytest.raises(SystemExit) as exc:
-        main(["convert", str(h5), "-o", str(tmp_path / "out.zarr"), "--backed", "--eager"])
-    assert exc.value.code == 2
-
-
-def test_eager_flag_forces_eager_load(tmp_path: Path) -> None:
-    """--eager overrides auto-select even when eager_max_bytes would otherwise pick backed."""
+    # --eager overrides auto-select even when eager_max_bytes would otherwise pick backed
     h5 = make_h5ad(tmp_path, "in.h5ad")
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text("[io]\neager_max_bytes = 0\n")
-    out = tmp_path / "out.zarr"
+    out_eager = tmp_path / "eager.zarr"
     with patch("anndata.read_h5ad", wraps=ad.read_h5ad) as mocked:
-        assert main(["convert", str(h5), "-o", str(out), "--eager", "--config", str(cfg_file)]) == 0
+        assert main(["convert", str(h5), "-o", str(out_eager), "--eager", "--config", str(cfg_file)]) == 0
     assert "backed" not in mocked.call_args_list[0].kwargs
 
+    # --auto-shard shards the sparse X arrays
+    h5_big = make_h5ad(tmp_path, "big.h5ad", adata=make_adata(n_obs=30, n_vars=20))
+    out_shard = tmp_path / "shard.zarr"
+    assert main(["convert", str(h5_big), "-o", str(out_shard), "--x-storage", "csr", "--auto-shard"]) == 0
+    assert_anndata_readable(out_shard)
+    root = zarr.open_group(str(out_shard), mode="r")
+    assert root["X"]["data"].shards is not None
 
-def test_auto_shard_and_no_auto_shard_are_mutually_exclusive(tmp_path: Path) -> None:
-    h5 = make_h5ad(tmp_path, "in.h5ad")
+
+def test_convert_arg_guards(tmp_path: Path) -> None:
+    h5 = make_h5ad(tmp_path, "a.h5ad")
     with pytest.raises(SystemExit) as exc:
-        main(["convert", str(h5), "-o", str(tmp_path / "out.zarr"), "--auto-shard", "--no-auto-shard"])
+        main(["convert", str(h5), "-o", str(tmp_path / "out.zarr"), "--obs-columns", "cell_type"])
     assert exc.value.code == 2
 
-
-def test_convert_auto_shard_flag_shards_sparse_arrays(tmp_path: Path) -> None:
-    import zarr
-
-    h5 = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=30, n_vars=20))
-    out = tmp_path / "out.zarr"
-    assert main(["convert", str(h5), "-o", str(out), "--x-storage", "csr", "--auto-shard"]) == 0
-    assert_anndata_readable(out)
-    root = zarr.open_group(str(out), mode="r")
-    assert root["X"]["data"].shards is not None
+    with pytest.raises(SystemExit) as exc:
+        main(["convert", str(h5), "-o", str(tmp_path / "out2.zarr"), "--backed", "--eager"])
+    assert exc.value.code == 2
 
 
 def test_overwrite_gating(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -133,13 +89,11 @@ def test_overwrite_gating(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert main(["convert", str(h5), "-o", str(out), "--overwrite"]) == 0
 
 
-def test_missing_input_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_convert_error_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["convert", str(tmp_path / "missing.h5ad"), "-o", str(tmp_path / "out.zarr")])
     assert rc == 1
     assert "error:" in capsys.readouterr().err
 
-
-def test_remote_output_without_ic_requires_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     h5 = make_h5ad(tmp_path, "in.h5ad")
     rc = main(["convert", str(h5), "-o", "s3://bucket/out.zarr"])
     assert rc == 1
@@ -159,7 +113,9 @@ def test_quiet_silences_info(tmp_path: Path, capsys: pytest.CaptureFixture[str])
 # ── add-expr / rechunk / sort / append ──────────────────────────────────────
 
 
-def test_add_expr_happy_path(tmp_path: Path) -> None:
+def test_op_happy_paths(tmp_path: Path) -> None:
+    """One minimal CLI happy-path per op, proving each subcommand's own distinguishing flag
+    is mapped and dispatched correctly (op-level behaviour is unit-tested elsewhere)."""
     h5 = make_h5ad(tmp_path, "in.h5ad")
     out = tmp_path / "out.zarr"
     assert main(["convert", str(h5), "-o", str(out)]) == 0
@@ -167,27 +123,21 @@ def test_add_expr_happy_path(tmp_path: Path) -> None:
     assert_anndata_readable(out)
     assert "gexp" in ad.read_zarr(str(out)).layers
 
-
-def test_rechunk_happy_path(tmp_path: Path) -> None:
-    h5 = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=8, n_vars=5))
+    h5_r = make_h5ad(tmp_path, "r.h5ad", adata=make_adata(n_obs=8, n_vars=5))
     store = tmp_path / "store.zarr"
-    assert main(["convert", str(h5), "-o", str(store)]) == 0
-    out = tmp_path / "rechunked.zarr"
-    assert main(["rechunk", str(store), "-o", str(out), "--sparse-flat-chunk", "4"]) == 0
-    got = ad.read_zarr(str(out))
-    assert got.n_obs == 8
+    assert main(["convert", str(h5_r), "-o", str(store)]) == 0
+    rechunked = tmp_path / "rechunked.zarr"
+    assert main(["rechunk", str(store), "-o", str(rechunked), "--sparse-flat-chunk", "4"]) == 0
+    assert ad.read_zarr(str(rechunked)).n_obs == 8
 
-
-def test_sort_happy_path(tmp_path: Path) -> None:
     # non-decreasing codes after sort is checked regardless of the input's initial order,
     # so make_adata's random "cell_type" categorical column exercises the same path
-    h5 = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=6, n_vars=4, seed=2))
-    store = tmp_path / "store.zarr"
-    assert main(["convert", str(h5), "-o", str(store)]) == 0
-    out = tmp_path / "sorted.zarr"
-    assert main(["sort", str(store), "-o", str(out), "--by", "cell_type"]) == 0
-    got = ad.read_zarr(str(out))
-    codes = got.obs["cell_type"].cat.codes.to_numpy()
+    h5_s = make_h5ad(tmp_path, "s.h5ad", adata=make_adata(n_obs=6, n_vars=4, seed=2))
+    store_s = tmp_path / "store_s.zarr"
+    assert main(["convert", str(h5_s), "-o", str(store_s)]) == 0
+    sorted_out = tmp_path / "sorted.zarr"
+    assert main(["sort", str(store_s), "-o", str(sorted_out), "--by", "cell_type"]) == 0
+    codes = ad.read_zarr(str(sorted_out)).obs["cell_type"].cat.codes.to_numpy()
     assert (np.diff(codes) >= 0).all()
 
 
@@ -251,11 +201,11 @@ def test_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out.strip() == f"annizarr {__version__}"
 
 
-@pytest.mark.parametrize("exe", ["annizarr", "anz"])
-def test_console_script_version(exe: str) -> None:
-    path = shutil.which(exe)
-    if path is None:
-        pytest.skip(f"the `{exe}` console script is not on PATH")
-    proc = subprocess.run([path, "--version"], capture_output=True, text=True)
-    assert proc.returncode == 0
-    assert proc.stdout.strip() == f"annizarr {__version__}"
+def test_console_script_version() -> None:
+    for exe in ("annizarr", "anz"):
+        path = shutil.which(exe)
+        if path is None:
+            pytest.skip(f"the `{exe}` console script is not on PATH")
+        proc = subprocess.run([path, "--version"], capture_output=True, text=True)
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == f"annizarr {__version__}"

@@ -91,37 +91,23 @@ def _open_on_moto(bucket: str, prefix: str, endpoint: str):
     return icechunk.Repository.open(storage)
 
 
-def test_copy_local_to_s3(moto_s3, tmp_path: Path) -> None:
-    client, endpoint, bucket_a, _ = moto_s3
+def test_copy_repo_round_trip_local_to_s3_to_s3_to_local(moto_s3, tmp_path: Path) -> None:
+    """copy_repo through a real S3 endpoint (moto), chained through all three directions:
+    local -> s3, s3 -> s3 (a different bucket), then s3 -> local -- each hop's objects
+    (and its 'main' branch, once reopened directly against moto) must match the original."""
+    client, endpoint, bucket_a, bucket_b = moto_s3
     repo_path = _make_repo(tmp_path)
     local = _local_objects(repo_path)
 
     copy_repo(str(repo_path), f"s3://{bucket_a}/p1")
-
     assert _s3_objects(client, bucket_a, "p1") == local
     assert _open_on_moto(bucket_a, "p1", endpoint).list_branches() == {"main"}
 
-
-def test_copy_s3_to_local(moto_s3, tmp_path: Path) -> None:
-    _, _, bucket_a, _ = moto_s3
-    repo_path = _make_repo(tmp_path)
-    local = _local_objects(repo_path)
-    copy_repo(str(repo_path), f"s3://{bucket_a}/p1")
+    copy_repo(f"s3://{bucket_a}/p1", f"s3://{bucket_b}/p2")
+    assert _s3_objects(client, bucket_b, "p2") == local
+    assert _open_on_moto(bucket_b, "p2", endpoint).list_branches() == {"main"}
 
     dest = tmp_path / "from_s3.icechunk"
-    copy_repo(f"s3://{bucket_a}/p1", str(dest))
-
+    copy_repo(f"s3://{bucket_b}/p2", str(dest))
     assert _local_objects(dest) == local
     assert Repo(dest).branches() == ["main"]
-
-
-def test_copy_s3_to_s3(moto_s3, tmp_path: Path) -> None:
-    client, endpoint, bucket_a, bucket_b = moto_s3
-    repo_path = _make_repo(tmp_path)
-    copy_repo(str(repo_path), f"s3://{bucket_a}/p1")
-    src_objects = _s3_objects(client, bucket_a, "p1")
-
-    copy_repo(f"s3://{bucket_a}/p1", f"s3://{bucket_b}/p2")
-
-    assert _s3_objects(client, bucket_b, "p2") == src_objects
-    assert _open_on_moto(bucket_b, "p2", endpoint).list_branches() == {"main"}
