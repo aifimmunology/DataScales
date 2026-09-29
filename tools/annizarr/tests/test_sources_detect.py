@@ -142,6 +142,28 @@ def test_open_source_h5ad(tmp_path: Path) -> None:
     src.close()  # safe twice
 
 
+def test_open_source_h5ad_auto_selects_eager_below_threshold(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """backed=None (default) with a huge threshold: X is tiny, so auto-select picks eager."""
+    caplog.set_level("INFO", logger="annizarr")
+    p = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=4, n_vars=3))
+    src = open_source(str(p), _cfg(backed=None, eager_max_bytes=2 * 1024**3))
+    assert not src.backed
+    assert any("Auto-selected eager load" in r.message for r in caplog.records)
+    src.close()
+
+
+def test_open_source_h5ad_auto_selects_backed_above_threshold(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """backed=None (default) with a zero threshold: any X exceeds it, so auto-select
+    picks backed — asserted both via caplog and via the loader's returned Source.backed."""
+    caplog.set_level("INFO", logger="annizarr")
+    p = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=4, n_vars=3))
+    src = open_source(str(p), _cfg(backed=None, eager_max_bytes=0))
+    assert src.backed
+    assert src.adata.isbacked
+    assert any("Auto-selected backed load" in r.message for r in caplog.records)
+    src.close()
+
+
 def test_open_source_10x(tmp_path: Path) -> None:
     p = tmp_path / "matrix.h5"
     _make_10x_v3(p)

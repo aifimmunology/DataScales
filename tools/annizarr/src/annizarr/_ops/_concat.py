@@ -25,7 +25,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def concat(paths: Sequence[PathLike], *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
+def concat(
+    paths: Sequence[PathLike],
+    *,
+    output: PathLike,
+    cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
+) -> OpResult:
     """Concatenate multiple .h5ad files along obs (rows) into a single zarr store.
 
     Requirements:
@@ -49,6 +56,11 @@ def concat(paths: Sequence[PathLike], *, output: PathLike, cfg: AppConfig | None
         Destination store path or URI.
     cfg
         Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+    branch
+        Icechunk branch to write to; created off the current tip if it doesn't exist yet.
+        Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the destination.
 
     Returns
     -------
@@ -195,25 +207,30 @@ def concat(paths: Sequence[PathLike], *, output: PathLike, cfg: AppConfig | None
         )
         t0 = time.perf_counter()
 
-        store, finalize = open_output_store(output_path, cfg, commit_message=f"annizarr concat → {output_path.name}")
-        set_anndata_root_attrs(store)
+        commit_message = message or f"annizarr concat → {output_path.name}"
+        out = open_output_store(output_path, cfg, commit_message=commit_message, branch=branch)
+        try:
+            set_anndata_root_attrs(out.root)
 
-        with stage("Writing metadata (obs, var, empty obsm/varm/uns/obsp/varp)"):
-            write_elem(store, "obs", obs_concat)
-            write_elem(store, "var", ref_var)
-            write_elem(store, "uns", {})
-            write_elem(store, "obsm", {})
-            write_elem(store, "varm", {})
-            write_elem(store, "obsp", {})
-            write_elem(store, "varp", {})
+            with stage("Writing metadata (obs, var, empty obsm/varm/uns/obsp/varp)"):
+                write_elem(out.root, "obs", obs_concat)
+                write_elem(out.root, "var", ref_var)
+                write_elem(out.root, "uns", {})
+                write_elem(out.root, "obsm", {})
+                write_elem(out.root, "varm", {})
+                write_elem(out.root, "obsp", {})
+                write_elem(out.root, "varp", {})
 
-        with stage(f"Writing X (n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"):
-            if cfg.io.x_storage == "dense":
-                _write_concatenated_dense(store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
-            else:  # csr
-                _write_concatenated_csr(store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
+            with stage(f"Writing X (n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"):
+                if cfg.io.x_storage == "dense":
+                    _write_concatenated_dense(out.root, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
+                else:  # csr
+                    _write_concatenated_csr(out.root, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
 
-        snapshot_id = finalize()
+            snapshot_id = out.finalize()
+        except BaseException:
+            out.abort()
+            raise
         logger.info(f"Done in {time.perf_counter() - t0:.1f}s")
         return OpResult(path=str(output_path), n_obs=n_obs_total, n_vars=n_vars, snapshot_id=snapshot_id)
 

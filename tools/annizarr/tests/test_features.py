@@ -106,7 +106,7 @@ def test_icechunk_roundtrip_eager(tmp_path: Path) -> None:
     convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=cfg)
 
     # Reopen through an icechunk read-only session and check X round-trips.
-    g = open_input_group(str(out), icechunk=True, branch="main")
+    g = open_input_group(str(out), branch="main")
     from anndata.io import read_elem, sparse_dataset
 
     X = sparse_dataset(g["X"])[:]
@@ -326,7 +326,7 @@ def test_sort_through_icechunk_and_read(tmp_path: Path) -> None:
     convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=_sorted_cfg(backend="icechunk"))
 
     # Read subsets from the icechunk-backed sorted store with stock anndata/zarr.
-    g = open_input_group(str(out), icechunk=True, branch="main")
+    g = open_input_group(str(out), branch="main")
     X_a, _ = _self_serve_subset(g, cell_type="A")
     assert _id_set(X_a) == {2, 3, 5}
     X_x, _ = _self_serve_subset(g, demographic="x")

@@ -87,7 +87,9 @@ def maybe_sort_adata(adata: ad.AnnData, cfg: AppConfig) -> ad.AnnData:
     return adata
 
 
-def _write_sorted_backed(adata: ad.AnnData, output_path: Path, cfg: AppConfig) -> str | None:
+def _write_sorted_backed(
+    adata: ad.AnnData, output_path: Path, cfg: AppConfig, *, branch: str | None = None, message: str | None = None
+) -> str | None:
     # streamed, memory-bounded sort for --backed input (bucket + concat): the eager sort
     # (maybe_sort_adata) does adata[perm].copy() — a full in-memory reorder transiently
     # holding ~2x X. For a backed load X stays on the h5py handle, so we keep it there: one
@@ -132,7 +134,8 @@ def _write_sorted_backed(adata: ad.AnnData, output_path: Path, cfg: AppConfig) -
         output_path,
         cfg,
         sort_by=cfg.grouping.sort_by,
-        commit_message=f"annizarr convert (sorted) → {output_path.name}",
+        commit_message=message or f"annizarr convert → {output_path.name}",
+        branch=branch,
     )
     return snapshot_id
 
@@ -150,6 +153,7 @@ def stream_sorted_store(
     *,
     sort_by: tuple[str, ...],
     commit_message: str | None = None,
+    branch: str | None = None,
 ) -> str | None:
     # buckets rows into temp per-group CSR stores, then concats them in sorted order;
     # returns the icechunk snapshot id, or None for a plain zarr store
@@ -249,26 +253,34 @@ def stream_sorted_store(
                     cursors[gi] = c + m
 
         # Concat the groups (in sorted order) into the final store.
-        store, finalize = open_output_store(
+        out = open_output_store(
             output_path,
             cfg,
             commit_message=commit_message or f"annizarr sort → {output_path.name}",
+            branch=branch,
         )
-        store.attrs["encoding-type"] = "anndata"
-        store.attrs["encoding-version"] = "0.1.0"
-        with stage("Writing metadata (sorted obs/obsm; var/varm/varp/uns as-is)"):
-            write_elem(store, "obs", obs.iloc[perm])
-            write_elem(store, "var", var)
-            write_elem(store, "uns", dict(uns))
-            write_elem(store, "obsm", {k: (v.iloc[perm] if hasattr(v, "iloc") else v[perm]) for k, v in obsm.items()})
-            write_elem(store, "varm", dict(varm))
-            write_elem(store, "obsp", {})  # empty (non-empty obsp is rejected by callers)
-            write_elem(store, "varp", dict(varp))
+        try:
+            store = out.root
+            store.attrs["encoding-type"] = "anndata"
+            store.attrs["encoding-version"] = "0.1.0"
+            with stage("Writing metadata (sorted obs/obsm; var/varm/varp/uns as-is)"):
+                write_elem(store, "obs", obs.iloc[perm])
+                write_elem(store, "var", var)
+                write_elem(store, "uns", dict(uns))
+                write_elem(
+                    store, "obsm", {k: (v.iloc[perm] if hasattr(v, "iloc") else v[perm]) for k, v in obsm.items()}
+                )
+                write_elem(store, "varm", dict(varm))
+                write_elem(store, "obsp", {})  # empty (non-empty obsp is rejected by callers)
+                write_elem(store, "varp", dict(varp))
 
-        temp_mats = [sparse_dataset(tg) for tg in temp_groups]
-        with stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, csr, concat {n_groups} groups)"):
-            _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
-        snapshot_id = finalize()
+            temp_mats = [sparse_dataset(tg) for tg in temp_groups]
+            with stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, csr, concat {n_groups} groups)"):
+                _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
+            snapshot_id = out.finalize()
+        except BaseException:
+            out.abort()
+            raise
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

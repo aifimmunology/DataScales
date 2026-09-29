@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -31,13 +32,27 @@ logger = logging.getLogger(__name__)
 
 
 def write_adata_to_store(
-    adata: ad.AnnData, output_path: PathLike, cfg: AppConfig, *, allow_grouping: bool = False
+    adata: ad.AnnData,
+    output_path: PathLike,
+    cfg: AppConfig,
+    *,
+    allow_grouping: bool = False,
+    branch: str | None = None,
+    message: str | None = None,
 ) -> OpResult:
     """Write AnnData to zarr (or icechunk).
 
     adata.X is expected to be CSR; CSC is converted to CSR in memory with a warning, and
     dense X is accepted (streamed for dense output, sparsified in memory for sparse output
     on eager loads). When ``allow_grouping`` and grouping is enabled, rows are sorted first.
+
+    Parameters
+    ----------
+    branch
+        Icechunk branch to write to; created off the current tip if it doesn't exist
+        yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the destination.
     """
     cfg = resolve_backend_cfg(cfg)
     configure_runtime(cfg.chunks.cpus)
@@ -45,7 +60,7 @@ def write_adata_to_store(
     if allow_grouping:
         if cfg.grouping.enabled and cfg.io.backed:
             # Backed input: sort X without ever materialising it (streamed bucket + concat).
-            snapshot_id = _write_sorted_backed(adata, Path(output_path), cfg)
+            snapshot_id = _write_sorted_backed(adata, Path(output_path), cfg, branch=branch, message=message)
             return OpResult(path=str(output_path), n_obs=adata.n_obs, n_vars=adata.n_vars, snapshot_id=snapshot_id)
         adata = maybe_sort_adata(adata, cfg)
     elif cfg.grouping.enabled:
@@ -88,20 +103,38 @@ def write_adata_to_store(
         f"{cfg.io.x_storage}, backend={cfg.io.backend})"
     )
     t0 = time.perf_counter()
-    store, finalize = open_output_store(
-        output_path, cfg, commit_message=f"annizarr convert → {store_name(output_path)}"
-    )
-    write_adata(adata, store, cfg, x_override=x_for_write)
-    snapshot_id = finalize()
+    commit_message = message or f"annizarr convert → {store_name(output_path)}"
+    out = open_output_store(output_path, cfg, commit_message=commit_message, branch=branch)
+    try:
+        write_adata(adata, out.root, cfg, x_override=x_for_write)
+        snapshot_id = out.finalize()
+    except BaseException:
+        out.abort()
+        raise
     logger.info(f"Done in {time.perf_counter() - t0:.1f}s")
     return OpResult(path=str(output_path), n_obs=adata.n_obs, n_vars=adata.n_vars, snapshot_id=snapshot_id)
 
 
-def convert_adata(adata: ad.AnnData, *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
+def convert_adata(
+    adata: ad.AnnData,
+    *,
+    output: PathLike,
+    cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
+) -> OpResult:
     """Write an in-memory AnnData to a zarr (or icechunk) store.
 
     Public library entry for data that doesn't start as .h5ad/10x: X may be CSR, CSC
     (converted), or dense; honors x_storage/backend/sort_by exactly like convert_h5ad.
+
+    Parameters
+    ----------
+    branch
+        Icechunk branch to write to; created off the current tip if it doesn't exist
+        yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the destination.
 
     Raises
     ------
@@ -112,19 +145,43 @@ def convert_adata(adata: ad.AnnData, *, output: PathLike, cfg: AppConfig | None 
         cfg = load_config()
     if cfg.io.backed:
         raise ConversionError("convert_adata takes an in-memory AnnData; io.backed does not apply.")
-    return write_adata_to_store(adata, output, cfg, allow_grouping=True)
+    return write_adata_to_store(adata, output, cfg, allow_grouping=True, branch=branch, message=message)
 
 
-def convert_h5ad(path: PathLike, *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
-    """Convert a .h5ad file to zarr."""
+def convert_h5ad(
+    path: PathLike,
+    *,
+    output: PathLike,
+    cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
+) -> OpResult:
+    """Convert a .h5ad file to zarr.
+
+    Parameters
+    ----------
+    branch
+        Icechunk branch to write to; created off the current tip if it doesn't exist
+        yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the destination.
+    """
     if cfg is None:
         cfg = load_config()
+    # icechunk never supports backed input, so resolve an unset (auto-select) backed to
+    # eager *before* load_h5ad's file-size peek ever runs.
+    cfg = resolve_backend_cfg(cfg)
     adata = None
     try:
         adata, load_warnings = load_h5ad(Path(path), cfg)
         for w in load_warnings:
             logger.warning(w)
-        return write_adata_to_store(adata, output, cfg, allow_grouping=True)
+        if cfg.io.backed is None:
+            # load_h5ad auto-selected; mirror its decision back onto cfg so every
+            # downstream `cfg.io.backed` check (grouping dispatch, dense/sparse
+            # conversion) sees the real, resolved value instead of "unset".
+            cfg = replace(cfg, io=replace(cfg.io, backed=adata.isbacked))
+        return write_adata_to_store(adata, output, cfg, allow_grouping=True, branch=branch, message=message)
     except AnzError:
         raise
     except Exception as e:
@@ -134,8 +191,24 @@ def convert_h5ad(path: PathLike, *, output: PathLike, cfg: AppConfig | None = No
             close_backed_if_needed(adata)
 
 
-def convert_10x_h5(path: PathLike, *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
-    """Convert a 10x Cell Ranger .h5 to zarr; expects CSR from the 10x load."""
+def convert_10x_h5(
+    path: PathLike,
+    *,
+    output: PathLike,
+    cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
+) -> OpResult:
+    """Convert a 10x Cell Ranger .h5 to zarr; expects CSR from the 10x load.
+
+    Parameters
+    ----------
+    branch
+        Icechunk branch to write to; created off the current tip if it doesn't exist
+        yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the destination.
+    """
     if cfg is None:
         cfg = load_config()
     try:
@@ -145,7 +218,7 @@ def convert_10x_h5(path: PathLike, *, output: PathLike, cfg: AppConfig | None = 
     except Exception as e:
         raise ConversionError(f"Failed to read 10x H5 file: {e}") from e
 
-    return write_adata_to_store(adata, output, cfg, allow_grouping=False)
+    return write_adata_to_store(adata, output, cfg, allow_grouping=False, branch=branch, message=message)
 
 
 def convert(
@@ -154,6 +227,8 @@ def convert(
     output: PathLike,
     cfg: AppConfig | None = None,
     fmt: Literal["h5ad", "10x"] | None = None,
+    branch: str | None = None,
+    message: str | None = None,
 ) -> OpResult:
     """Convert one or more inputs into a single AnnData zarr (or icechunk) store.
 
@@ -175,6 +250,11 @@ def convert(
     fmt
         ``"h5ad"`` or ``"10x"``, overriding content detection for a single input; ignored
         for an AnnData input or a multi-input concat.
+    branch
+        Icechunk branch to write to; created off the current tip if it doesn't exist
+        yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the destination.
 
     Returns
     -------
@@ -190,27 +270,29 @@ def convert(
         cfg = load_config()
 
     if isinstance(inputs, ad.AnnData):
-        return convert_adata(inputs, output=output, cfg=cfg)
+        return convert_adata(inputs, output=output, cfg=cfg, branch=branch, message=message)
 
     paths: list[PathLike] = [inputs] if isinstance(inputs, (str, os.PathLike)) else list(inputs)
     if not paths:
         raise ConversionError("convert requires at least one input.")
 
     if len(paths) == 1:
-        return _convert_one(paths[0], output, cfg, fmt)
+        return _convert_one(paths[0], output, cfg, fmt, branch=branch, message=message)
 
     for p in paths:
         if detect_format(p) != "h5ad":
             raise ConversionError("concat supports h5ad inputs only.")
-    return concat([str(p) for p in paths], output=output, cfg=cfg)
+    return concat([str(p) for p in paths], output=output, cfg=cfg, branch=branch, message=message)
 
 
-def _convert_one(path: PathLike, output: PathLike, cfg: AppConfig, fmt: str | None) -> OpResult:
+def _convert_one(
+    path: PathLike, output: PathLike, cfg: AppConfig, fmt: str | None, *, branch: str | None, message: str | None
+) -> OpResult:
     kind = fmt or detect_format(path)
     if kind == "h5ad":
-        return convert_h5ad(path, output=output, cfg=cfg)
+        return convert_h5ad(path, output=output, cfg=cfg, branch=branch, message=message)
     if kind == "10x":
-        return convert_10x_h5(path, output=output, cfg=cfg)
+        return convert_10x_h5(path, output=output, cfg=cfg, branch=branch, message=message)
     if kind in ("zarr", "icechunk"):
         raise ConversionError(f"{path} is already a store; use rechunk or sort.")
 
@@ -218,6 +300,6 @@ def _convert_one(path: PathLike, output: PathLike, cfg: AppConfig, fmt: str | No
     try:
         for w in source.warnings:
             logger.warning(w)
-        return write_adata_to_store(source.adata, output, cfg, allow_grouping=False)
+        return write_adata_to_store(source.adata, output, cfg, allow_grouping=False, branch=branch, message=message)
     finally:
         source.close()

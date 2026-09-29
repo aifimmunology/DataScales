@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from annizarr._ops._result import OpResult
 from annizarr._runtime import configure_runtime, stage
 from annizarr._storage import is_remote, open_store_rw
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+from annizarr._writers._sparse import write_transposed_sparse
 from annizarr._zarr import get_array, get_group, shape_attr
 from annizarr.errors import ConversionError
 
@@ -44,6 +46,8 @@ def add_expr(
     target_sum: float = 1e4,
     overwrite: bool = False,
     cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
 ) -> OpResult:
     """Add a log-normalized expression layer (``layers/<layer>``) derived from CSR X.
 
@@ -63,6 +67,11 @@ def add_expr(
         Replace an existing ``layers/<layer>`` instead of erroring.
     cfg
         Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+    branch
+        Icechunk branch to edit; created off the current tip if it doesn't exist yet.
+        Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op, ``fmt``, and the layer.
 
     Returns
     -------
@@ -80,7 +89,8 @@ def add_expr(
         raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
 
     configure_runtime(cfg.chunks.cpus)
-    root, finalize = open_store_rw(store, cfg, commit_message=f"annizarr add-expr {fmt} → layers/{layer}")
+    commit_message = message or f"annizarr add-expr {fmt} → layers/{layer}"
+    root, finalize = open_store_rw(store, cfg, commit_message=commit_message, branch=branch)
     if "X" not in root:
         raise ConversionError(f"no X in {store} — not an AnnData zarr store?")
     x = get_group(root, "X")
@@ -125,8 +135,23 @@ def add_expr(
         snapshot_id = finalize()
         return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
 
-    # csc/dense: pass 1 counts nnz per column; pass 2 buckets entries into column
-    # bands (disk-backed, so RAM stays one band); each band then writes its slice.
+    if fmt == "csc":
+        # Factors are computed up front, in the same row_step bands lognorm_band uses,
+        # so they match bit-for-bit what the fused per-band computation used to produce;
+        # the transpose (bucket-by-column, disk-backed, RAM bounded to one band) then
+        # lives once in _writers._sparse, shared with write_matrix's backed CSR->CSC.
+        factors = _lognorm_factors(data_arr, indptr, target_sum, row_step, n_obs)
+        layer_cfg = replace(cfg, chunks=replace(cfg.chunks, sparse_flat_chunk=chunk_elems))
+        with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
+            g = write_transposed_sparse(layers, layer, x, layer_cfg, row_scale=factors, target="csc")
+        g.attrs[_TARGET_SUM_ATTR] = float(target_sum)
+        snapshot_id = finalize()
+        return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
+
+    # fmt == "dense": pass 1 counts nnz per column; pass 2 buckets entries into column
+    # bands (disk-backed, so RAM stays one band); each band then scatters into its slice
+    # of the dense array. Self-contained (not shared with the csc path above) since the
+    # final materialisation — and so the band sizing — differs from a sparse write.
     col_nnz = np.zeros(n_vars, dtype=np.int64)
     flat_step = max(chunk_elems, _layout.BATCH_BYTES // 8)
     with stage("Counting nnz per gene"):
@@ -135,18 +160,9 @@ def add_expr(
             col_nnz += np.bincount(np.asarray(idx_arr[s0:s1]), minlength=n_vars)
     csc_indptr = np.concatenate([[0], np.cumsum(col_nnz)]).astype(np.int64)
 
-    if fmt == "dense":
-        k = max(1, chunk_elems // n_obs)
-        band_cols = max(k, (_layout.BATCH_BYTES // (4 * n_obs)) // k * k)
-        edges = [*range(0, n_vars, band_cols), n_vars]
-    else:
-        # 20 B/entry: 12 B bucket (i32+i32+f32) + 8 B argsort index in the write phase
-        max_band_nnz = _layout.BATCH_BYTES // 20
-        edges = [0]
-        while edges[-1] < n_vars:
-            target = csc_indptr[edges[-1]] + max_band_nnz
-            nxt = int(np.searchsorted(csc_indptr, target, side="right")) - 1
-            edges.append(min(max(nxt, edges[-1] + 1), n_vars))
+    k = max(1, chunk_elems // n_obs)
+    band_cols = max(k, (_layout.BATCH_BYTES // (4 * n_obs)) // k * k)
+    edges = [*range(0, n_vars, band_cols), n_vars]
     n_bands = len(edges) - 1
     band_nnz = [int(csc_indptr[edges[i + 1]] - csc_indptr[edges[i]]) for i in range(n_bands)]
 
@@ -154,7 +170,7 @@ def add_expr(
     tmp_dir = None if is_remote(store) else str(Path(store).parent)
     tmp_root = Path(tempfile.mkdtemp(prefix="annizarr_expr_", dir=tmp_dir))
     try:
-        buckets = []
+        buckets: list[dict[str, NDArray[Any]]] = []
         for i, m in enumerate(band_nnz):
             m = max(1, m)
             buckets.append(
@@ -187,46 +203,26 @@ def add_expr(
                     buckets[bi]["vals"][c : c + hi - lo] = vals[sel]
                     cursors[bi] = c + hi - lo
 
-        if fmt == "csc":
-            indices_dtype = np.int32
-            g = _sparse_layer(
-                layers, layer, "csc_matrix", (n_obs, n_vars), nnz, indices_dtype, indptr_dtype, chunk_elems, target_sum
-            )
-            g["indptr"][:] = csc_indptr.astype(indptr_dtype)
-            with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
-                for bi in range(n_bands):
-                    m = band_nnz[bi]
-                    if m == 0:
-                        continue
-                    # entries were appended in ascending row order, so a stable
-                    # sort by column yields canonical CSC
-                    order = np.argsort(np.asarray(buckets[bi]["cols"][:m]), kind="stable")
-                    o0, o1 = int(csc_indptr[edges[bi]]), int(csc_indptr[edges[bi + 1]])
-                    g["data"][o0:o1] = np.asarray(buckets[bi]["vals"][:m])[order]
-                    g["indices"][o0:o1] = np.asarray(buckets[bi]["rows"][:m])[order].astype(indices_dtype)
-        else:
-            arr = layers.require_array(
-                layer,
-                shape=(n_obs, n_vars),
-                dtype=np.float32,
-                chunks=(n_obs, k),
-                compressors=x_compressors(),
-                overwrite=True,
-            )
-            arr.attrs.update(
-                {"encoding-type": "array", "encoding-version": "0.2.0", _TARGET_SUM_ATTR: float(target_sum)}
-            )
-            with stage(f"Writing layers/{layer} (dense, {n_bands} column bands)"):
-                for bi in range(n_bands):
-                    c0, c1 = edges[bi], edges[bi + 1]
-                    block = np.zeros((n_obs, c1 - c0), dtype=np.float32)
-                    m = band_nnz[bi]
-                    if m:
-                        block[
-                            np.asarray(buckets[bi]["rows"][:m]),
-                            np.asarray(buckets[bi]["cols"][:m]) - c0,
-                        ] = np.asarray(buckets[bi]["vals"][:m])
-                    arr[:, c0:c1] = block
+        arr = layers.require_array(
+            layer,
+            shape=(n_obs, n_vars),
+            dtype=np.float32,
+            chunks=(n_obs, k),
+            compressors=x_compressors(),
+            overwrite=True,
+        )
+        arr.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0", _TARGET_SUM_ATTR: float(target_sum)})
+        with stage(f"Writing layers/{layer} (dense, {n_bands} column bands)"):
+            for bi in range(n_bands):
+                c0, c1 = edges[bi], edges[bi + 1]
+                block = np.zeros((n_obs, c1 - c0), dtype=np.float32)
+                m = band_nnz[bi]
+                if m:
+                    block[
+                        np.asarray(buckets[bi]["rows"][:m]),
+                        np.asarray(buckets[bi]["cols"][:m]) - c0,
+                    ] = np.asarray(buckets[bi]["vals"][:m])
+                arr[:, c0:c1] = block
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -248,6 +244,26 @@ def lognorm_band(
     factors[nz] = target_sum / sums[nz]
     vals = np.log1p(seg * np.repeat(factors, row_nnz[b0:b1])).astype(np.float32)
     return s0, s1, vals
+
+
+def _lognorm_factors(
+    data_arr: Any, indptr: NDArray[np.int64], target_sum: float, row_step: int, n_obs: int
+) -> NDArray[np.float64]:
+    """Per-row ``target_sum / row_sum`` factors, in the same ``row_step`` bands
+    :func:`lognorm_band` uses (so the sums match bit-for-bit); feeds
+    :func:`~annizarr._writers._sparse.write_transposed_sparse`'s ``row_scale``."""
+    factors = np.zeros(n_obs, dtype=np.float64)
+    for b0 in range(0, n_obs, row_step):
+        b1 = min(b0 + row_step, n_obs)
+        s0, s1 = int(indptr[b0]), int(indptr[b1])
+        seg = np.asarray(data_arr[s0:s1], dtype=np.float64)
+        cs = np.concatenate(([0.0], np.cumsum(seg)))
+        sums = cs[indptr[b0 + 1 : b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
+        band_factors = np.zeros(b1 - b0)
+        nz = sums > 0
+        band_factors[nz] = target_sum / sums[nz]
+        factors[b0:b1] = band_factors
+    return factors
 
 
 def introspect_gexp(node: Any) -> tuple[XStorage, int, float | None]:

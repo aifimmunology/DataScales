@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -10,13 +11,35 @@ from annizarr.errors import ConversionError
 if TYPE_CHECKING:
     import anndata as ad
 
+logger = logging.getLogger(__name__)
+
+
+def _peek_x_nbytes(path: Path) -> int:
+    """On-disk byte size of ``X``, from HDF5 dataset metadata only — no data read."""
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        x = f["X"]
+        if isinstance(x, h5py.Dataset):
+            return int(x.nbytes)
+        return int(x["data"].nbytes + x["indices"].nbytes + x["indptr"].nbytes)
+
 
 def load_h5ad(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnData, list[str]]:
     import anndata as ad
 
-    mode = "backed (streaming)" if cfg.io.backed else "eager (full load)"
+    backed = cfg.io.backed
+    if backed is None:
+        x_bytes = _peek_x_nbytes(input_path)
+        backed = x_bytes > cfg.io.eager_max_bytes
+        logger.info(
+            f"Auto-selected {'backed' if backed else 'eager'} load for {input_path}: "
+            f"X on-disk size={x_bytes} bytes, eager_max_bytes={cfg.io.eager_max_bytes} bytes."
+        )
+
+    mode = "backed (streaming)" if backed else "eager (full load)"
     with stage(f"Reading {input_path} [{mode}]"):
-        if cfg.io.backed:
+        if backed:
             try:
                 return ad.read_h5ad(input_path, backed="r"), []
             except Exception as exc:

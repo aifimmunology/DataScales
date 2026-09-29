@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import anndata as ad
 import h5py
@@ -81,6 +82,24 @@ def test_obs_columns_requires_two_inputs(tmp_path: Path) -> None:
             ]
         )
     assert exc.value.code == 2
+
+
+def test_backed_and_eager_are_mutually_exclusive(tmp_path: Path) -> None:
+    h5 = make_h5ad(tmp_path, "in.h5ad")
+    with pytest.raises(SystemExit) as exc:
+        main(["convert", str(h5), "-o", str(tmp_path / "out.zarr"), "--backed", "--eager"])
+    assert exc.value.code == 2
+
+
+def test_eager_flag_forces_eager_load(tmp_path: Path) -> None:
+    """--eager overrides auto-select even when eager_max_bytes would otherwise pick backed."""
+    h5 = make_h5ad(tmp_path, "in.h5ad")
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text("[io]\neager_max_bytes = 0\n")
+    out = tmp_path / "out.zarr"
+    with patch("anndata.read_h5ad", wraps=ad.read_h5ad) as mocked:
+        assert main(["convert", str(h5), "-o", str(out), "--eager", "--config", str(cfg_file)]) == 0
+    assert "backed" not in mocked.call_args_list[0].kwargs
 
 
 def test_overwrite_gating(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

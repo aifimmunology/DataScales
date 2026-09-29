@@ -296,11 +296,24 @@ def test_append_obs_dtype_mismatch(tmp_path):
         append(str(sa), cells=str(sb), cfg=_cfg())
 
 
-def test_append_duplicate_names_warn(tmp_path, caplog):
+def test_append_all_duplicate_names_raises(tmp_path):
+    # `b` has the identical obs index as `a` (same n, same seed) — every appended cell is
+    # already present, so this looks like a re-run of the same append and is a hard error.
     sa = _store(tmp_path, _adata(n=20, seed=0), "a.zarr")
     sb = _store(tmp_path, _adata(n=20, seed=0), "b.zarr")
+    with pytest.raises(ConversionError, match="already"):
+        append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
+
+
+def test_append_partial_duplicate_names_warns(tmp_path, caplog):
+    # only 2 of `b`'s 10 obs names collide with `a` — barcodes legitimately collide across
+    # samples, so this stays a warning, not a raise.
+    a, b = _adata(n=20, seed=0), _adata(n=10, seed=1)
+    b.obs_names = [a.obs_names[0], a.obs_names[1], *b.obs_names[2:]]
+    sa = _store(tmp_path, a, "a.zarr")
+    sb = _store(tmp_path, b, "b.zarr")
     append(str(sa), cells=str(sb), drop_derived=True, cfg=_cfg())
-    assert any("duplicate" in m for m in _messages(caplog))
+    assert any("2 duplicate" in m for m in _messages(caplog))
 
 
 def test_append_drop_derived(tmp_path, caplog):
@@ -380,7 +393,7 @@ def test_plan_append_reports_extendable_and_drops(tmp_path):
     assert plan.extendable_layers == ("gexp",)
     assert plan.drop_layers == ()
     assert plan.drop_obsm == ("X_umap",)
-    assert plan.duplicate_names is False
+    assert plan.n_duplicate_names == 0
 
     assert plan.drops() == ("obsm/X_umap", "layers/gexp")
     assert plan.drops(extend_layers=True) == ("obsm/X_umap",)  # gexp extended, not dropped

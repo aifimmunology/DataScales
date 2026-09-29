@@ -19,7 +19,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def sort(store: PathLike, *, output: PathLike, by: Sequence[str], cfg: AppConfig | None = None) -> OpResult:
+def sort(
+    store: PathLike,
+    *,
+    output: PathLike,
+    by: Sequence[str],
+    cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
+) -> OpResult:
     """Physically sort an existing zarr store by obs column(s) into a new store.
 
     Parameters
@@ -32,6 +40,11 @@ def sort(store: PathLike, *, output: PathLike, by: Sequence[str], cfg: AppConfig
         Obs column name(s) to sort by, primary key first.
     cfg
         Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+    branch
+        Icechunk branch to write ``output`` to; created off the current tip if it
+        doesn't exist yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the sort keys.
 
     Returns
     -------
@@ -81,6 +94,7 @@ def sort(store: PathLike, *, output: PathLike, by: Sequence[str], cfg: AppConfig
 
     x = sparse_dataset(src["X"])
     n_obs, n_vars = x.shape
+    commit_message = message or f"annizarr sort by {','.join(by)} → {store_name(output)}"
     snapshot_id = stream_sorted_store(
         x,
         read_elem(src["obs"]),
@@ -92,13 +106,14 @@ def sort(store: PathLike, *, output: PathLike, by: Sequence[str], cfg: AppConfig
         Path(output),
         cfg,
         sort_by=by,
-        commit_message=f"annizarr sort → {store_name(output)}",
+        commit_message=commit_message,
+        branch=branch,
     )
     if gexp_params is not None:
         fmt, chunk_elems, target_sum = gexp_params
         if target_sum is None:
             logger.warning("layers/gexp has no recorded target_sum; re-deriving at 1e4.")
             target_sum = 1e4
-        add_expr(output, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum, cfg=cfg)
+        add_expr(output, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum, cfg=cfg, branch=branch)
         logger.warning(f"layers/gexp re-derived ({fmt}) on the sorted store.")
     return OpResult(path=str(output), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)

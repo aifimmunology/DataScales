@@ -1,3 +1,5 @@
+import filecmp
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,6 +10,7 @@ import pytest
 import scipy.sparse as sp
 import zarr
 
+import annizarr._layout as _layout
 from annizarr._ops import convert_10x_h5, convert_adata, convert_h5ad
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 from annizarr.errors import ConversionError
@@ -345,3 +348,82 @@ def test_convert_adata_in_memory(tmp_path: Path) -> None:
 
     with pytest.raises(ConversionError, match="in-memory"):
         convert_adata(adata, output=str(tmp_path / "b.zarr"), cfg=_cfg_backed("csr"))
+
+
+# ---------------------------------------------------------------------------
+# Streamed sparse transposition (backed CSR<->CSC via write_transposed_sparse)
+# ---------------------------------------------------------------------------
+
+
+def _tree_files(root: Path) -> dict[str, Path]:
+    return {str(p.relative_to(root)): p for p in root.rglob("*") if p.is_file()}
+
+
+def _assert_byte_identical(a: Path, b: Path) -> None:
+    fa, fb = _tree_files(a), _tree_files(b)
+    assert set(fa) == set(fb), f"file set differs: {a.name} has {set(fa) - set(fb)}, {b.name} has {set(fb) - set(fa)}"
+    for rel in sorted(fa):
+        assert filecmp.cmp(fa[rel], fb[rel], shallow=False), f"differs: {rel}"
+
+
+def test_h5ad_backed_csr_to_csc_streamed_matches_eager_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backed CSR X targeted at csc output streams through write_transposed_sparse (never
+    materialises X); the resulting store must be byte-identical to converting the same
+    file eagerly. A tiny BATCH_BYTES forces many target (column) bands as well as several
+    output sparse_flat_chunk-sized chunks with a ragged tail; X's indices are scipy's
+    default int32."""
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 2048)
+
+    rng = np.random.default_rng(7)
+    n_obs, n_vars = 300, 200
+    dense = rng.random((n_obs, n_vars))
+    dense[dense < 0.85] = 0.0  # ~15% density, ~9000 nnz
+    X = sp.csr_matrix(dense.astype(np.float32))
+    assert X.indices.dtype == np.int32
+    h5 = tmp_path / "in.h5ad"
+    ad.AnnData(X=X).write_h5ad(h5)
+
+    cfg = AppConfig(
+        io=IOConfig(overwrite=True, x_storage="csc"),
+        chunks=ChunkConfig(x_row_chunk=64, x_col_chunk=48, sparse_flat_chunk=37),
+        validation=ValidationConfig(),
+    )
+    cfg_backed = replace(cfg, io=replace(cfg.io, backed=True))
+
+    out_eager = tmp_path / "eager.zarr"
+    out_backed = tmp_path / "backed.zarr"
+    convert_h5ad(str(h5), output=str(out_eager), cfg=cfg)
+    convert_h5ad(str(h5), output=str(out_backed), cfg=cfg_backed)
+
+    _assert_byte_identical(out_eager, out_backed)
+    got = ad.read_zarr(str(out_backed))
+    assert sp.isspmatrix_csc(got.X)
+    np.testing.assert_allclose(got.X.toarray(), dense.astype(np.float32))
+
+
+def _make_mixed_format_h5ad(path: Path) -> np.ndarray:
+    """X is CSR on disk; the 'counts' layer is CSC on disk — both are backed once opened
+    with backed="r", so this mixes the two directions in one file."""
+    dense = np.array(
+        [[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0], [6.0, 7.0, 0.0]],
+        dtype=np.float32,
+    )
+    adata = ad.AnnData(X=sp.csr_matrix(dense))
+    adata.layers["counts"] = sp.csc_matrix(dense * 2)
+    adata.write_h5ad(path)
+    return dense
+
+
+def test_h5ad_backed_csc_layer_streamed_to_csr(tmp_path: Path) -> None:
+    """A backed CSC layer targeted at csr output streams through write_transposed_sparse
+    too (the CSC->CSR direction). X is CSR here so convert's own X-specific CSC-to-CSR
+    normalisation (out of this unit's scope; always forces CSR eagerly regardless of
+    x_storage) never fires — write_matrix's generic backed dispatch handles the layer."""
+    h5 = tmp_path / "mixed.h5ad"
+    dense = _make_mixed_format_h5ad(h5)
+    out = tmp_path / "out.zarr"
+    convert_h5ad(str(h5), output=str(out), cfg=_cfg_backed("csr"))
+    got = ad.read_zarr(str(out))
+    assert sp.isspmatrix_csr(got.layers["counts"])
+    np.testing.assert_allclose(got.layers["counts"].toarray(), dense * 2)
+    np.testing.assert_allclose(got.X.toarray(), dense)

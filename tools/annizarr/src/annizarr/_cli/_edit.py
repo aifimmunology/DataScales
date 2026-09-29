@@ -5,11 +5,13 @@ import logging
 import sys
 
 from annizarr._cli._args import (
+    add_branch_arg,
     add_chunk_args,
     add_config_arg,
     add_consolidate_arg,
     add_cpus_arg,
     add_ic_arg,
+    add_message_arg,
     add_overwrite_arg,
     build_config,
 )
@@ -31,6 +33,8 @@ def add_add_expr_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     p.add_argument("--chunk-elems", type=int, default=1_000_000, help="chunk size (elements) for the layer")
     p.add_argument("--target-sum", type=float, default=1e4, help="library-size normalization target")
     add_overwrite_arg(p)
+    add_branch_arg(p)
+    add_message_arg(p)
     add_config_arg(p)
     p.set_defaults(func=_run_add_expr)
 
@@ -47,6 +51,8 @@ def _run_add_expr(args: argparse.Namespace) -> int:
         target_sum=args.target_sum,
         overwrite=bool(args.overwrite),
         cfg=cfg,
+        branch=args.branch,
+        message=args.message,
     )
     _LOG.info(f"updated {result.path} ({result.n_obs} x {result.n_vars})")
     if result.snapshot_id is not None:
@@ -64,6 +70,8 @@ def add_rechunk_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     add_overwrite_arg(p)
     add_consolidate_arg(p)
     add_ic_arg(p)
+    add_branch_arg(p)
+    add_message_arg(p)
     add_config_arg(p)
     p.set_defaults(func=_run_rechunk)
 
@@ -72,7 +80,9 @@ def _run_rechunk(args: argparse.Namespace) -> int:
     from annizarr._ops import rechunk
 
     cfg = build_config(args)
-    result = rechunk(args.store, output=args.output, array=args.array, cfg=cfg)
+    result = rechunk(
+        args.store, output=args.output, array=args.array, cfg=cfg, branch=args.branch, message=args.message
+    )
     _LOG.info(f"wrote {result.path} ({result.n_obs} x {result.n_vars})")
     if result.snapshot_id is not None:
         _LOG.info(f"icechunk snapshot {result.snapshot_id}")
@@ -95,6 +105,8 @@ def add_sort_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     add_overwrite_arg(p)
     add_consolidate_arg(p)
     add_ic_arg(p)
+    add_branch_arg(p)
+    add_message_arg(p)
     add_config_arg(p)
     p.set_defaults(func=_run_sort)
 
@@ -103,7 +115,7 @@ def _run_sort(args: argparse.Namespace) -> int:
     from annizarr._ops import sort
 
     cfg = build_config(args)
-    result = sort(args.store, output=args.output, by=args.sort_by, cfg=cfg)
+    result = sort(args.store, output=args.output, by=args.sort_by, cfg=cfg, branch=args.branch, message=args.message)
     _LOG.info(f"wrote {result.path} ({result.n_obs} x {result.n_vars})")
     if result.snapshot_id is not None:
         _LOG.info(f"icechunk snapshot {result.snapshot_id}")
@@ -131,6 +143,8 @@ def add_append_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
         action="store_true",
         help="assume yes for the loss-plan prompt",
     )
+    add_branch_arg(p)
+    add_message_arg(p)
     add_config_arg(p)
     p.set_defaults(func=_run_append)
 
@@ -150,8 +164,8 @@ def _run_append(args: argparse.Namespace) -> int:
     if plan.extendable_layers:
         verb = "extend in place" if args.extend_layers else "drop unless --extend-layers"
         _LOG.warning(f"layers {list(plan.extendable_layers)} eligible to {verb}")
-    if plan.duplicate_names:
-        _LOG.warning("appending would introduce duplicate obs names")
+    if plan.n_duplicate_names:
+        _LOG.warning(f"appending would introduce {plan.n_duplicate_names} duplicate obs name(s)")
     for note in plan.notes:
         _LOG.warning(note)
 
@@ -181,6 +195,8 @@ def _run_append(args: argparse.Namespace) -> int:
         drop_derived=drop_derived,
         extend_layers=args.extend_layers,
         cfg=cfg,
+        branch=args.branch,
+        message=args.message,
     )
     _LOG.info(f"updated {result.path} ({result.n_obs} x {result.n_vars})")
     if result.snapshot_id is not None:

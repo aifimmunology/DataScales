@@ -9,7 +9,7 @@ from annizarr._runtime import stage
 from annizarr._sources._matrix import is_backed, matrix_format
 from annizarr._writers._dense import _write_dense_streaming, _write_sparse_as_dense
 from annizarr._writers._encoding import set_anndata_root_attrs, set_raw_group_attrs, write_elem
-from annizarr._writers._sparse import _write_sparse_streaming
+from annizarr._writers._sparse import _write_sparse_streaming, write_transposed_sparse
 from annizarr._zarr import get_group
 
 if TYPE_CHECKING:
@@ -39,12 +39,13 @@ def write_matrix(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> No
         return
 
     # Sparse output (csr, csc).
-    # For backed input whose format doesn't match the target, we have no choice but to
-    # load into memory and convert (no incremental transpose). For matching format
-    # (CSR→CSR or CSC→CSC), streaming works directly from backed storage.
+    # A backed input whose format doesn't match the target streams through the bucket
+    # transpose engine (no full-matrix materialisation). For matching format (CSR→CSR or
+    # CSC→CSC), streaming works directly from backed storage.
     if backed and fmt in ("csr", "csc"):
         if fmt != mode:
-            matrix = matrix[:].tocsc() if mode == "csc" else matrix[:].tocsr()
+            write_transposed_sparse(group, key, matrix, cfg, target=mode)
+            return
     elif fmt == "dense":
         if not backed:
             # eager dense layer / raw.X under sparse output: sparsify in memory (issue #4)

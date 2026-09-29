@@ -3,7 +3,10 @@ overwrite = false
 consolidate_metadata = false
 # x_storage: "csr" (default), "csc" (force CSC), "dense" (force dense)
 x_storage = "csr"
-backed = false
+# backed: true (stream h5ad input), false (load eagerly). Commented out = auto (default):
+# peek X's on-disk size and pick backed when it exceeds eager_max_bytes, else eager.
+# backed = false
+eager_max_bytes = 2147483648
 # backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
 # one commit per conversion). icechunk requires eager input (not backed) for now.
 # An icechunk target is a local path or an s3://bucket/prefix URL (AWS env credentials).

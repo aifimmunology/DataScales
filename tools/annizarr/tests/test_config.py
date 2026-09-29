@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from annizarr.config import AppConfig, apply_cli_overrides, load_config
+from annizarr._config import resolve_backend_cfg
+from annizarr.config import AppConfig, IOConfig, apply_cli_overrides, load_config
+from annizarr.errors import ConversionError
 
 
 def test_default_config() -> None:
@@ -10,6 +12,46 @@ def test_default_config() -> None:
     assert isinstance(cfg, AppConfig)
     assert cfg.chunks.x_row_chunk == 2048
     assert cfg.io.x_storage == "csr"
+
+
+def test_default_backed_is_auto() -> None:
+    cfg = load_config(None)
+    assert cfg.io.backed is None
+    assert cfg.io.eager_max_bytes == 2 * 1024**3
+
+
+def test_negative_eager_max_bytes_rejected(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "bad.toml"
+    cfg_file.write_text("[io]\neager_max_bytes = -1\n")
+    with pytest.raises(ValueError, match="eager_max_bytes"):
+        load_config(str(cfg_file))
+
+
+def test_eager_max_bytes_configurable_via_toml(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text("[io]\neager_max_bytes = 1000\n")
+    cfg = load_config(str(cfg_file))
+    assert cfg.io.eager_max_bytes == 1000
+
+
+def test_resolve_backend_cfg_icechunk_backed_none_resolves_to_eager(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="annizarr")
+    cfg = AppConfig(io=IOConfig(backend="icechunk", backed=None))
+    resolved = resolve_backend_cfg(cfg)
+    assert resolved.io.backed is False
+    assert any("auto-selecting eager" in r.message for r in caplog.records)
+
+
+def test_resolve_backend_cfg_icechunk_backed_true_still_rejected() -> None:
+    cfg = AppConfig(io=IOConfig(backend="icechunk", backed=True))
+    with pytest.raises(ConversionError, match="does not support --backed"):
+        resolve_backend_cfg(cfg)
+
+
+def test_resolve_backend_cfg_zarr_backend_leaves_backed_none() -> None:
+    cfg = AppConfig(io=IOConfig(backend="zarr", backed=None))
+    resolved = resolve_backend_cfg(cfg)
+    assert resolved.io.backed is None
 
 
 def test_toml_load(tmp_path: Path) -> None:

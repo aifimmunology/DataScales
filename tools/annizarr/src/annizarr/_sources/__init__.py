@@ -35,7 +35,9 @@ __all__ = [
 
 def _load_h5ad_source(path: PathLike, cfg: AppConfig) -> Source:
     adata, warnings = load_h5ad(Path(path), cfg)
-    return Source(adata=adata, kind="h5ad", backed=cfg.io.backed, warnings=tuple(warnings))
+    # cfg.io.backed may be None (auto-select); load_h5ad already resolved the real
+    # decision onto adata itself, so read it back rather than the config field.
+    return Source(adata=adata, kind="h5ad", backed=adata.isbacked, warnings=tuple(warnings))
 
 
 def _load_10x_source(path: PathLike, cfg: AppConfig) -> Source:

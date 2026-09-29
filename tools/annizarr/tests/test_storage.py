@@ -95,18 +95,23 @@ def test_require_icechunk_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_open_output_store_finalize_is_idempotent_plain_zarr(tmp_path: Path) -> None:
-    root, finalize = open_output_store(tmp_path / "out.zarr", AppConfig(io=IOConfig(consolidate_metadata=True)))
-    root.attrs["marker"] = 1
-    assert finalize() is None
-    assert finalize() is None  # second call is a no-op, not a re-consolidate
+    target = tmp_path / "out.zarr"
+    out = open_output_store(target, AppConfig(io=IOConfig(consolidate_metadata=True)))
+    out.root.attrs["encoding-type"] = "anndata"
+    out.root.attrs["encoding-version"] = "0.1.0"
+    out.root.require_array("X", shape=(1, 1), dtype="float32")
+    assert out.finalize() is None
+    assert out.finalize() is None  # second call is a no-op, not a re-consolidate
+    assert target.exists()
+    assert not list(tmp_path.glob("*.tmp-*"))  # temp dir renamed away, none left behind
 
 
 def test_open_output_store_finalize_is_idempotent_icechunk(tmp_path: Path) -> None:
     pytest.importorskip("icechunk")
-    root, finalize = open_output_store(tmp_path / "repo.icechunk", AppConfig(io=IOConfig(backend="icechunk")))
-    root.attrs["marker"] = 1
-    first = finalize()
-    second = finalize()
+    out = open_output_store(tmp_path / "repo.icechunk", AppConfig(io=IOConfig(backend="icechunk")))
+    out.root.attrs["marker"] = 1
+    first = out.finalize()
+    second = out.finalize()
     assert first is not None
     assert second == first  # cached, not a second (empty) commit
 

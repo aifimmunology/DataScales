@@ -46,7 +46,15 @@ class IOConfig:
     x_storage
         On-disk layout for X (and layers): ``"csr"``, ``"csc"``, or ``"dense"``.
     backed
-        Load h5ad input in backed (HDF5-streamed) mode instead of eagerly; opt-in only.
+        Load h5ad input in backed (HDF5-streamed) mode instead of eagerly. ``None``
+        (the default) auto-selects per input: :func:`annizarr._sources._h5ad.load_h5ad`
+        peeks the on-disk size of ``X`` (no data read) and picks backed when it exceeds
+        ``eager_max_bytes``, else eager. Ignored for in-memory/10x input (always eager).
+    eager_max_bytes
+        Auto-select threshold, in bytes, used when ``backed`` is ``None``: an h5ad whose
+        on-disk ``X`` (``data``+``indices``+``indptr`` for sparse, the raw dataset for
+        dense) exceeds this loads backed instead of eagerly. Ignored when ``backed`` is
+        set explicitly.
     backend
         ``"zarr"`` writes a plain on-disk store; ``"icechunk"`` writes through a
         transactional, versioned Icechunk repository (one commit per op). Icechunk
@@ -56,7 +64,8 @@ class IOConfig:
     overwrite: bool = False
     consolidate_metadata: bool = False
     x_storage: XStorage = "csr"
-    backed: bool = False
+    backed: bool | None = None
+    eager_max_bytes: int = 2 * 1024**3
     backend: BackendMode = "zarr"
 
 
@@ -219,6 +228,8 @@ def _validate_config(config: AppConfig) -> AppConfig:
         raise ValidationError(
             f"chunks.x_shard_factor must be >= 1 (1 = no sharding); got {config.chunks.x_shard_factor}."
         )
+    if io.eager_max_bytes < 0:
+        raise ValidationError(f"io.eager_max_bytes must be >= 0; got {io.eager_max_bytes}.")
     return replace(config, io=io, grouping=grouping, concat=concat)
 
 
@@ -336,7 +347,10 @@ def apply_cli_overrides(
     overwrite, consolidate_metadata, x_storage, x_row_chunk, x_col_chunk,
     sparse_flat_chunk, x_shard_factor, cpus, backed, backend, sort_by, obs_columns
         Per-field overrides; a value of ``None`` leaves the corresponding field
-        untouched. ``sort_by`` also sets ``grouping.enabled = True``.
+        untouched. ``sort_by`` also sets ``grouping.enabled = True``. ``backed`` is
+        itself tri-state on :class:`IOConfig` (``None`` = auto-select); passing
+        ``None`` here means "don't touch it" (neither ``--backed`` nor ``--eager``
+        given), not "reset it to auto".
 
     Returns
     -------
@@ -383,7 +397,9 @@ def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
     commit), so in-process threaded paths keep ``cpus``. Only the backed-input
     writers are rejected: they fan out to worker processes that reopen the store by
     filesystem path, which an icechunk session can't provide (``Session.fork()`` is
-    the future path).
+    the future path). Since icechunk never supports backed input, an unset
+    (``None``, auto-select) ``backed`` resolves to eager here rather than falling
+    through to :func:`annizarr._sources._h5ad.load_h5ad`'s file-size peek.
 
     Parameters
     ----------
@@ -393,7 +409,8 @@ def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
     Returns
     -------
     AppConfig
-        ``cfg`` unchanged (validated).
+        ``cfg``, with ``io.backed`` resolved to ``False`` when the backend is
+        icechunk and it was ``None``; otherwise unchanged (validated).
 
     Raises
     ------
@@ -407,6 +424,9 @@ def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
             f"x_shard_factor={cfg.chunks.x_shard_factor} only applies to dense X; "
             f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored."
         )
+    if cfg.io.backend == "icechunk" and cfg.io.backed is None:
+        logger.info("backend='icechunk' does not support backed input; auto-selecting eager (backed=False).")
+        cfg = replace(cfg, io=replace(cfg.io, backed=False))
     if cfg.io.backend == "icechunk" and cfg.io.backed:
         raise ConversionError(
             "backend='icechunk' does not support --backed input yet (backed writers use "

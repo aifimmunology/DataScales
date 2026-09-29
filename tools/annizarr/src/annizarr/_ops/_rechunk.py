@@ -18,7 +18,15 @@ if TYPE_CHECKING:
 _SMALL_ELEMS = ("obs", "var", "uns", "varm", "varp")
 
 
-def rechunk(store: PathLike, *, output: PathLike, array: str = "X", cfg: AppConfig | None = None) -> OpResult:
+def rechunk(
+    store: PathLike,
+    *,
+    output: PathLike,
+    array: str = "X",
+    cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
+) -> OpResult:
     """Rewrite one matrix with the configured chunking; stream-copy everything else as-is.
 
     Parameters
@@ -31,6 +39,11 @@ def rechunk(store: PathLike, *, output: PathLike, array: str = "X", cfg: AppConf
         The matrix element to rechunk: ``"X"``, ``"layers/<name>"``, or ``"raw/X"``.
     cfg
         Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+    branch
+        Icechunk branch to write ``output`` to; created off the current tip if it
+        doesn't exist yet. Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and ``array``.
 
     Returns
     -------
@@ -62,46 +75,52 @@ def rechunk(store: PathLike, *, output: PathLike, array: str = "X", cfg: AppConf
         raise ConversionError(f"array '{array}' is not a matrix element ({matrix_keys}).")
 
     ad.settings.zarr_write_format = 3
-    dst, finalize = open_output_store(output, cfg, commit_message=f"annizarr rechunk {array} → {store_name(output)}")
-    dst.attrs.update(dict(src.attrs))
+    commit_message = message or f"annizarr rechunk {array} → {store_name(output)}"
+    out = open_output_store(output, cfg, commit_message=commit_message, branch=branch)
+    try:
+        dst = out.root
+        dst.attrs.update(dict(src.attrs))
 
-    with stage("Copying metadata elements"):
-        for key in _SMALL_ELEMS:
-            if key in src:
-                write_elem(dst, key, read_elem(src[key]))
-        # obsm/obsp scale with n_obs — stream arrays and sparse groups, chunks preserved
-        for key in ("obsm", "obsp"):
-            if key not in src:
-                continue
-            src_group = get_group(src, key)
-            g = dst.require_group(key)
-            g.attrs.update(dict(src_group.attrs))
-            for child in src_group:
-                node = src_group[child]
-                if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in ("csr_matrix", "csc_matrix"):
-                    _copy_matrix(node, dst, f"{key}/{child}", cfg, rechunk=False)
-                else:
-                    write_elem(g, child, read_elem(node))
-        if "raw" in src:
-            src_raw = get_group(src, "raw")
-            raw = dst.require_group("raw")
-            raw.attrs.update(dict(src_raw.attrs))
-            for key in ("var", "varm"):
-                if key in src_raw:
-                    write_elem(raw, key, read_elem(src_raw[key]))
+        with stage("Copying metadata elements"):
+            for key in _SMALL_ELEMS:
+                if key in src:
+                    write_elem(dst, key, read_elem(src[key]))
+            # obsm/obsp scale with n_obs — stream arrays and sparse groups, chunks preserved
+            for key in ("obsm", "obsp"):
+                if key not in src:
+                    continue
+                src_group = get_group(src, key)
+                g = dst.require_group(key)
+                g.attrs.update(dict(src_group.attrs))
+                for child in src_group:
+                    node = src_group[child]
+                    if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in ("csr_matrix", "csc_matrix"):
+                        _copy_matrix(node, dst, f"{key}/{child}", cfg, rechunk=False)
+                    else:
+                        write_elem(g, child, read_elem(node))
+            if "raw" in src:
+                src_raw = get_group(src, "raw")
+                raw = dst.require_group("raw")
+                raw.attrs.update(dict(src_raw.attrs))
+                for key in ("var", "varm"):
+                    if key in src_raw:
+                        write_elem(raw, key, read_elem(src_raw[key]))
 
-    if "layers" in src:
-        src_layers = get_group(src, "layers")
-        layers = dst.require_group("layers")
-        layers.attrs.update(dict(src_layers.attrs))
+        if "layers" in src:
+            src_layers = get_group(src, "layers")
+            layers = dst.require_group("layers")
+            layers.attrs.update(dict(src_layers.attrs))
 
-    for key in matrix_keys:
-        rechunked = key == array
-        with stage(f"{'Rechunking' if rechunked else 'Copying'} {key}"):
-            _copy_matrix(src[key], dst, key, cfg, rechunk=rechunked)
+        for key in matrix_keys:
+            rechunked = key == array
+            with stage(f"{'Rechunking' if rechunked else 'Copying'} {key}"):
+                _copy_matrix(src[key], dst, key, cfg, rechunk=rechunked)
 
-    n_obs, n_vars = _matrix_shape(src["X"])
-    snapshot_id = finalize()
+        n_obs, n_vars = _matrix_shape(src["X"])
+        snapshot_id = out.finalize()
+    except BaseException:
+        out.abort()
+        raise
     return OpResult(path=str(output), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
 
 

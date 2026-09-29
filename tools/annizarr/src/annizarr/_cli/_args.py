@@ -30,6 +30,25 @@ def add_ic_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ic", action="store_true", default=None, help="write through an Icechunk repository")
 
 
+def add_branch_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--branch",
+        default=None,
+        metavar="B",
+        help="Icechunk branch to read/write (default: current HEAD, falling back to 'main'); ignored for plain zarr",
+    )
+
+
+def add_message_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-m",
+        "--message",
+        default=None,
+        metavar="MSG",
+        help="Icechunk commit message (default: an auto-generated one naming the op); ignored for plain zarr",
+    )
+
+
 def add_cpus_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cpus", type=int, help="parallel workers for matrix chunk writes")
 

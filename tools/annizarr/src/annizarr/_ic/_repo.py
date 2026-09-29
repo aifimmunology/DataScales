@@ -211,7 +211,7 @@ class Repo:
 
     # -- reading & writing ---------------------------------------------------
 
-    def open_zarr(self, mode: str, *, snapshot_id: str | None = None) -> zarr.Group:
+    def open_zarr(self, mode: str, *, snapshot_id: str | None = None, truncate: bool = False) -> zarr.Group:
         """Open the store's zarr group — ``mode="r"`` (read) or ``mode="w"`` (write).
 
         ``"r"`` returns a read-only group at the current branch tip, or at
@@ -220,8 +220,16 @@ class Repo:
         :meth:`commit`, and repeated ``"w"`` calls reuse the one open session. Writes
         only ever go to the branch tip, so ``snapshot_id`` is rejected with ``"w"`` —
         read a past snapshot with ``"r"``, or :meth:`cherrypick` to reset the branch
-        there first. (``"w"`` opens an *editable* session, like zarr ``mode="a"``; it
-        never truncates the store.)
+        there first. (``"w"`` opens an *editable* session, like zarr ``mode="a"``, and
+        never truncates the store, unless ``truncate=True``.)
+
+        Parameters
+        ----------
+        truncate
+            With ``mode="w"``, replace the branch's current root contents with an
+            empty one (like zarr's own ``mode="w"``) instead of opening it editable —
+            used when writing a brand-new output onto a branch that may already hold
+            data from a previous write.
         """
         import zarr
 
@@ -241,7 +249,7 @@ class Repo:
                 )
             if self._session is None or self._session.read_only:
                 self._session = self._writer_repo().writable_session(self._branch)
-            return zarr.open_group(store=self._session.store, mode="a")
+            return zarr.open_group(store=self._session.store, mode="w" if truncate else "a")
         raise RepoError(f"open_zarr mode must be 'r' or 'w', got {mode!r}")
 
     def commit(

@@ -48,7 +48,8 @@ def plan_append(store: PathLike, *, cells: PathLike) -> AppendPlan:
     ------
     ConversionError
         ``store``/``cells`` is not a CSR AnnData zarr store, ``var`` names/order
-        mismatch, obs schema mismatch, or an X dtype mismatch.
+        mismatch, obs schema mismatch, an X dtype mismatch, or every appended cell's
+        obs name is already present in the store (already appended?).
     """
     root = open_input_group(store)
     src = open_input_group(cells)
@@ -100,7 +101,12 @@ def plan_append(store: PathLike, *, cells: PathLike) -> AppendPlan:
     if extras:
         notes.append("left behind (not carried from the cells store): " + ", ".join(extras))
 
-    duplicate_names = _has_duplicate_names(get_group(root, "obs"), get_group(src, "obs"), n_t)
+    n_duplicate_names = _count_duplicate_names(get_group(root, "obs"), get_group(src, "obs"), n_t)
+    if n_s > 0 and n_duplicate_names == n_s:
+        raise ConversionError(
+            f"append would add no new cells: all {n_s} appended cells are already present "
+            "in the store (already appended?)."
+        )
 
     return AppendPlan(
         n_new=n_s,
@@ -108,7 +114,7 @@ def plan_append(store: PathLike, *, cells: PathLike) -> AppendPlan:
         drop_obsp=tuple(obsp_keys),
         drop_layers=tuple(drop_layers),
         extendable_layers=tuple(ext_layers),
-        duplicate_names=duplicate_names,
+        n_duplicate_names=n_duplicate_names,
         notes=tuple(notes),
     )
 
@@ -120,6 +126,8 @@ def append(
     drop_derived: bool = False,
     extend_layers: bool = False,
     cfg: AppConfig | None = None,
+    branch: str | None = None,
+    message: str | None = None,
 ) -> OpResult:
     """Append the cells of another zarr store onto this one, in place.
 
@@ -142,6 +150,11 @@ def append(
         Extend eligible add-expr CSR layers in place instead of dropping them.
     cfg
         Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+    branch
+        Icechunk branch to edit; created off the current tip if it doesn't exist yet.
+        Ignored for plain zarr.
+    message
+        Icechunk commit message; ``None`` names the op and the two stores involved.
 
     Returns
     -------
@@ -151,7 +164,8 @@ def append(
     ------
     ConversionError
         The plan (see :func:`plan_append`) would drop derived elements and
-        ``drop_derived`` was not given, or the mutation fails partway through.
+        ``drop_derived`` was not given, every appended cell is already present (see
+        :func:`plan_append`), or the mutation fails partway through.
     """
     if cfg is None:
         cfg = load_config()
@@ -175,9 +189,8 @@ def append(
 
     configure_runtime(cfg.chunks.cpus)
     src = open_input_group(cells)
-    root, finalize = open_store_rw(
-        store, cfg, commit_message=f"annizarr append {store_name(cells)} → {store_name(store)}"
-    )
+    commit_message = message or f"annizarr append {store_name(cells)} → {store_name(store)}"
+    root, finalize = open_store_rw(store, cfg, commit_message=commit_message, branch=branch)
 
     x_t, x_s = get_group(root, "X"), get_group(src, "X")
     n_t, n_vars = shape_attr(x_t)
@@ -210,8 +223,11 @@ def append(
             f"(plain zarr cannot roll back — icechunk discards uncommitted changes): {e}"
         ) from e
 
-    if plan.duplicate_names:
-        logger.warning("obs names contain duplicates after append.")
+    if plan.n_duplicate_names:
+        logger.warning(
+            f"appended cells introduce {plan.n_duplicate_names} duplicate obs name(s) "
+            "(partial overlap with existing cells)."
+        )
     logger.warning("appended cells break any sorted-store contiguity; re-run `annizarr sort` if the store was sorted.")
     snapshot_id = finalize()
     return OpResult(path=str(store), n_obs=n_t + n_s, n_vars=n_vars, snapshot_id=snapshot_id)
@@ -268,19 +284,23 @@ def _check_obs_schema(obs_t: zarr.Group, obs_s: zarr.Group) -> None:
             raise ConversionError(f"obs column '{name}': unsupported encoding {enc!r} for in-place append.")
 
 
-def _has_duplicate_names(obs_t: zarr.Group, obs_s: zarr.Group, n_t: int) -> bool:
-    # duplicate obs-name check involving the appended cells — streamed over the store
-    # index in chunk-aligned slices, so memory stays O(cells store)
+def _count_duplicate_names(obs_t: zarr.Group, obs_s: zarr.Group, n_t: int) -> int:
+    # counts appended (cells) obs names that already occur in the merged (store + cells)
+    # index: collisions with the store's existing names (streamed over the store index in
+    # chunk-aligned slices, so memory stays O(cells store)), plus repeats within the cells
+    # store's own index (each beyond the first). n_duplicate_names == n_new means every
+    # appended cell is already present — plan_append raises on that.
     idx_s = np.asarray(get_array(obs_s, str_attr(obs_s, "_index"))[:])
-    if len(np.unique(idx_s)) < len(idx_s):
-        return True
+    _, counts = np.unique(idx_s, return_counts=True)
+    internal_dupes = int(np.clip(counts - 1, 0, None).sum())
+
     t_arr = get_array(obs_t, str_attr(obs_t, "_index"))
     chunk0 = t_arr.chunks[0]
     step = max(chunk0, (_INDEX_SCAN_ROWS // max(1, chunk0)) * chunk0)
+    seen_in_target = np.zeros(len(idx_s), dtype=bool)
     for i0 in range(0, n_t, step):
-        if np.isin(np.asarray(t_arr[i0 : min(i0 + step, n_t)]), idx_s).any():
-            return True
-    return False
+        seen_in_target |= np.isin(idx_s, np.asarray(t_arr[i0 : min(i0 + step, n_t)]))
+    return int(seen_in_target.sum()) + internal_dupes
 
 
 def _append_arrays(

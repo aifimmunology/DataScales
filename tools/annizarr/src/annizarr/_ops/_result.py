@@ -46,8 +46,14 @@ class AppendPlan:
         Layer keys eligible for in-place extension with ``append(..., extend_layers=True)``
         (add-expr CSR layers whose sparsity matches X exactly); dropped instead when
         ``extend_layers`` is not passed.
-    duplicate_names
-        Whether appending would introduce duplicate obs names.
+    n_duplicate_names
+        Count of appended obs names that already occur somewhere in the merged
+        (store + cells) obs index — collisions with the store's existing names, plus
+        any repeats within the cells store itself. ``n_duplicate_names == n_new`` means
+        every appended cell is already present (the cells store looks re-appended);
+        :func:`~annizarr._ops._append.plan_append` raises in that case. Anything less
+        is a partial overlap, which append only warns about (barcodes legitimately
+        collide across samples).
     notes
         Other human-readable notes: layers ineligible for extension despite carrying an
         add-expr marker (sparsity drifted from X), and cells-store elements append never
@@ -59,7 +65,7 @@ class AppendPlan:
     drop_obsp: tuple[str, ...]
     drop_layers: tuple[str, ...]
     extendable_layers: tuple[str, ...]
-    duplicate_names: bool
+    n_duplicate_names: int
     notes: tuple[str, ...]
 
     def drops(self, *, extend_layers: bool = False) -> tuple[str, ...]:
