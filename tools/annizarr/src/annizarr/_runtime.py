@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
@@ -17,7 +18,7 @@ _BLAS_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
 def pin_blas() -> None:
     """Pin every BLAS/OpenMP thread env var to 1 unless the caller already set it.
 
-    Guards against thread oversubscription (dask/process-pool workers x BLAS threads):
+    Guards against thread oversubscription (thread-pool/process-pool workers x BLAS threads):
     must run before numpy/scipy/blosc are imported, since OpenBLAS reads these once at
     import time.
     """
@@ -80,6 +81,42 @@ def run_parallel(
     with executor_cls(max_workers=cpus) as ex:
         for fut in [ex.submit(worker, *job) for job in jobs]:
             fut.result()
+
+
+def progress(total: int, label: str) -> Callable[[], None]:
+    """Return a thread-safe ``tick()`` that logs ``label`` progress for a writer's tasks.
+
+    Parameters
+    ----------
+    total
+        Number of ticks expected (tasks/blocks/segments); paces the percentage-based log.
+    label
+        Text prefixed to each progress line.
+
+    Returns
+    -------
+    Callable[[], None]
+        ``tick()``; logs at INFO at most once every ~5s or every 10% of ``total``,
+        whichever comes first, plus always on the final call. Safe to call concurrently.
+    """
+    lock = threading.Lock()
+    step = max(1, total // 10)
+    count = 0
+    last_time = time.perf_counter()
+    last_count = 0
+
+    def tick() -> None:
+        nonlocal count, last_time, last_count
+        with lock:
+            count += 1
+            now = time.perf_counter()
+            done = count >= total
+            if done or count - last_count >= step or now - last_time >= 5.0:
+                logger.info(f"{label}: {count}/{total}" + (" done" if done else ""))
+                last_time = now
+                last_count = count
+
+    return tick
 
 
 @contextmanager

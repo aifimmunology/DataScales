@@ -7,7 +7,7 @@ import scipy.sparse as sp
 
 from annizarr._runtime import stage
 from annizarr._sources._matrix import is_backed, matrix_format
-from annizarr._writers._dense import _write_dense_streaming, _write_sparse_as_dense_dask
+from annizarr._writers._dense import _write_dense_streaming, _write_sparse_as_dense
 from annizarr._writers._encoding import set_anndata_root_attrs, set_raw_group_attrs, write_elem
 from annizarr._writers._sparse import _write_sparse_streaming
 from annizarr._zarr import get_group
@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 def write_matrix(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
     # input may be any format (CSR, CSC, dense ndarray, backed SparseDataset) — adata.X is
     # guaranteed CSR by the caller, but other layers and raw.X may not be. Dispatches on
-    # cfg.io.x_storage: dense -> dask row-chunked write (CSC converted to CSR first for row
-    # slicing); csr/csc -> ensure that format, stream row/col-batches via dask (parallel for
-    # in-memory input).
+    # cfg.io.x_storage: dense -> row-chunked streaming write (CSC converted to CSR first for
+    # row slicing); csr/csc -> ensure that format, stream row/col-batches over a thread pool
+    # (parallel for in-memory input; a process pool for backed input).
     mode = cfg.io.x_storage
     fmt = matrix_format(matrix)
     backed = is_backed(matrix)
@@ -33,7 +33,7 @@ def write_matrix(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> No
         if fmt in ("csr", "csc"):
             if fmt != "csr":
                 matrix = matrix.tocsr()  # backed CSC: load into memory and convert; in-memory: direct
-            _write_sparse_as_dense_dask(group, matrix, key, cfg)
+            _write_sparse_as_dense(group, matrix, key, cfg)
         else:  # already dense
             _write_dense_streaming(group, matrix, key, cfg)
         return
@@ -72,7 +72,7 @@ def write_adata(adata: ad.AnnData, store: zarr.Group, cfg: AppConfig, x_override
         write_elem(store, "obsp", dict(adata.obsp))
         write_elem(store, "varp", dict(adata.varp))
 
-    # X: the heavy step — sub-progress comes from dask's ProgressBar inside.
+    # X: the heavy step — sub-progress comes from _runtime.progress() inside the writers.
     x_matrix = x_override if x_override is not None else adata.X
     x_nnz = getattr(x_matrix, "nnz", None)
     x_info = f"shape={x_matrix.shape}, {cfg.io.x_storage}"

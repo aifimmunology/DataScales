@@ -28,7 +28,6 @@ moto = ">=5"
 boto3 = ">=1.28"
 icechunk = "2.1.*"      # Phase 4 lifts: vendored ground truth is 2.1.2
 scanpy = ">=1.12.1,<2"  # dev only: reference for the h5py 10x reader test
-dask = ">=2026.3,<2027" # Phase 3 removes: moved writers still use dask
 python-build = "*"
 twine = "*"
 pre-commit = "*"

@@ -1,64 +1,51 @@
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from annizarr._layout import band_plan, dense_shards, x_compressors
-from annizarr._runtime import run_parallel
+from annizarr._runtime import progress, run_parallel
 from annizarr._sources._matrix import is_backed
 from annizarr._writers._encoding import set_array_attrs
 from annizarr._writers._workers import _densify_band_segment
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import zarr
 
     from annizarr._config import AppConfig
 
 
-def _build_tiled_dense_dask(matrix: Any, row_chunk: int, col_chunk: int) -> Any:
-    # blocks are exactly (row_chunk x col_chunk), matching the zarr chunk grid, so
-    # da.store() writes whole chunks (no read-modify-write); a single delayed row-slice
-    # (sparse CSR) is shared across that band's column tiles, so each row band is sliced
-    # from source storage only once. da.from_delayed (not da.from_array) is used because
-    # backed _CSRDataset has no ndim / array protocol.
-    # dask ships py.typed but delayed/from_delayed/concatenate are lazily re-exported and
-    # untyped at the call boundary; dask is removed in Phase 3.
-    import dask
-    import dask.array as da
-
-    n_rows, n_cols = matrix.shape
-    dtype = matrix.dtype
-
-    def _row_band(r0: int, r1: int) -> Any:
-        # Row-slicing returns scipy CSR for both backed and in-memory inputs.
-        return matrix[r0:r1]
-
-    row_blocks = []
-    for r0, r1 in band_plan(n_rows, row_chunk):
-        band = dask.delayed(_row_band)(r0, r1)  # type: ignore[attr-defined]  # sparse; computed once, reused per tile
-        col_blocks = []
-        for c0, c1 in band_plan(n_cols, col_chunk):
-            col_blocks.append(
-                da.from_delayed(  # type: ignore[no-untyped-call]
-                    dask.delayed(lambda b, a=c0, z=c1: np.asarray(b[:, a:z].toarray()))(band),  # type: ignore[attr-defined]
-                    shape=(r1 - r0, c1 - c0),
-                    dtype=dtype,
-                )
-            )
-        row_blocks.append(da.concatenate(col_blocks, axis=1))  # type: ignore[no-untyped-call]
-    return da.concatenate(row_blocks, axis=0)  # type: ignore[no-untyped-call]
+def _write_dense_block(
+    zarr_arr: zarr.Array[Any], matrix: Any, r0: int, r1: int, c0: int, c1: int, tick: Callable[[], None]
+) -> None:
+    # r0:r1 x c0:c1 is one write-block (the shard grid when sharded, else the chunk grid);
+    # blocks are disjoint across tasks, so no two threads ever touch the same chunk and no
+    # read-modify-write happens
+    zarr_arr[r0:r1, c0:c1] = np.asarray(matrix[r0:r1, c0:c1])
+    tick()
 
 
-def _write_sparse_as_dense_dask(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
-    # blocks match the zarr chunk grid (row_chunk x col_chunk) so the full dense matrix is
-    # never materialised. In-memory CSR streams through a 2D-tiled dask array
-    # (cfg.chunks.cpus threads); backed _CSRDataset is written by row band in parallel
-    # processes (each opens its own h5py handle; bands are chunk-aligned).
-    import dask.array as da
-    from dask.diagnostics import ProgressBar  # type: ignore[attr-defined]  # dask lazy-export; removed in Phase 3
+def _densify_row_band(
+    zarr_arr: zarr.Array[Any], matrix: Any, r0: int, r1: int, block_col: int, n_cols: int, tick: Callable[[], None]
+) -> None:
+    # slices the CSR row band once and reuses it for every column tile, so an in-memory
+    # sparse source is sliced n_rows/block_row times total, not once per (row, col) tile;
+    # each column tile write is block_col-wide, matching the write grid (no read-modify-write)
+    band = matrix[r0:r1]
+    for c0, c1 in band_plan(n_cols, block_col):
+        zarr_arr[r0:r1, c0:c1] = np.asarray(band[:, c0:c1].toarray())
+    tick()
 
+
+def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
+    # densifies without ever materialising the full matrix: row bands are block_row tall,
+    # densified in block_col-wide tiles matching the zarr write grid. In-memory CSR is
+    # thread-pooled over row bands; backed _CSRDataset is densified by row band in parallel
+    # processes (each opens its own h5py handle — h5py is not thread-safe, but independent
+    # read-only file handles across processes are).
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
@@ -82,8 +69,9 @@ def _write_sparse_as_dense_dask(group: zarr.Group, matrix: Any, key: str, cfg: A
         from zarr.storage import LocalStore
 
         # Bands are block_row tall and densified in block_col-wide tiles so each write
-        # covers whole shards (or whole chunks when unsharded) — no read-modify-write,
-        # and disjoint bands never share a shard so the parallel workers need no lock.
+        # covers whole shards (or whole chunks when unsharded) — no read-modify-write;
+        # disjoint bands never share a shard, so the process-pool workers need no
+        # cross-worker synchronisation.
         src = matrix.group
         store = zarr_arr.store_path.store
         # the process-pool workers re-open the store by filesystem path (see _workers.py)
@@ -96,26 +84,15 @@ def _write_sparse_as_dense_dask(group: zarr.Group, matrix: Any, key: str, cfg: A
         run_parallel(_densify_band_segment, jobs, cfg.chunks.cpus, mode="processes")
         return
 
-    dask_dense = _build_tiled_dense_dask(matrix, block_row, block_col)
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
-        # lock=False: this single-file path tiles from row 0 with block == the shard shape
-        # (dense_shards), so every da.store task writes one whole, disjoint shard — no shared
-        # chunk, so no write lock is needed. dask's default lock=True serializes the
-        # compress+write and pins the threaded path to ~1 core (measured ~6.5x slower on the
-        # unsharded dense path). NOTE: do NOT copy lock=False to the concat/_append_* paths —
-        # those write at a misaligned row/nnz offset and read-modify-write the seam chunk, so
-        # they must keep the lock or concurrent writes corrupt data.
-        # zarr.Array satisfies dask's array-store target at runtime; the dask stub's Buffer
-        # protocol match on __array__ doesn't recognise it (untyped internals, Phase 3 removes dask).
-        da.store(dask_dense, zarr_arr, scheduler="threads", num_workers=cfg.chunks.cpus, lock=False)  # type: ignore[arg-type]
+    row_bands = band_plan(n_rows, block_row)
+    tick = progress(len(row_bands), f"Writing {key} (sparse as dense)")
+    thread_jobs = [(zarr_arr, matrix, r0, r1, block_col, n_cols, tick) for r0, r1 in row_bands]
+    run_parallel(_densify_row_band, thread_jobs, cfg.chunks.cpus, mode="threads")
 
 
 def _write_dense_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
-    # anndata's write_elem assigns the whole array at once (full materialisation);
-    # da.from_array + da.store writes chunk-by-chunk to the zarr grid instead
-    import dask.array as da
-    from dask.diagnostics import ProgressBar  # type: ignore[attr-defined]  # dask lazy-export; removed in Phase 3
-
+    # anndata's write_elem assigns the whole array at once (full materialisation); this
+    # streams block-by-block onto the zarr write grid instead
     n_rows, n_cols = matrix.shape
     row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
     col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
@@ -132,17 +109,11 @@ def _write_dense_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
     )
     set_array_attrs(zarr_arr)
 
-    # Block to the shard grid (or chunk grid when unsharded) so each da.store write covers
-    # whole shards and never triggers a read-modify-write of a partial shard.
-    backed = is_backed(matrix)  # h5py-backed dense isn't thread-safe
-    arr = da.from_array(matrix, chunks=layout.block)  # type: ignore[no-untyped-call]
-    # lock=False: single-file, tiled from row 0 with block == the shard shape, so every
-    # da.store task writes one whole, disjoint shard (see _write_sparse_as_dense_dask).
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
-        da.store(
-            arr,
-            zarr_arr,  # type: ignore[arg-type]  # zarr.Array is a valid da.store target; dask stub mismatch
-            scheduler="synchronous" if backed else "threads",
-            num_workers=1 if backed else cfg.chunks.cpus,
-            lock=False,
-        )
+    # Blocks match the write grid (shard shape when sharded, else chunk shape), so every
+    # write covers a whole, disjoint block — no read-modify-write, no synchronisation needed.
+    block_row, block_col = layout.block
+    backed = is_backed(matrix)  # h5py-backed dense isn't thread-safe: force a serial pass
+    blocks = [(r0, r1, c0, c1) for r0, r1 in band_plan(n_rows, block_row) for c0, c1 in band_plan(n_cols, block_col)]
+    tick = progress(len(blocks), f"Writing {key}")
+    jobs = [(zarr_arr, matrix, r0, r1, c0, c1, tick) for r0, r1, c0, c1 in blocks]
+    run_parallel(_write_dense_block, jobs, 1 if backed else cfg.chunks.cpus, mode="threads")

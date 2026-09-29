@@ -1,95 +1,142 @@
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import scipy.sparse as sp
 import zarr
 
-from annizarr._layout import dense_shards, x_compressors
-from annizarr._sources._matrix import get_indptr, is_backed
-from annizarr._writers._dense import _build_tiled_dense_dask
+from annizarr._layout import band_plan, dense_shards, x_compressors
+from annizarr._runtime import progress, run_parallel
+from annizarr._sources._matrix import get_indptr, is_backed, matrix_format
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+from annizarr._writers._sparse import flat_segments
+from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from annizarr._config import AppConfig
 
 
-def _append_dense_region(zarr_arr: Any, matrix: Any, row_offset: int, cfg: AppConfig) -> None:
-    # writes a single matrix into zarr_arr[row_offset:row_offset+n_rows, :]
-    # dask ships py.typed but delayed/from_array/store/concatenate/ProgressBar are lazily
-    # re-exported and untyped at the call boundary; dask is removed in Phase 3.
-    import dask.array as da
-    from dask.diagnostics import ProgressBar  # type: ignore[attr-defined]
-
-    n_rows, n_cols = matrix.shape
-    # Block to the array's shard grid (or chunk grid when unsharded) so writes cover whole
-    # shards. NB: each input file starts at an arbitrary row_offset, so the shard straddling
-    # a file seam is read-modify-written — unavoidable with per-file concat region writes.
-    block_row, block_col = zarr_arr.shards or zarr_arr.chunks
-    block_row = min(block_row, n_rows)
-    block_col = min(block_col, n_cols)
-    region = (slice(row_offset, row_offset + n_rows), slice(None))
-
-    if not sp.issparse(matrix) and not is_backed(matrix):
-        # Already dense (ndarray-like); 2D-tile to the zarr chunk grid via region store.
-        arr = da.from_array(np.asarray(matrix), chunks=(block_row, block_col))  # type: ignore[no-untyped-call]
-        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
-            da.store(arr, zarr_arr, regions=region, scheduler="threads", num_workers=cfg.chunks.cpus)
-        return
-
-    backed = is_backed(matrix)
-    dask_dense = _build_tiled_dense_dask(matrix, block_row, block_col)
-    scheduler = "synchronous" if backed else "threads"
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
-        da.store(
-            dask_dense,
-            zarr_arr,
-            regions=region,
-            scheduler=scheduler,
-            num_workers=1 if backed else cfg.chunks.cpus,
-        )
+def _is_thread_unsafe(matrix: Any) -> bool:
+    # h5py-backed inputs aren't thread-safe; zarr-backed temp groups (e.g. from --sort-by's
+    # bucketing pass) are, so only an h5py-backed input forces a serial pass.
+    return is_backed(matrix) and not isinstance(getattr(matrix, "group", None), zarr.Group)
 
 
-def _csr_dask_parts(
-    matrix: Any, indptr_full: Any, n_rows: int, nnz_total: int, data_dtype: Any, indices_dtype: Any
-) -> tuple[list[Any], list[Any]]:
-    # builds (data_parts, indices_parts) dask arrays for ONE CSR matrix, batched by ~256 MB.
-    # Returns lazy parts rather than writing them, so callers can concatenate parts across
-    # many matrices and issue a SINGLE da.store — see _write_concatenated_csr for why that
-    # matters.
-    import dask
-    import dask.array as da
+def _flat_arrays(matrix: Any) -> tuple[Any, Any]:
+    if sp.issparse(matrix):
+        return matrix.data, matrix.indices
+    if hasattr(matrix, "group"):
+        g = matrix.group
+        return g["data"], g["indices"]
+    raise ConversionError(f"Cannot locate flat data/indices on sparse input of type {type(matrix).__name__}")
 
-    from annizarr import _layout
 
-    avg_nnz = max(1, nnz_total // max(1, n_rows))
-    bpm = avg_nnz * (np.dtype(data_dtype).itemsize + np.dtype(indices_dtype).itemsize)
-    batch_size = max(1_000, min(200_000, _layout.BATCH_BYTES // max(1, bpm)))
-
-    data_parts, indices_parts = [], []
-    for b0 in range(0, n_rows, batch_size):
-        b1 = min(b0 + batch_size, n_rows)
-        bnnz = int(indptr_full[b1] - indptr_full[b0])
-        if bnnz == 0:
+def _write_dense_concat_band(
+    zarr_arr: zarr.Array[Any],
+    matrices: tuple[Any, ...],
+    fmts: tuple[str, ...],
+    offsets: tuple[int, ...],
+    R0: int,
+    R1: int,
+    block_col: int,
+    n_cols: int,
+    tick: Callable[[], None],
+) -> None:
+    # [R0, R1) is one row band of the OUTPUT grid; every input whose row range overlaps it
+    # contributes a piece. A sparse input's row range is sliced once here and reused for
+    # every column tile below; a dense input is sliced row+col together (no benefit to
+    # pre-slicing rows only). Column tiles match block_col (the write grid), so every write
+    # is a whole, disjoint block — this removes the read-modify-write that used to happen
+    # whenever an input seam fell inside a shard/chunk.
+    overlaps = []
+    for matrix, fmt, off_lo, off_hi in zip(matrices, fmts, offsets[:-1], offsets[1:], strict=True):
+        lo, hi = max(R0, off_lo), min(R1, off_hi)
+        if lo >= hi:
             continue
-        batch = dask.delayed(lambda m, a, b: m[a:b])(matrix, b0, b1)  # type: ignore[attr-defined]
-        data_parts.append(
-            da.from_delayed(  # type: ignore[no-untyped-call]
-                dask.delayed(lambda b: np.asarray(b.data, dtype=data_dtype))(batch),  # type: ignore[attr-defined]
-                shape=(bnnz,),
-                dtype=data_dtype,
-            )
-        )
-        indices_parts.append(
-            da.from_delayed(  # type: ignore[no-untyped-call]
-                dask.delayed(lambda b: np.asarray(b.indices, dtype=indices_dtype))(batch),  # type: ignore[attr-defined]
-                shape=(bnnz,),
-                dtype=indices_dtype,
-            )
-        )
-    return data_parts, indices_parts
+        local_lo, local_hi = lo - off_lo, hi - off_lo
+        band = matrix if fmt == "dense" else matrix[local_lo:local_hi]
+        overlaps.append((lo - R0, hi - R0, band, fmt, local_lo, local_hi))
+
+    dtype = zarr_arr.dtype
+    for c0, c1 in band_plan(n_cols, block_col):
+        tile = np.empty((R1 - R0, c1 - c0), dtype=dtype)
+        for out_lo, out_hi, band, fmt, local_lo, local_hi in overlaps:
+            if fmt == "dense":
+                piece = np.asarray(band[local_lo:local_hi, c0:c1], dtype=dtype)
+            else:
+                piece = np.asarray(band[:, c0:c1].toarray(), dtype=dtype)
+            tile[out_lo:out_hi, :] = piece
+        zarr_arr[R0:R1, c0:c1] = tile
+    tick()
+
+
+def _write_concatenated_dense(
+    group: zarr.Group,
+    key: str,
+    matrices: list[Any],
+    n_obs_each: list[int],
+    n_vars: int,
+    data_dtype: Any,
+    cfg: AppConfig,
+) -> None:
+    n_obs_total = sum(n_obs_each)
+
+    row_chunk = min(cfg.chunks.x_row_chunk, n_obs_total)
+    col_chunk = min(cfg.chunks.x_col_chunk, n_vars)
+    layout = dense_shards(row_chunk, col_chunk, n_obs_total, n_vars, cfg.chunks.x_shard_factor)
+
+    zarr_arr = group.require_array(
+        key,
+        shape=(n_obs_total, n_vars),
+        dtype=data_dtype,
+        chunks=layout.chunks,
+        shards=layout.shards,
+        compressors=x_compressors(),
+        overwrite=True,
+    )
+    set_array_attrs(zarr_arr)
+
+    block_row, block_col = layout.block
+    offsets = tuple(int(v) for v in np.cumsum([0, *n_obs_each]))
+    fmts = tuple(matrix_format(m) for m in matrices)
+    matrices_t = tuple(matrices)
+    any_unsafe = any(_is_thread_unsafe(m) for m in matrices)
+
+    row_bands = band_plan(n_obs_total, block_row)
+    tick = progress(len(row_bands), f"Writing {key} (concat)")
+    jobs = [(zarr_arr, matrices_t, fmts, offsets, R0, R1, block_col, n_vars, tick) for R0, R1 in row_bands]
+    run_parallel(_write_dense_concat_band, jobs, 1 if any_unsafe else cfg.chunks.cpus, mode="threads")
+
+
+def _write_csr_concat_segment(
+    data_arr: zarr.Array[Any],
+    indices_arr: zarr.Array[Any],
+    flat_pairs: tuple[tuple[Any, Any], ...],
+    nnz_offsets: tuple[int, ...],
+    s0: int,
+    s1: int,
+    data_dtype: Any,
+    indices_dtype: Any,
+    tick: Callable[[], None],
+) -> None:
+    # [s0, s1) is one flat_chunk-aligned output segment. A segment spanning an input seam
+    # gathers the overlapping pieces from each input's own data/indices before one write, so
+    # every output chunk is written exactly once regardless of where the inputs seam.
+    data_buf = np.empty(s1 - s0, dtype=data_dtype)
+    indices_buf = np.empty(s1 - s0, dtype=indices_dtype)
+    for (data_src, indices_src), off_lo, off_hi in zip(flat_pairs, nnz_offsets[:-1], nnz_offsets[1:], strict=True):
+        lo, hi = max(s0, off_lo), min(s1, off_hi)
+        if lo >= hi:
+            continue
+        local_lo, local_hi = lo - off_lo, hi - off_lo
+        data_buf[lo - s0 : hi - s0] = np.asarray(data_src[local_lo:local_hi], dtype=data_dtype)
+        indices_buf[lo - s0 : hi - s0] = np.asarray(indices_src[local_lo:local_hi], dtype=indices_dtype)
+    data_arr[s0:s1] = data_buf
+    indices_arr[s0:s1] = indices_buf
+    tick()
 
 
 def _write_concatenated_csr(
@@ -149,76 +196,17 @@ def _write_concatenated_csr(
         nnz_offset += nnz_i
     indptr_arr[:] = full_indptr
 
-    # ── ONE da.store across ALL matrices, rechunked to the output chunk grid ──
-    # This used to be one `da.store` per matrix, writing into an arbitrary nnz region. Two costs
-    # made that pathological once the matrix count got large (e.g. `--sort-by` on high-cardinality
-    # keys, which buckets one matrix per distinct key tuple):
-    #   1. Every `da.store` is wrapped in `ProgressBar(dt=1.0)`, whose teardown joins a timer
-    #      thread sleeping `dt` — ~1 s of fixed cost per matrix regardless of payload. Measured
-    #      slope was 1.02 s/matrix, so 10^5 groups meant tens of hours of pure overhead.
-    #   2. A per-matrix nnz region is never chunk-aligned, so zarr read-modify-wrote a whole
-    #      `flat_chunk` (data + indices) for every matrix — amplification ~= flat_chunk/mean nnz.
-    # Concatenating the lazy parts and rechunking to `flat_chunk` fixes both: one ProgressBar for
-    # the whole write, and each output chunk written exactly once.
-    import dask.array as da
-    from dask.diagnostics import ProgressBar  # type: ignore[attr-defined]  # dask lazy-export; removed in Phase 3
-
-    all_data, all_indices = [], []
-    backed_any = False
-    for matrix, ip, n_obs_i, nnz_i in zip(matrices, indptrs, n_obs_each, nnz_each, strict=True):
-        if nnz_i == 0:
-            continue
-        if is_backed(matrix) and not isinstance(getattr(matrix, "group", None), zarr.Group):
-            backed_any = True  # h5py-backed: not thread-safe (zarr-backed temps are)
-        d_parts, i_parts = _csr_dask_parts(matrix, ip, n_obs_i, nnz_i, data_dtype, indices_dtype)
-        all_data.extend(d_parts)
-        all_indices.extend(i_parts)
-
-    if not all_data:
+    if nnz_total == 0:
         return
 
-    data_dask = da.concatenate(all_data).rechunk((flat_chunk,))  # type: ignore[no-untyped-call]
-    indices_dask = da.concatenate(all_indices).rechunk((flat_chunk,))  # type: ignore[no-untyped-call]
-    scheduler = "synchronous" if backed_any else "threads"
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
-        da.store(
-            [data_dask, indices_dask],
-            [data_arr, indices_arr],  # type: ignore[list-item]  # zarr.Array is a valid da.store target
-            scheduler=scheduler,
-            num_workers=1 if backed_any else cfg.chunks.cpus,
-        )
+    nnz_offsets = tuple(int(v) for v in np.cumsum([0, *nnz_each]))
+    flat_pairs = tuple(_flat_arrays(m) for m in matrices)
+    any_unsafe = any(_is_thread_unsafe(m) for m in matrices)
 
-
-def _write_concatenated_dense(
-    group: zarr.Group,
-    key: str,
-    matrices: list[Any],
-    n_obs_each: list[int],
-    n_vars: int,
-    data_dtype: Any,
-    cfg: AppConfig,
-) -> None:
-    n_obs_total = sum(n_obs_each)
-
-    # _append_dense_region 2D-tiles each file to the array's write-block grid (shard shape
-    # when sharding, else chunk shape), so peak RAM is bounded by one block — no need to
-    # shrink row_chunk for wide matrices.
-    row_chunk = min(cfg.chunks.x_row_chunk, n_obs_total)
-    col_chunk = min(cfg.chunks.x_col_chunk, n_vars)
-    layout = dense_shards(row_chunk, col_chunk, n_obs_total, n_vars, cfg.chunks.x_shard_factor)
-
-    zarr_arr = group.require_array(
-        key,
-        shape=(n_obs_total, n_vars),
-        dtype=data_dtype,
-        chunks=layout.chunks,
-        shards=layout.shards,
-        compressors=x_compressors(),
-        overwrite=True,
-    )
-    set_array_attrs(zarr_arr)
-
-    row_offset = 0
-    for matrix, n_rows in zip(matrices, n_obs_each, strict=True):
-        _append_dense_region(zarr_arr, matrix, row_offset, cfg)
-        row_offset += n_rows
+    bytes_per_nnz = np.dtype(data_dtype).itemsize + np.dtype(indices_dtype).itemsize
+    segments = flat_segments(nnz_total, flat_chunk, bytes_per_nnz)
+    tick = progress(len(segments), f"Writing {key} (concat)")
+    jobs = [
+        (data_arr, indices_arr, flat_pairs, nnz_offsets, s0, s1, data_dtype, indices_dtype, tick) for s0, s1 in segments
+    ]
+    run_parallel(_write_csr_concat_segment, jobs, 1 if any_unsafe else cfg.chunks.cpus, mode="threads")
