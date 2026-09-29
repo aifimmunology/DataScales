@@ -1,28 +1,27 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import scipy.sparse as sp
 import zarr
 
-from .._config import AppConfig
-from .._layout import dense_shards, x_compressors
-from .._sources._matrix import get_indptr
-from ._dense import _build_tiled_dense_dask
-from ._encoding import make_sparse_group, set_array_attrs
+from annizarr._layout import dense_shards, x_compressors
+from annizarr._sources._matrix import get_indptr, is_backed
+from annizarr._writers._dense import _build_tiled_dense_dask
+from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+
+if TYPE_CHECKING:
+    from annizarr._config import AppConfig
 
 
-def _append_dense_region(
-    zarr_arr: Any,
-    matrix: Any,
-    row_offset: int,
-    cfg: AppConfig,
-) -> None:
-    """Write a single matrix into zarr_arr[row_offset:row_offset+n_rows, :]."""
+def _append_dense_region(zarr_arr: Any, matrix: Any, row_offset: int, cfg: AppConfig) -> None:
+    # writes a single matrix into zarr_arr[row_offset:row_offset+n_rows, :]
+    # dask ships py.typed but delayed/from_array/store/concatenate/ProgressBar are lazily
+    # re-exported and untyped at the call boundary; dask is removed in Phase 3.
     import dask.array as da
-    from dask.diagnostics import ProgressBar
+    from dask.diagnostics import ProgressBar  # type: ignore[attr-defined]
 
     n_rows, n_cols = matrix.shape
     # Block to the array's shard grid (or chunk grid when unsharded) so writes cover whole
@@ -33,25 +32,20 @@ def _append_dense_region(
     block_col = min(block_col, n_cols)
     region = (slice(row_offset, row_offset + n_rows), slice(None))
 
-    is_backed_sparse = not sp.issparse(matrix) and hasattr(matrix, "format")
-    if not sp.issparse(matrix) and not is_backed_sparse:
+    if not sp.issparse(matrix) and not is_backed(matrix):
         # Already dense (ndarray-like); 2D-tile to the zarr chunk grid via region store.
-        arr = da.from_array(np.asarray(matrix), chunks=(block_row, block_col))
-        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
-            da.store(
-                arr, zarr_arr,
-                regions=region,
-                scheduler="threads",
-                num_workers=cfg.chunks.cpus,
-            )
+        arr = da.from_array(np.asarray(matrix), chunks=(block_row, block_col))  # type: ignore[no-untyped-call]
+        with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
+            da.store(arr, zarr_arr, regions=region, scheduler="threads", num_workers=cfg.chunks.cpus)
         return
 
-    backed = is_backed_sparse
+    backed = is_backed(matrix)
     dask_dense = _build_tiled_dense_dask(matrix, block_row, block_col)
     scheduler = "synchronous" if backed else "threads"
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
         da.store(
-            dask_dense, zarr_arr,
+            dask_dense,
+            zarr_arr,
             regions=region,
             scheduler=scheduler,
             num_workers=1 if backed else cfg.chunks.cpus,
@@ -59,26 +53,20 @@ def _append_dense_region(
 
 
 def _csr_dask_parts(
-    matrix: Any,
-    indptr_full: Any,
-    n_rows: int,
-    nnz_total: int,
-    data_dtype: Any,
-    indices_dtype: Any,
+    matrix: Any, indptr_full: Any, n_rows: int, nnz_total: int, data_dtype: Any, indices_dtype: Any
 ) -> tuple[list[Any], list[Any]]:
-    """Build (data_parts, indices_parts) dask arrays for ONE CSR matrix, batched by ~256 MB.
-
-    Returns lazy parts rather than writing them, so callers can concatenate parts across many
-    matrices and issue a SINGLE ``da.store`` — see :func:`_write_concatenated_csr` for why that
-    matters.
-    """
+    # builds (data_parts, indices_parts) dask arrays for ONE CSR matrix, batched by ~256 MB.
+    # Returns lazy parts rather than writing them, so callers can concatenate parts across
+    # many matrices and issue a SINGLE da.store — see _write_concatenated_csr for why that
+    # matters.
     import dask
     import dask.array as da
 
-    _TARGET_BATCH_BYTES = 256 * 1024 * 1024
+    from annizarr import _layout
+
     avg_nnz = max(1, nnz_total // max(1, n_rows))
     bpm = avg_nnz * (np.dtype(data_dtype).itemsize + np.dtype(indices_dtype).itemsize)
-    batch_size = max(1_000, min(200_000, _TARGET_BATCH_BYTES // max(1, bpm)))
+    batch_size = max(1_000, min(200_000, _layout.BATCH_BYTES // max(1, bpm)))
 
     data_parts, indices_parts = [], []
     for b0 in range(0, n_rows, batch_size):
@@ -86,15 +74,21 @@ def _csr_dask_parts(
         bnnz = int(indptr_full[b1] - indptr_full[b0])
         if bnnz == 0:
             continue
-        batch = dask.delayed(lambda m, a, b: m[a:b])(matrix, b0, b1)
-        data_parts.append(da.from_delayed(
-            dask.delayed(lambda b: np.asarray(b.data, dtype=data_dtype))(batch),
-            shape=(bnnz,), dtype=data_dtype,
-        ))
-        indices_parts.append(da.from_delayed(
-            dask.delayed(lambda b: np.asarray(b.indices, dtype=indices_dtype))(batch),
-            shape=(bnnz,), dtype=indices_dtype,
-        ))
+        batch = dask.delayed(lambda m, a, b: m[a:b])(matrix, b0, b1)  # type: ignore[attr-defined]
+        data_parts.append(
+            da.from_delayed(  # type: ignore[no-untyped-call]
+                dask.delayed(lambda b: np.asarray(b.data, dtype=data_dtype))(batch),  # type: ignore[attr-defined]
+                shape=(bnnz,),
+                dtype=data_dtype,
+            )
+        )
+        indices_parts.append(
+            da.from_delayed(  # type: ignore[no-untyped-call]
+                dask.delayed(lambda b: np.asarray(b.indices, dtype=indices_dtype))(batch),  # type: ignore[attr-defined]
+                shape=(bnnz,),
+                dtype=indices_dtype,
+            )
+        )
     return data_parts, indices_parts
 
 
@@ -119,16 +113,27 @@ def _write_concatenated_csr(
 
     flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
     data_arr = sp_group.require_array(
-        "data", shape=(nnz_total,), dtype=data_dtype,
-        chunks=(flat_chunk,), compressors=x_compressors(), overwrite=True,
+        "data",
+        shape=(nnz_total,),
+        dtype=data_dtype,
+        chunks=(flat_chunk,),
+        compressors=x_compressors(),
+        overwrite=True,
     )
     indices_arr = sp_group.require_array(
-        "indices", shape=(nnz_total,), dtype=indices_dtype,
-        chunks=(flat_chunk,), compressors=x_compressors(), overwrite=True,
+        "indices",
+        shape=(nnz_total,),
+        dtype=indices_dtype,
+        chunks=(flat_chunk,),
+        compressors=x_compressors(),
+        overwrite=True,
     )
     indptr_arr = sp_group.require_array(
-        "indptr", shape=(n_obs_total + 1,), dtype=indptr_dtype,
-        chunks=(n_obs_total + 1,), overwrite=True,
+        "indptr",
+        shape=(n_obs_total + 1,),
+        dtype=indptr_dtype,
+        chunks=(n_obs_total + 1,),
+        overwrite=True,
     )
     for a in (data_arr, indices_arr, indptr_arr):
         set_array_attrs(a)
@@ -138,10 +143,8 @@ def _write_concatenated_csr(
     full_indptr[0] = 0
     row_offset = 0
     nnz_offset = 0
-    for ip, n_obs_i, nnz_i in zip(indptrs, n_obs_each, nnz_each):
-        full_indptr[row_offset + 1 : row_offset + 1 + n_obs_i] = (
-            ip[1:].astype(indptr_dtype, copy=False) + nnz_offset
-        )
+    for ip, n_obs_i, nnz_i in zip(indptrs, n_obs_each, nnz_each, strict=True):
+        full_indptr[row_offset + 1 : row_offset + 1 + n_obs_i] = ip[1:].astype(indptr_dtype, copy=False) + nnz_offset
         row_offset += n_obs_i
         nnz_offset += nnz_i
     indptr_arr[:] = full_indptr
@@ -158,33 +161,29 @@ def _write_concatenated_csr(
     # Concatenating the lazy parts and rechunking to `flat_chunk` fixes both: one ProgressBar for
     # the whole write, and each output chunk written exactly once.
     import dask.array as da
-    from dask.diagnostics import ProgressBar
+    from dask.diagnostics import ProgressBar  # type: ignore[attr-defined]  # dask lazy-export; removed in Phase 3
 
     all_data, all_indices = [], []
     backed_any = False
-    for matrix, ip, n_obs_i, nnz_i in zip(matrices, indptrs, n_obs_each, nnz_each):
+    for matrix, ip, n_obs_i, nnz_i in zip(matrices, indptrs, n_obs_each, nnz_each, strict=True):
         if nnz_i == 0:
             continue
-        if not sp.issparse(matrix) and not isinstance(
-            getattr(matrix, "group", None), zarr.Group
-        ):
+        if is_backed(matrix) and not isinstance(getattr(matrix, "group", None), zarr.Group):
             backed_any = True  # h5py-backed: not thread-safe (zarr-backed temps are)
-        d_parts, i_parts = _csr_dask_parts(
-            matrix, ip, n_obs_i, nnz_i, data_dtype, indices_dtype
-        )
+        d_parts, i_parts = _csr_dask_parts(matrix, ip, n_obs_i, nnz_i, data_dtype, indices_dtype)
         all_data.extend(d_parts)
         all_indices.extend(i_parts)
 
     if not all_data:
         return
 
-    data_dask = da.concatenate(all_data).rechunk((flat_chunk,))
-    indices_dask = da.concatenate(all_indices).rechunk((flat_chunk,))
+    data_dask = da.concatenate(all_data).rechunk((flat_chunk,))  # type: ignore[no-untyped-call]
+    indices_dask = da.concatenate(all_indices).rechunk((flat_chunk,))  # type: ignore[no-untyped-call]
     scheduler = "synchronous" if backed_any else "threads"
-    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):
+    with ProgressBar(out=sys.stderr, dt=1.0, minimum=0):  # type: ignore[no-untyped-call]
         da.store(
             [data_dask, indices_dask],
-            [data_arr, indices_arr],
+            [data_arr, indices_arr],  # type: ignore[list-item]  # zarr.Array is a valid da.store target
             scheduler=scheduler,
             num_workers=1 if backed_any else cfg.chunks.cpus,
         )
@@ -206,18 +205,20 @@ def _write_concatenated_dense(
     # shrink row_chunk for wide matrices.
     row_chunk = min(cfg.chunks.x_row_chunk, n_obs_total)
     col_chunk = min(cfg.chunks.x_col_chunk, n_vars)
-    shards, _, _ = dense_shards(
-        row_chunk, col_chunk, n_obs_total, n_vars, cfg.chunks.x_shard_factor
-    )
+    layout = dense_shards(row_chunk, col_chunk, n_obs_total, n_vars, cfg.chunks.x_shard_factor)
 
     zarr_arr = group.require_array(
-        key, shape=(n_obs_total, n_vars), dtype=data_dtype,
-        chunks=(row_chunk, col_chunk), shards=shards,
-        compressors=x_compressors(), overwrite=True,
+        key,
+        shape=(n_obs_total, n_vars),
+        dtype=data_dtype,
+        chunks=layout.chunks,
+        shards=layout.shards,
+        compressors=x_compressors(),
+        overwrite=True,
     )
     set_array_attrs(zarr_arr)
 
     row_offset = 0
-    for matrix, n_rows in zip(matrices, n_obs_each):
+    for matrix, n_rows in zip(matrices, n_obs_each, strict=True):
         _append_dense_region(zarr_arr, matrix, row_offset, cfg)
         row_offset += n_rows

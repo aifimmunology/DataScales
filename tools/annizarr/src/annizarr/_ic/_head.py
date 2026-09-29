@@ -1,13 +1,3 @@
-"""Where the current branch ("HEAD") is remembered between CLI invocations.
-
-HEAD is an annizarr concept — icechunk itself has no notion of a current branch —
-so it is stored locally, like git's ``.git/HEAD``:
-
-* a **writable local repo** keeps an ``annizarr_head`` file at its root (moves with the dir);
-* anything else — a read-only path, an ``s3://``/``gs://`` URI — uses a per-user
-  sidecar under ``$ANNIZARR_HOME/heads/`` (default ``~/.cache/annizarr``), keyed
-  by the repo's canonical location. Nothing is ever written into a read-only repo.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -26,12 +16,11 @@ def home_dir() -> Path:
 
 
 class HeadStore:
-    """Read/write the HEAD branch name for one repo location.
-
-    ``in_repo_dir`` is the repo directory when it is local and writable (HEAD lives
-    inside it); otherwise pass ``None`` and give ``key`` (the canonical location) so the
-    sidecar is used.
-    """
+    # HEAD is an annizarr concept (icechunk has no notion of a current branch), stored
+    # locally like git's .git/HEAD: a writable local repo keeps an annizarr_head file at
+    # its root (moves with the dir); anything else (read-only path, s3:///gs:// URI) uses
+    # a per-user sidecar under $ANNIZARR_HOME/heads/, keyed by the canonical location.
+    # `in_repo_dir` selects the first form; pass None and `key` for the sidecar form.
 
     def __init__(self, *, key: str, in_repo_dir: str | None = None) -> None:
         self.key = key

@@ -1,13 +1,14 @@
 """copy_group (init's zarr import) and Repo.copy / `annizarr ic copy` (repo clone)."""
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import zarr
-from conftest import snapshot_tree
+from _ic_helpers import snapshot_tree
 
+from annizarr._cli import main
 from annizarr._ic import Repo
-from annizarr._ic._cli import main
 from annizarr._ic._copy import copy_group
 from annizarr._ic._head import HEAD_FILE
 from annizarr.errors import RepoError
@@ -66,9 +67,9 @@ def test_copy_refuses_bad_destinations(src_zarr, repo_path, tmp_path, monkeypatc
 
 def test_cli_copy(src_zarr, repo_path, tmp_path, capsys):
     path, _ = src_zarr
-    main(["init", str(path), str(repo_path)])
+    main(["ic", "init", str(path), str(repo_path)])
     dest = tmp_path / "cli-copy.icechunk"
-    assert main(["copy", "-C", str(repo_path), str(dest)]) == 0
-    assert "Copied" in capsys.readouterr().out
-    assert main(["checkout", "-C", str(dest), "-b", "work"]) == 0
+    assert main(["ic", "copy", str(repo_path), str(dest)]) == 0
+    assert "Copied" in capsys.readouterr().err
+    assert main(["ic", "checkout", str(dest), "-b", "work"]) == 0
     assert "work" in Repo(dest).branches() and "work" not in Repo(repo_path).branches()

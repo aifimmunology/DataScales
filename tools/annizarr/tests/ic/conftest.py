@@ -1,13 +1,11 @@
-"""Shared fixtures (hermetic, tmp_path): tiny anndata-style zarr stores, and a repo
-plus a stale copy of it standing in for a read-only mirror with a writable origin."""
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
 
 import numpy as np
 import pytest
 import zarr
+from _ic_helpers import snapshot_tree
 
 
 @pytest.fixture(autouse=True)
@@ -26,8 +24,7 @@ def _write_anndata_like(root: zarr.Group, x: np.ndarray) -> None:
     for name, n in (("obs", n_obs), ("var", n_var)):
         g = root.create_group(name)
         g.attrs.update(
-            {"encoding-type": "dataframe", "encoding-version": "0.2.0",
-             "_index": "_index", "column-order": []}
+            {"encoding-type": "dataframe", "encoding-version": "0.2.0", "_index": "_index", "column-order": []}
         )
         idx = g.create_array("_index", shape=(n,), dtype="int64", chunks=(n,))
         idx[...] = np.arange(n)
@@ -47,13 +44,6 @@ def src_zarr(tmp_path):
 @pytest.fixture
 def repo_path(tmp_path):
     return tmp_path / "store.icechunk"
-
-
-def snapshot_tree(root: Path) -> dict[str, int]:
-    """{relative file: mtime_ns} — to prove a location was not touched."""
-    return {
-        str(p.relative_to(root)): p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file()
-    }
 
 
 @pytest.fixture

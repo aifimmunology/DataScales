@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from anndata._io.specs import write_elem  # private API; verified against .claude/vendor/anndata/src (0.12.19)
 
@@ -20,14 +20,12 @@ CSC_ENCODING_TYPE = "csc_matrix"
 SPARSE_ENCODING_VERSION = "0.1.0"
 
 
-def set_array_attrs(arr: zarr.Array) -> None:
-    """Mark a zarr array with anndata's plain dense-array encoding."""
+def set_array_attrs(arr: zarr.Array[Any]) -> None:
     arr.attrs["encoding-type"] = ARRAY_ENCODING_TYPE
     arr.attrs["encoding-version"] = ARRAY_ENCODING_VERSION
 
 
 def set_anndata_root_attrs(group: zarr.Group) -> None:
-    """Mark a group as the root of a valid AnnData zarr store."""
     group.attrs["encoding-type"] = ANNDATA_ENCODING_TYPE
     group.attrs["encoding-version"] = ANNDATA_ENCODING_VERSION
 
@@ -38,10 +36,7 @@ def set_raw_group_attrs(group: zarr.Group) -> None:
 
 
 def make_sparse_group(parent: zarr.Group, key: str, *, csr: bool, shape: tuple[int, int]) -> zarr.Group:
-    """Create (or replace) a csr_matrix/csc_matrix group with shape + encoding attrs set.
-
-    Callers still create the ``data``/``indices``/``indptr`` child arrays themselves.
-    """
+    # callers still create the data/indices/indptr child arrays themselves
     group = parent.require_group(key)
     group.attrs["encoding-type"] = CSR_ENCODING_TYPE if csr else CSC_ENCODING_TYPE
     group.attrs["encoding-version"] = SPARSE_ENCODING_VERSION

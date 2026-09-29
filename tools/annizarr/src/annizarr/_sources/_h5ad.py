@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import anndata as ad
+from annizarr._config import AppConfig
+from annizarr._runtime import stage
+from annizarr.errors import ConversionError
 
-from .._config import AppConfig
-from .._runtime import stage
-from ..errors import ConversionError
+if TYPE_CHECKING:
+    import anndata as ad
 
 
 def load_h5ad(input_path: Path, cfg: AppConfig) -> tuple[ad.AnnData, list[str]]:
+    import anndata as ad
+
     mode = "backed (streaming)" if cfg.io.backed else "eager (full load)"
     with stage(f"Reading {input_path} [{mode}]"):
         if cfg.io.backed:

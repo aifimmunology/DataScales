@@ -1,25 +1,31 @@
 from __future__ import annotations
 
-import sys
+import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anndata as ad
 
-from .._config import AppConfig, resolve_backend_cfg
-from .._runtime import configure_runtime, stage
-from .._sources import close_backed_if_needed, ensure_csr, load_h5ad
-from .._storage import open_output_store
-from .._validation import validate_single_cell_anndata
-from .._writers import _write_concatenated_csr, _write_concatenated_dense
-from .._writers._encoding import set_anndata_root_attrs, write_elem
-from ..errors import ConversionError
+from annizarr._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._ops._result import OpResult
+from annizarr._runtime import configure_runtime, stage
+from annizarr._sources import close_backed_if_needed, ensure_csr, load_h5ad
+from annizarr._storage import open_output_store
+from annizarr._validation import validate_single_cell_anndata
+from annizarr._writers import _write_concatenated_csr, _write_concatenated_dense
+from annizarr._writers._encoding import set_anndata_root_attrs, write_elem
+from annizarr.errors import AnzError, ConversionError
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from annizarr.typing import PathLike
+
+logger = logging.getLogger(__name__)
 
 
-def concat(
-    input_h5ads: list[str], output_zarr: str, cfg: AppConfig
-) -> list[str]:
+def concat(paths: Sequence[PathLike], *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
     """Concatenate multiple .h5ad files along obs (rows) into a single zarr store.
 
     Requirements:
@@ -34,36 +40,52 @@ def concat(
 
     Sparse output uses CSR; dense output is supported. CSC output is not supported
     for multi-file concat (would require costly transpose).
+
+    Parameters
+    ----------
+    paths
+        Two or more ``.h5ad`` file paths to concatenate.
+    output
+        Destination store path or URI.
+    cfg
+        Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+
+    Returns
+    -------
+    OpResult
+
+    Raises
+    ------
+    ConversionError
+        ``paths`` is empty, ``cfg.io.x_storage == "csc"``, grouping is enabled, an
+        obs/var schema mismatch is found, or the concatenation otherwise fails.
     """
     import pandas as pd
 
-    if not input_h5ads:
+    if cfg is None:
+        cfg = load_config()
+    if not paths:
         raise ConversionError("concat requires at least one input file.")
 
-    if cfg.io.x_storage == "sparse-csc":
-        raise ConversionError(
-            "x_storage='sparse-csc' is not supported for multi-h5ad concat. "
-            "Use 'sparse-csr' or 'dense'."
-        )
+    if cfg.io.x_storage == "csc":
+        raise ConversionError("x_storage='csc' is not supported for multi-h5ad concat. Use 'csr' or 'dense'.")
 
     cfg = resolve_backend_cfg(cfg)
     configure_runtime(cfg.chunks.cpus)
     if cfg.grouping.enabled:
         raise ConversionError("grouping (sort_by) is only supported by convert for now.")
 
-    inputs = [Path(p) for p in input_h5ads]
-    output_path = Path(output_zarr)
+    inputs = [Path(p) for p in paths]
+    output_path = Path(output)
     # Fail fast on a pre-existing output before the (expensive) multi-file load; the actual
     # prepare/overwrite happens in open_output_store below.
     if output_path.exists() and not cfg.io.overwrite:
         raise ConversionError(
-            f"Output path already exists: {output_path}. "
-            "Use overwrite=true in config or --overwrite flag."
+            f"Output path already exists: {output_path}. Use overwrite=true in config or --overwrite flag."
         )
     ad.settings.zarr_write_format = 3
 
     adatas: list[ad.AnnData] = []
-    all_warnings: list[str] = []
     try:
         # ── Pass 1: load + validate ───────────────────────────────────────────
         for p in inputs:
@@ -94,9 +116,8 @@ def concat(
                     )
                 dropped = [c for c in a.obs.columns if c not in obs_columns]
                 if dropped:
-                    all_warnings.append(
-                        f"[{inputs[i].name}] dropping {len(dropped)} obs column(s) not in "
-                        f"obs_columns: {dropped}."
+                    logger.warning(
+                        f"[{inputs[i].name}] dropping {len(dropped)} obs column(s) not in obs_columns: {dropped}."
                     )
             # Categorical columns must line up across inputs. If they don't (mixed
             # categorical/non-categorical, or differing category *sets*), pandas coerces the
@@ -116,8 +137,7 @@ def concat(
                         f"drop it from obs_columns."
                     )
                 cat0 = set(adatas[0].obs[c].cat.categories)
-                bad = [inputs[i].name for i, a in enumerate(adatas)
-                       if set(a.obs[c].cat.categories) != cat0]
+                bad = [inputs[i].name for i, a in enumerate(adatas) if set(a.obs[c].cat.categories) != cat0]
                 if bad:
                     raise ConversionError(
                         f"obs column '{c}' has mismatched categorical categories across "
@@ -132,13 +152,12 @@ def concat(
             for i, a in enumerate(adatas[1:], start=1):
                 if list(a.obs.columns) != ref_obs_cols:
                     raise ConversionError(
-                        f"obs schema mismatch in {inputs[i]}: expected columns "
-                        f"{ref_obs_cols}, got {list(a.obs.columns)}."
+                        f"obs schema mismatch in {inputs[i]}: expected columns {ref_obs_cols}, "
+                        f"got {list(a.obs.columns)}."
                     )
 
         for i, a in enumerate(adatas):
-            vr = validate_single_cell_anndata(a, cfg.validation)
-            all_warnings.extend(f"[{inputs[i].name}] {w}" for w in vr.warnings)
+            _validate_and_warn(a, cfg, inputs[i].name)
 
         # ── Ensure CSR for X; verify common dtype ─────────────────────────────
         x_matrices: list[Any] = []
@@ -146,14 +165,11 @@ def concat(
         for i, a in enumerate(adatas):
             x, warn = ensure_csr(a.X, inputs[i].name)
             if warn:
-                all_warnings.append(warn)
+                logger.warning(warn)
             if x_dtype is None:
                 x_dtype = x.dtype
             elif x.dtype != x_dtype:
-                raise ConversionError(
-                    f"X dtype mismatch: {inputs[i].name} has {x.dtype}, "
-                    f"expected {x_dtype}."
-                )
+                raise ConversionError(f"X dtype mismatch: {inputs[i].name} has {x.dtype}, expected {x_dtype}.")
             x_matrices.append(x)
 
         n_obs_each = [a.n_obs for a in adatas]
@@ -169,22 +185,17 @@ def concat(
                 in_dtypes = {str(a.obs[c].dtype) for a in adatas}
                 out_dtype = str(obs_concat[c].dtype)
                 if in_dtypes != {out_dtype}:
-                    all_warnings.append(
-                        f"obs column '{c}' coerced on concat: {sorted(in_dtypes)} -> {out_dtype}."
-                    )
+                    logger.warning(f"obs column '{c}' coerced on concat: {sorted(in_dtypes)} -> {out_dtype}.")
         else:
             obs_concat = pd.concat([a.obs for a in adatas], axis=0)
 
-        print(
+        logger.info(
             f"Concatenating {len(inputs)} h5ads → {output_path} "
-            f"(n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})",
-            flush=True, file=sys.stderr,
+            f"(n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"
         )
         t0 = time.perf_counter()
 
-        store, finalize = open_output_store(
-            output_path, cfg, commit_message=f"annizarr concat → {output_path.name}",
-        )
+        store, finalize = open_output_store(output_path, cfg, commit_message=f"annizarr concat → {output_path.name}")
         set_anndata_root_attrs(store)
 
         with stage("Writing metadata (obs, var, empty obsm/varm/uns/obsp/varp)"):
@@ -198,23 +209,24 @@ def concat(
 
         with stage(f"Writing X (n_obs={n_obs_total}, n_vars={n_vars}, {cfg.io.x_storage})"):
             if cfg.io.x_storage == "dense":
-                _write_concatenated_dense(
-                    store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg,
-                )
-            else:  # sparse-csr
-                _write_concatenated_csr(
-                    store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg,
-                )
+                _write_concatenated_dense(store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
+            else:  # csr
+                _write_concatenated_csr(store, "X", x_matrices, n_obs_each, n_vars, x_dtype, cfg)
 
-        finalize()
-        print(
-            f"Done in {time.perf_counter() - t0:.1f}s",
-            flush=True, file=sys.stderr,
-        )
-        return all_warnings
+        snapshot_id = finalize()
+        logger.info(f"Done in {time.perf_counter() - t0:.1f}s")
+        return OpResult(path=str(output_path), n_obs=n_obs_total, n_vars=n_vars, snapshot_id=snapshot_id)
 
+    except AnzError:
+        raise
     except Exception as e:
         raise ConversionError(f"Failed to concatenate h5ads: {e}") from e
     finally:
         for a in adatas:
             close_backed_if_needed(a)
+
+
+def _validate_and_warn(adata: ad.AnnData, cfg: AppConfig, label: str) -> None:
+    result = validate_single_cell_anndata(adata, cfg.validation)
+    for w in result.warnings:
+        logger.warning(f"[{label}] {w}")

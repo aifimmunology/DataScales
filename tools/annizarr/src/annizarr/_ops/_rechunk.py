@@ -1,44 +1,68 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import zarr
 
-from .._config import AppConfig, resolve_backend_cfg
-from .._layout import dense_shards
-from .._runtime import configure_runtime, run_parallel, stage
-from .._storage import open_input_group, open_output_store, store_name
-from ..errors import ConversionError
+from annizarr._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._layout import dense_shards
+from annizarr._ops._result import OpResult
+from annizarr._runtime import configure_runtime, run_parallel, stage
+from annizarr._storage import open_input_group, open_output_store, store_name
+from annizarr._zarr import get_group, shape_attr
+from annizarr.errors import ConversionError
+
+if TYPE_CHECKING:
+    from annizarr.typing import PathLike
 
 _SMALL_ELEMS = ("obs", "var", "uns", "varm", "varp")
-_SEG_BYTES = 256 * 1024 * 1024
 
 
-def rechunk(
-    input_store: str, output_zarr: str, cfg: AppConfig, *, array: str = "X"
-) -> list[str]:
-    """Rewrite one matrix with the configured chunking; stream-copy everything else as-is."""
+def rechunk(store: PathLike, *, output: PathLike, array: str = "X", cfg: AppConfig | None = None) -> OpResult:
+    """Rewrite one matrix with the configured chunking; stream-copy everything else as-is.
+
+    Parameters
+    ----------
+    store
+        Existing AnnData zarr (or Icechunk) store to read from.
+    output
+        Destination store path or URI.
+    array
+        The matrix element to rechunk: ``"X"``, ``"layers/<name>"``, or ``"raw/X"``.
+    cfg
+        Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+
+    Returns
+    -------
+    OpResult
+
+    Raises
+    ------
+    ConversionError
+        ``array`` is not a matrix element present on ``store``.
+    """
     import anndata as ad
     from anndata.io import read_elem
 
-    from .._writers._encoding import write_elem
+    from annizarr._writers._encoding import write_elem
 
+    if cfg is None:
+        cfg = load_config()
     cfg = resolve_backend_cfg(cfg)
     configure_runtime(cfg.chunks.cpus)
-    src = open_input_group(input_store)
+    src = open_input_group(store)
 
     # validate the target before touching (or overwriting) the output
     matrix_keys = ["X"]
     if "layers" in src:
-        matrix_keys += [f"layers/{k}" for k in src["layers"]]
-    if "raw" in src and "X" in src["raw"]:
+        matrix_keys += [f"layers/{k}" for k in get_group(src, "layers")]
+    if "raw" in src and "X" in get_group(src, "raw"):
         matrix_keys.append("raw/X")
     if array not in matrix_keys:
         raise ConversionError(f"array '{array}' is not a matrix element ({matrix_keys}).")
 
     ad.settings.zarr_write_format = 3
-    dst, finalize = open_output_store(
-        output_zarr, cfg,
-        commit_message=f"annizarr rechunk {array} → {store_name(output_zarr)}",
-    )
+    dst, finalize = open_output_store(output, cfg, commit_message=f"annizarr rechunk {array} → {store_name(output)}")
     dst.attrs.update(dict(src.attrs))
 
     with stage("Copying metadata elements"):
@@ -49,37 +73,48 @@ def rechunk(
         for key in ("obsm", "obsp"):
             if key not in src:
                 continue
+            src_group = get_group(src, key)
             g = dst.require_group(key)
-            g.attrs.update(dict(src[key].attrs))
-            for child in src[key]:
-                node = src[key][child]
-                if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in (
-                    "csr_matrix", "csc_matrix",
-                ):
+            g.attrs.update(dict(src_group.attrs))
+            for child in src_group:
+                node = src_group[child]
+                if isinstance(node, zarr.Array) or node.attrs.get("encoding-type") in ("csr_matrix", "csc_matrix"):
                     _copy_matrix(node, dst, f"{key}/{child}", cfg, rechunk=False)
                 else:
                     write_elem(g, child, read_elem(node))
         if "raw" in src:
+            src_raw = get_group(src, "raw")
             raw = dst.require_group("raw")
-            raw.attrs.update(dict(src["raw"].attrs))
+            raw.attrs.update(dict(src_raw.attrs))
             for key in ("var", "varm"):
-                if key in src["raw"]:
-                    write_elem(raw, key, read_elem(src["raw"][key]))
+                if key in src_raw:
+                    write_elem(raw, key, read_elem(src_raw[key]))
 
     if "layers" in src:
+        src_layers = get_group(src, "layers")
         layers = dst.require_group("layers")
-        layers.attrs.update(dict(src["layers"].attrs))
+        layers.attrs.update(dict(src_layers.attrs))
 
     for key in matrix_keys:
         rechunked = key == array
         with stage(f"{'Rechunking' if rechunked else 'Copying'} {key}"):
             _copy_matrix(src[key], dst, key, cfg, rechunk=rechunked)
 
-    finalize()
-    return []
+    n_obs, n_vars = _matrix_shape(src["X"])
+    snapshot_id = finalize()
+    return OpResult(path=str(output), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
 
 
-def _copy_matrix(node, dst_root, key, cfg: AppConfig, *, rechunk: bool) -> None:
+def _matrix_shape(node: Any) -> tuple[int, int]:
+    if isinstance(node, zarr.Array):
+        n_rows, n_cols = node.shape
+        return n_rows, n_cols
+    return shape_attr(node)
+
+
+def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk: bool) -> None:
+    from annizarr import _layout
+
     parent_path, _, name = key.rpartition("/")
     parent = dst_root[parent_path] if parent_path else dst_root
 
@@ -88,16 +123,21 @@ def _copy_matrix(node, dst_root, key, cfg: AppConfig, *, rechunk: bool) -> None:
         if rechunk:
             row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
             col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
-            shards, block_row, block_col = dense_shards(
-                row_chunk, col_chunk, n_rows, n_cols, cfg.chunks.x_shard_factor
-            )
+            layout = dense_shards(row_chunk, col_chunk, n_rows, n_cols, cfg.chunks.x_shard_factor)
+            out_chunks, shards, (block_row, block_col) = layout.chunks, layout.shards, layout.block
         else:
-            row_chunk, col_chunk = node.chunks
-            shards = node.shards
-            block_row, block_col = shards or node.chunks
+            out_chunks = (node.chunks[0], node.chunks[1])
+            node_shards = node.shards
+            shards = (node_shards[0], node_shards[1]) if node_shards is not None else None
+            block_row, block_col = shards or out_chunks
         out = parent.require_array(
-            name, shape=node.shape, dtype=node.dtype, chunks=(row_chunk, col_chunk),
-            shards=shards, compressors=node.compressors, overwrite=True,
+            name,
+            shape=node.shape,
+            dtype=node.dtype,
+            chunks=out_chunks,
+            shards=shards,
+            compressors=node.compressors,
+            overwrite=True,
         )
         out.attrs.update(dict(node.attrs))
         jobs = [
@@ -121,24 +161,26 @@ def _copy_matrix(node, dst_root, key, cfg: AppConfig, *, rechunk: bool) -> None:
     for arr_name in ("data", "indices"):
         src_a = node[arr_name]
         out = g.require_array(
-            arr_name, shape=src_a.shape, dtype=src_a.dtype, chunks=(flat,),
-            compressors=src_a.compressors, overwrite=True,
+            arr_name,
+            shape=src_a.shape,
+            dtype=src_a.dtype,
+            chunks=(flat,),
+            compressors=src_a.compressors,
+            overwrite=True,
         )
         out.attrs.update(dict(src_a.attrs))
-        seg = max(1, _SEG_BYTES // (flat * src_a.dtype.itemsize)) * flat
-        jobs = [(src_a, out, s0, min(s0 + seg, nnz)) for s0 in range(0, nnz, seg)]
-        run_parallel(_copy_flat, jobs, cfg.chunks.cpus)
+        seg = max(1, _layout.BATCH_BYTES // (flat * src_a.dtype.itemsize)) * flat
+        flat_jobs = [(src_a, out, s0, min(s0 + seg, nnz)) for s0 in range(0, nnz, seg)]
+        run_parallel(_copy_flat, flat_jobs, cfg.chunks.cpus)
     ip = node["indptr"]
-    out = g.require_array(
-        "indptr", shape=ip.shape, dtype=ip.dtype, chunks=ip.shape, overwrite=True
-    )
+    out = g.require_array("indptr", shape=ip.shape, dtype=ip.dtype, chunks=ip.shape, overwrite=True)
     out.attrs.update(dict(ip.attrs))
     out[:] = ip[:]
 
 
-def _copy_block(src, dst, r0, r1, c0, c1):
+def _copy_block(src: Any, dst: Any, r0: int, r1: int, c0: int, c1: int) -> None:
     dst[r0:r1, c0:c1] = src[r0:r1, c0:c1]
 
 
-def _copy_flat(src, dst, s0, s1):
+def _copy_flat(src: Any, dst: Any, s0: int, s1: int) -> None:
     dst[s0:s1] = src[s0:s1]

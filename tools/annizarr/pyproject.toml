@@ -58,6 +58,9 @@ ignore = ["D100", "D104", "D105", "D107"]
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
 
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
 [tool.ruff.lint.per-file-ignores]
 "src/annizarr/**/_*.py" = ["D"]
 "src/annizarr/_*.py" = ["D"]
@@ -68,9 +71,22 @@ strict = true
 files = ["src/annizarr"]
 warn_unused_ignores = true
 
+# no py.typed marker shipped; dask, icechunk, moto, numpy, zarr are typed and stay checked
+[[tool.mypy.overrides]]
+module = [
+  "anndata.*",
+  "scanpy.*",
+  "scipy.*",
+  "pandas.*",
+  "h5py.*",
+  "boto3.*",
+  "botocore.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not slow' --cov=annizarr --cov-report=term-missing:skip-covered"
+addopts = "-m 'not slow' --cov=annizarr --cov-report=term-missing:skip-covered --cov-fail-under=85"
 markers = ["slow: large synthetic store, run with -m slow"]
 
 [tool.coverage.run]

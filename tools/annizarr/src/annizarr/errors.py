@@ -16,7 +16,7 @@ class StorageError(AnzError):
 
 
 class ValidationError(AnzError, ValueError):
-    """The input does not satisfy the single-cell AnnData constraints."""
+    """An input or configuration value does not satisfy annizarr's constraints."""
 
 
 class RepoError(AnzError):

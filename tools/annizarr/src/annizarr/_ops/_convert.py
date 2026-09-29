@@ -1,31 +1,38 @@
 from __future__ import annotations
 
-import sys
+import logging
+import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
 import numpy as np
 import scipy.sparse as sp
 
-from .._config import AppConfig, resolve_backend_cfg
-from .._runtime import configure_runtime
-from .._sorting import _write_sorted_backed, maybe_sort_adata
-from .._sources import close_backed_if_needed, load_10x_h5, load_h5ad
-from .._storage import open_output_store, store_name
-from .._validation import validate_single_cell_anndata
-from .._writers import write_adata
-from ..errors import ConversionError
+from annizarr._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._ops._concat import concat
+from annizarr._ops._result import OpResult
+from annizarr._runtime import configure_runtime
+from annizarr._sorting import _write_sorted_backed, maybe_sort_adata
+from annizarr._sources import close_backed_if_needed, detect_format, load_10x_h5, load_h5ad, open_source
+from annizarr._sources._matrix import is_backed, matrix_format
+from annizarr._storage import open_output_store, store_name
+from annizarr._validation import validate_single_cell_anndata
+from annizarr._writers import write_adata
+from annizarr.errors import AnzError, ConversionError
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from annizarr.typing import PathLike
+
+logger = logging.getLogger(__name__)
 
 
 def write_adata_to_store(
-    adata: ad.AnnData,
-    output_path: str | Path,
-    cfg: AppConfig,
-    load_warnings: list[str],
-    allow_grouping: bool = False,
-) -> list[str]:
+    adata: ad.AnnData, output_path: PathLike, cfg: AppConfig, *, allow_grouping: bool = False
+) -> OpResult:
     """Write AnnData to zarr (or icechunk).
 
     adata.X is expected to be CSR; CSC is converted to CSR in memory with a warning, and
@@ -34,116 +41,183 @@ def write_adata_to_store(
     """
     cfg = resolve_backend_cfg(cfg)
     configure_runtime(cfg.chunks.cpus)
-    warnings = list(load_warnings)
 
     if allow_grouping:
         if cfg.grouping.enabled and cfg.io.backed:
             # Backed input: sort X without ever materialising it (streamed bucket + concat).
-            return _write_sorted_backed(adata, Path(output_path), cfg, warnings)
-        adata = maybe_sort_adata(adata, cfg, warnings)
+            snapshot_id = _write_sorted_backed(adata, Path(output_path), cfg)
+            return OpResult(path=str(output_path), n_obs=adata.n_obs, n_vars=adata.n_vars, snapshot_id=snapshot_id)
+        adata = maybe_sort_adata(adata, cfg)
     elif cfg.grouping.enabled:
-        raise ConversionError(
-            "grouping (sort_by) is only supported by convert for now."
-        )
+        raise ConversionError("grouping (sort_by) is only supported by convert for now.")
 
     x_for_write: Any | None = None
     x = adata.X
-    is_sparse_mem = sp.issparse(x)
-    backed_format = getattr(x, "format", None)  # anndata backed sparse datasets
-    is_csr = sp.isspmatrix_csr(x) or (not is_sparse_mem and backed_format == "csr")
-    is_csc = sp.isspmatrix_csc(x) or (not is_sparse_mem and backed_format == "csc")
-    # dense: in-memory ndarray, or a backed h5py dataset (2-D, no sparse format);
-    # masked arrays are excluded — silently dropping a mask would corrupt values
-    is_dense = (
-        not is_sparse_mem
-        and backed_format is None
-        and getattr(x, "ndim", 0) == 2
-        and not np.ma.isMaskedArray(x)
-    )
+    fmt = matrix_format(x)
 
-    if not is_csr:
-        if is_csc:
-            if is_sparse_mem:
-                x_for_write = x.tocsr()
+    if fmt != "csr":
+        # masked arrays would classify as "dense" below; silently dropping a mask would
+        # corrupt values, so refuse outright instead of the dense/sparse-conversion paths.
+        if np.ma.isMaskedArray(x):
+            raise ConversionError(f"adata.X must be CSR, CSC, or dense. Got: {type(x).__name__}")
+        if fmt == "csc":
+            x_for_write = x[:].tocsr() if is_backed(x) else x.tocsr()
+            logger.warning("adata.X was CSC and has been converted to CSR in memory before zarr conversion.")
+        elif fmt == "dense":
+            if cfg.io.x_storage == "dense":
+                pass  # the writer streams dense input to dense output directly
+            elif not cfg.io.backed:
+                # eager dense (issue #4): X is already in memory — sparsify for sparse output,
+                # directly in the target format (no CSR->CSC double conversion)
+                to_sparse = sp.csr_matrix if cfg.io.x_storage == "csr" else sp.csc_matrix
+                x_for_write = to_sparse(np.asarray(x))
+                logger.warning("adata.X was dense and has been converted to sparse in memory for sparse output.")
             else:
-                x_for_write = x[:].tocsr()
-            warnings.append(
-                "adata.X was CSC and has been converted to CSR in memory before zarr conversion."
-            )
-        elif is_dense and cfg.io.x_storage == "dense":
-            pass  # the writer streams dense input to dense output directly
-        elif is_dense and not cfg.io.backed:
-            # eager dense (issue #4): X is already in memory — sparsify for sparse output,
-            # directly in the target format (no CSR->CSC double conversion)
-            to_sparse = sp.csr_matrix if cfg.io.x_storage == "sparse-csr" else sp.csc_matrix
-            x_for_write = to_sparse(np.asarray(x))
-            warnings.append(
-                "adata.X was dense and has been converted to sparse in memory for sparse output."
-            )
-        elif is_dense:
-            raise ConversionError(
-                "backed dense X with sparse output is not supported: use --x-storage dense "
-                "(streamed) or omit --backed to convert in memory."
-            )
-        else:
-            raise ConversionError(
-                f"adata.X must be CSR, CSC, or dense. Got: {type(x).__name__}"
-            )
+                raise ConversionError(
+                    "backed dense X with sparse output is not supported: use --x-storage dense "
+                    "(streamed) or omit --backed to convert in memory."
+                )
 
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
+    for w in validation_result.warnings:
+        logger.warning(w)
     ad.settings.zarr_write_format = 3
 
-    print(
-        f"Converting → {output_path} "
-        f"(n_obs={adata.n_obs}, n_vars={adata.n_vars}, {cfg.io.x_storage}, backend={cfg.io.backend})",
-        flush=True, file=sys.stderr,
+    logger.info(
+        f"Converting → {output_path} (n_obs={adata.n_obs}, n_vars={adata.n_vars}, "
+        f"{cfg.io.x_storage}, backend={cfg.io.backend})"
     )
     t0 = time.perf_counter()
     store, finalize = open_output_store(
-        output_path, cfg, commit_message=f"annizarr convert → {store_name(output_path)}",
+        output_path, cfg, commit_message=f"annizarr convert → {store_name(output_path)}"
     )
     write_adata(adata, store, cfg, x_override=x_for_write)
-    finalize()
-    print(
-        f"Done in {time.perf_counter() - t0:.1f}s",
-        flush=True, file=sys.stderr,
-    )
-    return [*warnings, *validation_result.warnings]
+    snapshot_id = finalize()
+    logger.info(f"Done in {time.perf_counter() - t0:.1f}s")
+    return OpResult(path=str(output_path), n_obs=adata.n_obs, n_vars=adata.n_vars, snapshot_id=snapshot_id)
 
 
-def convert_adata(adata: ad.AnnData, output_zarr: str, cfg: AppConfig) -> list[str]:
-    """Write an in-memory AnnData to a zarr (or icechunk) store; returns warnings.
+def convert_adata(adata: ad.AnnData, *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
+    """Write an in-memory AnnData to a zarr (or icechunk) store.
 
     Public library entry for data that doesn't start as .h5ad/10x: X may be CSR, CSC
     (converted), or dense; honors x_storage/backend/sort_by exactly like convert_h5ad.
+
+    Raises
+    ------
+    ConversionError
+        ``cfg.io.backed`` is set (backed loading does not apply to an in-memory input).
     """
+    if cfg is None:
+        cfg = load_config()
     if cfg.io.backed:
-        raise ConversionError(
-            "convert_adata takes an in-memory AnnData; io.backed does not apply."
-        )
-    return write_adata_to_store(adata, output_zarr, cfg, [], allow_grouping=True)
+        raise ConversionError("convert_adata takes an in-memory AnnData; io.backed does not apply.")
+    return write_adata_to_store(adata, output, cfg, allow_grouping=True)
 
 
-def convert_h5ad(input_h5ad: str, output_zarr: str, cfg: AppConfig) -> list[str]:
-    """Convert a .h5ad file to zarr; returns the warnings encountered."""
+def convert_h5ad(path: PathLike, *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
+    """Convert a .h5ad file to zarr."""
+    if cfg is None:
+        cfg = load_config()
     adata = None
-    load_warnings: list[str] = []
     try:
-        adata, load_warnings = load_h5ad(Path(input_h5ad), cfg)
-        return write_adata_to_store(adata, output_zarr, cfg, load_warnings, allow_grouping=True)
+        adata, load_warnings = load_h5ad(Path(path), cfg)
+        for w in load_warnings:
+            logger.warning(w)
+        return write_adata_to_store(adata, output, cfg, allow_grouping=True)
+    except AnzError:
+        raise
     except Exception as e:
-        load_warnings = f"Warnings: {load_warnings}" if load_warnings else ""
-        raise ConversionError(f"Failed to convert .h5ad file: {e}.{load_warnings}") from e
+        raise ConversionError(f"Failed to convert .h5ad file: {e}") from e
     finally:
         if adata is not None:
             close_backed_if_needed(adata)
 
 
-def convert_10x_h5(input_h5: str, output_zarr: str, cfg: AppConfig) -> list[str]:
+def convert_10x_h5(path: PathLike, *, output: PathLike, cfg: AppConfig | None = None) -> OpResult:
     """Convert a 10x Cell Ranger .h5 to zarr; expects CSR from the 10x load."""
+    if cfg is None:
+        cfg = load_config()
     try:
-        adata = load_10x_h5(input_h5)
+        adata = load_10x_h5(path)
+    except AnzError:
+        raise
     except Exception as e:
         raise ConversionError(f"Failed to read 10x H5 file: {e}") from e
 
-    return write_adata_to_store(adata, output_zarr, cfg, [])
+    return write_adata_to_store(adata, output, cfg, allow_grouping=False)
+
+
+def convert(
+    inputs: PathLike | ad.AnnData | Sequence[PathLike],
+    *,
+    output: PathLike,
+    cfg: AppConfig | None = None,
+    fmt: Literal["h5ad", "10x"] | None = None,
+) -> OpResult:
+    """Convert one or more inputs into a single AnnData zarr (or icechunk) store.
+
+    Dispatches on ``inputs``: an in-memory AnnData goes through :func:`convert_adata`; a
+    single path (or a one-element sequence) is sniffed with :func:`~annizarr.sources.detect_format`
+    (or forced via ``fmt``) and routed to :func:`convert_h5ad`, :func:`convert_10x_h5`, or —
+    for any other registered kind (see :func:`~annizarr.sources.register_source`) — through
+    :func:`~annizarr.sources.open_source`; a sequence of two or more paths concatenates them
+    (h5ad only).
+
+    Parameters
+    ----------
+    inputs
+        A single path/URI, an in-memory :class:`~anndata.AnnData`, or a sequence of paths.
+    output
+        Destination store path or URI.
+    cfg
+        Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+    fmt
+        ``"h5ad"`` or ``"10x"``, overriding content detection for a single input; ignored
+        for an AnnData input or a multi-input concat.
+
+    Returns
+    -------
+    OpResult
+
+    Raises
+    ------
+    ConversionError
+        ``inputs`` is an empty sequence; a single input already is a zarr/icechunk store
+        (use rechunk or sort instead); or a multi-input sequence mixes non-h5ad formats.
+    """
+    if cfg is None:
+        cfg = load_config()
+
+    if isinstance(inputs, ad.AnnData):
+        return convert_adata(inputs, output=output, cfg=cfg)
+
+    paths: list[PathLike] = [inputs] if isinstance(inputs, (str, os.PathLike)) else list(inputs)
+    if not paths:
+        raise ConversionError("convert requires at least one input.")
+
+    if len(paths) == 1:
+        return _convert_one(paths[0], output, cfg, fmt)
+
+    for p in paths:
+        if detect_format(p) != "h5ad":
+            raise ConversionError("concat supports h5ad inputs only.")
+    return concat([str(p) for p in paths], output=output, cfg=cfg)
+
+
+def _convert_one(path: PathLike, output: PathLike, cfg: AppConfig, fmt: str | None) -> OpResult:
+    kind = fmt or detect_format(path)
+    if kind == "h5ad":
+        return convert_h5ad(path, output=output, cfg=cfg)
+    if kind == "10x":
+        return convert_10x_h5(path, output=output, cfg=cfg)
+    if kind in ("zarr", "icechunk"):
+        raise ConversionError(f"{path} is already a store; use rechunk or sort.")
+
+    source = open_source(path, cfg, fmt=kind)
+    try:
+        for w in source.warnings:
+            logger.warning(w)
+        return write_adata_to_store(source.adata, output, cfg, allow_grouping=False)
+    finally:
+        source.close()

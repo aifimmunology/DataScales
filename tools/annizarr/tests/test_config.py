@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from annizarr.config import AppConfig, apply_cli_overrides, load_config
 
 
@@ -7,7 +9,7 @@ def test_default_config() -> None:
     cfg = load_config(None)
     assert isinstance(cfg, AppConfig)
     assert cfg.chunks.x_row_chunk == 2048
-    assert cfg.io.x_storage == "sparse-csr"
+    assert cfg.io.x_storage == "csr"
 
 
 def test_toml_load(tmp_path: Path) -> None:
@@ -35,11 +37,11 @@ x_col_chunk = 512
 
 def test_cli_override() -> None:
     cfg = load_config(None)
-    cfg2 = apply_cli_overrides(cfg, x_row_chunk=128, overwrite=True, x_storage="sparse-csr")
+    cfg2 = apply_cli_overrides(cfg, x_row_chunk=128, overwrite=True, x_storage="csr")
 
     assert cfg2.chunks.x_row_chunk == 128
     assert cfg2.io.overwrite is True
-    assert cfg2.io.x_storage == "sparse-csr"
+    assert cfg2.io.x_storage == "csr"
 
 
 def test_invalid_x_storage_rejected(tmp_path: Path) -> None:
@@ -52,13 +54,8 @@ x_storage = "not-a-mode"
         encoding="utf-8",
     )
 
-    try:
+    with pytest.raises(ValueError):
         load_config(str(cfg_file))
-        raised = False
-    except ValueError:
-        raised = True
-
-    assert raised
 
 
 def test_csc_x_storage_valid(tmp_path: Path) -> None:
@@ -66,21 +63,18 @@ def test_csc_x_storage_valid(tmp_path: Path) -> None:
     cfg_file.write_text(
         """
 [io]
-x_storage = "sparse-csc"
+x_storage = "csc"
 """.strip(),
         encoding="utf-8",
     )
 
     cfg = load_config(str(cfg_file))
-    assert cfg.io.x_storage == "sparse-csc"
+    assert cfg.io.x_storage == "csc"
 
 
 def test_unknown_top_level_section_rejected(tmp_path: Path) -> None:
     cfg_file = tmp_path / "bad.toml"
     cfg_file.write_text("[chunk]\nx_row_chunk = 1000\n")
 
-    try:
+    with pytest.raises(ValueError, match="chunk"):
         load_config(str(cfg_file))
-        assert False
-    except ValueError as e:
-        assert "chunk" in str(e)

@@ -189,7 +189,7 @@ def convert_datascale(inp: Path, out: Path, workers: int) -> None:
     from annizarr._ops import convert_h5ad
     from annizarr.config import apply_cli_overrides, load_config
 
-    cfg = load_config(None)  # defaults: sparse-csr, zarr backend
+    cfg = load_config(None)  # defaults: csr, zarr backend
     # Always backed so this row is ALWAYS the streaming/bounded CSR->CSR path
     # (workers just sets the process count). At workers=1 it is the serial
     # streaming copy, not eager — keeps the row's meaning stable.

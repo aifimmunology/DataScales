@@ -1,50 +1,97 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from .._config import AppConfig
-from .._layout import x_compressors
-from .._runtime import configure_runtime, stage
-from .._storage import is_s3_url, open_store_rw
-from ..errors import ConversionError
+import numpy as np
 
-_BAND_BYTES = 256 * 1024 * 1024
+from annizarr import _layout
+from annizarr._config import load_config
+from annizarr._layout import x_compressors
+from annizarr._ops._result import OpResult
+from annizarr._runtime import configure_runtime, stage
+from annizarr._storage import is_remote, open_store_rw
+from annizarr._writers._encoding import make_sparse_group, set_array_attrs
+from annizarr._zarr import get_array, get_group, shape_attr
+from annizarr.errors import ConversionError
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+    from annizarr._config import AppConfig
+    from annizarr.typing import PathLike, XStorage
+
+logger = logging.getLogger(__name__)
+
+_TARGET_SUM_ATTR = "annizarr_target_sum"
+_TARGET_SUM_ATTR_LEGACY = "zarrsmith_target_sum"  # written by pre-merge zarrsmith; read-compat only
+
+
+def target_sum_attr(attrs: Any) -> float | None:
+    value = attrs.get(_TARGET_SUM_ATTR, attrs.get(_TARGET_SUM_ATTR_LEGACY))
+    return None if value is None else float(value)
 
 
 def add_expr(
-    store: str,
-    cfg: AppConfig,
+    store: PathLike,
     *,
-    fmt: str = "csc",
+    fmt: XStorage = "csc",
     layer: str = "gexp",
     chunk_elems: int = 1_000_000,
     target_sum: float = 1e4,
-) -> list[str]:
-    """Add a log-normalized expression layer (layers/<layer>) derived from CSR X."""
-    import numpy as np
+    overwrite: bool = False,
+    cfg: AppConfig | None = None,
+) -> OpResult:
+    """Add a log-normalized expression layer (``layers/<layer>``) derived from CSR X.
 
+    Parameters
+    ----------
+    store
+        Existing AnnData zarr (or Icechunk) store to update, in place.
+    fmt
+        Storage format for the new layer.
+    layer
+        Layer name.
+    chunk_elems
+        Chunk size (elements) for the layer.
+    target_sum
+        Library-size normalization target (per-row sum after normalization).
+    overwrite
+        Replace an existing ``layers/<layer>`` instead of erroring.
+    cfg
+        Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
+
+    Returns
+    -------
+    OpResult
+
+    Raises
+    ------
+    ConversionError
+        ``store`` has no CSR X, ``layers/<layer>`` already exists and ``overwrite`` is
+        not set, or ``fmt`` is not one of ``"csr"``, ``"csc"``, ``"dense"``.
+    """
+    if cfg is None:
+        cfg = load_config()
     if fmt not in ("csc", "dense", "csr"):
         raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
 
     configure_runtime(cfg.chunks.cpus)
-    root, finalize = open_store_rw(
-        store, cfg, commit_message=f"annizarr add-expr {fmt} → layers/{layer}"
-    )
+    root, finalize = open_store_rw(store, cfg, commit_message=f"annizarr add-expr {fmt} → layers/{layer}")
     if "X" not in root:
         raise ConversionError(f"no X in {store} — not an AnnData zarr store?")
-    x = root["X"]
+    x = get_group(root, "X")
     if x.attrs.get("encoding-type") != "csr_matrix":
-        raise ConversionError(
-            f"add-expr requires CSR X; got encoding {x.attrs.get('encoding-type')!r}."
-        )
+        raise ConversionError(f"add-expr requires CSR X; got encoding {x.attrs.get('encoding-type')!r}.")
 
-    n_obs, n_vars = (int(v) for v in x.attrs["shape"])
+    n_obs, n_vars = shape_attr(x)
     if max(n_obs, n_vars) > 2**31 - 1:
         raise ConversionError("add-expr supports up to 2^31-1 cells/genes.")
-    data_arr, idx_arr = x["data"], x["indices"]
-    indptr = np.asarray(x["indptr"][:], dtype=np.int64)
+    data_arr, idx_arr = get_array(x, "data"), get_array(x, "indices")
+    indptr = np.asarray(get_array(x, "indptr")[:], dtype=np.int64)
     nnz = int(indptr[-1])
     row_nnz = np.diff(indptr)
 
@@ -52,21 +99,22 @@ def add_expr(
     if "encoding-type" not in dict(layers.attrs):
         layers.attrs.update({"encoding-type": "dict", "encoding-version": "0.1.0"})
     if layer in layers:
-        if not cfg.io.overwrite:
-            raise ConversionError(f"layers/{layer} already exists; pass --overwrite to replace it.")
+        if not overwrite:
+            raise ConversionError(f"layers/{layer} already exists; pass overwrite=True to replace it.")
         del layers[layer]
 
     bytes_per_row = max(1, nnz // max(1, n_obs)) * 12
-    row_step = max(1_000, min(200_000, _BAND_BYTES // bytes_per_row))
+    row_step = max(1_000, min(200_000, _layout.BATCH_BYTES // bytes_per_row))
 
-    def _band(b0: int, b1: int):
+    def _band(b0: int, b1: int) -> tuple[int, int, NDArray[np.float32]]:
         return lognorm_band(data_arr, indptr, row_nnz, target_sum, b0, b1)
 
     indptr_dtype = np.int64 if nnz > np.iinfo(np.int32).max else np.int32
 
     if fmt == "csr":
-        g = _sparse_layer(layers, layer, "csr_matrix", (n_obs, n_vars), nnz,
-                          idx_arr.dtype, indptr_dtype, chunk_elems, target_sum)
+        g = _sparse_layer(
+            layers, layer, "csr_matrix", (n_obs, n_vars), nnz, idx_arr.dtype, indptr_dtype, chunk_elems, target_sum
+        )
         g["indptr"][:] = indptr.astype(indptr_dtype)
         with stage(f"Writing layers/{layer} (csr, nnz={nnz})"):
             for b0 in range(0, n_obs, row_step):
@@ -74,13 +122,13 @@ def add_expr(
                 s0, s1, vals = _band(b0, b1)
                 g["data"][s0:s1] = vals
                 g["indices"][s0:s1] = idx_arr[s0:s1]
-        finalize()
-        return []
+        snapshot_id = finalize()
+        return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
 
     # csc/dense: pass 1 counts nnz per column; pass 2 buckets entries into column
     # bands (disk-backed, so RAM stays one band); each band then writes its slice.
     col_nnz = np.zeros(n_vars, dtype=np.int64)
-    flat_step = max(chunk_elems, _BAND_BYTES // 8)
+    flat_step = max(chunk_elems, _layout.BATCH_BYTES // 8)
     with stage("Counting nnz per gene"):
         for s0 in range(0, nnz, flat_step):
             s1 = min(s0 + flat_step, nnz)
@@ -89,11 +137,11 @@ def add_expr(
 
     if fmt == "dense":
         k = max(1, chunk_elems // n_obs)
-        band_cols = max(k, (_BAND_BYTES // (4 * n_obs)) // k * k)
-        edges = list(range(0, n_vars, band_cols)) + [n_vars]
+        band_cols = max(k, (_layout.BATCH_BYTES // (4 * n_obs)) // k * k)
+        edges = [*range(0, n_vars, band_cols), n_vars]
     else:
         # 20 B/entry: 12 B bucket (i32+i32+f32) + 8 B argsort index in the write phase
-        max_band_nnz = _BAND_BYTES // 20
+        max_band_nnz = _layout.BATCH_BYTES // 20
         edges = [0]
         while edges[-1] < n_vars:
             target = csc_indptr[edges[-1]] + max_band_nnz
@@ -102,18 +150,20 @@ def add_expr(
     n_bands = len(edges) - 1
     band_nnz = [int(csc_indptr[edges[i + 1]] - csc_indptr[edges[i]]) for i in range(n_bands)]
 
-    # bucket temp files sit next to a local store (same filesystem); system tmp for s3
-    tmp_dir = None if is_s3_url(store) else str(Path(store).parent)
+    # bucket temp files sit next to a local store (same filesystem); system tmp for a remote one
+    tmp_dir = None if is_remote(store) else str(Path(store).parent)
     tmp_root = Path(tempfile.mkdtemp(prefix="annizarr_expr_", dir=tmp_dir))
     try:
         buckets = []
         for i, m in enumerate(band_nnz):
             m = max(1, m)
-            buckets.append({
-                "rows": np.memmap(tmp_root / f"r{i}", dtype=np.int32, mode="w+", shape=(m,)),
-                "cols": np.memmap(tmp_root / f"c{i}", dtype=np.int32, mode="w+", shape=(m,)),
-                "vals": np.memmap(tmp_root / f"v{i}", dtype=np.float32, mode="w+", shape=(m,)),
-            })
+            buckets.append(
+                {
+                    "rows": np.memmap(tmp_root / f"r{i}", dtype=np.int32, mode="w+", shape=(m,)),
+                    "cols": np.memmap(tmp_root / f"c{i}", dtype=np.int32, mode="w+", shape=(m,)),
+                    "vals": np.memmap(tmp_root / f"v{i}", dtype=np.float32, mode="w+", shape=(m,)),
+                }
+            )
         edges_arr = np.asarray(edges[1:], dtype=np.int64)
 
         cursors = [0] * n_bands
@@ -132,15 +182,16 @@ def add_expr(
                         continue
                     sel = order[lo:hi]
                     c = cursors[bi]
-                    buckets[bi]["rows"][c:c + hi - lo] = rows[sel]
-                    buckets[bi]["cols"][c:c + hi - lo] = cols[sel]
-                    buckets[bi]["vals"][c:c + hi - lo] = vals[sel]
+                    buckets[bi]["rows"][c : c + hi - lo] = rows[sel]
+                    buckets[bi]["cols"][c : c + hi - lo] = cols[sel]
+                    buckets[bi]["vals"][c : c + hi - lo] = vals[sel]
                     cursors[bi] = c + hi - lo
 
         if fmt == "csc":
             indices_dtype = np.int32
-            g = _sparse_layer(layers, layer, "csc_matrix", (n_obs, n_vars), nnz,
-                              indices_dtype, indptr_dtype, chunk_elems, target_sum)
+            g = _sparse_layer(
+                layers, layer, "csc_matrix", (n_obs, n_vars), nnz, indices_dtype, indptr_dtype, chunk_elems, target_sum
+            )
             g["indptr"][:] = csc_indptr.astype(indptr_dtype)
             with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
                 for bi in range(n_bands):
@@ -155,11 +206,16 @@ def add_expr(
                     g["indices"][o0:o1] = np.asarray(buckets[bi]["rows"][:m])[order].astype(indices_dtype)
         else:
             arr = layers.require_array(
-                layer, shape=(n_obs, n_vars), dtype=np.float32,
-                chunks=(n_obs, k), compressors=x_compressors(), overwrite=True,
+                layer,
+                shape=(n_obs, n_vars),
+                dtype=np.float32,
+                chunks=(n_obs, k),
+                compressors=x_compressors(),
+                overwrite=True,
             )
-            arr.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0",
-                              "zarrsmith_target_sum": float(target_sum)})
+            arr.attrs.update(
+                {"encoding-type": "array", "encoding-version": "0.2.0", _TARGET_SUM_ATTR: float(target_sum)}
+            )
             with stage(f"Writing layers/{layer} (dense, {n_bands} column bands)"):
                 for bi in range(n_bands):
                     c0, c1 = edges[bi], edges[bi + 1]
@@ -174,19 +230,19 @@ def add_expr(
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
-    finalize()
-    return []
+    snapshot_id = finalize()
+    return OpResult(path=str(store), n_obs=n_obs, n_vars=n_vars, snapshot_id=snapshot_id)
 
 
-def lognorm_band(data_arr, indptr, row_nnz, target_sum, b0, b1):
+def lognorm_band(
+    data_arr: Any, indptr: NDArray[np.int64], row_nnz: NDArray[np.int64], target_sum: float, b0: int, b1: int
+) -> tuple[int, int, NDArray[np.float32]]:
     """Lognorm one row band of CSR data. Factors are row-local, so they fuse into the
     transform: one pass over the band's data. Also used by append --extend-layers."""
-    import numpy as np
-
     s0, s1 = int(indptr[b0]), int(indptr[b1])
     seg = np.asarray(data_arr[s0:s1], dtype=np.float64)
     cs = np.concatenate(([0.0], np.cumsum(seg)))
-    sums = cs[indptr[b0 + 1:b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
+    sums = cs[indptr[b0 + 1 : b1 + 1] - indptr[b0]] - cs[indptr[b0:b1] - indptr[b0]]
     factors = np.zeros(b1 - b0)
     nz = sums > 0
     factors[nz] = target_sum / sums[nz]
@@ -194,35 +250,41 @@ def lognorm_band(data_arr, indptr, row_nnz, target_sum, b0, b1):
     return s0, s1, vals
 
 
-def introspect_gexp(node) -> tuple[str, int, float | None]:
-    """Recover (fmt, chunk_elems, target_sum) from an existing gexp layer."""
+def introspect_gexp(node: Any) -> tuple[XStorage, int, float | None]:
+    # recovers (fmt, chunk_elems, target_sum) from an existing gexp layer
     import zarr
 
-    target_sum = node.attrs.get("zarrsmith_target_sum")
+    target_sum = target_sum_attr(node.attrs)
     if isinstance(node, zarr.Array):
         return "dense", node.chunks[0] * node.chunks[1], target_sum
     enc = node.attrs.get("encoding-type")
-    fmt = {"csr_matrix": "csr", "csc_matrix": "csc"}.get(enc)
+    fmt_map: dict[str, XStorage] = {"csr_matrix": "csr", "csc_matrix": "csc"}
+    fmt = fmt_map.get(enc)
     if fmt is None:
         raise ConversionError(f"cannot re-derive layers/gexp: unsupported encoding {enc!r}.")
     return fmt, int(node["data"].chunks[0]), target_sum
 
 
-def _sparse_layer(layers, name, enc, shape, nnz, indices_dtype, indptr_dtype,
-                  chunk_elems, target_sum):
-    import numpy as np
-
-    g = layers.require_group(name)
-    g.attrs.update({"encoding-type": enc, "encoding-version": "0.1.0", "shape": list(shape),
-                    "zarrsmith_target_sum": float(target_sum)})
+def _sparse_layer(
+    layers: Any,
+    name: str,
+    enc: str,
+    shape: tuple[int, int],
+    nnz: int,
+    indices_dtype: Any,
+    indptr_dtype: Any,
+    chunk_elems: int,
+    target_sum: float,
+) -> Any:
+    g = make_sparse_group(layers, name, csr=(enc == "csr_matrix"), shape=shape)
+    g.attrs[_TARGET_SUM_ATTR] = float(target_sum)
     n_major = shape[0] if enc == "csr_matrix" else shape[1]
     flat = min(chunk_elems, max(1, nnz))
-    g.require_array("data", shape=(nnz,), dtype=np.float32, chunks=(flat,),
-                    compressors=x_compressors(), overwrite=True)
-    g.require_array("indices", shape=(nnz,), dtype=indices_dtype, chunks=(flat,),
-                    compressors=x_compressors(), overwrite=True)
-    g.require_array("indptr", shape=(n_major + 1,), dtype=indptr_dtype,
-                    chunks=(n_major + 1,), overwrite=True)
+    g.require_array("data", shape=(nnz,), dtype=np.float32, chunks=(flat,), compressors=x_compressors(), overwrite=True)
+    g.require_array(
+        "indices", shape=(nnz,), dtype=indices_dtype, chunks=(flat,), compressors=x_compressors(), overwrite=True
+    )
+    g.require_array("indptr", shape=(n_major + 1,), dtype=indptr_dtype, chunks=(n_major + 1,), overwrite=True)
     for a in ("data", "indices", "indptr"):
-        g[a].attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
+        set_array_attrs(get_array(g, a))
     return g

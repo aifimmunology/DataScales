@@ -1,34 +1,102 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 
-def x_compressors():
-    """Blosc(zstd) + byte-shuffle. zarr's default is bare zstd level-0 with no
-    shuffle; the shuffle gives a large ratio/throughput win on numeric matrices."""
+# Target bytes per streamed write/copy batch. Shared by every band/segment loop across
+# _ops/_append.py, _ops/_rechunk.py, _ops/_expr.py, _writers/*, and _sorting.py — read as
+# `_layout.BATCH_BYTES` (module attribute, not a `from`-import) so tests can monkeypatch it.
+BATCH_BYTES = 256 * 1024 * 1024
+
+__all__ = ["BATCH_BYTES", "DenseLayout", "band_plan", "dense_shards", "x_compressors"]
+
+
+def x_compressors() -> tuple[object, ...]:
+    """Return the codec tuple used for every X (and layer) array.
+
+    Returns
+    -------
+    tuple[object, ...]
+        A single ``BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")``. zarr's own
+        default is bare zstd level-0 with no shuffle; the byte-shuffle gives a large
+        ratio/throughput win on numeric matrices.
+    """
     from zarr.codecs import BloscCodec
+
     return (BloscCodec(cname="zstd", clevel=5, shuffle="shuffle"),)
 
 
-def dense_shards(row_chunk, col_chunk, n_rows, n_cols, factor):
-    """Resolve the zarr v3 shard shape and the write-block shape for a dense X array.
+@dataclass(frozen=True, slots=True)
+class DenseLayout:
+    """Resolved chunk/shard/write-block shape for a dense X (or layer) array.
 
-    With sharding on (``factor`` > 1) the inner chunk stays (row_chunk, col_chunk) — that
-    remains the read granularity — and many inner chunks are packed into one shard object,
-    cutting file/object count. zarr requires the shard shape to be an integer multiple of the
-    inner chunk shape, so the shard is ``chunk * factor`` per axis, capped at the number of
-    chunks the array actually spans (no point in a shard reaching far past the data).
+    Parameters
+    ----------
+    chunks
+        The array's inner chunk shape — the read granularity, unaffected by sharding.
+    shards
+        The ``shards=`` kwarg for ``zarr.Group.require_array``; ``None`` when unsharded.
+    block
+        The shape callers must write at. Equals ``shards`` when sharding is on (writing a
+        partial shard makes zarr's sharding codec read-modify-write the whole shard), else
+        equals ``chunks``.
+    """
 
-    Returns ``(shards, block_row, block_col)`` where ``shards`` is the shards= kwarg (None when
-    no sharding) and (block_row, block_col) is the granularity callers must write at. Writing a
-    *partial* shard makes zarr's sharding codec read-modify-write the whole shard (silent perf
-    killer #2), so the block shape equals the shard shape when sharding is on, and the inner
-    chunk shape otherwise. Peak dense RAM per write block therefore grows by ~factor**2 when
-    sharding — the documented cost of fewer, larger objects.
+    chunks: tuple[int, int]
+    shards: tuple[int, int] | None
+    block: tuple[int, int]
+
+
+def dense_shards(row_chunk: int, col_chunk: int, n_rows: int, n_cols: int, factor: int) -> DenseLayout:
+    """Resolve the zarr v3 shard shape and write-block shape for a dense X array.
+
+    With sharding on (``factor`` > 1) the inner chunk stays ``(row_chunk, col_chunk)`` —
+    that remains the read granularity — and many inner chunks are packed into one shard
+    object, cutting file/object count. zarr requires the shard shape to be an integer
+    multiple of the inner chunk shape, so the shard is ``chunk * factor`` per axis, capped
+    at the number of chunks the array actually spans (no point in a shard reaching far past
+    the data). Peak dense RAM per write block grows by ``~factor**2`` when sharding — the
+    documented cost of fewer, larger objects.
+
+    Parameters
+    ----------
+    row_chunk, col_chunk
+        Inner chunk shape.
+    n_rows, n_cols
+        Full array shape.
+    factor
+        Shards per axis relative to the inner chunk; ``1`` disables sharding.
+
+    Returns
+    -------
+    DenseLayout
+        ``shards`` is ``None`` when ``factor <= 1``.
     """
     if factor <= 1:
-        return None, row_chunk, col_chunk
+        return DenseLayout(chunks=(row_chunk, col_chunk), shards=None, block=(row_chunk, col_chunk))
     import math
+
     rf = min(factor, math.ceil(n_rows / row_chunk))
     cf = min(factor, math.ceil(n_cols / col_chunk))
     shard_row = row_chunk * rf
     shard_col = col_chunk * cf
-    return (shard_row, shard_col), shard_row, shard_col
+    return DenseLayout(chunks=(row_chunk, col_chunk), shards=(shard_row, shard_col), block=(shard_row, shard_col))
+
+
+def band_plan(n_rows: int, band_rows: int) -> tuple[tuple[int, int], ...]:
+    """Split ``[0, n_rows)`` into contiguous ``(start, end)`` bands of ``band_rows`` each.
+
+    Parameters
+    ----------
+    n_rows
+        Total number of rows (or flat elements) to cover.
+    band_rows
+        Rows per band; the last band is clipped to ``n_rows``.
+
+    Returns
+    -------
+    tuple[tuple[int, int], ...]
+        Empty when ``n_rows <= 0`` or ``band_rows <= 0``.
+    """
+    if n_rows <= 0 or band_rows <= 0:
+        return ()
+    return tuple((r0, min(r0 + band_rows, n_rows)) for r0 in range(0, n_rows, band_rows))

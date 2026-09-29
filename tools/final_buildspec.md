@@ -19,7 +19,7 @@ sweep that brings the existing implementation up to them.
 | Scope of this workflow | Phases 1–5 in code + Phase 6 files. **Not** here: PyPI reservation, publishing, filter-repo, filing the anndata upstream issue. |
 | Dask | Replaced by `ThreadPoolExecutor` and **deleted**. Golden stores generated from the old code first. |
 | scanpy | Dropped. h5py reader for 10x HDF5 (v3 `matrix/features/*`, v2 `<genome>/genes,gene_names`). scanpy only in `dev` for the reference test. |
-| icechunk | **Optional extra** `annizarr[icechunk]`, one `require_icechunk()` guard, friendly `ImportError`. Plain zarr paths never import it. |
+| icechunk | **Optional extra** `annizarr[icechunk]`, one `require_icechunk()` guard raising `StorageError` with the install hint (`ImportError` cannot share a base with `RuntimeError`, and the CLI must catch it as an `AnzError`). Plain zarr paths never import it. |
 | GCS | `gs://` repos open/read/write via `icechunk.gcs_storage`. `ic copy` is local + `s3://` (boto3 via `[s3]`). No gs copy. |
 | Compatibility | **Clean break.** No forwarders, no `scizarr_ic` shim; env vars `ANNIZARR_ORIGIN`, `ANNIZARR_HOME`; HEAD file `annizarr_head`. |
 | CLI shape | Flat ops `convert`, `add-expr`, `rechunk`, `sort`, `append`; Icechunk commands under `ic`. Positional inputs, `-o/--output`, positional REPO for `ic`. Global `-v/-q`. |
@@ -62,10 +62,11 @@ tools/annizarr/
     _runtime.py             # pin_blas, configure_runtime, run_parallel(mode=…), stage() timer → logging
     _layout.py              # PURE  DenseLayout/SparseLayout/BandPlan, dense_shards, band_plan, x_compressors, BATCH_BYTES
     _validation.py          # PURE  ValidationResult, validate_single_cell_anndata
+    _zarr.py                # typed zarr accessors (as_array/get_group/...): the one place the Array|Group union is narrowed
     _sorting.py             # PURE  compute_sort → SortPlan;  I/O  stream_sorted_store(plan, …, commit_message)
     _sources/               # I/O read
       __init__.py           #   registry: open_source, register_source, detect_format
-      _base.py  _detect.py  _h5ad.py  _tenx.py  _memory.py  _zarr_store.py  _matrix.py
+      _base.py  _detect.py  _h5ad.py  _tenx.py  _memory.py  _matrix.py
     _storage/               # I/O open
       __init__.py           #   open_output_store, open_store_rw, open_input_group
       _uri.py (PURE)  _backends.py  _open.py
@@ -74,6 +75,7 @@ tools/annizarr/
       _encoding.py  _dense.py  _sparse.py  _concat.py  _adata.py  _workers.py
     _ops/                   # source(s) → plan → writer → storage
       __init__.py
+      _result.py            #   OpResult, AppendPlan
       _convert.py  _concat.py  _expr.py  _rechunk.py  _sort.py  _append.py
     _ic/                    # Icechunk versioning
       __init__.py
@@ -367,9 +369,9 @@ tarballs match file-for-file; suite green; dask absent from `pyproject`, `pixi.l
 
 | Unit | Model | Owns |
 |---|---|---|
-| 4.1 extras, guards, CI | Sonnet | `pyproject.toml`, `require_icechunk`, boto3 guard, `tests/test_import_guards.py`, moto test for s3 `copy_repo`, pre-commit (ruff, ruff-format, mypy), `.github/workflows/annizarr.yml` (3.10–3.13 × `pip install .` / `.[all]`; anndata pre-release job `continue-on-error`; coverage gate) |
+| 4.1 extras, guards, CI | Sonnet | `pyproject.toml`, boto3 guard, `tests/test_import_guards.py`, moto test for s3 `copy_repo`, pre-commit (ruff, ruff-format, mypy), `.github/workflows/annizarr.yml` (3.10–3.13 × `pip install .` / `.[all]`; anndata pre-release job `continue-on-error`; coverage gate) |
 
-Acceptance: `python -m build && twine check dist/*`; core env shows the friendly ImportError;
+Acceptance: `python -m build && twine check dist/*`; core env shows the friendly install-hint `StorageError`;
 numpy upper bound removed if the suite passes on the resolved latest.
 
 ### Phase 5 — invariants: versioned, atomic, idempotent, memory-bounded
@@ -377,8 +379,8 @@ numpy upper bound removed if the suite passes on the resolved latest.
 | Unit | Model | Owns | Depends |
 |---|---|---|---|
 | 5.1 storage through Repo | Sonnet | `_storage/_open.py`, `IOConfig.branch`, `_cli/_args.py` (`--branch`, `-m`) | 1 |
-| 5.2 op wiring + atomic outputs | Sonnet | `_ops/*`, `_sorting.stream_sorted_store(commit_message)`, `OUT.tmp-<uuid>` + verify + rename, idempotency rules, `tests/test_versioned_edits.py`, `tests/test_atomic.py` | 5.1 |
-| 5.3 streaming everywhere | Sonnet | streamed CSR→CSC for `convert --x-storage csc` from backed input (reuse the `_expr` bucket engine in `_writers/_sparse.py`), `io.eager_max_bytes` auto-select, `tests/test_large_store.py` (`-m slow`, 50k × 30k, subprocess peak-RSS ceiling) | 3 |
+| 5.2 op wiring + atomic outputs | Sonnet | `_ops/*`, `_sorting.stream_sorted_store(commit_message)`, `OUT.tmp-<uuid>` + verify + rename, idempotency rules (incl. `append` "all obs names already present" → error; R1 finding 2), `open_input_group(path, *, branch=None, snapshot_id=None)` (R1 finding 5), `tests/test_versioned_edits.py`, `tests/test_atomic.py` | 5.1 |
+| 5.3 streaming everywhere | Sonnet | streamed CSR→CSC for `convert --x-storage csc` from backed input (reuse the `_expr` bucket engine in `_writers/_sparse.py`), `io.eager_max_bytes` auto-select + CLI `--eager` (R1 finding 6), `tests/test_large_store.py` (`-m slow`, 50k × 30k, subprocess peak-RSS ceiling) | 3 |
 | R5 review | Sonnet | read-only | 5.3 |
 
 Acceptance: icechunk lifecycle (`convert --ic` → `add-expr` → `append` → `sort --ic`) shows one

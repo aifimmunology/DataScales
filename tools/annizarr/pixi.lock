@@ -1731,7 +1731,7 @@ packages:
 - pypi: ./
   name: annizarr
   version: 0.1.0
-  sha256: d8cd8bff6420c61c0e607f50a64abfaf669b2781ab5cd394b93d551d0dee7919
+  sha256: 46f9c4a2b30d3f72a3dc5ce8958793f89a1dc7539e901797666fead058a3f9ee
   requires_dist:
   - anndata>=0.12.10,<0.13
   - h5py>=3.8

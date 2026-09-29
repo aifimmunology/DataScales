@@ -1,42 +1,60 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import scipy.sparse as sp
 
-from ..errors import ConversionError
+from annizarr.errors import ConversionError
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+__all__ = ["ensure_csr", "get_indptr", "is_backed", "matrix_format"]
 
 
-def get_indptr(matrix: Any):
-    """Return indptr as a numpy array for in-memory or backed sparse input."""
-    import numpy as np
+def matrix_format(matrix: Any) -> Literal["csr", "csc", "dense"]:
+    # recognises in-memory scipy sparse and anndata backed datasets (_CSRDataset/_CSCDataset,
+    # via their .format attribute) as csr/csc; a plain 2-D array-like (ndarray, h5py-backed
+    # dense) is "dense"; anything else (COO/LIL/DOK/BSR sparse, 1-D arrays, unknown objects)
+    # is rejected outright rather than silently treated as dense
+    if sp.isspmatrix_csr(matrix):
+        return "csr"
+    if sp.isspmatrix_csc(matrix):
+        return "csc"
+    if sp.issparse(matrix):
+        raise ConversionError(f"adata.X must be CSR, CSC, or a 2-D dense array. Got: {matrix.format}")
+    backed_fmt = getattr(matrix, "format", None)
+    if backed_fmt == "csr":
+        return "csr"
+    if backed_fmt == "csc":
+        return "csc"
+    if backed_fmt is None and getattr(matrix, "ndim", 0) == 2:
+        return "dense"
+    got = backed_fmt or type(matrix).__name__
+    raise ConversionError(f"adata.X must be CSR, CSC, or a 2-D dense array. Got: {got}")
+
+
+def is_backed(matrix: Any) -> bool:
+    return not sp.issparse(matrix) and not isinstance(matrix, np.ndarray)
+
+
+def get_indptr(matrix: Any) -> NDArray[np.int64]:
     if sp.issparse(matrix):
         return np.asarray(matrix.indptr)
     if hasattr(matrix, "indptr"):
         return np.asarray(matrix.indptr[:])
     if hasattr(matrix, "group"):
         return np.asarray(matrix.group["indptr"][:])
-    raise ConversionError(
-        f"Cannot locate indptr on sparse input of type {type(matrix).__name__}"
-    )
+    raise ConversionError(f"Cannot locate indptr on sparse input of type {type(matrix).__name__}")
 
 
 def ensure_csr(matrix: Any, label: str) -> tuple[Any, str | None]:
-    """Return (csr_matrix, optional warning). Accepts CSR or CSC (in-memory or backed)."""
-    is_csr = sp.isspmatrix_csr(matrix) or (
-        not sp.issparse(matrix) and getattr(matrix, "format", None) == "csr"
-    )
-    is_csc = sp.isspmatrix_csc(matrix) or (
-        not sp.issparse(matrix) and getattr(matrix, "format", None) == "csc"
-    )
-    if is_csr:
+    # (csr_matrix, optional warning); accepts CSR or CSC (in-memory or backed)
+    fmt = matrix_format(matrix)
+    if fmt == "csr":
         return matrix, None
-    if is_csc:
-        if sp.issparse(matrix):
-            converted = matrix.tocsr()
-        else:
-            converted = matrix[:].tocsr()
+    if fmt == "csc":
+        converted = matrix[:].tocsr() if is_backed(matrix) else matrix.tocsr()
         return converted, f"[{label}] adata.X was CSC and converted to CSR in memory."
-    raise ConversionError(
-        f"[{label}] adata.X must be CSR or CSC; got {type(matrix).__name__}"
-    )
+    raise ConversionError(f"[{label}] adata.X must be CSR or CSC; got {type(matrix).__name__}")

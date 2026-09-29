@@ -1,82 +1,176 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import tomllib
 
+from annizarr.errors import ValidationError
+
+if TYPE_CHECKING:
+    from annizarr.typing import XStorage
+
+yaml: Any
 try:
     import yaml
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     yaml = None
 
+logger = logging.getLogger(__name__)
 
-XStorageMode = Literal["sparse-csr", "sparse-csc", "dense"]
 BackendMode = Literal["zarr", "icechunk"]
 
+__all__ = [
+    "AppConfig",
+    "ChunkConfig",
+    "ConcatConfig",
+    "GroupingConfig",
+    "IOConfig",
+    "ValidationConfig",
+    "apply_cli_overrides",
+    "load_config",
+]
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class IOConfig:
+    """Input/output toggles shared by every op.
+
+    Parameters
+    ----------
+    overwrite
+        Replace an existing output path/store instead of erroring.
+    consolidate_metadata
+        Consolidate zarr metadata into one object after writing (plain zarr only).
+    x_storage
+        On-disk layout for X (and layers): ``"csr"``, ``"csc"``, or ``"dense"``.
+    backed
+        Load h5ad input in backed (HDF5-streamed) mode instead of eagerly; opt-in only.
+    backend
+        ``"zarr"`` writes a plain on-disk store; ``"icechunk"`` writes through a
+        transactional, versioned Icechunk repository (one commit per op). Icechunk
+        targets are a local path or an ``s3://bucket/prefix`` URL (env credentials).
+    """
+
     overwrite: bool = False
     consolidate_metadata: bool = False
-    x_storage: XStorageMode = "sparse-csr"
-    backed: bool = False  # load h5ad in backed (HDF5-streamed) mode; opt-in only
-    # Storage backend for the output store. "zarr" writes a plain on-disk zarr; "icechunk"
-    # writes through a transactional, versioned Icechunk repository (one commit per convert).
-    # Icechunk targets are a local path or an s3://bucket/prefix URL (env credentials).
+    x_storage: XStorage = "csr"
+    backed: bool = False
     backend: BackendMode = "zarr"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ChunkConfig:
+    """Chunk/shard sizing and worker count for matrix writes.
+
+    Parameters
+    ----------
+    x_row_chunk
+        Row chunk size for X (dense row axis; CSR major axis granularity).
+    x_col_chunk
+        Column chunk size for dense X.
+    sparse_flat_chunk
+        Flat chunk size for sparse X ``data``/``indices``.
+    cpus
+        Workers for parallel matrix chunk writes: threads for in-memory input,
+        processes when backed (h5py is not thread-safe); raise on HPC.
+    x_shard_factor
+        Pack this many chunks per shard along each axis of dense X (``1`` = no
+        sharding; sparse output ignores it). See :func:`annizarr._layout.dense_shards`.
+    """
+
     x_row_chunk: int = 2048
     x_col_chunk: int = 2048
     sparse_flat_chunk: int = 1_000_000
-    cpus: int = 1  # workers for parallel matrix chunk writes; threads in-memory, processes when backed; raise on HPC
-    # Pack dense X inner chunks into shards of (x_row_chunk, x_col_chunk) * factor.
-    # 1 = no sharding. Dense X only (sparse output ignores it). See _layout.dense_shards.
+    cpus: int = 1
     x_shard_factor: int = 1
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ValidationConfig:
+    """Thresholds for :func:`annizarr._validation.validate_single_cell_anndata`.
+
+    Parameters
+    ----------
+    reject_spatial
+        Raise if spatial markers (``uns["spatial"]``, an ``obsm`` key containing
+        "spatial") are detected.
+    require_non_empty
+        Raise if ``n_obs``/``n_vars`` fall below ``min_obs``/``min_vars``.
+    min_obs, min_vars
+        Minimum observation/variable counts when ``require_non_empty`` is set.
+    """
+
     reject_spatial: bool = True
     require_non_empty: bool = True
     min_obs: int = 1
     min_vars: int = 1
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class GroupingConfig:
-    """Sort + partition X by one or more obs columns (Feature B).
+    """Sort + partition X by one or more obs columns, for ``convert --sort-by``.
 
-    When enabled, rows are physically sorted by ``sort_by`` (primary key first), so each
-    distinct key tuple becomes a contiguous row block. No tool-specific index is written —
-    the result is a plain sorted AnnData; a downstream reader derives the ranges from the
-    (now sorted) obs column(s) and slices ``X[start:end]`` with stock anndata/zarr, no
-    annizarr dependency. All obs-aligned arrays are reordered consistently so the store
-    stays a valid AnnData. convert-h5ad only, with sparse-csr or dense X.
+    When enabled, rows are physically sorted by ``sort_by`` (primary key first), so
+    each distinct key tuple becomes a contiguous row block. No tool-specific index is
+    written — the result is a plain sorted AnnData; a downstream reader derives the
+    ranges from the (now sorted) obs column(s) and slices ``X[start:end]`` with stock
+    anndata/zarr, no annizarr dependency. All obs-aligned arrays are reordered
+    consistently so the store stays a valid AnnData. ``convert`` only, with csr or
+    dense X; the standalone ``sort`` op takes its keys via an explicit ``by`` argument
+    instead of this config.
+
+    Parameters
+    ----------
+    enabled
+        Whether ``convert`` should sort rows by ``sort_by``.
+    sort_by
+        Obs column names, primary sort key first.
     """
+
     enabled: bool = False
-    sort_by: tuple[str, ...] = ()  # obs column names, primary sort key first
+    sort_by: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ConcatConfig:
-    """obs-column policy for concat (multi-file concat).
+    """obs-column policy for multi-file ``convert``/``concat``.
 
-    ``obs_columns`` empty (default) → strict: every input must have an *identical*
-    obs schema (same column names, same order). Non-empty → validate that every
-    input contains those columns, then project each input's obs down to exactly
-    those columns (in the given order) before concatenating; all other columns are
-    dropped. concat only.
+    ``obs_columns`` empty (default) means strict: every input must have an
+    *identical* obs schema (same column names, same order). Non-empty validates that
+    every input contains those columns, then projects each input's obs down to
+    exactly those columns (in the given order) before concatenating; all other
+    columns are dropped.
+
+    Parameters
+    ----------
+    obs_columns
+        obs columns to keep and join on; ``()`` means strict all-match.
     """
-    obs_columns: tuple[str, ...] = ()  # obs columns to keep+join on; () = strict all-match
+
+    obs_columns: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AppConfig:
+    """The resolved configuration passed to every op.
+
+    Parameters
+    ----------
+    io
+        Input/output toggles.
+    chunks
+        Chunk/shard sizing and worker count.
+    validation
+        Single-cell AnnData validation thresholds.
+    grouping
+        ``convert --sort-by`` sort/partition settings.
+    concat
+        Multi-file concat obs-column policy.
+    """
+
     io: IOConfig = IOConfig()
     chunks: ChunkConfig = ChunkConfig()
     validation: ValidationConfig = ValidationConfig()
@@ -84,13 +178,13 @@ class AppConfig:
     concat: ConcatConfig = ConcatConfig()
 
 
-def _normalize_x_storage(value: str) -> XStorageMode:
+def _normalize_x_storage(value: str) -> XStorage:
     mode = value.lower().strip()
-    allowed = {"sparse-csr", "sparse-csc", "dense"}
+    allowed = {"csr", "csc", "dense"}
     if mode not in allowed:
         allowed_list = ", ".join(sorted(allowed))
-        raise ValueError(f"Invalid io.x_storage '{value}'. Expected one of: {allowed_list}")
-    return mode  # type: ignore[return-value]
+        raise ValidationError(f"Invalid io.x_storage '{value}'. Expected one of: {allowed_list}")
+    return mode  # type: ignore[return-value]  # mode is in `allowed`, a subset of XStorage's literals
 
 
 def _normalize_backend(value: str) -> BackendMode:
@@ -98,8 +192,8 @@ def _normalize_backend(value: str) -> BackendMode:
     allowed = {"zarr", "icechunk"}
     if mode not in allowed:
         allowed_list = ", ".join(sorted(allowed))
-        raise ValueError(f"Invalid io.backend '{value}'. Expected one of: {allowed_list}")
-    return mode  # type: ignore[return-value]
+        raise ValidationError(f"Invalid io.backend '{value}'. Expected one of: {allowed_list}")
+    return mode  # type: ignore[return-value]  # mode is in `allowed`, a subset of BackendMode's literals
 
 
 def _validate_config(config: AppConfig) -> AppConfig:
@@ -115,7 +209,7 @@ def _validate_config(config: AppConfig) -> AppConfig:
         sort_by = (sort_by,)
     grouping = replace(config.grouping, sort_by=tuple(sort_by))
     if grouping.enabled and not grouping.sort_by:
-        raise ValueError("grouping.enabled is true but grouping.sort_by is empty.")
+        raise ValidationError("grouping.enabled is true but grouping.sort_by is empty.")
     # obs_columns may arrive from TOML/YAML as a list (or a bare string for one column);
     # freeze to a tuple. Empty tuple keeps the default strict all-match behavior.
     obs_columns = config.concat.obs_columns
@@ -123,14 +217,13 @@ def _validate_config(config: AppConfig) -> AppConfig:
         obs_columns = (obs_columns,)
     concat = replace(config.concat, obs_columns=tuple(obs_columns))
     if config.chunks.x_shard_factor < 1:
-        raise ValueError(
+        raise ValidationError(
             f"chunks.x_shard_factor must be >= 1 (1 = no sharding); got {config.chunks.x_shard_factor}."
         )
     return replace(config, io=io, grouping=grouping, concat=concat)
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
-    """Physically reads the config file, and parses it according to the file extension."""
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
 
@@ -138,27 +231,44 @@ def _read_config_file(path: Path) -> dict[str, Any]:
         return tomllib.loads(text)
 
     if suffix in {".yaml", ".yml"}:
+        if yaml is None:
+            raise ValidationError("YAML config support requires PyYAML.")
         data = yaml.safe_load(text)
         return data or {}
 
-    raise ValueError(f"Unsupported config file extension: {suffix}")
+    raise ValidationError(f"Unsupported config file extension: {suffix}")
 
 
 def _merge_dataclass(base: Any, patch: dict[str, Any]) -> Any:
-    valid_fields = {k for k in base.__dataclass_fields__.keys()}
+    valid_fields = set(base.__dataclass_fields__.keys())
     unknown = set(patch.keys()) - valid_fields
     if unknown:
         bad = ", ".join(sorted(unknown))
-        raise ValueError(f"Unknown config keys for {type(base).__name__}: {bad}")
+        raise ValidationError(f"Unknown config keys for {type(base).__name__}: {bad}")
     return replace(base, **patch)
 
 
 def load_config(config_path: str | None = None) -> AppConfig:
-    """
-    Loads a config file, and uses the valid config values to override the defaults.
-    If no path is provided, returns the default config.
-    """
+    """Load a config file and merge it over the defaults.
 
+    Parameters
+    ----------
+    config_path
+        Path to a ``.toml``/``.yaml``/``.yml`` config file; ``None`` returns the
+        default :class:`AppConfig`.
+
+    Returns
+    -------
+    AppConfig
+        Defaults merged with the file's ``[io]``/``[chunks]``/``[validation]``/
+        ``[grouping]``/``[concat]`` sections.
+
+    Raises
+    ------
+    ValidationError
+        ``config_path`` does not exist, has an unsupported extension, contains an
+        unknown top-level section or config key, or an invalid value.
+    """
     config = AppConfig()
 
     if not config_path:
@@ -166,7 +276,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
 
     path = Path(config_path)
     if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
+        raise ValidationError(f"Config file not found: {path}")
 
     data = _read_config_file(path)
 
@@ -174,9 +284,8 @@ def load_config(config_path: str | None = None) -> AppConfig:
     unknown_sections = set(data.keys()) - known_sections
     if unknown_sections:
         bad = ", ".join(sorted(unknown_sections))
-        raise ValueError(
-            f"Unknown top-level config sections: {bad}. "
-            f"Expected only: {', '.join(sorted(known_sections))}"
+        raise ValidationError(
+            f"Unknown top-level config sections: {bad}. Expected only: {', '.join(sorted(known_sections))}"
         )
 
     io_patch = data.get("io", {})
@@ -185,8 +294,11 @@ def load_config(config_path: str | None = None) -> AppConfig:
     grouping_patch = data.get("grouping", {})
     concat_patch = data.get("concat", {})
 
-    if not all(isinstance(p, dict) for p in (io_patch, chunks_patch, validation_patch, grouping_patch, concat_patch)):
-        raise ValueError("Config sections [io], [chunks], [validation], [grouping], [concat] must be maps/objects.")
+    patches = (io_patch, chunks_patch, validation_patch, grouping_patch, concat_patch)
+    if not all(isinstance(p, dict) for p in patches):
+        raise ValidationError(
+            "Config sections [io], [chunks], [validation], [grouping], [concat] must be maps/objects."
+        )
 
     config = replace(
         config,
@@ -202,6 +314,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
 
 def apply_cli_overrides(
     config: AppConfig,
+    *,
     overwrite: bool | None = None,
     consolidate_metadata: bool | None = None,
     x_storage: str | None = None,
@@ -215,6 +328,22 @@ def apply_cli_overrides(
     sort_by: list[str] | None = None,
     obs_columns: list[str] | None = None,
 ) -> AppConfig:
+    """Apply CLI flag overrides (``None`` = unset) onto a loaded config.
+
+    Parameters
+    ----------
+    config
+        Base configuration, typically from :func:`load_config`.
+    overwrite, consolidate_metadata, x_storage, x_row_chunk, x_col_chunk,
+    sparse_flat_chunk, x_shard_factor, cpus, backed, backend, sort_by, obs_columns
+        Per-field overrides; a value of ``None`` leaves the corresponding field
+        untouched. ``sort_by`` also sets ``grouping.enabled = True``.
+
+    Returns
+    -------
+    AppConfig
+        ``config`` with the given overrides applied and re-validated.
+    """
     io_cfg = config.io
     chunk_cfg = config.chunks
     grouping_cfg = config.grouping
@@ -245,28 +374,39 @@ def apply_cli_overrides(
     if obs_columns is not None:
         concat_cfg = replace(concat_cfg, obs_columns=tuple(obs_columns))
 
-    return _validate_config(
-        replace(config, io=io_cfg, chunks=chunk_cfg, grouping=grouping_cfg, concat=concat_cfg)
-    )
+    return _validate_config(replace(config, io=io_cfg, chunks=chunk_cfg, grouping=grouping_cfg, concat=concat_cfg))
 
 
 def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
-    """Validate + adapt config for the chosen storage backend.
+    """Validate and adapt a config for the chosen storage backend.
 
-    Icechunk supports multi-threaded writes against one shared session (single commit),
-    so in-process threaded paths keep cpus. Only the backed-input writers are rejected:
-    they fan out to worker processes that reopen the store by filesystem path, which an
-    icechunk session can't provide (Session.fork() is the future path).
+    Icechunk supports multi-threaded writes against one shared session (single
+    commit), so in-process threaded paths keep ``cpus``. Only the backed-input
+    writers are rejected: they fan out to worker processes that reopen the store by
+    filesystem path, which an icechunk session can't provide (``Session.fork()`` is
+    the future path).
+
+    Parameters
+    ----------
+    cfg
+        Configuration to validate.
+
+    Returns
+    -------
+    AppConfig
+        ``cfg`` unchanged (validated).
+
+    Raises
+    ------
+    ConversionError
+        ``backend='icechunk'`` combined with ``backed=True``.
     """
-    import sys
-
-    from .errors import ConversionError
+    from annizarr.errors import ConversionError
 
     if cfg.chunks.x_shard_factor > 1 and cfg.io.x_storage != "dense":
-        print(
-            f"→ x_shard_factor={cfg.chunks.x_shard_factor} only applies to dense X; "
-            f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored.",
-            flush=True, file=sys.stderr,
+        logger.warning(
+            f"x_shard_factor={cfg.chunks.x_shard_factor} only applies to dense X; "
+            f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored."
         )
     if cfg.io.backend == "icechunk" and cfg.io.backed:
         raise ConversionError(

@@ -1,4 +1,5 @@
 """Python-API coverage for annizarr._ic.Repo."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -158,7 +159,7 @@ def test_writable_reuses_one_session_until_commit(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
     repo.open_zarr("w").attrs["k"] = 1
-    repo.open_zarr("w").attrs["j"] = 2          # same staged session, not a second one
+    repo.open_zarr("w").attrs["j"] = 2  # same staged session, not a second one
     assert repo._session.has_uncommitted_changes
     repo.commit("one commit for both")
     assert repo._session is None and repo.open_zarr("r").attrs["k"] == 1 and repo.open_zarr("r").attrs["j"] == 2

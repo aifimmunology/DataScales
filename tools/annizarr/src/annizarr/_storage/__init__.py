@@ -1,16 +1,29 @@
 from __future__ import annotations
 
-from ._backends import icechunk_storage, is_icechunk_repo
-from ._open import open_input_group, open_output_store, open_store_rw
-from ._uri import is_s3_url, prepare_output_path, store_name
+from annizarr._storage._backends import is_icechunk_repo, require_icechunk, storage_for
+from annizarr._storage._open import open_input_group, open_output_store, open_store_rw
+from annizarr._storage._uri import (
+    bucket_prefix,
+    canonical_location,
+    is_readonly_path,
+    is_remote,
+    prepare_output_path,
+    scheme,
+    store_name,
+)
 
 __all__ = [
-    "icechunk_storage",
+    "bucket_prefix",
+    "canonical_location",
     "is_icechunk_repo",
-    "is_s3_url",
+    "is_readonly_path",
+    "is_remote",
     "open_input_group",
     "open_output_store",
     "open_store_rw",
     "prepare_output_path",
+    "require_icechunk",
+    "scheme",
+    "storage_for",
     "store_name",
 ]

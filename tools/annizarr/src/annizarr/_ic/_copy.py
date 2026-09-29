@@ -1,32 +1,23 @@
-"""Copy routines.
-
-* :func:`copy_group` — stream a zarr hierarchy into another root group. Used by
-  ``Repo.init`` to seed a repo from a zarr store: arrays are re-created with the source
-  layout (chunks, shards, codecs, fill value, attrs) and data is copied in
-  chunk-grid-aligned bands along axis 0 so memory stays bounded.
-* :func:`copy_repo` — replicate a whole icechunk repo (every branch and snapshot) to a
-  new location byte for byte. Icechunk's object tree is content-addressed, so a plain
-  file copy is a faithful clone. Used by ``Repo.copy``.
-"""
 from __future__ import annotations
 
 import importlib.util
 import math
 import shutil
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..errors import RepoError
-from ._head import HEAD_FILE
-from ._storage import is_remote
+from annizarr._ic._head import HEAD_FILE
+from annizarr._storage import is_remote
+from annizarr.errors import RepoError
 
 BAND_BYTES = 128 * 1024**2
 
 
 def check_copyable(src: str, dst: str) -> None:
-    """Raise unless ``src`` -> ``dst`` is a copy this module can perform (no I/O)."""
+    # raises unless src -> dst is a copy this module can perform (no I/O)
     for loc in (src, dst):
         if is_remote(loc) and urlparse(loc).scheme != "s3":
             raise RepoError(f"copy supports local paths and s3:// only, got '{loc}'")
@@ -35,13 +26,9 @@ def check_copyable(src: str, dst: str) -> None:
 
 
 def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
-    """Copy the repo object tree at ``src`` to ``dst`` (local dirs and/or ``s3://``).
-
-    Local→local uses ``shutil``; anything involving ``s3://`` goes through boto3 with
-    credentials from the environment, ``workers`` objects in flight at a time. The
-    local HEAD file is never copied. Callers run :func:`check_copyable` and make sure
-    ``dst`` is a fresh location.
-    """
+    # local->local uses shutil; anything involving s3:// goes through boto3 with
+    # credentials from the environment. The local HEAD file is never copied; callers
+    # run check_copyable() first and make sure dst is a fresh location.
     if not (is_remote(src) or is_remote(dst)):
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns(HEAD_FILE), dirs_exist_ok=True)
         return
@@ -55,7 +42,7 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
         u = urlparse(uri)
         return u.netloc, u.path.strip("/")
 
-    def s3_keys(bucket: str, prefix: str):
+    def s3_keys(bucket: str, prefix: str) -> Iterator[str]:
         for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/"):
             for obj in page.get("Contents", []):
                 yield obj["Key"]
@@ -66,12 +53,12 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
         if is_remote(dst):
             db, dp = s3_parts(dst)
             jobs = [
-                (lambda k=k: s3.copy({"Bucket": sb, "Key": k}, db, f"{dp}/{k[len(sp) + 1:]}"))
-                for k in s3_keys(sb, sp)
+                (lambda k=k: s3.copy({"Bucket": sb, "Key": k}, db, f"{dp}/{k[len(sp) + 1 :]}")) for k in s3_keys(sb, sp)
             ]
         else:
+
             def download(k: str) -> None:
-                local = Path(dst) / k[len(sp) + 1:]
+                local = Path(dst) / k[len(sp) + 1 :]
                 local.parent.mkdir(parents=True, exist_ok=True)
                 s3.download_file(sb, k, str(local))
 
@@ -92,7 +79,7 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
 
 
 def copy_group(src: Any, dst: Any, *, band_bytes: int = BAND_BYTES) -> int:
-    """Replicate ``src`` (groups, arrays, attrs, layout) into ``dst``; return array count."""
+    # replicates src (groups, arrays, attrs, layout) into dst; returns the array count
     import zarr
 
     dst.update_attributes(dict(src.attrs))
