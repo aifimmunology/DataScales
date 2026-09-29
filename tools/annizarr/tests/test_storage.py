@@ -82,6 +82,7 @@ def test_is_icechunk_repo_missing_dir(tmp_path: Path) -> None:
 
 
 def test_require_icechunk_returns_module() -> None:
+    pytest.importorskip("icechunk")
     icechunk = require_icechunk()
     assert icechunk.__name__ == "icechunk"
 

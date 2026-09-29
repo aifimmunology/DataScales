@@ -7,6 +7,8 @@ import pytest
 import zarr
 from _ic_helpers import snapshot_tree
 
+pytest.importorskip("icechunk")  # this whole directory is icechunk-only; core env has no extras
+
 
 @pytest.fixture(autouse=True)
 def _zarr_v3():

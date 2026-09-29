@@ -46,3 +46,34 @@ def test_import_annizarr_ic_without_icechunk(monkeypatch: pytest.MonkeyPatch) ->
 
     assert hasattr(ic, "Repo")
     assert sys.modules["icechunk"] is None  # importing the module never touched icechunk
+
+
+def test_repo_copy_to_s3_without_boto3_raises_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    # check_copyable is Repo.copy's/`ic copy`'s pre-flight: no I/O, so no repo needed
+    from annizarr._ic._copy import check_copyable
+    from annizarr.errors import RepoError
+
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    with pytest.raises(RepoError, match=r"annizarr\[s3\]"):
+        check_copyable("some/local/repo", "s3://bucket/prefix")
+
+
+def test_cli_ic_copy_to_s3_without_boto3_reports_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("icechunk")  # a real repo is needed to reach the s3 destination check
+    import zarr
+
+    from annizarr._ic import Repo
+
+    src = tmp_path / "src.zarr"
+    zarr.open_group(str(src), mode="w").create_array("X", shape=(2, 2), dtype="float32", chunks=(2, 2))
+    repo_path = tmp_path / "repo.icechunk"
+    Repo.init(src, repo_path)
+
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    exit_code = main(["ic", "copy", str(repo_path), "s3://bucket/prefix"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "annizarr[s3]" in err

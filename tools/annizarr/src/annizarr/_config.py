@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-
-import tomllib
 
 from annizarr.errors import ValidationError
 

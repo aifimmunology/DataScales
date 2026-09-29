@@ -1,0 +1,97 @@
+# Gate on PRs to main for the annizarr package (pip-based; independent of the pixi dev env).
+name: annizarr
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/annizarr/**'
+      - '.github/workflows/annizarr.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/annizarr/**'
+      - '.github/workflows/annizarr.yml'
+
+defaults:
+  run:
+    working-directory: tools/annizarr
+
+jobs:
+  all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # real floor is 3.12: zarr>=3.3 itself requires python>=3.12 (verified against
+        # PyPI/conda-forge metadata — every zarr 3.2+ release), so 3.10/3.11 cannot install
+        python-version: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: tools/annizarr/pyproject.toml
+
+      - run: pip install ".[all,dev]"
+
+      - run: ruff check src tests benchmarking
+      - run: ruff format --check src tests benchmarking
+      - run: mypy --strict src/annizarr
+      - run: pytest  # coverage gate is in pyproject.toml
+
+  core:
+    # hard deps + pytest only — no icechunk/boto3/scanpy; proves the extras are truly optional
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: tools/annizarr/pyproject.toml
+
+      # not "pip install .[dev]": dev pulls moto[s3] -> boto3, defeating the point of this job
+      - run: pip install . pytest pytest-cov hypothesis
+      - run: pytest --no-cov
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: tools/annizarr/pyproject.toml
+
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+
+  anndata-prerelease:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: tools/annizarr/pyproject.toml
+
+      - run: pip install ".[all,dev]"
+      - run: pip install --pre --upgrade anndata
+      - run: ruff check src tests benchmarking
+      - run: ruff format --check src tests benchmarking
+      - run: mypy --strict src/annizarr
+      - run: pytest

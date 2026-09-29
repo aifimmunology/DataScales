@@ -132,7 +132,7 @@ def add_expr(
     with stage("Counting nnz per gene"):
         for s0 in range(0, nnz, flat_step):
             s1 = min(s0 + flat_step, nnz)
-            col_nnz += np.bincount(idx_arr[s0:s1], minlength=n_vars)
+            col_nnz += np.bincount(np.asarray(idx_arr[s0:s1]), minlength=n_vars)
     csc_indptr = np.concatenate([[0], np.cumsum(col_nnz)]).astype(np.int64)
 
     if fmt == "dense":

@@ -28,8 +28,8 @@ sweep that brings the existing implementation up to them.
 | Storage enum | *Assumption:* `x_storage` becomes `Literal["csr", "csc", "dense"]` everywhere (config, CLI `--x-storage`, `add-expr --format`). The old `sparse-csr`/`sparse-csc` spellings are not accepted (clean break). |
 | Hard deps | `anndata>=0.12.10,<0.13`, `zarr>=3.3,<4`, `numpy`, `scipy`, `h5py`, `PyYAML`. |
 | Extras | `icechunk`, `s3`, `all`, `dev`. |
-| Versions | `requires-python >=3.10`; CI 3.10–3.13; drop `numpy<2.5` unless a test proves it; keep `anndata<0.13` with reason + issue link. |
-| Dev env pins (Phase 1–3) | pixi dev env pins `zarr 3.3.*`, `icechunk 2.1.*`, `numpy <2.5` to match the vendored ground truth and the old envs, so the move and the golden tests are not confounded by a library bump; Phase 4 lifts them one at a time. Python 3.13 in the dev env. |
+| Versions | `requires-python >=3.12` — **corrected in Phase 4**: every zarr ≥3.2 release and every icechunk wheel require 3.12, so a 3.10 floor was never installable. CI 3.12–3.13. Lifted with evidence: `zarr>=3.3,<4` (3.4.0 keeps all 16 goldens byte-identical), `icechunk>=2.1.2,<3` (2.2.2), numpy unbounded (2.5.3). Keep `anndata<0.13` with reason + issue link. |
+| Dev env pins | Phases 1–3 pinned `zarr 3.3.*`, `icechunk 2.1.*`, `numpy <2.5` so the move and the goldens were not confounded by a library bump; Phase 4 lifted them one at a time (see Versions). Envs: `default` (3.13, all extras), `core` (hard deps + pytest), `py312` (floor check). |
 | Versioning | *Assumption:* static `version = "0.1.0"` while in the monorepo; `hatch-vcs` after the repo split. |
 | Errors | One hierarchy rooted at `AnzError`; children `ConversionError`, `StorageError`, `ValidationError`, `RepoError`. CLI catches `AnzError` only. |
 | Output of ops | *Assumption:* every op returns a frozen `OpResult(path, n_obs, n_vars, snapshot_id)`; warnings go through `logging`, not return values. |
@@ -258,7 +258,7 @@ name = "annizarr"
 version = "0.1.0"                     # → hatch-vcs after the repo split
 description = "AnnData zarr stores: convert, edit, and version with Icechunk"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"   # zarr>=3.3 and icechunk wheels need 3.12
 license = "MIT"
 authors = [{ name = "Alex Holly", email = "alex.holly@alleninstitute.org" }]
 dependencies = [
@@ -275,7 +275,7 @@ icechunk = ["icechunk>=2.1.2,<3"]
 s3       = ["boto3>=1.28"]
 all      = ["annizarr[icechunk,s3]"]
 dev      = ["pytest>=8", "pytest-cov", "hypothesis", "ruff", "mypy", "types-PyYAML",
-            "moto[s3]>=5", "scanpy>=1.10", "build", "twine", "pre-commit"]
+            "moto[s3,server]>=5", "scanpy>=1.10", "build", "twine", "pre-commit"]
 
 [project.scripts]
 annizarr = "annizarr._cli:main"
@@ -369,7 +369,7 @@ tarballs match file-for-file; suite green; dask absent from `pyproject`, `pixi.l
 
 | Unit | Model | Owns |
 |---|---|---|
-| 4.1 extras, guards, CI | Sonnet | `pyproject.toml`, boto3 guard, `tests/test_import_guards.py`, moto test for s3 `copy_repo`, pre-commit (ruff, ruff-format, mypy), `.github/workflows/annizarr.yml` (3.10–3.13 × `pip install .` / `.[all]`; anndata pre-release job `continue-on-error`; coverage gate) |
+| 4.1 extras, guards, CI | Sonnet | `pyproject.toml`, boto3 guard, `tests/test_import_guards.py`, moto test for s3 `copy_repo`, pre-commit (ruff, ruff-format, mypy), `.github/workflows/annizarr.yml` (jobs: `all` on 3.12/3.13 with `.[all,dev]`, `core` without extras, `build` + twine, anndata pre-release `continue-on-error`) |
 
 Acceptance: `python -m build && twine check dist/*`; core env shows the friendly install-hint `StorageError`;
 numpy upper bound removed if the suite passes on the resolved latest.

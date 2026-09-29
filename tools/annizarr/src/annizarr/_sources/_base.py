@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 from annizarr._config import AppConfig
 from annizarr._sources._h5ad import close_backed_if_needed
@@ -43,5 +43,5 @@ class Source:
 
 # Loader/Sniffer are plain Callable aliases; a custom kind is not restricted to the
 # builtin kinds below, so the return type here is documentation, not an enforced bound.
-Loader: TypeAlias = Callable[[PathLike, AppConfig], Source]
-Sniffer: TypeAlias = Callable[[Path], str | None]
+type Loader = Callable[[PathLike, AppConfig], Source]
+type Sniffer = Callable[[Path], str | None]

@@ -1,0 +1,21 @@
+# NOTE: while annizarr lives inside the DataScale monorepo, pre-commit resolves the git
+# root at the monorepo top, so `files:` below is pinned to tools/annizarr/ on every hook
+# to keep this config from touching the other tools. Drop that prefix after the repo split.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^tools/annizarr/
+      - id: ruff-format
+        files: ^tools/annizarr/
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy --strict src/annizarr
+        entry: bash -c 'cd tools/annizarr && pixi run -e default mypy --strict src/annizarr'
+        language: system
+        pass_filenames: false
+        files: ^tools/annizarr/src/annizarr/

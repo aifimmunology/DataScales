@@ -95,6 +95,7 @@ def _self_serve_subset(g, **keys):
 
 
 def test_icechunk_roundtrip_eager(tmp_path: Path) -> None:
+    pytest.importorskip("icechunk")
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "repo.icechunk"
     cfg = AppConfig(
@@ -319,6 +320,7 @@ def test_sort_backed_rejects_dense(tmp_path: Path) -> None:
 
 
 def test_sort_through_icechunk_and_read(tmp_path: Path) -> None:
+    pytest.importorskip("icechunk")
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "repo.icechunk"
     convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=_sorted_cfg(backend="icechunk"))
