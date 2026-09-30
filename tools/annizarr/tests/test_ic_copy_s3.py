@@ -19,8 +19,8 @@ pytest.importorskip("moto")
 
 from moto.server import ThreadedMotoServer  # noqa: E402
 
-from annizarr._ic import Repo, copy_repo  # noqa: E402
-from annizarr._ic._head import HEAD_FILE  # noqa: E402
+from annizarr.ic import Repo, copy_repo  # noqa: E402
+from annizarr.ic._head import HEAD_FILE  # noqa: E402
 
 
 @pytest.fixture

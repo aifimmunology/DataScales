@@ -12,10 +12,6 @@ __all__ = ["ensure_csr", "get_indptr", "is_backed", "matrix_format"]
 
 
 def matrix_format(matrix: Any) -> Literal["csr", "csc", "dense"]:
-    # recognises in-memory scipy sparse and anndata backed datasets (_CSRDataset/_CSCDataset,
-    # via their .format attribute) as csr/csc; a plain 2-D array-like (ndarray, h5py-backed
-    # dense) is "dense"; anything else (COO/LIL/DOK/BSR sparse, 1-D arrays, unknown objects)
-    # is rejected outright rather than silently treated as dense
     import scipy.sparse as sp
 
     if sp.isspmatrix_csr(matrix):
@@ -56,15 +52,8 @@ def get_indptr(matrix: Any) -> NDArray[np.int64]:
 
 
 def ensure_csr(matrix: Any, label: str, *, eager_max_bytes: int | None = None) -> tuple[Any, str | None]:
-    """(csr_matrix, optional warning); accepts CSR or CSC (in-memory or backed).
-
-    Parameters
-    ----------
-    eager_max_bytes
-        For a backed CSC input, refuse (instead of silently loading it) when its on-disk
-        size exceeds this. ``None`` skips the check (matches the pre-existing, unbounded
-        behavior) — concat is the only caller that has a budget to enforce.
-    """
+    # eager_max_bytes=None skips the backed-CSC size check (concat is the only caller with
+    # a budget to enforce)
     fmt = matrix_format(matrix)
     if fmt == "csr":
         return matrix, None

@@ -4,12 +4,12 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from annizarr._config import AppConfig, load_config, resolve_backend_cfg
-from annizarr._ops._result import OpResult
-from annizarr._sorting import stream_sorted_store
+from annizarr._core._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._core._sorting import stream_sorted_store
+from annizarr._core._zarr import get_group
 from annizarr._storage import check_output_target, is_remote, open_input_group, store_name
-from annizarr._zarr import get_group
 from annizarr.errors import ConversionError
+from annizarr.ops._result import OpResult
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -62,7 +62,7 @@ def sort(
     """
     from anndata.io import read_elem, sparse_dataset
 
-    from annizarr._ops._expr import introspect_gexp, write_expr_layer
+    from annizarr.ops._expr import introspect_gexp, write_expr_layer
 
     if cfg is None:
         cfg = load_config()
@@ -109,9 +109,8 @@ def sort(
         def after_write(
             root: zarr.Group, fmt: XStorage = fmt, chunk_elems: int = chunk_elems, target_sum: float = target_sum
         ) -> None:
-            # runs on the sorted output's still-open root, before stream_sorted_store's one
-            # finalize() — re-deriving gexp here (instead of a separate add_expr call after
-            # the fact) keeps this to a single commit for an icechunk output.
+            # re-derives gexp before stream_sorted_store's finalize(), so it lands in the
+            # same icechunk commit rather than a separate add_expr call afterwards.
             write_expr_layer(root, cfg, fmt=fmt, chunk_elems=chunk_elems, target_sum=target_sum)
             logger.warning(f"layers/gexp re-derived ({fmt}) on the sorted store.")
 

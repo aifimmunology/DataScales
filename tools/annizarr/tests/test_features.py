@@ -9,8 +9,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from annizarr._config import _validate_config
-from annizarr._ops import concat, convert_h5ad
+from annizarr._core._config import _validate_config
 from annizarr._storage import open_input_group
 from annizarr.config import (
     AppConfig,
@@ -21,6 +20,7 @@ from annizarr.config import (
     ValidationConfig,
 )
 from annizarr.errors import ConversionError
+from annizarr.ops import concat, convert_h5ad
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,7 +97,7 @@ def _self_serve_subset(g, **keys):
 
 def test_icechunk_roundtrip_eager_and_op_result_snapshot_ids(tmp_path: Path) -> None:
     pytest.importorskip("icechunk")
-    from annizarr._ops import add_expr
+    from annizarr.ops import add_expr
 
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "repo.icechunk"
@@ -288,8 +288,8 @@ def test_backed_sort_default_commit_message_names_sort_columns(tmp_path: Path) -
     cfg, since --backed + backend=icechunk is otherwise rejected upstream (icechunk never
     supports backed input) before it would reach this code path."""
     pytest.importorskip("icechunk")
-    from annizarr._ic import Repo
-    from annizarr._sorting import _write_sorted_backed
+    from annizarr._core._sorting import _write_sorted_backed
+    from annizarr.ic import Repo
 
     _labelled_h5ad(tmp_path / "in.h5ad")
     adata = ad.read_h5ad(tmp_path / "in.h5ad", backed="r")

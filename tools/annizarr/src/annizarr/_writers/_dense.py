@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from annizarr._layout import band_plan, dense_shards, write_grid, x_compressors
-from annizarr._runtime import progress, run_parallel
+from annizarr._core._layout import band_plan, dense_shards, write_grid, x_compressors
+from annizarr._core._runtime import progress, run_parallel
 from annizarr._sources._matrix import is_backed
 from annizarr._writers._concat import _is_thread_unsafe
 from annizarr._writers._encoding import set_array_attrs
@@ -16,15 +16,13 @@ if TYPE_CHECKING:
 
     import zarr
 
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
 
 
 def _write_dense_block(
     zarr_arr: zarr.Array[Any], matrix: Any, r0: int, r1: int, c0: int, c1: int, tick: Callable[[], None]
 ) -> None:
-    # r0:r1 x c0:c1 is one write-block (the shard grid when sharded, else the chunk grid);
-    # blocks are disjoint across tasks, so no two threads ever touch the same chunk and no
-    # read-modify-write happens
+    # disjoint write-grid blocks: no two threads touch the same chunk (no read-modify-write)
     zarr_arr[r0:r1, c0:c1] = np.asarray(matrix[r0:r1, c0:c1])
     tick()
 
@@ -32,9 +30,6 @@ def _write_dense_block(
 def _densify_row_band(
     zarr_arr: zarr.Array[Any], matrix: Any, r0: int, r1: int, block_col: int, n_cols: int, tick: Callable[[], None]
 ) -> None:
-    # slices the CSR row band once and reuses it for every column tile, so an in-memory
-    # sparse source is sliced n_rows/block_row times total, not once per (row, col) tile;
-    # each column tile write is block_col-wide, matching the write grid (no read-modify-write)
     band = matrix[r0:r1]
     for c0, c1 in band_plan(n_cols, block_col):
         zarr_arr[r0:r1, c0:c1] = np.asarray(band[:, c0:c1].toarray())
@@ -42,12 +37,7 @@ def _densify_row_band(
 
 
 def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
-    # densifies without ever materialising the full matrix: row bands are block_row tall,
-    # densified in block_col-wide tiles matching the zarr write grid. In-memory CSR, and a
-    # zarr-backed CSR (e.g. write_matrix's backed-CSC-to-dense temp store), are thread-pooled
-    # over row bands (zarr is thread-safe); an h5py-backed _CSRDataset is densified by row
-    # band in parallel processes instead (each opens its own h5py handle — h5py is not
-    # thread-safe, but independent read-only file handles across processes are).
+    # h5py-backed input uses processes (h5py is not thread-safe); zarr-backed uses threads.
     n_rows, n_cols = matrix.shape
     dtype = matrix.dtype
 
@@ -66,18 +56,13 @@ def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
     )
     set_array_attrs(zarr_arr)
 
-    # aligned to the array's write grid: shards if sharded, else chunks
     block_row, block_col = write_grid(zarr_arr)
     if _is_thread_unsafe(matrix):
         from zarr.storage import LocalStore
 
-        # Bands are block_row tall and densified in block_col-wide tiles so each write
-        # covers whole shards (or whole chunks when unsharded) — no read-modify-write;
-        # disjoint bands never share a shard, so the process-pool workers need no
-        # cross-worker synchronisation.
+        # disjoint row bands never share a shard/chunk, so no synchronisation is needed.
         src = matrix.group
         store = zarr_arr.store_path.store
-        # the process-pool workers re-open the store by filesystem path (see _workers.py)
         assert isinstance(store, LocalStore), "backed dense write requires a local zarr store"
         out_root = store.root
         jobs = [
@@ -94,8 +79,6 @@ def _write_sparse_as_dense(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
 
 
 def _write_dense_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig) -> None:
-    # anndata's write_elem assigns the whole array at once (full materialisation); this
-    # streams block-by-block onto the zarr write grid instead
     n_rows, n_cols = matrix.shape
     row_chunk = min(cfg.chunks.x_row_chunk, n_rows)
     col_chunk = min(cfg.chunks.x_col_chunk, n_cols)
@@ -112,8 +95,6 @@ def _write_dense_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCon
     )
     set_array_attrs(zarr_arr)
 
-    # Blocks match the write grid (shard shape when sharded, else chunk shape), so every
-    # write covers a whole, disjoint block — no read-modify-write, no synchronisation needed.
     block_row, block_col = write_grid(zarr_arr)
     backed = is_backed(matrix)  # h5py-backed dense isn't thread-safe: force a serial pass
     blocks = [(r0, r1, c0, c1) for r0, r1 in band_plan(n_rows, block_row) for c0, c1 in band_plan(n_cols, block_col)]

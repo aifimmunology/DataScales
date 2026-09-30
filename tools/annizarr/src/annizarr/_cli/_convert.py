@@ -15,7 +15,7 @@ from annizarr._cli._args import (
     add_overwrite_arg,
     build_config,
 )
-from annizarr._config import IOConfig
+from annizarr._core._config import IOConfig
 
 _LOG = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
 
 
 def _run(args: argparse.Namespace) -> int:
-    from annizarr._ops import convert
+    from annizarr.ops import convert
 
     if args.obs_columns and len(args.inputs) < 2:
         args._parser.error("--obs-columns requires at least two inputs")

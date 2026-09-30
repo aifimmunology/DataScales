@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 from _builders import make_adata, make_h5ad
-from annizarr._ic import Repo
-from annizarr._ops import add_expr, append, convert_h5ad, sort
 from annizarr._storage import open_input_group
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
+from annizarr.ic import Repo
+from annizarr.ops import add_expr, append, convert_h5ad, sort
 
 _CHUNKS = ChunkConfig(x_row_chunk=16, x_col_chunk=4, sparse_flat_chunk=64)
 

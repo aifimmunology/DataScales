@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 from typing import TYPE_CHECKING
 
-from annizarr._config import ChunkConfig, apply_cli_overrides, load_config
+from annizarr._core._config import ChunkConfig, apply_cli_overrides, load_config
 
 if TYPE_CHECKING:
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
 
 
 def add_config_arg(parser: argparse.ArgumentParser) -> None:

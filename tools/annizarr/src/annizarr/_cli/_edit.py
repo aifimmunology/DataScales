@@ -23,10 +23,8 @@ _LOG = logging.getLogger(__name__)
 def add_add_expr_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = subparsers.add_parser("add-expr", help="Add a log-normalized expression layer derived from CSR X")
     p.add_argument("store", metavar="STORE")
-    # defaults below are literals, not derived from annizarr._ops._expr.add_expr's signature
-    # at parser-build time: that module imports numpy/zarr, and _build_parser() constructs
-    # every subcommand's parser on every invocation (even --version) — keep them in sync by
-    # hand with add_expr's `fmt`/`layer`/`chunk_elems`/`target_sum` defaults.
+    # defaults below are literals, kept in sync by hand with add_expr's signature: importing
+    # it here would pull in numpy/zarr on every CLI invocation, even --version.
     p.add_argument(
         "--format",
         dest="format",
@@ -48,7 +46,7 @@ def add_add_expr_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
 
 def _run_add_expr(args: argparse.Namespace) -> int:
-    from annizarr._ops import add_expr
+    from annizarr.ops import add_expr
 
     cfg = build_config(args)
     result = add_expr(
@@ -86,7 +84,7 @@ def add_rechunk_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 
 def _run_rechunk(args: argparse.Namespace) -> int:
-    from annizarr._ops import rechunk
+    from annizarr.ops import rechunk
 
     cfg = build_config(args)
     result = rechunk(
@@ -122,7 +120,7 @@ def add_sort_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def _run_sort(args: argparse.Namespace) -> int:
-    from annizarr._ops import sort
+    from annizarr.ops import sort
 
     cfg = build_config(args)
     result = sort(args.store, output=args.output, by=args.sort_by, cfg=cfg, branch=args.branch, message=args.message)
@@ -160,7 +158,7 @@ def add_append_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
 
 def _run_append(args: argparse.Namespace) -> int:
-    from annizarr._ops import append, plan_append
+    from annizarr.ops import append, plan_append
 
     cfg = build_config(args)
     plan = plan_append(args.store, cells=args.cells)

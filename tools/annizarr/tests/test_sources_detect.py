@@ -11,9 +11,9 @@ import zarr
 
 from _builders import make_adata, make_h5ad
 from _readable import assert_anndata_readable
-from annizarr._ops import convert
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
 from annizarr.errors import ConversionError
+from annizarr.ops import convert
 from annizarr.sources import Source, detect_format, open_source, register_source
 
 # ---------------------------------------------------------------------------

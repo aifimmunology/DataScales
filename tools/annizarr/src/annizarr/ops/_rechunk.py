@@ -4,14 +4,14 @@ from typing import TYPE_CHECKING, Any
 
 import zarr
 
-from annizarr._config import AppConfig, load_config, resolve_backend_cfg
-from annizarr._layout import dense_shards, write_grid
-from annizarr._ops._result import OpResult
-from annizarr._runtime import configure_runtime, run_parallel, stage
+from annizarr._core._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._core._layout import dense_shards, write_grid
+from annizarr._core._runtime import configure_runtime, run_parallel, stage
+from annizarr._core._zarr import get_group, shape_attr
 from annizarr._storage import check_output_target, open_input_group, open_output_store, store_name
 from annizarr._writers._encoding import sparse_shards, suppress_autoshard_warning
-from annizarr._zarr import get_group, shape_attr
 from annizarr.errors import ConversionError
+from annizarr.ops._result import OpResult
 
 if TYPE_CHECKING:
     from annizarr.typing import PathLike
@@ -67,7 +67,6 @@ def rechunk(
     configure_runtime(cfg.chunks.cpus)
     src = open_input_group(store)
 
-    # validate the target before touching (or overwriting) the output
     matrix_keys = ["X"]
     if "layers" in src:
         matrix_keys += [f"layers/{k}" for k in get_group(src, "layers")]
@@ -88,7 +87,6 @@ def rechunk(
                 for key in _SMALL_ELEMS:
                     if key in src:
                         write_elem(dst, key, read_elem(src[key]))
-                # obsm/obsp scale with n_obs — stream arrays and sparse groups, chunks preserved
                 for key in ("obsm", "obsp"):
                     if key not in src:
                         continue
@@ -138,7 +136,7 @@ def _matrix_shape(node: Any) -> tuple[int, int]:
 
 
 def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk: bool) -> None:
-    from annizarr import _layout
+    from annizarr._core import _layout
 
     parent_path, _, name = key.rpartition("/")
     parent = dst_root[parent_path] if parent_path else dst_root
@@ -164,16 +162,13 @@ def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk:
             overwrite=True,
         )
         out.attrs.update(dict(node.attrs))
-        # aligned to the array's write grid, read off `out` as created (not recomputed from
-        # config): shards if sharded, else chunks
         block_row, block_col = write_grid(out)
         jobs = [
             (node, out, r0, min(r0 + block_row, n_rows), c0, min(c0 + block_col, n_cols))
             for r0 in range(0, n_rows, block_row)
             for c0 in range(0, n_cols, block_col)
         ]
-        # cap in-flight blocks: peak RSS ~ workers x block, budgeted at ~2 GiB
-        block_bytes = block_row * block_col * node.dtype.itemsize
+        block_bytes = block_row * block_col * node.dtype.itemsize  # cap in-flight RSS to ~2 GiB
         workers = max(1, min(cfg.chunks.cpus, (2 << 30) // max(1, block_bytes)))
         run_parallel(_copy_block, jobs, workers)
         return
@@ -184,9 +179,8 @@ def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk:
     g = parent.require_group(name)
     g.attrs.update(dict(node.attrs))
     nnz = int(node["data"].shape[0])
-    # rechunk=True: a freshly-chosen flat chunk, auto-sharded per cfg like any array this op
-    # creates. rechunk=False (copy-as-is, e.g. obsm/obsp or an untouched matrix_key): preserve
-    # the source's own chunk AND shard shape exactly, so a copy never silently drops sharding.
+    # rechunk=False (copy-as-is) preserves the source's exact chunk+shard shape, so a copy
+    # never silently drops sharding.
     if rechunk:
         flat = min(cfg.chunks.sparse_flat_chunk, max(1, nnz))
         out_shards = sparse_shards(cfg.chunks.auto_shard)
@@ -206,7 +200,6 @@ def _copy_matrix(node: Any, dst_root: Any, key: str, cfg: AppConfig, *, rechunk:
                 overwrite=True,
             )
         out.attrs.update(dict(src_a.attrs))
-        # aligned to the OUTPUT array's write grid, read off `out` as created
         step = write_grid(out)[0]
         seg = max(1, _layout.BATCH_BYTES // (step * src_a.dtype.itemsize)) * step
         flat_jobs = [(src_a, out, s0, min(s0 + seg, nnz)) for s0 in range(0, nnz, seg)]

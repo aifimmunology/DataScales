@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 
@@ -9,9 +10,9 @@ import anndata as ad
 import pytest
 
 from _builders import make_adata, make_h5ad, make_store
-from annizarr._ops import convert_h5ad, sort
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
 from annizarr.errors import ConversionError
+from annizarr.ops import convert_h5ad, sort
 
 _CHUNKS = ChunkConfig(x_row_chunk=16, x_col_chunk=4, sparse_flat_chunk=64)
 
@@ -49,7 +50,8 @@ def _fail_open_store_replace_on_call(monkeypatch: pytest.MonkeyPatch, n: int) ->
 def test_convert_failure_or_interrupt_leaves_no_target_and_no_tmp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import annizarr._ops._convert as _convert_mod
+    # annizarr.ops._convert (the name) is shadowed by the convert function; fetch the module via sys.modules.
+    _convert_mod = importlib.import_module("annizarr.ops._convert")
 
     def _interrupt(*_a: object, **_kw: object) -> None:
         raise KeyboardInterrupt
@@ -80,7 +82,8 @@ def test_convert_overwrite_failing_rerun_keeps_old_store_then_successful_rerun_r
     convert_h5ad(str(h5), output=str(out), cfg=_cfg())
     old_n_obs = ad.read_zarr(str(out)).n_obs
 
-    import annizarr._ops._convert as _convert_mod
+    # annizarr.ops._convert (the name) is shadowed by the convert function; fetch the module via sys.modules.
+    _convert_mod = importlib.import_module("annizarr.ops._convert")
 
     monkeypatch.setattr(_convert_mod, "write_adata", _boom)
     with pytest.raises(RuntimeError, match="boom"):
@@ -138,7 +141,7 @@ def test_sort_temp_buckets_cleaned_up_on_success_and_failure(tmp_path: Path, mon
     assert not list(tmp_path.glob("annizarr_sort_*"))
     assert not list(tmp_path.glob("sorted.zarr.tmp-*"))
 
-    import annizarr._sorting as _sorting_mod
+    import annizarr._core._sorting as _sorting_mod
 
     monkeypatch.setattr(_sorting_mod, "_write_concatenated_csr", _boom)
     sorted_out2 = tmp_path / "sorted2.zarr"
@@ -152,8 +155,9 @@ def test_sort_temp_buckets_cleaned_up_on_success_and_failure(tmp_path: Path, mon
 
 def test_convert_icechunk_failure_leaves_no_extra_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("icechunk")
-    import annizarr._ops._convert as _convert_mod
-    from annizarr._ic import Repo
+    # annizarr.ops._convert (the name) is shadowed by the convert function; fetch the module via sys.modules.
+    _convert_mod = importlib.import_module("annizarr.ops._convert")
+    from annizarr.ic import Repo
 
     monkeypatch.setattr(_convert_mod, "write_adata", _boom)
 

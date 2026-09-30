@@ -32,9 +32,7 @@ def canonical_location(path: PathLike) -> str:
 
 
 def is_readonly_path(path: PathLike) -> bool:
-    # os.access(W_OK) reports False on read-only mounts even for root; a path that
-    # doesn't exist yet is judged by its nearest existing ancestor. Remote URIs are
-    # never read-only.
+    # a path that doesn't exist yet is judged by its nearest existing ancestor
     if is_remote(path):
         return False
     probe = os.path.abspath(str(path))

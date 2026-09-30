@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from annizarr._config import resolve_backend_cfg
+from annizarr._core._config import resolve_backend_cfg
 from annizarr.config import AppConfig, IOConfig, apply_cli_overrides, load_config
 from annizarr.errors import ConversionError
 

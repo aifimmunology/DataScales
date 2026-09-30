@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from annizarr._config import AppConfig
+from annizarr._core._config import AppConfig
 from annizarr._sources._h5ad import close_backed_if_needed
 from annizarr.typing import PathLike
 
@@ -17,19 +17,7 @@ __all__ = ["Loader", "Sniffer", "Source"]
 
 @dataclass(frozen=True, slots=True)
 class Source:
-    """An opened conversion input, ready to write.
-
-    Parameters
-    ----------
-    adata
-        The loaded AnnData — eager or backed, per ``kind``/``backed``.
-    kind
-        Registered source kind that produced this (e.g. ``"h5ad"``, ``"10x"``, ``"anndata"``).
-    backed
-        Whether ``adata`` is backed (HDF5-streamed) rather than fully in memory.
-    warnings
-        Non-fatal notes collected while loading (e.g. a format conversion).
-    """
+    """An opened conversion input, ready to write."""
 
     adata: AnnData
     kind: str

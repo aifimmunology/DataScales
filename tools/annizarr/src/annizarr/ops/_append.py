@@ -7,17 +7,17 @@ import numpy as np
 import zarr
 from anndata.io import read_elem
 
-from annizarr import _layout
-from annizarr._config import load_config
-from annizarr._ops._expr import lognorm_band, target_sum_attr
-from annizarr._ops._result import AppendPlan, OpResult
-from annizarr._runtime import configure_runtime, run_parallel, stage
+from annizarr._core import _layout
+from annizarr._core._config import load_config
+from annizarr._core._runtime import configure_runtime, run_parallel, stage
+from annizarr._core._zarr import as_array, as_group, get_array, get_group, shape_attr, str_attr, str_list_attr
 from annizarr._storage import open_input_group, open_store_rw, store_name
-from annizarr._zarr import as_array, as_group, get_array, get_group, shape_attr, str_attr, str_list_attr
 from annizarr.errors import ConversionError
+from annizarr.ops._expr import lognorm_band, target_sum_attr
+from annizarr.ops._result import AppendPlan, OpResult
 
 if TYPE_CHECKING:
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
     from annizarr.typing import PathLike
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,7 @@ def append(
     Extends X and obs only. Derived obs-aligned elements on the store (obsm embeddings,
     obsp graphs, layers) are invalidated by new cells; :func:`plan_append` is called first,
     and if it would drop anything this raises unless ``drop_derived=True`` (re-derive
-    layers afterwards with :func:`~annizarr._ops._expr.add_expr`). With ``extend_layers``,
+    layers afterwards with :func:`~annizarr.ops._expr.add_expr`). With ``extend_layers``,
     CSR layers created by add-expr (recorded target_sum, X's exact sparsity) are extended
     in place instead — the lognorm transform runs on the appended cells only.
 
@@ -234,7 +234,6 @@ def append(
 
 
 def _check_obs_schema(obs_t: zarr.Group, obs_s: zarr.Group) -> None:
-    # column-level schema equality at the zarr encoding level — no full obs read
     cols_t = str_list_attr(obs_t, "column-order")
     cols_s = str_list_attr(obs_s, "column-order")
     if cols_t != cols_s:
@@ -257,8 +256,7 @@ def _check_obs_schema(obs_t: zarr.Group, obs_s: zarr.Group) -> None:
             t_grp, s_grp = as_group(t), as_group(s)
             cat_t = np.asarray(get_array(t_grp, "categories")[:])
             cat_s = np.asarray(get_array(s_grp, "categories")[:])
-            # codes are positional, so categories must match in value AND order —
-            # anything less silently remaps the appended labels
+            # codes are positional: mismatched categories/order would silently remap labels
             if (
                 bool(t_grp.attrs.get("ordered", False)) != bool(s_grp.attrs.get("ordered", False))
                 or len(cat_t) != len(cat_s)
@@ -285,15 +283,9 @@ def _check_obs_schema(obs_t: zarr.Group, obs_s: zarr.Group) -> None:
 
 
 def _count_duplicate_names(obs_t: zarr.Group, obs_s: zarr.Group, n_t: int) -> int:
-    # a cells-store row is a duplicate if its name already occurs in the target OR it
-    # repeats an earlier row of the cells store — counted once per row (not once per
-    # colliding pair), so a name that is both already in the target AND repeated within
-    # the cells store isn't counted twice. n_duplicate_names == n_new means every appended
-    # cell is already present — plan_append raises on that.
+    # counted once per row, not once per colliding pair
     idx_s = np.asarray(get_array(obs_s, str_attr(obs_s, "_index"))[:])
 
-    # stable sort groups equal names together in original-position order, so within each
-    # group every position but the first (in the group) repeats an earlier cells-store row.
     order = np.argsort(idx_s, kind="stable")
     repeats_earlier = np.zeros(len(idx_s), dtype=bool)
     if len(idx_s) > 1:
@@ -338,9 +330,7 @@ def _append_arrays(
 
 
 def _extend_flat(dst_a: Any, src_a: Any, off: int, n_src: int, cpus: int) -> None:
-    # resizes dst by n_src and copies src[:n_src] to dst[off:]; after the seam, cuts land on
-    # dst's write-grid multiples (shard if sharded, else chunk), so segments are disjoint
-    # whole-shard/chunk writes (threaded, no RMW)
+    # after the seam, cuts land on dst's write-grid multiples (no read-modify-write).
     dst_a.resize((off + n_src,))
     grid0 = _layout.write_grid(dst_a)[0]
     step = max(grid0, (_layout.BATCH_BYTES // max(1, grid0 * dst_a.dtype.itemsize)) * grid0)
@@ -365,10 +355,7 @@ def _rewrite_indptr(parent: Any, indptr_t: Any, indptr_s: Any, n_new: int) -> No
 
 
 def _extendable_layers(layers: Any, keys: list[str], indptr_t: Any) -> tuple[list[str], list[str]]:
-    # (extendable, mismatched); extendable = CSR with add-expr's recorded target_sum and
-    # X's exact sparsity (indptr identical), so extension is a shifted copy of X's new
-    # indices + the lognorm transform on the new cells' data. Mismatched carry the attr but
-    # a different sparsity — extending would corrupt them.
+    # a sparsity mismatch goes to `bad` instead — extending it in place would corrupt it.
     ext, bad = [], []
     for k in keys:
         node = layers[k]
@@ -387,17 +374,13 @@ def _extendable_layers(layers: Any, keys: list[str], indptr_t: Any) -> tuple[lis
 def _extend_lognorm_layers(
     root: Any, x_s: Any, keys: list[str], indptr_t: Any, indptr_s: Any, n_new: int, n_vars: int, cfg: AppConfig
 ) -> None:
-    # indices shift-copy from the cells store's X (identical sparsity), indptr is
-    # value-identical to X's appended indptr, and data gets the lognorm transform over
-    # the new cells only — no old row is read or rewritten
     nnz_t, nnz_s = int(indptr_t[-1]), int(indptr_s[-1])
     row_nnz_s = np.diff(indptr_s)
     n_s = len(row_nnz_s)
     row_step = max(1_000, min(200_000, _layout.BATCH_BYTES // (max(1, nnz_s // max(1, n_s)) * 12)))
     for k in keys:
         g = root["layers"][k]
-        # eligibility (_extendable_layers) already checked this attr is present, under either key
-        target_sum = target_sum_attr(g.attrs)
+        target_sum = target_sum_attr(g.attrs)  # eligibility already checked this is present
         assert target_sum is not None
         with stage(f"Extending layers/{k} ({n_s} cells, nnz={nnz_s})"):
             _extend_flat(g["indices"], x_s["indices"], nnz_t, nnz_s, cfg.chunks.cpus)
@@ -412,7 +395,6 @@ def _extend_lognorm_layers(
 
 
 def _append_obs(obs_t: Any, obs_s: Any, n_t: int, n_new: int) -> None:
-    # extends each obs column in place — O(cells store) memory, no target rewrite
     pairs = [(c, c) for c in obs_t.attrs["column-order"]]
     pairs.append((obs_t.attrs["_index"], obs_s.attrs["_index"]))
     for name_t, name_s in pairs:

@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from annizarr._ic._head import HEAD_FILE
 from annizarr._storage import is_remote
 from annizarr.errors import RepoError
+from annizarr.ic._head import HEAD_FILE
 
 BAND_BYTES = 128 * 1024**2
 
@@ -26,9 +26,7 @@ def check_copyable(src: str, dst: str) -> None:
 
 
 def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
-    # local->local uses shutil; anything involving s3:// goes through boto3 with
-    # credentials from the environment. The local HEAD file is never copied; callers
-    # run check_copyable() first and make sure dst is a fresh location.
+    # local HEAD file is never copied; callers run check_copyable() first.
     if not (is_remote(src) or is_remote(dst)):
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns(HEAD_FILE), dirs_exist_ok=True)
         return

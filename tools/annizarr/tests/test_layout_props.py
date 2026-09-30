@@ -7,8 +7,8 @@ import pandas as pd
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from annizarr._layout import band_plan, dense_shards
-from annizarr._sorting import compute_sort
+from annizarr._core._layout import band_plan, dense_shards
+from annizarr._core._sorting import compute_sort
 from annizarr._storage._uri import bucket_prefix, canonical_location, is_remote, scheme, store_name
 
 _DIM = st.integers(min_value=1, max_value=500)

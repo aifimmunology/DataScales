@@ -9,13 +9,13 @@ import numpy as np
 import scipy.sparse as sp
 import zarr
 
-from annizarr import _layout
-from annizarr._layout import write_grid, x_compressors
-from annizarr._runtime import progress, run_parallel
+from annizarr._core import _layout
+from annizarr._core._layout import write_grid, x_compressors
+from annizarr._core._runtime import progress, run_parallel
+from annizarr._core._zarr import get_array, shape_attr
 from annizarr._sources._matrix import get_indptr, is_backed
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._workers import _copy_sparse_segment
-from annizarr._zarr import get_array, shape_attr
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
@@ -24,19 +24,11 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
 
 
 def flat_segments(nnz_total: int, step: int, bytes_per_nnz: int) -> list[tuple[int, int]]:
-    """Split ``[0, nnz_total)`` into ``step``-aligned segments (the last one ragged).
-
-    ``step`` must be the output arrays' write grid (:func:`~annizarr._layout.write_grid`:
-    the shard length when sharded, else the chunk length) — not the raw configured chunk
-    size, which would under-align a sharded array and let two tasks share a shard. Segment
-    size is ``k * step`` with ``k`` chosen so each segment holds about ``_layout.BATCH_BYTES``.
-    Every segment covers whole write-grid steps, so parallel writers never share one and no
-    read-modify-write happens.
-    """
+    # step is the output's write grid (not the raw chunk size), so segments never share one
     if nnz_total <= 0:
         return []
     seg = max(1, _layout.BATCH_BYTES // max(1, step * bytes_per_nnz)) * step
@@ -53,29 +45,16 @@ def _write_flat_segment(
     indices_dtype: Any,
     tick: Callable[[], None],
 ) -> None:
-    # data/indices are already flat, output-ordered arrays (write_matrix converts the
-    # matrix to the target format before calling in), so s0:s1 is a straight copy; the
-    # range is flat_chunk-aligned, so this write never shares a chunk with another task
     data_arr[s0:s1] = data[s0:s1]
     indices_arr[s0:s1] = np.asarray(indices[s0:s1], dtype=indices_dtype)
     tick()
 
 
 def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig, csr: bool) -> None:
-    # reads indptr upfront (small, ~8B per row/col) to know exact output offsets. In-memory
-    # scipy sparse already matches the output format by the time this is called (write_matrix
-    # converts beforehand), so its .data/.indices ARE the output's flat arrays — a thread pool
-    # writes them in flat_chunk-aligned segments. Backed _CSRDataset/_CSCDataset is the same
-    # format as the output too, so its data/indices map 1:1 to the output — workers flat-copy
-    # chunk-aligned nnz segments in parallel processes (h5py is not thread-safe, but
-    # independent process handles are).
     n_rows, n_cols = matrix.shape
-    # CSR iterates over rows; CSC iterates over columns.
     n_major = n_rows if csr else n_cols
 
-    # indptr is small (~8B per row); load fully to compute exact offsets.
-    # Backed _CSRDataset/_CSCDataset doesn't expose .indptr directly — read from
-    # the underlying h5py group instead.
+    # backed _CSRDataset/_CSCDataset doesn't expose .indptr directly — read the h5py group.
     if sp.issparse(matrix):
         indptr_full = np.asarray(matrix.indptr)
     elif hasattr(matrix, "indptr"):
@@ -122,21 +101,17 @@ def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCo
     for a in (data_arr, indices_arr, indptr_arr):
         set_array_attrs(a)
 
-    # indptr is small — write it directly.
     indptr_arr[:] = indptr_full
 
     bytes_per_nnz = np.dtype(matrix.dtype).itemsize + np.dtype(indices_dtype).itemsize
-    # aligned to the arrays' write grid: shards if auto-sharded, else chunks
     step = write_grid(data_arr)[0]
 
     if backed:
         from zarr.storage import LocalStore
 
-        # Flat-copy write-grid-aligned nnz segments in parallel processes. Segments are
-        # multiples of the write grid step, so each shard/chunk is owned by exactly one worker.
+        # h5py is not thread-safe, so backed segments copy in worker processes instead.
         src = matrix.group
         store = data_arr.store_path.store
-        # the process-pool workers re-open the store by filesystem path (see _workers.py)
         assert isinstance(store, LocalStore), "backed sparse write requires a local zarr store"
         out_root = store.root
         jobs = [
@@ -164,10 +139,6 @@ def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCo
 
 
 def _sparse_source(matrix: Any) -> tuple[Any, Any, NDArray[np.int64], tuple[int, int], Any]:
-    # matrix is either a zarr.Group (an existing store's on-disk sparse X/layer, e.g.
-    # add_expr's source) or a backed anndata _CSRDataset/_CSCDataset (h5py-backed convert
-    # input) — the latter exposes no public .data/.indices, only .group (the underlying
-    # h5py group) and get_indptr's .indptr. Returns (data, indices, indptr, shape, dtype).
     if isinstance(matrix, zarr.Group):
         data = get_array(matrix, "data")
         indices = get_array(matrix, "indices")
@@ -178,8 +149,6 @@ def _sparse_source(matrix: Any) -> tuple[Any, Any, NDArray[np.int64], tuple[int,
 
 
 def _local_tmp_dir(group: zarr.Group) -> str | None:
-    # bucket temp files sit next to a local store (same filesystem, cheap memmap);
-    # fall back to the system tmp dir for a non-local (e.g. icechunk) store.
     from zarr.storage import LocalStore
 
     store = group.store_path.store
@@ -195,48 +164,7 @@ def write_transposed_sparse(
     row_scale: NDArray[np.float64] | None = None,
     target: Literal["csc", "csr"],
 ) -> zarr.Group:
-    """Stream a row-major (CSR) or column-major (CSC) sparse source into the other axis.
-
-    Two passes, both bounded to ``_layout.BATCH_BYTES`` per band, so the source and the
-    output are each read/written a band at a time — the whole matrix is never
-    materialised. Pass 1 histograms ``indices`` into the target major axis to get its
-    ``indptr``. Pass 2 re-reads the source in source-major bands, buckets each entry's
-    (source position, target position, value) into disk-backed temp files sized per
-    target band; each band is then sorted by target position (stable, so ties keep the
-    source-ascending append order — canonical CSR/CSC) and written to its slice of the
-    output.
-
-    Used for a backed CSR X/layer targeted at ``csc`` output, a backed CSC X/layer
-    targeted at ``csr`` output (:func:`annizarr._writers._adata.write_matrix`), and
-    ``add_expr``'s CSR X → lognormalized ``csc`` layer (with ``row_scale``).
-
-    Parameters
-    ----------
-    group
-        Parent group the new sparse group is created under.
-    key
-        Child group name.
-    matrix
-        Row-major source when ``target="csc"``, column-major source when
-        ``target="csr"``: a backed anndata sparse dataset, or a zarr ``Group`` holding
-        ``data``/``indices``/``indptr`` (e.g. an existing store's ``X``).
-    cfg
-        Resolved configuration; ``cfg.chunks.sparse_flat_chunk`` sizes the output's flat
-        chunks (and the pass-1 read batch).
-    row_scale
-        Optional per-source-major-unit multiplicative factor (length = the source's
-        major axis — rows, since this is only meaningful for a CSR source). When given,
-        each value is written as ``log1p(value * row_scale[unit])`` — what
-        ``add_expr``'s lognorm layer needs — instead of copied as-is.
-    target
-        Output layout: ``"csc"`` for a CSR source, ``"csr"`` for a CSC source.
-
-    Returns
-    -------
-    zarr.Group
-        The newly written sparse group (encoding attrs already set); callers may add
-        further attrs (e.g. a target-sum) before the store is finalized.
-    """
+    # two BATCH_BYTES-bounded passes so the whole matrix is never materialised.
     data_src, idx_src, indptr_src, (n_rows, n_cols), src_dtype = _sparse_source(matrix)
     n_source_major = n_rows if target == "csc" else n_cols
     n_target_major = n_cols if target == "csc" else n_rows
@@ -247,8 +175,6 @@ def write_transposed_sparse(
     indices_dtype = np.int32  # source-major positions in the output; matches scipy's default
     indptr_dtype = np.int64 if nnz > np.iinfo(np.int32).max else np.int32
 
-    # Pass 1: histogram source `indices` (already target-major positions) into the
-    # target axis's indptr. Reads only `indices`, in BATCH_BYTES-ish flat batches.
     target_nnz = np.zeros(n_target_major, dtype=np.int64)
     flat_step = max(cfg.chunks.sparse_flat_chunk, _layout.BATCH_BYTES // 8)
     for s0 in range(0, nnz, flat_step):
@@ -256,8 +182,6 @@ def write_transposed_sparse(
         target_nnz += np.bincount(np.asarray(idx_src[s0:s1]), minlength=n_target_major)
     target_indptr = np.concatenate([[0], np.cumsum(target_nnz)]).astype(np.int64)
 
-    # Target bands sized so one band's bucket triple (source pos + target pos + value,
-    # plus the argsort index at write time) stays within BATCH_BYTES.
     bytes_per_entry = value_dtype.itemsize + 16
     max_band_nnz = max(1, _layout.BATCH_BYTES // bytes_per_entry)
     edges = [0]
@@ -268,7 +192,6 @@ def write_transposed_sparse(
     n_bands = len(edges) - 1
     band_nnz = [int(target_indptr[edges[i + 1]] - target_indptr[edges[i]]) for i in range(n_bands)]
 
-    # Source bands sized off the average source-major density, same BATCH_BYTES budget.
     bytes_per_source_unit = max(1, nnz // max(1, n_source_major)) * 12
     source_step = max(1_000, min(200_000, _layout.BATCH_BYTES // bytes_per_source_unit))
 
@@ -350,10 +273,7 @@ def write_transposed_sparse(
                 continue
             order = np.argsort(np.asarray(buckets[bi]["tgt"][:m]), kind="stable")
             o0, o1 = int(target_indptr[edges[bi]]), int(target_indptr[edges[bi + 1]])
-            # o0/o1 are nnz-derived, not aligned to the write grid (shard or chunk), so a
-            # boundary shard/chunk can get a read-modify-write from each of its two adjacent
-            # bands; this loop is serial (no concurrent writers), so that RMW is a perf cost
-            # bounded to one write-grid step per band, never a correctness risk.
+            # not write-grid aligned, but serial (no concurrent writers): a bounded perf cost.
             data_arr[o0:o1] = np.asarray(buckets[bi]["val"][:m])[order]
             indices_arr[o0:o1] = np.asarray(buckets[bi]["src"][:m])[order].astype(indices_dtype)
     finally:

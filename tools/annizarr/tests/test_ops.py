@@ -11,9 +11,9 @@ import zarr
 # the bare module name "conftest", and tests/ic/conftest.py collides with tests/conftest.py
 # depending on collection order — so the shared helper lives in its own uniquely-named module.
 from _readable import assert_anndata_readable
-from annizarr._ops import add_expr, append, convert_h5ad, rechunk, sort
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
 from annizarr.errors import ConversionError, StorageError
+from annizarr.ops import add_expr, append, convert_h5ad, rechunk, sort
 
 
 def _cfg(**io):
@@ -122,7 +122,7 @@ def test_add_expr_empty_rows_and_genes(tmp_path):
 def test_add_expr_multiband(tmp_path, monkeypatch):
     # tiny band budget → many column bands + multiple row batches, exercising the
     # bucket cursors and band-edge math the default 256 MB budget never hits in tests
-    monkeypatch.setattr("annizarr._layout.BATCH_BYTES", 600)
+    monkeypatch.setattr("annizarr._core._layout.BATCH_BYTES", 600)
     adata = _adata(n=1200, v=12, seed=4)
     for fmt in ("csc", "dense"):
         out = _store(tmp_path, adata, f"mb-{fmt}.zarr")
@@ -373,8 +373,8 @@ def test_append_extend_layers_guards(tmp_path, caplog):
 
 
 def test_plan_append(tmp_path):
-    from annizarr._ops import plan_append
-    from annizarr._ops._expr import introspect_gexp
+    from annizarr.ops import plan_append
+    from annizarr.ops._expr import introspect_gexp
 
     a, b = _adata(n=30, seed=0), _adata(n=12, seed=1)
     sa = _store(tmp_path, a, "a.zarr")

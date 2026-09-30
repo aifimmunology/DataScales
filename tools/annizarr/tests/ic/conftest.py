@@ -55,7 +55,7 @@ def mirror(src_zarr, tmp_path, monkeypatch):
     Stands in for a read-only mirror of an s3:// prefix — reads go to the copy, writes
     to the origin passed explicitly. HEAD sidecars go under tmp_path/home.
     """
-    from annizarr._ic import Repo
+    from annizarr.ic import Repo
 
     path, _ = src_zarr
     origin = tmp_path / "origin.icechunk"

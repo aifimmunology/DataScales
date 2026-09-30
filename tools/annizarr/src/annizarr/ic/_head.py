@@ -16,11 +16,9 @@ def home_dir() -> Path:
 
 
 class HeadStore:
-    # HEAD is an annizarr concept (icechunk has no notion of a current branch), stored
-    # locally like git's .git/HEAD: a writable local repo keeps an annizarr_head file at
-    # its root (moves with the dir); anything else (read-only path, s3:///gs:// URI) uses
-    # a per-user sidecar under $ANNIZARR_HOME/heads/, keyed by the canonical location.
-    # `in_repo_dir` selects the first form; pass None and `key` for the sidecar form.
+    """Persists the current branch ("HEAD") locally, like git's .git/HEAD, since icechunk
+    itself has no notion of one: `in_repo_dir` for a writable local repo (an annizarr_head
+    file at its root), else a per-user sidecar under `$ANNIZARR_HOME/heads/` keyed by `key`."""
 
     def __init__(self, *, key: str, in_repo_dir: str | None = None) -> None:
         self.key = key

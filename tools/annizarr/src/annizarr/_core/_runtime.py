@@ -16,12 +16,7 @@ _BLAS_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
 
 
 def pin_blas() -> None:
-    """Pin every BLAS/OpenMP thread env var to 1 unless the caller already set it.
-
-    Guards against thread oversubscription (thread-pool/process-pool workers x BLAS threads):
-    must run before numpy/scipy/blosc are imported, since OpenBLAS reads these once at
-    import time.
-    """
+    # must run before numpy/scipy/blosc import: OpenBLAS reads these env vars once, at import.
     for var in _BLAS_VARS:
         os.environ.setdefault(var, "1")
 
@@ -30,14 +25,6 @@ _configured = False
 
 
 def configure_runtime(cpus: int) -> None:
-    """Pin BLAS threads and size zarr's dispatch/decode pools, once per process.
-
-    Parameters
-    ----------
-    cpus
-        Requested worker count; zarr's thread pool is sized to at least this and the
-        physical core count, whichever is larger.
-    """
     global _configured
     if _configured:
         return
@@ -45,6 +32,7 @@ def configure_runtime(cpus: int) -> None:
     import zarr
 
     pin_blas()
+    # both zarr knobs: async.concurrency only dispatches fetches, max_workers runs decompression.
     workers = max(cpus, os.cpu_count() or 1)
     zarr.config.set({"async.concurrency": 64, "threading.max_workers": workers})
 
@@ -56,22 +44,7 @@ def run_parallel(
     *,
     mode: Literal["threads", "processes"] = "threads",
 ) -> None:
-    """Run ``worker(*job)`` for each job in ``jobs`` in a pool (``cpus > 1``) or inline,
-    cancelling not-yet-started jobs and re-raising as soon as one worker fails.
-
-    Parameters
-    ----------
-    worker
-        Callable invoked as ``worker(*job)`` for each entry in ``jobs``.
-    jobs
-        Positional-argument tuples, one per unit of work.
-    cpus
-        Pool size; ``<= 1`` (or a single job) runs inline, skipping pool spawn overhead.
-    mode
-        ``"processes"`` for backed inputs (h5py is not thread-safe, but independent
-        read-only file handles across processes are); ``"threads"`` (default) for
-        zarr-to-zarr copies, where blosc codecs release the GIL.
-    """
+    # mode="processes" for backed inputs (h5py is not thread-safe); "threads" otherwise.
     if cpus <= 1 or len(jobs) <= 1:
         for job in jobs:
             worker(*job)
@@ -85,28 +58,11 @@ def run_parallel(
             for fut in futures:
                 fut.result()
         except BaseException:
-            # a worker already failed: drop every job that hasn't started instead of
-            # draining the whole queue first.
             ex.shutdown(wait=False, cancel_futures=True)
             raise
 
 
 def progress(total: int, label: str) -> Callable[[], None]:
-    """Return a thread-safe ``tick()`` that logs ``label`` progress for a writer's tasks.
-
-    Parameters
-    ----------
-    total
-        Number of ticks expected (tasks/blocks/segments); paces the percentage-based log.
-    label
-        Text prefixed to each progress line.
-
-    Returns
-    -------
-    Callable[[], None]
-        ``tick()``; logs at INFO at most once every ~5s or every 10% of ``total``,
-        whichever comes first, plus always on the final call. Safe to call concurrently.
-    """
     lock = threading.Lock()
     step = max(1, total // 10)
     count = 0
@@ -129,7 +85,6 @@ def progress(total: int, label: str) -> Callable[[], None]:
 
 @contextmanager
 def stage(label: str) -> Iterator[None]:
-    """Log a labelled progress stage at INFO, with elapsed time on exit."""
     logger.info(f"{label} ...")
     t0 = time.perf_counter()
     try:

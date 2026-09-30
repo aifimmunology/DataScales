@@ -86,7 +86,7 @@ class ChunkConfig:
         processes when backed (h5py is not thread-safe); raise on HPC.
     x_shard_factor
         Pack this many chunks per shard along each axis of dense X (``1`` = no
-        sharding; sparse output ignores it). See :func:`annizarr._layout.dense_shards`.
+        sharding; sparse output ignores it). See :func:`annizarr._core._layout.dense_shards`.
     auto_shard
         Shard our own 1-D sparse arrays (``data``/``indices`` of X, layers, raw.X, and the
         add-expr/rechunk/sort-created ones) with zarr's ``shards="auto"``, and set
@@ -110,18 +110,7 @@ class ChunkConfig:
 
 @dataclass(frozen=True, slots=True)
 class ValidationConfig:
-    """Thresholds for :func:`annizarr._validation.validate_single_cell_anndata`.
-
-    Parameters
-    ----------
-    reject_spatial
-        Raise if spatial markers (``uns["spatial"]``, an ``obsm`` key containing
-        "spatial") are detected.
-    require_non_empty
-        Raise if ``n_obs``/``n_vars`` fall below ``min_obs``/``min_vars``.
-    min_obs, min_vars
-        Minimum observation/variable counts when ``require_non_empty`` is set.
-    """
+    """Thresholds for single-cell AnnData validation."""
 
     reject_spatial: bool = True
     require_non_empty: bool = True
@@ -131,24 +120,7 @@ class ValidationConfig:
 
 @dataclass(frozen=True, slots=True)
 class GroupingConfig:
-    """Sort + partition X by one or more obs columns, for ``convert --sort-by``.
-
-    When enabled, rows are physically sorted by ``sort_by`` (primary key first), so
-    each distinct key tuple becomes a contiguous row block. No tool-specific index is
-    written — the result is a plain sorted AnnData; a downstream reader derives the
-    ranges from the (now sorted) obs column(s) and slices ``X[start:end]`` with stock
-    anndata/zarr, no annizarr dependency. All obs-aligned arrays are reordered
-    consistently so the store stays a valid AnnData. ``convert`` only, with csr or
-    dense X; the standalone ``sort`` op takes its keys via an explicit ``by`` argument
-    instead of this config.
-
-    Parameters
-    ----------
-    enabled
-        Whether ``convert`` should sort rows by ``sort_by``.
-    sort_by
-        Obs column names, primary sort key first.
-    """
+    """Sort + partition X by one or more obs columns, for ``convert --sort-by``."""
 
     enabled: bool = False
     sort_by: tuple[str, ...] = ()
@@ -156,19 +128,7 @@ class GroupingConfig:
 
 @dataclass(frozen=True, slots=True)
 class ConcatConfig:
-    """obs-column policy for multi-file ``convert``/``concat``.
-
-    ``obs_columns`` empty (default) means strict: every input must have an
-    *identical* obs schema (same column names, same order). Non-empty validates that
-    every input contains those columns, then projects each input's obs down to
-    exactly those columns (in the given order) before concatenating; all other
-    columns are dropped.
-
-    Parameters
-    ----------
-    obs_columns
-        obs columns to keep and join on; ``()`` means strict all-match.
-    """
+    """obs-column policy for multi-file ``convert``/``concat``."""
 
     obs_columns: tuple[str, ...] = ()
 
@@ -222,17 +182,13 @@ def _validate_config(config: AppConfig) -> AppConfig:
         x_storage=_normalize_x_storage(config.io.x_storage),
         backend=_normalize_backend(config.io.backend),
     )
-    # sort_by may arrive from TOML/YAML as a list; freeze it to a tuple. A bare string
-    # ("AIFI_L1") is treated as a single key.
-    sort_by = config.grouping.sort_by
+    sort_by = config.grouping.sort_by  # may arrive as a list or bare string; freeze to a tuple
     if isinstance(sort_by, str):
         sort_by = (sort_by,)
     grouping = replace(config.grouping, sort_by=tuple(sort_by))
     if grouping.enabled and not grouping.sort_by:
         raise ValidationError("grouping.enabled is true but grouping.sort_by is empty.")
-    # obs_columns may arrive from TOML/YAML as a list (or a bare string for one column);
-    # freeze to a tuple. Empty tuple keeps the default strict all-match behavior.
-    obs_columns = config.concat.obs_columns
+    obs_columns = config.concat.obs_columns  # same TOML/YAML list-or-string freeze as sort_by
     if isinstance(obs_columns, str):
         obs_columns = (obs_columns,)
     concat = replace(config.concat, obs_columns=tuple(obs_columns))
@@ -271,26 +227,7 @@ def _merge_dataclass(base: Any, patch: dict[str, Any]) -> Any:
 
 
 def load_config(config_path: str | None = None) -> AppConfig:
-    """Load a config file and merge it over the defaults.
-
-    Parameters
-    ----------
-    config_path
-        Path to a ``.toml``/``.yaml``/``.yml`` config file; ``None`` returns the
-        default :class:`AppConfig`.
-
-    Returns
-    -------
-    AppConfig
-        Defaults merged with the file's ``[io]``/``[chunks]``/``[validation]``/
-        ``[grouping]``/``[concat]`` sections.
-
-    Raises
-    ------
-    ValidationError
-        ``config_path`` does not exist, has an unsupported extension, contains an
-        unknown top-level section or config key, or an invalid value.
-    """
+    """Load a ``.toml``/``.yaml``/``.yml`` config file and merge it over the defaults."""
     config = AppConfig()
 
     if not config_path:
@@ -351,25 +288,7 @@ def apply_cli_overrides(
     sort_by: list[str] | None = None,
     obs_columns: list[str] | None = None,
 ) -> AppConfig:
-    """Apply CLI flag overrides (``None`` = unset) onto a loaded config.
-
-    Parameters
-    ----------
-    config
-        Base configuration, typically from :func:`load_config`.
-    overwrite, consolidate_metadata, x_storage, x_row_chunk, x_col_chunk,
-    sparse_flat_chunk, x_shard_factor, auto_shard, cpus, backed, backend, sort_by, obs_columns
-        Per-field overrides; a value of ``None`` leaves the corresponding field
-        untouched. ``sort_by`` also sets ``grouping.enabled = True``. ``backed`` is
-        itself tri-state on :class:`IOConfig` (``None`` = auto-select); passing
-        ``None`` here means "don't touch it" (neither ``--backed`` nor ``--eager``
-        given), not "reset it to auto".
-
-    Returns
-    -------
-    AppConfig
-        ``config`` with the given overrides applied and re-validated.
-    """
+    """Apply CLI flag overrides (``None`` = unset) onto a loaded config."""
     io_cfg = config.io
     chunk_cfg = config.chunks
     grouping_cfg = config.grouping
@@ -381,7 +300,7 @@ def apply_cli_overrides(
         io_cfg = replace(io_cfg, consolidate_metadata=consolidate_metadata)
     if x_storage is not None:
         io_cfg = replace(io_cfg, x_storage=_normalize_x_storage(x_storage))
-    if backed is not None:
+    if backed is not None:  # None means "don't touch it" (IOConfig.backed is itself tri-state), not "reset to auto"
         io_cfg = replace(io_cfg, backed=backed)
     if backend is not None:
         io_cfg = replace(io_cfg, backend=_normalize_backend(backend))
@@ -406,32 +325,6 @@ def apply_cli_overrides(
 
 
 def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
-    """Validate and adapt a config for the chosen storage backend.
-
-    Icechunk supports multi-threaded writes against one shared session (single
-    commit), so in-process threaded paths keep ``cpus``. Only the backed-input
-    writers are rejected: they fan out to worker processes that reopen the store by
-    filesystem path, which an icechunk session can't provide (``Session.fork()`` is
-    the future path). Since icechunk never supports backed input, an unset
-    (``None``, auto-select) ``backed`` resolves to eager here rather than falling
-    through to :func:`annizarr._sources._h5ad.load_h5ad`'s file-size peek.
-
-    Parameters
-    ----------
-    cfg
-        Configuration to validate.
-
-    Returns
-    -------
-    AppConfig
-        ``cfg``, with ``io.backed`` resolved to ``False`` when the backend is
-        icechunk and it was ``None``; otherwise unchanged (validated).
-
-    Raises
-    ------
-    ConversionError
-        ``backend='icechunk'`` combined with ``backed=True``.
-    """
     from annizarr.errors import ConversionError
 
     if cfg.chunks.x_shard_factor > 1 and cfg.io.x_storage != "dense":
@@ -442,6 +335,7 @@ def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
     if cfg.io.backend == "icechunk" and cfg.io.backed is None:
         logger.info("backend='icechunk' does not support backed input; auto-selecting eager (backed=False).")
         cfg = replace(cfg, io=replace(cfg.io, backed=False))
+    # icechunk's backed writers would need Session.fork() (not available) to reopen by path
     if cfg.io.backend == "icechunk" and cfg.io.backed:
         raise ConversionError(
             "backend='icechunk' does not support --backed input yet (backed writers use "

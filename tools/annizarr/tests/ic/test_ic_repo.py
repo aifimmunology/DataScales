@@ -1,12 +1,12 @@
-"""Python-API coverage for annizarr._ic.Repo."""
+"""Python-API coverage for annizarr.ic.Repo."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from annizarr._ic import Repo
 from annizarr.errors import RepoError
+from annizarr.ic import Repo
 
 
 def test_init_imports_store_faithfully(src_zarr, repo_path):

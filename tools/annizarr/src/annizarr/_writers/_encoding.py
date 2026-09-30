@@ -41,22 +41,7 @@ def set_raw_group_attrs(group: zarr.Group) -> None:
 
 @contextmanager
 def autoshard_setting(auto_shard: bool) -> Iterator[None]:
-    """Temporarily set ``ad.settings.auto_shard_zarr_v3`` around our own ``write_elem`` calls.
-
-    Restored on exit (even on error), so the setting never leaks to the caller's process.
-    With this set, anndata's own ``write_elem`` passes ``shards="auto"`` to every array it
-    writes (obs/var columns, obsm, uns, …) and suppresses zarr's "automatic shard shape
-    inference is experimental" warning itself (``zarr_v3_sharding``/``suppress_autoshard_warning``
-    in ``anndata._io.specs.methods``) — nothing further to do here for those calls.
-
-    Parameters
-    ----------
-    auto_shard
-        Value to set. ``False`` is an explicit value, distinct from anndata's unset default
-        (``None``): either explicit value silences anndata's "autosharding will be the default"
-        warning, and ``False`` reproduces the pre-autoshard on-disk layout exactly.
-    """
-    import anndata as ad
+    import anndata as ad  # restored on exit; makes anndata's own write_elem pass shards="auto" too
 
     previous = ad.settings.auto_shard_zarr_v3
     ad.settings.auto_shard_zarr_v3 = auto_shard
@@ -68,18 +53,7 @@ def autoshard_setting(auto_shard: bool) -> Iterator[None]:
 
 @contextmanager
 def suppress_autoshard_warning(enabled: bool) -> Iterator[None]:
-    """Suppress zarr's "shard shape inference is experimental" warning, mirroring anndata's
-    own ``suppress_autoshard_warning`` decorator, around OUR OWN ``shards="auto"`` array
-    creations (the 1-D sparse ``data``/``indices`` arrays we create directly via
-    ``zarr.Group.require_array`` — anndata's ``write_elem`` is not involved, so anndata's
-    decorator never sees these calls).
-
-    Parameters
-    ----------
-    enabled
-        No-op when ``False`` (an explicit ``shards=`` — or none — should still warn if it
-        legitimately would).
-    """
+    # mirrors anndata's own decorator, for raw require_array calls it never sees
     if not enabled:
         yield
         return
@@ -89,14 +63,10 @@ def suppress_autoshard_warning(enabled: bool) -> Iterator[None]:
 
 
 def sparse_shards(auto_shard: bool) -> Any:
-    """The ``shards=`` kwarg for a 1-D sparse ``data``/``indices`` array: ``"auto"`` when
-    ``auto_shard``, else ``None`` (unsharded). Dense X/layers are never auto-sharded — they
-    keep the explicit ``x_shard_factor`` (see ``_layout.dense_shards``)."""
     return "auto" if auto_shard else None
 
 
 def make_sparse_group(parent: zarr.Group, key: str, *, csr: bool, shape: tuple[int, int]) -> zarr.Group:
-    # callers still create the data/indices/indptr child arrays themselves
     group = parent.require_group(key)
     group.attrs["encoding-type"] = CSR_ENCODING_TYPE if csr else CSC_ENCODING_TYPE
     group.attrs["encoding-version"] = SPARSE_ENCODING_VERSION

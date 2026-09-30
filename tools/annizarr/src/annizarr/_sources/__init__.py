@@ -15,7 +15,7 @@ from annizarr.errors import ConversionError
 if TYPE_CHECKING:
     from anndata import AnnData
 
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
     from annizarr.typing import PathLike
 
 __all__ = [
@@ -58,46 +58,14 @@ _LOADERS: dict[str, Loader] = {
 
 
 def register_source(kind: str, loader: Loader, *, sniffer: Sniffer | None = None) -> None:
-    """Register a loader (and optional content sniffer) for a new input kind.
-
-    Parameters
-    ----------
-    kind
-        Name under which ``loader`` is registered; pass it as ``fmt=`` to
-        :func:`open_source`, or let a registered ``sniffer`` select it automatically.
-    loader
-        Called as ``loader(path, cfg)``; must return a :class:`Source`.
-    sniffer
-        Optional content sniffer consulted by :func:`detect_format` before the builtin
-        rules; it returns ``kind`` when it recognises ``path``, else ``None``.
-    """
+    """Register a loader (and optional content sniffer) for a new input kind."""
     _LOADERS[kind] = loader
     if sniffer is not None:
         _register_sniffer(sniffer)
 
 
 def open_source(source: PathLike | AnnData, cfg: AppConfig, *, fmt: str | None = None) -> Source:
-    """Open any registered input — a path/URI or an in-memory AnnData — as a Source.
-
-    Parameters
-    ----------
-    source
-        A path/URI to detect and load, or an in-memory :class:`~anndata.AnnData`.
-    cfg
-        Resolved configuration, passed through to the selected loader.
-    fmt
-        Explicit kind, overriding content detection (ignored for an AnnData ``source``).
-
-    Returns
-    -------
-    Source
-        The opened input, ready to write; call :meth:`Source.close` when done with it.
-
-    Raises
-    ------
-    ConversionError
-        ``fmt`` (or the detected kind) is not a registered source kind.
-    """
+    """Open any registered input — a path/URI or an in-memory AnnData — as a Source."""
     import anndata as ad
 
     if isinstance(source, ad.AnnData):

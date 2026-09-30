@@ -9,22 +9,22 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from annizarr import _layout
-from annizarr._config import load_config
-from annizarr._layout import x_compressors
-from annizarr._ops._result import OpResult
-from annizarr._runtime import configure_runtime, stage
+from annizarr._core import _layout
+from annizarr._core._config import load_config
+from annizarr._core._layout import x_compressors
+from annizarr._core._runtime import configure_runtime, stage
+from annizarr._core._zarr import get_array, get_group, shape_attr
 from annizarr._storage import open_store_rw
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._sparse import _local_tmp_dir, write_transposed_sparse
-from annizarr._zarr import get_array, get_group, shape_attr
 from annizarr.errors import ConversionError
+from annizarr.ops._result import OpResult
 
 if TYPE_CHECKING:
     import zarr
     from numpy.typing import NDArray
 
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
     from annizarr.typing import PathLike, XStorage
 
 logger = logging.getLogger(__name__)
@@ -107,19 +107,8 @@ def write_expr_layer(
     target_sum: float = 1e4,
     overwrite: bool = False,
 ) -> None:
-    """Write ``layers/<layer>`` (log-normalized, derived from CSR X) into an already-open
-    store root; does not finalize it — the caller owns opening/finalizing the store (this
-    is what lets :func:`~annizarr._ops._sort.sort` re-derive a lone ``gexp`` layer on its
-    freshly-sorted output in the same commit as the sort itself).
-
-    Parameters mirror :func:`add_expr`.
-
-    Raises
-    ------
-    ConversionError
-        ``root`` has no CSR X, ``layers/<layer>`` already exists and ``overwrite`` is not
-        set, or ``fmt`` is not one of ``"csr"``, ``"csc"``, ``"dense"``.
-    """
+    # does not finalize the store — the caller owns that, so sort() can re-derive a lone
+    # gexp layer in the same commit as the sort itself.
     if fmt not in ("csc", "dense", "csr"):
         raise ConversionError(f"add-expr format must be csc, dense, or csr; got '{fmt}'.")
     if "X" not in root:
@@ -166,9 +155,8 @@ def write_expr_layer(
             cfg.chunks.auto_shard,
         )
         g["indptr"][:] = indptr.astype(indptr_dtype)
-        # row_step bands are nnz-derived, not aligned to the write grid (shard or chunk); this
-        # loop is serial (no concurrent writers), so a boundary write-grid step can get a
-        # read-modify-write, but only as a bounded perf cost, never a correctness risk.
+        # row_step isn't write-grid aligned, but this loop is serial (no concurrent writers),
+        # so a boundary read-modify-write is a bounded perf cost, never a correctness risk.
         with stage(f"Writing layers/{layer} (csr, nnz={nnz})"):
             for b0 in range(0, n_obs, row_step):
                 b1 = min(b0 + row_step, n_obs)
@@ -178,10 +166,6 @@ def write_expr_layer(
         return
 
     if fmt == "csc":
-        # Factors are computed up front, in the same row_step bands lognorm_band uses,
-        # so they match bit-for-bit what the fused per-band computation used to produce;
-        # the transpose (bucket-by-column, disk-backed, RAM bounded to one band) then
-        # lives once in _writers._sparse, shared with write_matrix's backed CSR->CSC.
         factors = _lognorm_factors(data_arr, indptr, target_sum, row_step, n_obs)
         layer_cfg = replace(cfg, chunks=replace(cfg.chunks, sparse_flat_chunk=chunk_elems))
         with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
@@ -189,10 +173,6 @@ def write_expr_layer(
         g.attrs[_TARGET_SUM_ATTR] = float(target_sum)
         return
 
-    # fmt == "dense": pass 1 counts nnz per column; pass 2 buckets entries into column
-    # bands (disk-backed, so RAM stays one band); each band then scatters into its slice
-    # of the dense array. Self-contained (not shared with the csc path above) since the
-    # final materialisation — and so the band sizing — differs from a sparse write.
     col_nnz = np.zeros(n_vars, dtype=np.int64)
     flat_step = max(chunk_elems, _layout.BATCH_BYTES // 8)
     with stage("Counting nnz per gene"):
@@ -207,7 +187,6 @@ def write_expr_layer(
     n_bands = len(edges) - 1
     band_nnz = [int(csc_indptr[edges[i + 1]] - csc_indptr[edges[i]]) for i in range(n_bands)]
 
-    # bucket temp files sit next to a local store (same filesystem); system tmp otherwise
     tmp_root = Path(tempfile.mkdtemp(prefix="annizarr_expr_", dir=_local_tmp_dir(root)))
     try:
         buckets: list[dict[str, NDArray[Any]]] = []
@@ -270,8 +249,6 @@ def write_expr_layer(
 def lognorm_band(
     data_arr: Any, indptr: NDArray[np.int64], row_nnz: NDArray[np.int64], target_sum: float, b0: int, b1: int
 ) -> tuple[int, int, NDArray[np.float32]]:
-    """Lognorm one row band of CSR data. Factors are row-local, so they fuse into the
-    transform: one pass over the band's data. Also used by append --extend-layers."""
     s0, s1 = int(indptr[b0]), int(indptr[b1])
     seg = np.asarray(data_arr[s0:s1], dtype=np.float64)
     cs = np.concatenate(([0.0], np.cumsum(seg)))
@@ -286,9 +263,7 @@ def lognorm_band(
 def _lognorm_factors(
     data_arr: Any, indptr: NDArray[np.int64], target_sum: float, row_step: int, n_obs: int
 ) -> NDArray[np.float64]:
-    """Per-row ``target_sum / row_sum`` factors, in the same ``row_step`` bands
-    :func:`lognorm_band` uses (so the sums match bit-for-bit); feeds
-    :func:`~annizarr._writers._sparse.write_transposed_sparse`'s ``row_scale``."""
+    # same row_step bands lognorm_band uses, so the sums match bit-for-bit
     factors = np.zeros(n_obs, dtype=np.float64)
     for b0 in range(0, n_obs, row_step):
         b1 = min(b0 + row_step, n_obs)
@@ -304,7 +279,6 @@ def _lognorm_factors(
 
 
 def introspect_gexp(node: Any) -> tuple[XStorage, int, float | None]:
-    # recovers (fmt, chunk_elems, target_sum) from an existing gexp layer
     import zarr
 
     target_sum = target_sum_attr(node.attrs)

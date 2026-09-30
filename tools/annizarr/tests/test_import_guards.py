@@ -39,7 +39,7 @@ def test_cli_ic_log_without_icechunk_reports_hint(
 
 def test_import_annizarr_ic_without_icechunk(monkeypatch: pytest.MonkeyPatch) -> None:
     _hide_icechunk(monkeypatch)
-    for mod in ("annizarr.ic", "annizarr._ic"):
+    for mod in ("annizarr.ic", "annizarr.ic"):
         monkeypatch.delitem(sys.modules, mod, raising=False)
 
     ic = importlib.import_module("annizarr.ic")
@@ -50,8 +50,8 @@ def test_import_annizarr_ic_without_icechunk(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_repo_copy_to_s3_without_boto3_raises_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     # check_copyable is Repo.copy's/`ic copy`'s pre-flight: no I/O, so no repo needed
-    from annizarr._ic._copy import check_copyable
     from annizarr.errors import RepoError
+    from annizarr.ic._copy import check_copyable
 
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     with pytest.raises(RepoError, match=r"annizarr\[icechunk\]"):
@@ -64,7 +64,7 @@ def test_cli_ic_copy_to_s3_without_boto3_reports_hint(
     pytest.importorskip("icechunk")  # a real repo is needed to reach the s3 destination check
     import zarr
 
-    from annizarr._ic import Repo
+    from annizarr.ic import Repo
 
     src = tmp_path / "src.zarr"
     zarr.open_group(str(src), mode="w").create_array("X", shape=(2, 2), dtype="float32", chunks=(2, 2))

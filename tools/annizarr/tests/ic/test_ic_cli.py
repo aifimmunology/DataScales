@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from annizarr._cli import main
-from annizarr._ic import Repo
+from annizarr.ic import Repo
 
 
 def test_cli_init_log_checkout_tree(src_zarr, repo_path, capsys):

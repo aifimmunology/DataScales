@@ -15,7 +15,7 @@ import zarr
 from _builders import make_adata, make_h5ad
 from _readable import assert_anndata_readable
 from annizarr._cli import main
-from annizarr._config import ChunkConfig
+from annizarr._core._config import ChunkConfig
 from annizarr._version import __version__
 
 

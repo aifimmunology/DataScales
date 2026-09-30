@@ -5,9 +5,9 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from annizarr._ic._head import HeadStore
 from annizarr._storage import canonical_location, is_readonly_path, is_remote, require_icechunk, storage_for
 from annizarr.errors import RepoError
+from annizarr.ic._head import HeadStore
 
 if TYPE_CHECKING:
     import zarr
@@ -21,8 +21,6 @@ ENV_ORIGIN = "ANNIZARR_ORIGIN"
 
 
 def _fresh_destination(location: str | Path) -> str:
-    # rejects read-only paths, non-empty local dirs, and remote prefixes that already
-    # hold a repo; creates the local parent directory
     icechunk = require_icechunk()
 
     out = str(location)
@@ -103,8 +101,6 @@ class Repo:
         else:
             raise RepoError(f"No '{DEFAULT_BRANCH}' branch in '{self.path}'")
 
-    # -- creating ------------------------------------------------------------
-
     @classmethod
     def create(cls, out_path: str | Path) -> Repo:
         """Create an EMPTY repo at a fresh, writable ``out_path`` (local dir or URI).
@@ -130,7 +126,7 @@ class Repo:
         """
         import zarr
 
-        from annizarr._ic._copy import copy_group
+        from annizarr.ic._copy import copy_group
 
         try:
             src = zarr.open_group(str(zarr_path), mode="r")
@@ -161,7 +157,7 @@ class Repo:
         ``path`` as given; nothing is written into the source. The current branch
         carries over when the copy has it.
         """
-        from annizarr._ic._copy import check_copyable, copy_repo
+        from annizarr.ic._copy import check_copyable, copy_repo
 
         dest = str(dest)
         check_copyable(self.path, dest)
@@ -174,14 +170,10 @@ class Repo:
             repo._head.save(repo._branch)
         return repo
 
-    # -- location ------------------------------------------------------------
-
     @property
     def resolved(self) -> bool:
         """True when writes go somewhere other than ``path``."""
         return self.origin is not None and canonical_location(self.origin) != canonical_location(self.path)
-
-    # -- branch state --------------------------------------------------------
 
     @property
     def branch(self) -> str:
@@ -208,8 +200,6 @@ class Repo:
         self._head.save(branch)
         tip: str = self._repo.lookup_branch(branch)
         return tip
-
-    # -- reading & writing ---------------------------------------------------
 
     def open_zarr(self, mode: str, *, snapshot_id: str | None = None, truncate: bool = False) -> zarr.Group:
         """Open the store's zarr group — ``mode="r"`` (read) or ``mode="w"`` (write).
@@ -275,8 +265,6 @@ class Repo:
             self._session.discard_changes()
         self._session = None
 
-    # -- history -------------------------------------------------------------
-
     def log(self, *, branch: str | None = None) -> list[SnapshotInfo]:
         """Snapshots on the current (or given) branch, newest first."""
         target = branch or self._branch
@@ -300,8 +288,6 @@ class Repo:
         self._session = None
         resolved: str = info.id
         return resolved
-
-    # -- internals -----------------------------------------------------------
 
     @property
     def _repo(self) -> Any:
@@ -340,9 +326,7 @@ class Repo:
         return self._writer
 
     def _branch_exists(self, name: str, *, consult_origin: bool = True) -> bool:
-        # a read-only mirror is a cached view of the origin: a branch created moments ago
-        # (possibly by another process) may not show up yet, so fall back to the origin
-        # when the read view may be stale
+        # a read-only mirror may be stale, so fall back to the origin when consulting it
         if name in self._repo.list_branches():
             return True
         if consult_origin and self.resolved and self._writer is None:

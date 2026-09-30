@@ -1,4 +1,5 @@
 import filecmp
+import importlib
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -10,10 +11,10 @@ import pytest
 import scipy.sparse as sp
 import zarr
 
-import annizarr._layout as _layout
-from annizarr._ops import convert_10x_h5, convert_adata, convert_h5ad
+import annizarr._core._layout as _layout
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 from annizarr.errors import ConversionError, StorageError
+from annizarr.ops import convert_10x_h5, convert_adata, convert_h5ad
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -200,7 +201,8 @@ def test_convert_h5ad_existing_target_fails_before_loading_and_flat_chunk_applie
     out = tmp_path / "out.zarr"
     out.mkdir()  # a pre-existing target, overwrite not set
 
-    import annizarr._ops._convert as _convert_mod
+    # annizarr.ops._convert (the name) is shadowed by the convert function; fetch the module via sys.modules.
+    _convert_mod = importlib.import_module("annizarr.ops._convert")
 
     def _fail_loudly(*_a, **_kw):
         raise AssertionError("load_h5ad should not run when the target already exists and overwrite is unset")

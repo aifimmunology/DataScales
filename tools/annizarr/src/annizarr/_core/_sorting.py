@@ -13,28 +13,24 @@ import pandas as pd
 import scipy.sparse as sp
 import zarr
 
-from annizarr._runtime import configure_runtime, stage
+from annizarr._core._runtime import configure_runtime, stage
+from annizarr._core._validation import validate_single_cell_anndata
+from annizarr._core._zarr import get_array
 from annizarr._sources._matrix import get_indptr
 from annizarr._storage import open_output_store
-from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers._concat import _write_concatenated_csr
 from annizarr._writers._encoding import autoshard_setting, make_sparse_group, set_array_attrs, write_elem
-from annizarr._zarr import get_array
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
 
 logger = logging.getLogger(__name__)
 
 
 def compute_sort(obs: pd.DataFrame, sort_by: tuple[str, ...]) -> tuple[np.ndarray, pd.DataFrame]:
-    # returns (perm, ranges): perm is the int64 permutation (original row position for each
-    # sorted position); ranges has one row per distinct key tuple, with the sort-key columns
-    # plus start/end (half-open) row offsets into the sorted store. Sort is lexicographic
-    # with sort_by[0] as the primary key, stable.
     missing = [c for c in sort_by if c not in obs.columns]
     if missing:
         raise ConversionError(f"grouping sort_by columns not found in obs: {missing}. Available: {list(obs.columns)}")
@@ -60,12 +56,6 @@ def compute_sort(obs: pd.DataFrame, sort_by: tuple[str, ...]) -> tuple[np.ndarra
 
 
 def maybe_sort_adata(adata: ad.AnnData, cfg: AppConfig) -> ad.AnnData:
-    # if grouping is enabled, reorders all obs-aligned arrays by the sort keys. Uses anndata
-    # fancy indexing so obs/obsm/obsp/layers/raw share one permutation and the store stays a
-    # valid AnnData; no tool-specific index is written — the result is a plain, physically
-    # sorted AnnData, so each distinct key tuple is a contiguous row block a downstream
-    # reader derives from the sorted obs column(s). Raises if x_storage isn't csr/dense, or
-    # if cfg.io.backed is set (backed grouping goes through stream_sorted_store instead).
     if not cfg.grouping.enabled:
         return adata
 
@@ -92,18 +82,8 @@ def maybe_sort_adata(adata: ad.AnnData, cfg: AppConfig) -> ad.AnnData:
 def _write_sorted_backed(
     adata: ad.AnnData, output_path: Path, cfg: AppConfig, *, branch: str | None = None, message: str | None = None
 ) -> str | None:
-    # streamed, memory-bounded sort for --backed input (bucket + concat): the eager sort
-    # (maybe_sort_adata) does adata[perm].copy() — a full in-memory reorder transiently
-    # holding ~2x X. For a backed load X stays on the h5py handle, so we keep it there: one
-    # sequential pass over X buckets each source row into a temporary per-group CSR zarr
-    # store (contiguous append — no random scatter, no read-modify-write of output chunks),
-    # then the groups are concatenated in sorted order into the final store via the existing
-    # concat writer. Peak RAM is one row-batch of X, not the whole matrix.
-    # Scope (raises otherwise): csr X only, on disk; layers/raw/obsp must be absent (obs-
-    # aligned, would need their own reorder). obs/obsm reordered in memory (backed mode
-    # already loads them); var/varm/varp/uns are not obs-aligned and written as-is. Dense or
-    # CSC sort still works eagerly (omit --backed). Returns the icechunk snapshot id, or
-    # None for a plain zarr store.
+    # streams X into temp per-group CSR stores (peak RAM one row-batch), unlike
+    # maybe_sort_adata's adata[perm].copy() (~2x X in RAM).
     if cfg.io.x_storage != "csr":
         raise ConversionError(
             f"--backed --sort-by supports x_storage='csr' only (got '{cfg.io.x_storage}'). "
@@ -159,17 +139,10 @@ def stream_sorted_store(
     branch: str | None = None,
     after_write: Callable[[zarr.Group], None] | None = None,
 ) -> str | None:
-    # buckets rows into temp per-group CSR stores, then concats them in sorted order;
-    # returns the icechunk snapshot id, or None for a plain zarr store. after_write, if
-    # given, runs on the still-open output root before the single finalize() below — e.g.
-    # sort's own re-derivation of a lone gexp layer, so it lands in the same commit as the
-    # sort itself instead of a second one.
     from anndata.io import sparse_dataset
 
-    from annizarr import _layout
+    from annizarr._core import _layout
 
-    # the target-exists check happens in each caller (sort op / convert's --backed
-    # --sort-by dispatch) before their own expensive work, via check_output_target
     configure_runtime(cfg.chunks.cpus)
 
     n_obs, n_vars = x.shape
@@ -181,17 +154,13 @@ def stream_sorted_store(
     starts = ranges["start"].to_numpy()
     ends = ranges["end"].to_numpy()
 
-    # For each SOURCE row, the group (in sorted-group order) it routes to. perm[start:end] lists
-    # a group's source rows in output order, which for a stable lexsort is ascending source order.
     group_of_source = np.empty(n_obs, dtype=np.int64)
-    group_rows = []  # source-row ids per group, ascending (== stable within-group order)
+    group_rows = []
     for gi in range(n_groups):
         rows = perm[starts[gi] : ends[gi]]
         group_of_source[rows] = gi
         group_rows.append(rows)
 
-    # Per-group nnz + full indptr, precomputed from the (small) source indptr — no data pass
-    # needed for structure, only for the data/indices values.
     row_nnz = np.diff(get_indptr(x)).astype(np.int64)
     n_rows_each = [int(r.size) for r in group_rows]
     indptr_each = [np.concatenate([[0], np.cumsum(row_nnz[r])]).astype(np.int64) for r in group_rows]
@@ -206,8 +175,6 @@ def stream_sorted_store(
 
     tmp_root = Path(tempfile.mkdtemp(prefix="annizarr_sort_", dir=str(output_path.parent)))
     try:
-        # Create temp per-group CSR stores (indptr known upfront; data filled by the pass) as
-        # subgroups of one shared temp store.
         tmp_store_root = zarr.open_group(str(tmp_root), mode="w")
         temp_groups = []
         for gi in range(n_groups):
@@ -226,12 +193,7 @@ def stream_sorted_store(
             ip[:] = indptr_each[gi]
             temp_groups.append(tg)
 
-        # Single sequential pass over X: bucket each row-batch into its groups. Writes land at
-        # per-group nnz cursors, not aligned to the temp arrays' write grid — a perf-only cost
-        # (never a correctness risk: this pass is serial, one writer, like the transposition
-        # engine's serial writes), and the temp groups are scratch (chunks="auto", never
-        # sharded) deleted once the final concat below has read them. Batch to ~256 MB of nnz
-        # like the other streaming writers.
+        # per-group cursors aren't write-grid aligned, but this pass is serial: a perf cost only.
         nnz_total = int(row_nnz.sum())
         bpm = max(1, nnz_total // max(1, n_obs)) * (np.dtype(x_dtype).itemsize + np.dtype(indices_dtype).itemsize)
         batch_size = max(1_000, min(200_000, _layout.BATCH_BYTES // bpm))
@@ -242,8 +204,6 @@ def stream_sorted_store(
                 batch = x[b0:b1]  # backed CSR slice -> in-memory scipy CSR (one batch bounds RAM)
                 if not sp.isspmatrix_csr(batch):
                     batch = batch.tocsr()
-                # one stable argsort per batch instead of a boolean mask per group —
-                # O(rows·log) not O(rows·groups) at high-cardinality keys
                 g_batch = group_of_source[b0:b1]
                 order = np.argsort(g_batch, kind="stable")
                 sorted_g = g_batch[order]
@@ -260,7 +220,6 @@ def stream_sorted_store(
                     get_array(temp_groups[gi], "indices")[c : c + m] = sub.indices.astype(indices_dtype, copy=False)
                     cursors[gi] = c + m
 
-        # Concat the groups (in sorted order) into the final store.
         out = open_output_store(
             output_path,
             cfg,

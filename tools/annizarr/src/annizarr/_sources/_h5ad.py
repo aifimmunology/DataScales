@@ -4,8 +4,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from annizarr._config import AppConfig
-from annizarr._runtime import stage
+from annizarr._core._config import AppConfig
+from annizarr._core._runtime import stage
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def _peek_x_nbytes(path: Path) -> int:
-    """On-disk byte size of ``X``, from HDF5 dataset metadata only — no data read."""
+    # from HDF5 dataset metadata only — no data read
     import h5py
 
     with h5py.File(path, "r") as f:

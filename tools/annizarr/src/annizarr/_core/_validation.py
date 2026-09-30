@@ -8,23 +8,13 @@ from annizarr.errors import ValidationError
 if TYPE_CHECKING:
     from anndata import AnnData
 
-    from annizarr._config import ValidationConfig
+    from annizarr._core._config import ValidationConfig
 
 __all__ = ["ValidationResult", "validate_single_cell_anndata"]
 
 
 @dataclass(frozen=True, slots=True)
 class ValidationResult:
-    """Outcome of :func:`validate_single_cell_anndata`.
-
-    Parameters
-    ----------
-    ok
-        Always ``True`` — a failed validation raises instead of returning ``ok=False``.
-    warnings
-        Non-fatal issues found (e.g. duplicate obs/var names); callers log these.
-    """
-
     ok: bool
     warnings: list[str]
 
@@ -42,26 +32,6 @@ def _has_spatial_markers(adata: AnnData) -> bool:
 
 
 def validate_single_cell_anndata(adata: AnnData, cfg: ValidationConfig) -> ValidationResult:
-    """Validate that ``adata`` is a non-spatial, single-cell AnnData ready to convert.
-
-    Parameters
-    ----------
-    adata
-        Input to validate.
-    cfg
-        Thresholds and toggles for the checks below.
-
-    Returns
-    -------
-    ValidationResult
-        ``ok=True`` with any non-fatal warnings (duplicate obs/var names).
-
-    Raises
-    ------
-    ValidationError
-        Too few observations/variables, no ``X``, or spatial markers detected while
-        ``cfg.reject_spatial`` is set.
-    """
     warnings: list[str] = []
 
     if cfg.require_non_empty:

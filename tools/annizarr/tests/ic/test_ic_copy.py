@@ -8,10 +8,10 @@ import zarr
 from _ic_helpers import snapshot_tree
 
 from annizarr._cli import main
-from annizarr._ic import Repo
-from annizarr._ic._copy import copy_group
-from annizarr._ic._head import HEAD_FILE
 from annizarr.errors import RepoError
+from annizarr.ic import Repo
+from annizarr.ic._copy import copy_group
+from annizarr.ic._head import HEAD_FILE
 
 
 def test_copy_group_preserves_nested_layout_and_data(tmp_path):

@@ -7,15 +7,15 @@ from typing import TYPE_CHECKING, Any
 
 import anndata as ad
 
-from annizarr._config import AppConfig, load_config, resolve_backend_cfg
-from annizarr._ops._result import OpResult
-from annizarr._runtime import configure_runtime, stage
+from annizarr._core._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._core._runtime import configure_runtime, stage
+from annizarr._core._validation import validate_single_cell_anndata
 from annizarr._sources import close_backed_if_needed, ensure_csr, load_h5ad
 from annizarr._storage import check_output_target, open_output_store
-from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers import _write_concatenated_csr, _write_concatenated_dense
 from annizarr._writers._encoding import autoshard_setting, set_anndata_root_attrs, write_elem
 from annizarr.errors import AnzError, ConversionError
+from annizarr.ops._result import OpResult
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -33,45 +33,7 @@ def concat(
     branch: str | None = None,
     message: str | None = None,
 ) -> OpResult:
-    """Concatenate multiple .h5ad files along obs (rows) into a single zarr store.
-
-    Requirements:
-      - All inputs must share the same `var` (gene names + order, strict match).
-      - obs columns: by default all inputs must share an identical obs schema
-        (same names + order). If ``cfg.concat.obs_columns`` is set, each input must
-        instead merely *contain* those columns; obs is projected to exactly those
-        (in that order) and all other columns are dropped before concatenation. A
-        selected column that is categorical must have the same categories in every
-        input, else it would degrade to a string array on concat — a hard error.
-      - Only X, obs, var are written. layers/raw/uns/obsm/etc. are ignored.
-
-    Sparse output uses CSR; dense output is supported. CSC output is not supported
-    for multi-file concat (would require costly transpose).
-
-    Parameters
-    ----------
-    paths
-        Two or more ``.h5ad`` file paths to concatenate.
-    output
-        Destination store path or URI.
-    cfg
-        Resolved configuration; ``None`` loads :func:`~annizarr.config.load_config` defaults.
-    branch
-        Icechunk branch to write to; created off the current tip if it doesn't exist yet.
-        Ignored for plain zarr.
-    message
-        Icechunk commit message; ``None`` names the op and the destination.
-
-    Returns
-    -------
-    OpResult
-
-    Raises
-    ------
-    ConversionError
-        ``paths`` is empty, ``cfg.io.x_storage == "csc"``, grouping is enabled, an
-        obs/var schema mismatch is found, or the concatenation otherwise fails.
-    """
+    """Concatenate multiple .h5ad files along obs (rows) into a single zarr store (X/obs/var only)."""
     import pandas as pd
 
     if cfg is None:
@@ -89,14 +51,11 @@ def concat(
 
     inputs = [Path(p) for p in paths]
     output_path = Path(output)
-    # Fail fast on a pre-existing output before the (expensive) multi-file load; the actual
-    # prepare/overwrite happens in open_output_store below.
     check_output_target(output_path, cfg)
     ad.settings.zarr_write_format = 3
 
     adatas: list[ad.AnnData] = []
     try:
-        # ── Pass 1: load + validate ───────────────────────────────────────────
         for p in inputs:
             adata, _ = load_h5ad(p, cfg)
             adatas.append(adata)
@@ -113,9 +72,6 @@ def concat(
 
         obs_columns = list(cfg.concat.obs_columns)
         if obs_columns:
-            # Explicit selection: every input must contain the named columns; obs is then
-            # projected down to exactly these (in this order) at concat time — all other
-            # columns are dropped. Lets files with differing *extra* columns be joined.
             for i, a in enumerate(adatas):
                 missing = [c for c in obs_columns if c not in a.obs.columns]
                 if missing:
@@ -128,10 +84,9 @@ def concat(
                     logger.warning(
                         f"[{inputs[i].name}] dropping {len(dropped)} obs column(s) not in obs_columns: {dropped}."
                     )
-            # Categorical columns must line up across inputs. If they don't (mixed
-            # categorical/non-categorical, or differing category *sets*), pandas coerces the
-            # column to a string (object) array on concat — dropping the compact categorical
-            # `codes` encoding and making per-cell-type access far slower. Fail loudly instead.
+            # a categorical column with mismatched categories/dtype across inputs would
+            # silently coerce to a string array on concat (dropping the compact `codes`
+            # encoding); fail loudly instead.
             for c in obs_columns:
                 is_cat = [isinstance(a.obs[c].dtype, pd.CategoricalDtype) for a in adatas]
                 if not any(is_cat):
@@ -156,7 +111,6 @@ def concat(
                         f"'{c}' from obs_columns."
                     )
         else:
-            # Default: strict identical obs schema (names + order) against file 0.
             ref_obs_cols = list(adatas[0].obs.columns)
             for i, a in enumerate(adatas[1:], start=1):
                 if list(a.obs.columns) != ref_obs_cols:
@@ -168,7 +122,6 @@ def concat(
         for i, a in enumerate(adatas):
             _validate_and_warn(a, cfg, inputs[i].name)
 
-        # ── Ensure CSR for X; verify common dtype ─────────────────────────────
         x_matrices: list[Any] = []
         x_dtype = None
         for i, a in enumerate(adatas):
@@ -184,11 +137,7 @@ def concat(
         n_obs_each = [a.n_obs for a in adatas]
         n_obs_total = sum(n_obs_each)
 
-        # ── Concat obs (small; pandas) ────────────────────────────────────────
         if obs_columns:
-            # Project each obs to the selected columns (fixes output order), then concat.
-            # (Categorical mismatches already errored out above; any coercion left here is
-            # numeric, e.g. int+float -> float — harmless, but worth a heads-up.)
             obs_concat = pd.concat([a.obs[obs_columns] for a in adatas], axis=0)
             for c in obs_columns:
                 in_dtypes = {str(a.obs[c].dtype) for a in adatas}

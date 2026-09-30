@@ -22,27 +22,7 @@ def register_sniffer(sniffer: Sniffer) -> None:
 
 
 def detect_format(path: PathLike) -> Literal["h5ad", "10x", "zarr", "icechunk"]:
-    """Sniff the input format of ``path`` from its content, never its extension.
-
-    A registered custom sniffer (see :func:`register_sniffer` /
-    :func:`annizarr.sources.register_source`) is consulted before the builtin rules below,
-    so its return value may be any registered kind, not only the four listed here.
-
-    Parameters
-    ----------
-    path
-        A local filesystem path, or a remote URI (``s3://``, ``gs://``, ``gcs://``).
-
-    Returns
-    -------
-    One of ``"h5ad"``, ``"10x"``, ``"zarr"``, ``"icechunk"`` (or a custom sniffer's kind).
-
-    Raises
-    ------
-    ConversionError
-        ``path`` does not exist, is not HDF5, or its layout is not recognised; the message
-        names ``path`` and suggests ``--from h5ad|10x`` to override detection.
-    """
+    """Sniff the input format of ``path`` from its content, never its extension."""
     if urlparse(str(path)).scheme in _REMOTE_SCHEMES:
         return "icechunk"
 

@@ -1,7 +1,7 @@
 import numpy as np
 from anndata import AnnData
 
-from annizarr._validation import validate_single_cell_anndata
+from annizarr._core._validation import validate_single_cell_anndata
 from annizarr.config import ValidationConfig
 from annizarr.errors import ValidationError
 

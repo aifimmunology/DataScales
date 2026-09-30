@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from annizarr._config import (
+from annizarr._core._config import (
     AppConfig,
     ChunkConfig,
     ConcatConfig,

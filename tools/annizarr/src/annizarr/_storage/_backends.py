@@ -12,8 +12,6 @@ if TYPE_CHECKING:
 
 
 def require_icechunk() -> ModuleType:
-    # every icechunk code path calls this first, so a missing optional dep fails with an
-    # install hint instead of a bare ImportError (which can't share a base with AnzError)
     try:
         import icechunk
     except ImportError as exc:
@@ -24,9 +22,7 @@ def require_icechunk() -> ModuleType:
 
 
 def storage_for(path: PathLike) -> Any:
-    # the one icechunk.Storage constructor used everywhere; from_env=True resolves
-    # credentials from AWS_*/GOOGLE_* variables, a profile, or an instance/container role
-    icechunk = require_icechunk()
+    icechunk = require_icechunk()  # from_env=True: AWS_*/GOOGLE_* vars, a profile, or instance role
     if is_remote(path):
         bucket, prefix = bucket_prefix(path)
         if scheme(path) == "s3":
@@ -36,7 +32,5 @@ def storage_for(path: PathLike) -> Any:
 
 
 def is_icechunk_repo(path: PathLike) -> bool:
-    # local icechunk repos carry repo/ + snapshots/ and no zarr.json at the root;
-    # remote URIs always return False here — callers combine this with is_remote()
-    p = Path(path)
+    p = Path(path)  # local repos carry repo/ + snapshots/, no zarr.json; remote always False here
     return p.is_dir() and not (p / "zarr.json").exists() and (p / "snapshots").is_dir() and (p / "repo").exists()

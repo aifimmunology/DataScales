@@ -11,17 +11,17 @@ import anndata as ad
 import numpy as np
 import scipy.sparse as sp
 
-from annizarr._config import AppConfig, load_config, resolve_backend_cfg
-from annizarr._ops._concat import concat
-from annizarr._ops._result import OpResult
-from annizarr._runtime import configure_runtime
-from annizarr._sorting import _write_sorted_backed, maybe_sort_adata
+from annizarr._core._config import AppConfig, load_config, resolve_backend_cfg
+from annizarr._core._runtime import configure_runtime
+from annizarr._core._sorting import _write_sorted_backed, maybe_sort_adata
+from annizarr._core._validation import validate_single_cell_anndata
 from annizarr._sources import close_backed_if_needed, detect_format, load_10x_h5, load_h5ad, open_source
 from annizarr._sources._matrix import is_backed, matrix_format
 from annizarr._storage import check_output_target, open_output_store, store_name
-from annizarr._validation import validate_single_cell_anndata
 from annizarr._writers import write_adata
 from annizarr.errors import AnzError, ConversionError
+from annizarr.ops._concat import concat
+from annizarr.ops._result import OpResult
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,26 +40,11 @@ def write_adata_to_store(
     branch: str | None = None,
     message: str | None = None,
 ) -> OpResult:
-    """Write AnnData to zarr (or icechunk).
-
-    adata.X is expected to be CSR; CSC is converted to CSR in memory with a warning, and
-    dense X is accepted (streamed for dense output, sparsified in memory for sparse output
-    on eager loads). When ``allow_grouping`` and grouping is enabled, rows are sorted first.
-
-    Parameters
-    ----------
-    branch
-        Icechunk branch to write to; created off the current tip if it doesn't exist
-        yet. Ignored for plain zarr.
-    message
-        Icechunk commit message; ``None`` names the op and the destination.
-    """
     cfg = resolve_backend_cfg(cfg)
     configure_runtime(cfg.chunks.cpus)
 
     if allow_grouping:
         if cfg.grouping.enabled and cfg.io.backed:
-            # Backed input: sort X without ever materialising it (streamed bucket + concat).
             snapshot_id = _write_sorted_backed(adata, Path(output_path), cfg, branch=branch, message=message)
             return OpResult(path=str(output_path), n_obs=adata.n_obs, n_vars=adata.n_vars, snapshot_id=snapshot_id)
         adata = maybe_sort_adata(adata, cfg)
@@ -71,22 +56,18 @@ def write_adata_to_store(
     fmt = matrix_format(x)
 
     if fmt != "csr":
-        # masked arrays would classify as "dense" below; silently dropping a mask would
-        # corrupt values, so refuse outright instead of the dense/sparse-conversion paths.
+        # a masked array would classify as "dense" below; refuse rather than silently drop the mask
         if np.ma.isMaskedArray(x):
             raise ConversionError(f"adata.X must be CSR, CSC, or dense. Got: {type(x).__name__}")
         if fmt == "csc":
             if not is_backed(x):
                 x_for_write = x.tocsr()
-            # backed: left as the raw CSC dataset; write_matrix streams it instead (no in-memory
-            # .tocsr() — anndata's backed _CSCDataset doesn't have one anyway).
+            # backed anndata's _CSCDataset has no .tocsr(); write_matrix streams it instead.
             logger.warning("adata.X was CSC and has been converted to CSR in memory before zarr conversion.")
         elif fmt == "dense":
             if cfg.io.x_storage == "dense":
                 pass  # the writer streams dense input to dense output directly
             elif not cfg.io.backed:
-                # eager dense (issue #4): X is already in memory — sparsify for sparse output,
-                # directly in the target format (no CSR->CSC double conversion)
                 to_sparse = sp.csr_matrix if cfg.io.x_storage == "csr" else sp.csc_matrix
                 x_for_write = to_sparse(np.asarray(x))
                 logger.warning("adata.X was dense and has been converted to sparse in memory for sparse output.")
@@ -126,28 +107,9 @@ def convert_adata(
     branch: str | None = None,
     message: str | None = None,
 ) -> OpResult:
-    """Write an in-memory AnnData to a zarr (or icechunk) store.
-
-    Public library entry for data that doesn't start as .h5ad/10x: X may be CSR, CSC
-    (converted), or dense; honors x_storage/backend/sort_by exactly like convert_h5ad.
-
-    Parameters
-    ----------
-    branch
-        Icechunk branch to write to; created off the current tip if it doesn't exist
-        yet. Ignored for plain zarr.
-    message
-        Icechunk commit message; ``None`` names the op and the destination.
-
-    Raises
-    ------
-    ConversionError
-        ``cfg.io.backed`` is set (backed loading does not apply to an in-memory input).
-    """
+    """Write an in-memory AnnData to a zarr (or icechunk) store."""
     if cfg is None:
         cfg = load_config()
-    # pure config check first: no icechunk import needed to reject this, unlike
-    # check_output_target's icechunk-backend branch (Repo.exists()).
     if cfg.io.backed:
         raise ConversionError("convert_adata takes an in-memory AnnData; io.backed does not apply.")
     check_output_target(output, cfg)
@@ -162,22 +124,10 @@ def convert_h5ad(
     branch: str | None = None,
     message: str | None = None,
 ) -> OpResult:
-    """Convert a .h5ad file to zarr.
-
-    Parameters
-    ----------
-    branch
-        Icechunk branch to write to; created off the current tip if it doesn't exist
-        yet. Ignored for plain zarr.
-    message
-        Icechunk commit message; ``None`` names the op and the destination.
-    """
+    """Convert a .h5ad file to zarr."""
     if cfg is None:
         cfg = load_config()
-    # resolve_backend_cfg's backed+icechunk validation first: it's a pure config check (no
-    # icechunk import), so it must fail before check_output_target's Repo.exists() would
-    # otherwise require icechunk to be installed just to reach that same error.
-    cfg = resolve_backend_cfg(cfg)
+    cfg = resolve_backend_cfg(cfg)  # before check_output_target's Repo.exists(), a heavier check
     check_output_target(output, cfg)
     adata = None
     try:
@@ -185,9 +135,7 @@ def convert_h5ad(
         for w in load_warnings:
             logger.warning(w)
         if cfg.io.backed is None:
-            # load_h5ad auto-selected; mirror its decision back onto cfg so every
-            # downstream `cfg.io.backed` check (grouping dispatch, dense/sparse
-            # conversion) sees the real, resolved value instead of "unset".
+            # mirror load_h5ad's auto-selection so downstream cfg.io.backed checks see it resolved
             cfg = replace(cfg, io=replace(cfg.io, backed=adata.isbacked))
         return write_adata_to_store(adata, output, cfg, allow_grouping=True, branch=branch, message=message)
     except AnzError:
@@ -207,16 +155,7 @@ def convert_10x_h5(
     branch: str | None = None,
     message: str | None = None,
 ) -> OpResult:
-    """Convert a 10x Cell Ranger .h5 to zarr; expects CSR from the 10x load.
-
-    Parameters
-    ----------
-    branch
-        Icechunk branch to write to; created off the current tip if it doesn't exist
-        yet. Ignored for plain zarr.
-    message
-        Icechunk commit message; ``None`` names the op and the destination.
-    """
+    """Convert a 10x Cell Ranger .h5 to zarr; expects CSR from the 10x load."""
     if cfg is None:
         cfg = load_config()
     check_output_target(output, cfg)

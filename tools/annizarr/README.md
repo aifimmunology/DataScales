@@ -8,17 +8,10 @@ Icechunk-versioned.
 Not yet on PyPI — install from this directory:
 
 ```bash
-pip install .                # core: convert, add-expr, rechunk, sort, append
-pip install ".[icechunk]"    # + Icechunk versioning (branches, S3/GCS) and `ic copy` to/from s3:// (boto3)
-```
-
-For contributors, via pixi:
-
-```bash
-cd tools/annizarr
-pixi install                 # default env: extras + dev tools
-pixi run annizarr --help
-pixi run pytest
+pip install .             
+pip install ".[icechunk]"   
+#OR
+pixi install   
 ```
 
 ## Quickstart

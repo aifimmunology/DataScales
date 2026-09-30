@@ -21,11 +21,11 @@ import pytest
 import scipy.sparse as sp
 import zarr
 
-import annizarr._layout as _layout
+import annizarr._core._layout as _layout
 from _readable import assert_anndata_readable
-from annizarr._ops import append, concat, convert_adata, rechunk
-from annizarr._runtime import run_parallel
+from annizarr._core._runtime import run_parallel
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
+from annizarr.ops import append, concat, convert_adata, rechunk
 
 
 def _rand_dense(n_obs: int, n_vars: int, *, seed: int, density: float) -> np.ndarray:

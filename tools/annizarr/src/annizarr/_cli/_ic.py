@@ -10,7 +10,7 @@ from annizarr.errors import StorageError
 if TYPE_CHECKING:
     import datetime
 
-    from annizarr._ic import Repo
+    from annizarr.ic import Repo
 
 _LOG = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def _fmt_when(dt: datetime.datetime) -> str:
 
 
 def _open(args: argparse.Namespace) -> Repo:
-    from annizarr._ic import Repo
+    from annizarr.ic import Repo
 
     return Repo(args.repo, origin=getattr(args, "origin", None))
 
@@ -49,7 +49,7 @@ def _note_resolved(repo: Repo) -> None:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
-    from annizarr._ic import Repo
+    from annizarr.ic import Repo
 
     _quiet_icechunk_logs()
     repo = Repo.init(args.zarr, args.repo, message=args.message)

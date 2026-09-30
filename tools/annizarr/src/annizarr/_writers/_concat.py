@@ -6,8 +6,8 @@ import numpy as np
 import scipy.sparse as sp
 import zarr
 
-from annizarr._layout import band_plan, dense_shards, write_grid, x_compressors
-from annizarr._runtime import progress, run_parallel
+from annizarr._core._layout import band_plan, dense_shards, write_grid, x_compressors
+from annizarr._core._runtime import progress, run_parallel
 from annizarr._sources._matrix import get_indptr, is_backed, matrix_format
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._sparse import flat_segments
@@ -16,12 +16,11 @@ from annizarr.errors import ConversionError
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from annizarr._config import AppConfig
+    from annizarr._core._config import AppConfig
 
 
 def _is_thread_unsafe(matrix: Any) -> bool:
-    # h5py-backed inputs aren't thread-safe; zarr-backed temp groups (e.g. from --sort-by's
-    # bucketing pass) are, so only an h5py-backed input forces a serial pass.
+    # h5py-backed inputs aren't thread-safe; zarr-backed ones are.
     return is_backed(matrix) and not isinstance(getattr(matrix, "group", None), zarr.Group)
 
 
@@ -45,12 +44,8 @@ def _write_dense_concat_band(
     n_cols: int,
     tick: Callable[[], None],
 ) -> None:
-    # [R0, R1) is one row band of the OUTPUT grid; every input whose row range overlaps it
-    # contributes a piece. A sparse input's row range is sliced once here and reused for
-    # every column tile below; a dense input is sliced row+col together (no benefit to
-    # pre-slicing rows only). Column tiles match block_col (the write grid), so every write
-    # is a whole, disjoint block — this removes the read-modify-write that used to happen
-    # whenever an input seam fell inside a shard/chunk.
+    # column tiles match block_col (the write grid), so every write is a whole, disjoint
+    # block even when an input seam falls inside it — no read-modify-write.
     overlaps = []
     for matrix, fmt, off_lo, off_hi in zip(matrices, fmts, offsets[:-1], offsets[1:], strict=True):
         lo, hi = max(R0, off_lo), min(R1, off_hi)
@@ -99,7 +94,6 @@ def _write_concatenated_dense(
     )
     set_array_attrs(zarr_arr)
 
-    # aligned to the array's write grid: shards if sharded, else chunks
     block_row, block_col = write_grid(zarr_arr)
     offsets = tuple(int(v) for v in np.cumsum([0, *n_obs_each]))
     fmts = tuple(matrix_format(m) for m in matrices)
@@ -123,8 +117,7 @@ def _write_csr_concat_segment(
     indices_dtype: Any,
     tick: Callable[[], None],
 ) -> None:
-    # [s0, s1) is one flat_chunk-aligned output segment. A segment spanning an input seam
-    # gathers the overlapping pieces from each input's own data/indices before one write, so
+    # a segment spanning an input seam gathers the overlapping pieces before one write, so
     # every output chunk is written exactly once regardless of where the inputs seam.
     data_buf = np.empty(s1 - s0, dtype=data_dtype)
     indices_buf = np.empty(s1 - s0, dtype=indices_dtype)
@@ -190,7 +183,6 @@ def _write_concatenated_csr(
     for a in (data_arr, indices_arr, indptr_arr):
         set_array_attrs(a)
 
-    # Build full indptr in memory (small: ~8B per row) then write once.
     full_indptr = np.empty(n_obs_total + 1, dtype=indptr_dtype)
     full_indptr[0] = 0
     row_offset = 0
@@ -209,7 +201,6 @@ def _write_concatenated_csr(
     any_unsafe = any(_is_thread_unsafe(m) for m in matrices)
 
     bytes_per_nnz = np.dtype(data_dtype).itemsize + np.dtype(indices_dtype).itemsize
-    # aligned to the arrays' write grid: shards if auto-sharded, else chunks
     segments = flat_segments(nnz_total, write_grid(data_arr)[0], bytes_per_nnz)
     tick = progress(len(segments), f"Writing {key} (concat)")
     jobs = [

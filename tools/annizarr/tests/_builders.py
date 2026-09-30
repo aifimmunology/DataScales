@@ -6,8 +6,8 @@ import pandas as pd
 import scipy.sparse as sp
 from anndata import AnnData
 
-from annizarr._ops import convert_adata
 from annizarr.config import AppConfig
+from annizarr.ops import convert_adata
 
 
 def make_adata(n_obs: int = 100, n_vars: int = 50, *, seed: int = 0, density: float = 0.3) -> AnnData:
