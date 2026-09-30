@@ -15,6 +15,7 @@ from annizarr._cli._args import (
     add_overwrite_arg,
     build_config,
 )
+from annizarr._config import IOConfig
 
 _LOG = logging.getLogger(__name__)
 
@@ -49,7 +50,11 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         default=None,
         help="load h5ad input eagerly, overriding auto-select for a large file",
     )
-    p.add_argument("--x-storage", choices=("csr", "csc", "dense"), help="output X layout")
+    p.add_argument(
+        "--x-storage",
+        choices=("csr", "csc", "dense"),
+        help=f"output X layout (default: {IOConfig().x_storage})",
+    )
     add_cpus_arg(p)
     add_chunk_args(p)
     add_autoshard_arg(p)

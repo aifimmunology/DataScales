@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ import zarr
 from _builders import make_adata, make_h5ad
 from _readable import assert_anndata_readable
 from annizarr._cli import main
+from annizarr._config import ChunkConfig
 from annizarr._version import __version__
 
 
@@ -191,6 +193,31 @@ def test_append_with_drop_derived_succeeds(tmp_path: Path) -> None:
 
     assert main(["append", str(sa), str(sb), "--drop-derived"]) == 0
     assert ad.read_zarr(str(sa)).n_obs == 6
+
+
+# ── --help / import guards ───────────────────────────────────────────────────
+
+
+def test_help_shows_config_defaults(capsys: pytest.CaptureFixture[str]) -> None:
+    """Numeric/choice flags whose value falls through to the config dataclasses show that
+    default in --help (they're `default=None` on the argparse arg itself; the config supplies
+    the value at runtime)."""
+    with pytest.raises(SystemExit) as exc:
+        main(["convert", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert f"default: {ChunkConfig().x_row_chunk}" in out
+
+
+def test_cli_import_leaves_numpy_unimported() -> None:
+    """`import annizarr._cli` alone (no CLI invocation) must stay free of heavy deps — checked
+    in a subprocess since numpy is already imported in this test process."""
+    proc = subprocess.run(
+        [sys.executable, "-c", "import sys\nimport annizarr._cli\nassert 'numpy' not in sys.modules"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 # ── --version / entry points ─────────────────────────────────────────────────

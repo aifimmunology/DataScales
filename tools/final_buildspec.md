@@ -27,7 +27,7 @@ sweep that brings the existing implementation up to them.
 | Icechunk output | New stores are plain zarr unless `--ic`; remote output without `--ic` is an error. Existing repos as inputs or in-place targets are auto-detected. |
 | Storage enum | *Assumption:* `x_storage` becomes `Literal["csr", "csc", "dense"]` everywhere (config, CLI `--x-storage`, `add-expr --format`). The old `sparse-csr`/`sparse-csc` spellings are not accepted (clean break). |
 | Hard deps | `anndata>=0.12.10,<0.13`, `zarr>=3.3,<4`, `numpy`, `scipy`, `h5py`, `PyYAML`. |
-| Extras | `icechunk`, `s3`, `all`, `dev`. |
+| Extras | `icechunk` (icechunk + boto3), `dev`. No `s3`/`all` (Alex, 2026-09-29). |
 | Versions | `requires-python >=3.12` — **corrected in Phase 4**: every zarr ≥3.2 release and every icechunk wheel require 3.12, so a 3.10 floor was never installable. CI 3.12–3.13. Lifted with evidence: `zarr>=3.3,<4` (3.4.0 keeps all 16 goldens byte-identical), `icechunk>=2.1.2,<3` (2.2.2), numpy unbounded (2.5.3). Keep `anndata<0.13` with reason + issue link. |
 | Dev env pins | Phases 1–3 pinned `zarr 3.3.*`, `icechunk 2.1.*`, `numpy <2.5` so the move and the goldens were not confounded by a library bump; Phase 4 lifted them one at a time (see Versions). Envs: `default` (3.13, all extras), `core` (hard deps + pytest), `py312` (floor check). |
 | Versioning | *Assumption:* static `version = "0.1.0"` while in the monorepo; `hatch-vcs` after the repo split. |
@@ -272,9 +272,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-icechunk = ["icechunk>=2.1.2,<3"]
-s3       = ["boto3>=1.28"]
-all      = ["annizarr[icechunk,s3]"]
+icechunk = ["icechunk>=2.1.2,<3", "boto3>=1.28"]
 dev      = ["pytest>=8", "pytest-cov", "hypothesis", "ruff", "mypy", "types-PyYAML",
             "moto[s3,server]>=5", "scanpy>=1.10", "build", "twine", "pre-commit"]
 
@@ -310,7 +308,7 @@ omit = ["src/annizarr/_cli/*", "src/annizarr/__main__.py"]
 ```
 
 `pixi.toml` (separate): conda-forge; `python = ">=3.12,<3.14"` for dev; environments
-`default` (extras dev+icechunk+s3) and `core` (no extras).
+`default` (extras dev+icechunk) and `core` (no extras).
 
 ---
 

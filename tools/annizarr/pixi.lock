@@ -1933,7 +1933,7 @@ packages:
 - pypi: ./
   name: annizarr
   version: 0.1.0
-  sha256: be66b2b00be47c382ad69358c32fd10674d26f1a525fa83b9eb5013e7b34f3ed
+  sha256: 477015fc4bc4de25c696b40de0c05dd28c3ba13ef7a3b2ea68c8ab8fbca82a03
   requires_dist:
   - anndata>=0.12.10,<0.13
   - h5py>=3.8
@@ -1941,8 +1941,6 @@ packages:
   - pyyaml>=6
   - scipy>=1.10
   - zarr>=3.3,<4
-  - boto3>=1.28 ; extra == 'all'
-  - icechunk>=2.1.2,<3 ; extra == 'all'
   - build ; extra == 'dev'
   - hypothesis ; extra == 'dev'
   - moto[s3,server]>=5 ; extra == 'dev'
@@ -1954,8 +1952,8 @@ packages:
   - scanpy>=1.10 ; extra == 'dev'
   - twine ; extra == 'dev'
   - types-pyyaml ; extra == 'dev'
+  - boto3>=1.28 ; extra == 'icechunk'
   - icechunk>=2.1.2,<3 ; extra == 'icechunk'
-  - boto3>=1.28 ; extra == 's3'
   requires_python: '>=3.12'
 - conda: https://conda.anaconda.org/conda-forge/noarch/annotated-types-0.8.0-pyhd8ed1ab_0.conda
   sha256: b8fcb994134d3918d1c64a9d62f4168ff85d5bfb89e698102fe4ed679fe0df24

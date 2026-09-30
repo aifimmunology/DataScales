@@ -36,7 +36,7 @@ jobs:
           cache: pip
           cache-dependency-path: tools/annizarr/pyproject.toml
 
-      - run: pip install ".[all,dev]"
+      - run: pip install ".[icechunk,dev]"
 
       - run: ruff check src tests benchmarking
       - run: ruff format --check src tests benchmarking
@@ -89,7 +89,7 @@ jobs:
           cache: pip
           cache-dependency-path: tools/annizarr/pyproject.toml
 
-      - run: pip install ".[all,dev]"
+      - run: pip install ".[icechunk,dev]"
       - run: pip install --pre --upgrade anndata
       - run: ruff check src tests benchmarking
       - run: ruff format --check src tests benchmarking

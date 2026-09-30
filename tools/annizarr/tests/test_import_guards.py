@@ -54,7 +54,7 @@ def test_repo_copy_to_s3_without_boto3_raises_install_hint(monkeypatch: pytest.M
     from annizarr.errors import RepoError
 
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
-    with pytest.raises(RepoError, match=r"annizarr\[s3\]"):
+    with pytest.raises(RepoError, match=r"annizarr\[icechunk\]"):
         check_copyable("some/local/repo", "s3://bucket/prefix")
 
 
@@ -76,4 +76,4 @@ def test_cli_ic_copy_to_s3_without_boto3_reports_hint(
     err = capsys.readouterr().err
 
     assert exit_code == 1
-    assert "annizarr[s3]" in err
+    assert "annizarr[icechunk]" in err

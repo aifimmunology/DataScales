@@ -23,16 +23,22 @@ _LOG = logging.getLogger(__name__)
 def add_add_expr_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = subparsers.add_parser("add-expr", help="Add a log-normalized expression layer derived from CSR X")
     p.add_argument("store", metavar="STORE")
+    # defaults below are literals, not derived from annizarr._ops._expr.add_expr's signature
+    # at parser-build time: that module imports numpy/zarr, and _build_parser() constructs
+    # every subcommand's parser on every invocation (even --version) — keep them in sync by
+    # hand with add_expr's `fmt`/`layer`/`chunk_elems`/`target_sum` defaults.
     p.add_argument(
         "--format",
         dest="format",
         choices=("csr", "csc", "dense"),
         default="csc",
-        help="layer storage format",
+        help="layer storage format (default: csc)",
     )
-    p.add_argument("--layer", default="gexp", help="layer name")
-    p.add_argument("--chunk-elems", type=int, default=1_000_000, help="chunk size (elements) for the layer")
-    p.add_argument("--target-sum", type=float, default=1e4, help="library-size normalization target")
+    p.add_argument("--layer", default="gexp", help="layer name (default: gexp)")
+    p.add_argument(
+        "--chunk-elems", type=int, default=1_000_000, help="chunk size (elements) for the layer (default: 1000000)"
+    )
+    p.add_argument("--target-sum", type=float, default=1e4, help="library-size normalization target (default: 10000.0)")
     add_autoshard_arg(p)
     add_overwrite_arg(p)
     add_branch_arg(p)
@@ -66,7 +72,7 @@ def add_rechunk_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     p = subparsers.add_parser("rechunk", help="Rewrite one matrix with new chunking; stream-copy the rest as-is")
     p.add_argument("store", metavar="STORE")
     p.add_argument("-o", "--output", required=True, help="output store path or URI")
-    p.add_argument("--array", default="X", help="matrix element to rechunk (X, layers/<name>, raw/X)")
+    p.add_argument("--array", default="X", help="matrix element to rechunk (X, layers/<name>, raw/X) (default: X)")
     add_chunk_args(p)
     add_autoshard_arg(p)
     add_cpus_arg(p)

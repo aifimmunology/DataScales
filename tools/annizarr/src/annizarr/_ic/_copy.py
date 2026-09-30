@@ -22,7 +22,7 @@ def check_copyable(src: str, dst: str) -> None:
         if is_remote(loc) and urlparse(loc).scheme != "s3":
             raise RepoError(f"copy supports local paths and s3:// only, got '{loc}'")
     if (is_remote(src) or is_remote(dst)) and importlib.util.find_spec("boto3") is None:
-        raise RepoError("Copying to/from s3:// needs boto3 (pip install 'annizarr[s3]')")
+        raise RepoError("Copying to/from s3:// needs boto3 (pip install 'annizarr[icechunk]')")
 
 
 def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:

@@ -3,14 +3,18 @@ from __future__ import annotations
 import argparse
 from typing import TYPE_CHECKING
 
-from annizarr._config import apply_cli_overrides, load_config
+from annizarr._config import ChunkConfig, apply_cli_overrides, load_config
 
 if TYPE_CHECKING:
     from annizarr._config import AppConfig
 
 
 def add_config_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", help="TOML/YAML config file")
+    parser.add_argument(
+        "--config",
+        help="TOML/YAML config file whose keys mirror these flags (see example_config.toml); "
+        "precedence: defaults < file < flags",
+    )
 
 
 def add_overwrite_arg(parser: argparse.ArgumentParser) -> None:
@@ -50,14 +54,26 @@ def add_message_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def add_cpus_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--cpus", type=int, help="parallel workers for matrix chunk writes")
+    defaults = ChunkConfig()
+    parser.add_argument("--cpus", type=int, help=f"parallel workers for matrix chunk writes (default: {defaults.cpus})")
 
 
 def add_chunk_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--x-row-chunk", type=int, help="row chunk size for X")
-    parser.add_argument("--x-col-chunk", type=int, help="column chunk size for dense X")
-    parser.add_argument("--sparse-flat-chunk", type=int, help="flat chunk size for sparse X data/indices")
-    parser.add_argument("--x-shard-factor", type=int, help="pack this many chunks per shard (dense X only)")
+    defaults = ChunkConfig()
+    parser.add_argument("--x-row-chunk", type=int, help=f"row chunk size for X (default: {defaults.x_row_chunk})")
+    parser.add_argument(
+        "--x-col-chunk", type=int, help=f"column chunk size for dense X (default: {defaults.x_col_chunk})"
+    )
+    parser.add_argument(
+        "--sparse-flat-chunk",
+        type=int,
+        help=f"flat chunk size for sparse X data/indices (default: {defaults.sparse_flat_chunk})",
+    )
+    parser.add_argument(
+        "--x-shard-factor",
+        type=int,
+        help=f"pack this many chunks per shard (dense X only) (default: {defaults.x_shard_factor})",
+    )
 
 
 def add_autoshard_arg(parser: argparse.ArgumentParser) -> None:

@@ -22,9 +22,7 @@ dependencies = [
 # clean through zarr 3.4.0 / icechunk 2.2.2 / numpy 2.5.3
 
 [project.optional-dependencies]
-icechunk = ["icechunk>=2.1.2,<3"]
-s3 = ["boto3>=1.28"]
-all = ["annizarr[icechunk,s3]"]
+icechunk = ["icechunk>=2.1.2,<3", "boto3>=1.28"]
 dev = [
   "pytest>=8",
   "pytest-cov",
