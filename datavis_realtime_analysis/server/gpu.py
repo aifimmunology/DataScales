@@ -215,14 +215,14 @@ def _probe_gpu() -> dict:
         s, low = str(e), str(e).lower()
         if "403" in s or "does not have" in low or "denied" in low:
             return _verdict("error", "bucket",
-                            "The backend can reach GCS but lacks bucket access.", s[-400:],
-                            [f"grant the VM's service account roles/storage.objectAdmin "
-                             f"on gs://{SOURCE['bucket']}"])
+                            "The backend can reach GCS but the credential lacks bucket access.",
+                            s[-400:],
+                            [f"your account needs roles/storage.objectAdmin on gs://{SOURCE['bucket']}"])
         return _verdict("error", "adc",
-                        "The backend has no working GCS credential. On the GPU VM this "
-                        "comes from the metadata server — check the VM's service account "
-                        "and access scopes. On a laptop, run `gcloud auth "
-                        "application-default login` and restart the backend.", s[-400:])
+                        "The backend has no working GCS credential (missing or expired ADC).",
+                        s[-400:],
+                        ["on the VM: gcloud auth application-default login --no-launch-browser",
+                         "docker compose restart backend"])
     try:
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
     except FileNotFoundError:

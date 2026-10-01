@@ -24,7 +24,7 @@ Download and install Docker Desktop for your platform from https://docs.docker.c
 
 ## Data
 
-`DATA_DIR` points at the root of an AnnData zarr v3 store — the directory (or GCS prefix) containing `zarr.json`. It can be a local path (`./data/soundlife-other-tiny.zarr`) or a private GCS store (`gs://my-bucket/path/store.zarr`, read with the VM's service account — see [Deploy on the GPU VM](#deploy-on-the-gpu-vm)).
+`DATA_DIR` points at the root of an AnnData zarr v3 store — the directory (or GCS prefix) containing `zarr.json`. It can be a local path (`./data/soundlife-other-tiny.zarr`) or a private GCS store (`gs://my-bucket/path/store.zarr`, read with your gcloud credentials — see [Deploy on the GPU VM](#deploy-on-the-gpu-vm)).
 
 One store serves everything:
 
@@ -69,52 +69,44 @@ DATA_DIR=./data/soundlife-other-tiny.zarr uvicorn server.main:app --reload
 
 ## Deploy on the GPU VM
 
-Everything runs on the GPU VM ([deploy-spec.md](deploy-spec.md) phase 1): nginx serves the built frontend and proxies `/api` to the FastAPI backend (compose, one published port — **8000**). The backend container has the GPU and runs the rapids pipeline itself — env baked into the image from `server/pixi.toml`. The VM's service account is the only credential — no `gcloud auth login` anywhere.
+nginx serves the built frontend and proxies `/api` to the FastAPI backend; one published port, **8000**. The backend container has the GPU and runs the rapids pipeline itself (env baked into the image from `server/pixi.toml`).
 
-### 0. One-time bucket grant
-
-Grant the VM's service account access to the team bucket (views, labels, and job records all ride it):
+### 1. Authenticate (on the VM)
 
 ```bash
-gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
-  --member="serviceAccount:<vm-service-account>" --role="roles/storage.objectAdmin"
+gcloud auth login --no-launch-browser
+gcloud auth application-default login --no-launch-browser
 ```
 
-### 1. VM setup
+The second command writes `~/.config/gcloud/application_default_credentials.json`, which compose mounts into the backend — that is the app's GCS credential. Your account needs `roles/storage.objectAdmin` on the bucket. The org policy expires these credentials roughly weekly: re-run both commands and `docker compose restart backend`.
 
-Install docker + the compose plugin, plus the NVIDIA container toolkit (once):
+### 2. Run
+
+Once per VM: docker + compose plugin, and the NVIDIA container toolkit:
 
 ```bash
 sudo apt install nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
 ```
 
-Clone the repo, then from `datavis_realtime_analysis/`:
-
-- **Config** — set `DATA_DIR` as instance metadata:
-  `gcloud compute instances add-metadata $VM --zone=$ZONE --metadata=DATA_DIR=gs://...`
-  — or put it in `.env` in the repo. Metadata wins at boot (`deploy/write-env.sh`).
-- **Build** — `docker compose build` (first build downloads the rapids env — expect a while and a large image)
-- **systemd unit** —
+Then, from the checkout:
 
 ```bash
-sudo cp deploy/datavis-app.service /etc/systemd/system/
-# edit the paths to your checkout
-sudo systemctl daemon-reload
-sudo systemctl enable --now datavis-app
+echo DATA_DIR=gs://MY_BUCKET/store.zarr > .env
+docker compose up -d --build   # first build pulls the rapids env: slow once, ~6.5 GB image
 ```
 
-### 2. Access from your laptop
+If the checkout lives on the VM's local SSD, it is wiped on every stop/start — re-clone and run this again after a restart.
+
+### 3. Access from your laptop
+
+Set `GPU_INSTANCE` and `GPU_ZONE` at the top of `deploy/tunnel.sh`, then:
 
 ```bash
-deploy/tunnel.sh          # IAP TCP tunnel → http://localhost:8000
-deploy/tunnel.sh --ssh    # fallback: forward over IAP ssh — needs only ssh access
+deploy/tunnel.sh    # IAP ssh tunnel → http://localhost:8000
 ```
 
-The direct tunnel needs `roles/iap.tunnelResourceAccessor` on the VM plus a firewall rule allowing `35.235.240.0/20 → tcp:8000`; if you can't get the firewall rule, the `--ssh` fallback rides the existing ssh rule (port 22).
+### 4. Troubleshoot
 
-### 3. Verify & troubleshoot
-
-- A red **GPU runs** rail badge → the tab shows the failing step with fix commands: bucket access (SA grant missing) or the container can't see the GPU (toolkit/compose device reservation). Hit *Re-check* after fixing.
-- Everything logs in one place: `docker compose logs -f backend` (submits, pipeline stages, worker stderr).
-- `sudo systemctl stop datavis-app` (or `docker compose down`) stops the stack. For a local store instead of GCS, mount it into the backend and run with `DATA_DIR=/data`.
+- A red **GPU runs** rail badge shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing.
+- Logs: `docker compose logs -f backend`. Stop: `docker compose down`.
