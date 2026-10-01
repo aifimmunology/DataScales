@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime
 
 # Pin host BLAS/OpenMP threads so N worker processes don't each spawn N BLAS
-# threads (CLAUDE.md silent perf killer #1). These are ENV VARS, read at library
+# threads (N×N contention). These are ENV VARS, read at library
 # init in each process — set here at module top so the dask-cuda worker children
 # inherit them. Deliberate + recorded in provenance. Host BLAS is not the GPU
 # pipeline's bottleneck, so pinning to 1 costs ~nothing and prevents N×N contention.

@@ -79,7 +79,7 @@ import time
 from pathlib import Path
 
 # Pin BLAS/OpenMP threads to 1 so N worker processes don't each spawn N BLAS
-# threads (CLAUDE.md silent perf killer #1: N×N contention on a 64-core box).
+# threads (N×N contention on a 64-core box).
 # Deliberate + recorded in provenance. Must run before any numpy/scipy import —
 # those are lazy (inside functions), so module top is early enough; child procs
 # re-import this module and inherit these into their own worker pools.

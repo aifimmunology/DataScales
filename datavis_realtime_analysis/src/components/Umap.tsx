@@ -61,8 +61,8 @@ export default function Umap() {
   const [submitCount, setSubmitCount] = useState(0)
   const [runsActive, setRunsActive] = useState(false) // any job queued/running → rail badge
 
-  // GPU access probe (temp while dispatch rides ssh): runs on app load so an
-  // expired credential lights up the GPU-runs rail tab before anyone submits.
+  // GPU access probe: runs on app load so an expired credential lights up the
+  // GPU-runs rail tab before anyone submits.
   const [gpuHealth, setGpuHealth] = useState<GpuHealth | null>(null)
   const checkGpuHealth = (refresh = false) =>
     fetchGpuHealth(refresh).then(h => h && setGpuHealth(h)).catch(() => {})
