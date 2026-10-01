@@ -225,6 +225,7 @@ def stream_sorted_store(
             cfg,
             commit_message=commit_message or f"annizarr sort → {output_path.name}",
             branch=branch,
+            expected_shape=(n_obs, n_vars),
         )
         try:
             store = out.root

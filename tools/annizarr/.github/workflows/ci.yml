@@ -30,8 +30,8 @@ jobs:
 
       - run: pip install ".[icechunk,dev]"
 
-      - run: ruff check src tests benchmarking
-      - run: ruff format --check src tests benchmarking
+      - run: ruff check src tests
+      - run: ruff format --check src tests
       - run: mypy --strict src/annizarr
       - run: pytest  # coverage gate is in pyproject.toml
 
@@ -83,7 +83,7 @@ jobs:
 
       - run: pip install ".[icechunk,dev]"
       - run: pip install --pre --upgrade anndata
-      - run: ruff check src tests benchmarking
-      - run: ruff format --check src tests benchmarking
+      - run: ruff check src tests
+      - run: ruff format --check src tests
       - run: mypy --strict src/annizarr
       - run: pytest

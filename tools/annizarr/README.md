@@ -32,7 +32,7 @@ annizarr sort merged.zarr -o sorted.zarr --by cell_type
 # append cells in place; errors if it would drop obsm/obsp/layers unless you consent
 annizarr append sorted.zarr more_cells.zarr --drop-derived -y
 
-# add a log-normalized layer (layers/gexp) derived from CSR X, helpful is wanting CSC layer for visualization
+# add a log-normalized layer (layers/gexp) derived from CSR X, CSC layer for visualization
 annizarr add-expr merged.zarr --format csr
 
 # --- Icechunk: same ops, but each one lands as a commit ---
@@ -78,7 +78,7 @@ Defaults < config file < CLI flags. See [`example_config.toml`](example_config.t
 | GCS | `gs://` repos open/read/write via icechunk | no `ic copy` to/from `gs://` |
 
 
-## Python API for Icechunk
+## Python API for Icechunk usage
 
 ```python
 import annizarr as az

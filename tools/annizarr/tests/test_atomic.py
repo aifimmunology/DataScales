@@ -11,7 +11,7 @@ import pytest
 
 from _builders import make_adata, make_h5ad, make_store
 from annizarr.config import AppConfig, ChunkConfig, IOConfig
-from annizarr.errors import ConversionError
+from annizarr.errors import ConversionError, StorageError
 from annizarr.ops import convert_h5ad, sort
 
 _CHUNKS = ChunkConfig(x_row_chunk=16, x_col_chunk=4, sparse_flat_chunk=64)
@@ -168,3 +168,38 @@ def test_convert_icechunk_failure_leaves_no_extra_commit(tmp_path: Path, monkeyp
 
     repo = Repo(str(repo_path))
     assert [s.message for s in repo.log(branch="main")] == ["Repository initialized"]  # no commit landed
+
+
+def _write_wrong_shape_x(root, shape: tuple[int, int]) -> None:
+    root.attrs["encoding-type"] = "anndata"
+    root.attrs["encoding-version"] = "0.1.0"
+    root.require_array("X", shape=shape, dtype="float32", chunks=shape)
+
+
+def test_finalize_rejects_x_shape_mismatch_and_leaves_no_target(tmp_path: Path) -> None:
+    from annizarr._storage import open_output_store
+
+    out_path = tmp_path / "bad.zarr"
+    out = open_output_store(out_path, _cfg(), expected_shape=(5, 5))
+    _write_wrong_shape_x(out.root, (2, 2))
+    with pytest.raises(StorageError, match="shape mismatch"):
+        out.finalize()
+    out.abort()
+    assert not out_path.exists()
+    assert not list(tmp_path.glob("bad.zarr.tmp-*"))
+
+
+def test_finalize_shape_mismatch_leaves_existing_overwrite_target_intact(tmp_path: Path) -> None:
+    from annizarr._storage import open_output_store
+
+    store = make_store(tmp_path, "existing.zarr", adata=make_adata(n_obs=5, n_vars=5, seed=0), cfg=_cfg())
+    old_n_obs = ad.read_zarr(str(store)).n_obs
+
+    out = open_output_store(store, _cfg(overwrite=True), expected_shape=(5, 5))
+    _write_wrong_shape_x(out.root, (3, 3))
+    with pytest.raises(StorageError, match="shape mismatch"):
+        out.finalize()
+    out.abort()
+
+    assert store.exists()
+    assert ad.read_zarr(str(store)).n_obs == old_n_obs

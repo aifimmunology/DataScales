@@ -8,7 +8,8 @@ retired in the monorepo merge; its source is preserved in history at `git show
 2dba863:tools/convert-to-zarr/`.
 
 **Instrument:**
-[`tools/annizarr/benchmarking/writer_engine_bench.py`](../../tools/annizarr/benchmarking/writer_engine_bench.py).
+`writer_engine_bench.py`, retired from the tree ahead of annizarr's standalone split; recover it with
+`git show 9f3a1cf:tools/annizarr/benchmarking/writer_engine_bench.py`.
 Both pixi envs pin `zarr 3.3.0` / `anndata 0.12.19` / `numpy 2.4.6` / `numcodecs 0.16.5` with
 identical chunk/codec math (`tests/test_golden_writers.py` proves byte-identical output), and
 here the converted stores land at the same size across engines for every case (below) — so

@@ -21,14 +21,7 @@ def pin_blas() -> None:
         os.environ.setdefault(var, "1")
 
 
-_configured = False
-
-
 def configure_runtime(cpus: int) -> None:
-    global _configured
-    if _configured:
-        return
-    _configured = True
     import zarr
 
     pin_blas()

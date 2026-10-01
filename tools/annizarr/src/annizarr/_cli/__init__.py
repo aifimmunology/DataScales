@@ -15,7 +15,9 @@ def _build_parser() -> argparse.ArgumentParser:
     from annizarr._cli._edit import add_add_expr_parser, add_append_parser, add_rechunk_parser, add_sort_parser
     from annizarr._cli._ic import add_ic_parser
 
-    parser = argparse.ArgumentParser(description="AnnData zarr stores: convert, edit, and version with Icechunk.")
+    parser = argparse.ArgumentParser(
+        prog="annizarr", description="AnnData zarr stores: convert, edit, and version with Icechunk."
+    )
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="debug logging")

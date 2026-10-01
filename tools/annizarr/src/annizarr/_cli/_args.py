@@ -80,10 +80,11 @@ def add_autoshard_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--auto-shard",
         dest="auto_shard",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="shard the anndata-written elements and the 1-D sparse arrays with zarr's "
-        "automatic shard shape (default: unsharded)",
+        "automatic shard shape; default is off (unsharded). --no-auto-shard overrides a "
+        "config file's auto_shard = true for this run",
     )
 
 

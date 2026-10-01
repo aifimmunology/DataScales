@@ -154,7 +154,9 @@ def concat(
         t0 = time.perf_counter()
 
         commit_message = message or f"annizarr concat → {output_path.name}"
-        out = open_output_store(output_path, cfg, commit_message=commit_message, branch=branch)
+        out = open_output_store(
+            output_path, cfg, commit_message=commit_message, branch=branch, expected_shape=(n_obs_total, n_vars)
+        )
         try:
             set_anndata_root_attrs(out.root)
 

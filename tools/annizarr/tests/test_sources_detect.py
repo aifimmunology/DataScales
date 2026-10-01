@@ -142,6 +142,22 @@ def test_open_source_dispatches_by_kind_and_rejects_unknown(tmp_path: Path) -> N
         open_source(str(h5ad_path), _cfg(), fmt="not-a-kind")
 
 
+def test_open_source_anndata_reflects_backed_state(tmp_path: Path) -> None:
+    """The AnnData-passthrough source (load_anndata) must read the backed state off the
+    object itself, not hardcode eager."""
+    h5ad_path = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=4, n_vars=3))
+
+    backed = ad.read_h5ad(h5ad_path, backed="r")
+    src = open_source(backed, _cfg())
+    assert src.backed is True
+    src.close()
+
+    eager = ad.AnnData(X=sp.csr_matrix(np.eye(3, dtype=np.float32)))
+    src = open_source(eager, _cfg())
+    assert src.backed is False
+    src.close()
+
+
 def test_open_source_h5ad_auto_selects_eager_or_backed_by_threshold(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

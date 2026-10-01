@@ -9,4 +9,4 @@ if TYPE_CHECKING:
 
 
 def load_anndata(adata: AnnData) -> Source:
-    return Source(adata=adata, kind="anndata", backed=False, warnings=())
+    return Source(adata=adata, kind="anndata", backed=bool(getattr(adata, "isbacked", False)), warnings=())

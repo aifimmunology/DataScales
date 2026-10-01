@@ -294,8 +294,31 @@ def test_convert_adata_in_memory(tmp_path: Path) -> None:
     got = ad.read_zarr(str(out))
     np.testing.assert_array_equal(got.X.toarray(), X.toarray())
 
-    with pytest.raises(ConversionError, match="in-memory"):
-        convert_adata(adata, output=str(tmp_path / "b.zarr"), cfg=_cfg_backed("csr"))
+    # cfg.io.backed is synced from adata.isbacked, not taken at face value: a genuinely
+    # in-memory AnnData converts fine even if the caller's cfg says backed=True.
+    out_b = tmp_path / "b.zarr"
+    convert_adata(adata, output=str(out_b), cfg=_cfg_backed("csr"))
+    assert ad.read_zarr(str(out_b)).n_obs == adata.n_obs
+
+
+def test_convert_adata_accepts_a_backed_anndata(tmp_path: Path) -> None:
+    """convert_adata also takes an already-backed AnnData (e.g. ad.read_h5ad(path, backed='r')),
+    syncing cfg.io.backed from it: backed dense X with sparse output hits the same interim
+    guard as convert_h5ad; dense output streams without materialising."""
+    h5 = tmp_path / "in.h5ad"
+    dense = _make_dense_h5ad(h5)
+    adata = ad.read_h5ad(h5, backed="r")
+    try:
+        out = tmp_path / "out.zarr"
+        with pytest.raises(ConversionError, match="backed dense X with sparse output"):
+            convert_adata(adata, output=str(out), cfg=AppConfig(io=IOConfig(x_storage="csr")))
+        assert not out.exists()
+
+        out_dense = tmp_path / "out_dense.zarr"
+        convert_adata(adata, output=str(out_dense), cfg=AppConfig(io=IOConfig(x_storage="dense")))
+        np.testing.assert_array_equal(zarr.open(str(out_dense), mode="r")["X"][:], dense)
+    finally:
+        adata.file.close()
 
 
 # ---------------------------------------------------------------------------

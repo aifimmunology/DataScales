@@ -209,6 +209,25 @@ def test_help_shows_config_defaults(capsys: pytest.CaptureFixture[str]) -> None:
     assert f"default: {ChunkConfig().x_row_chunk}" in out
 
 
+def test_help_usage_names_annizarr(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.startswith("usage: annizarr")
+
+
+def test_no_auto_shard_flag_overrides_config_file(tmp_path: Path) -> None:
+    """A config file's auto_shard = true is overridable per run with --no-auto-shard."""
+    h5 = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=30, n_vars=20))
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text("[chunks]\nauto_shard = true\n")
+    out = tmp_path / "out.zarr"
+    args = ["convert", str(h5), "-o", str(out), "--config", str(cfg_file), "--no-auto-shard"]
+    assert main(args) == 0
+    root = zarr.open_group(str(out), mode="r")
+    assert root["X"]["data"].shards is None
+
+
 def test_cli_import_leaves_numpy_unimported() -> None:
     """`import annizarr._cli` alone (no CLI invocation) must stay free of heavy deps — checked
     in a subprocess since numpy is already imported in this test process."""

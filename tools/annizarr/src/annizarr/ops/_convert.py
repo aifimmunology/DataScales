@@ -67,7 +67,7 @@ def write_adata_to_store(
         elif fmt == "dense":
             if cfg.io.x_storage == "dense":
                 pass  # the writer streams dense input to dense output directly
-            elif not cfg.io.backed:
+            elif not is_backed(x):
                 to_sparse = sp.csr_matrix if cfg.io.x_storage == "csr" else sp.csc_matrix
                 x_for_write = to_sparse(np.asarray(x))
                 logger.warning("adata.X was dense and has been converted to sparse in memory for sparse output.")
@@ -88,7 +88,9 @@ def write_adata_to_store(
     )
     t0 = time.perf_counter()
     commit_message = message or f"annizarr convert → {store_name(output_path)}"
-    out = open_output_store(output_path, cfg, commit_message=commit_message, branch=branch)
+    out = open_output_store(
+        output_path, cfg, commit_message=commit_message, branch=branch, expected_shape=(adata.n_obs, adata.n_vars)
+    )
     try:
         write_adata(adata, out.root, cfg, x_override=x_for_write)
         snapshot_id = out.finalize()
@@ -107,11 +109,10 @@ def convert_adata(
     branch: str | None = None,
     message: str | None = None,
 ) -> OpResult:
-    """Write an in-memory AnnData to a zarr (or icechunk) store."""
+    """Write an AnnData (in-memory or already backed) to a zarr (or icechunk) store."""
     if cfg is None:
         cfg = load_config()
-    if cfg.io.backed:
-        raise ConversionError("convert_adata takes an in-memory AnnData; io.backed does not apply.")
+    cfg = replace(cfg, io=replace(cfg.io, backed=adata.isbacked))
     check_output_target(output, cfg)
     return write_adata_to_store(adata, output, cfg, allow_grouping=True, branch=branch, message=message)
 

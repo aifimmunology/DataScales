@@ -61,6 +61,7 @@ def open_output_store(
     *,
     commit_message: str | None = None,
     branch: str | None = None,
+    expected_shape: tuple[int, int] | None = None,
 ) -> OutputStore:
     import zarr
 
@@ -81,6 +82,7 @@ def open_output_store(
         def finalize_icechunk() -> str | None:
             nonlocal committed
             if committed is None:
+                _verify_new_store(root, expected_shape=expected_shape)
                 msg = commit_message or f"annizarr write → {store_name(output_path)}"
                 committed = repo.commit(msg)
                 logger.info(f"icechunk commit {committed} on branch '{repo.branch}'")
@@ -111,7 +113,8 @@ def open_output_store(
             return None
         if state is not _SwapState.OPEN:
             return None  # a previous finalize() already failed and cleaned up; nothing to redo
-        _verify_new_store(tmp_path)
+        verify_root = zarr.open_group(str(tmp_path), mode="r")
+        _verify_new_store(verify_root, expected_shape=expected_shape)
         if cfg.io.consolidate_metadata:
             zarr.consolidate_metadata(str(tmp_path))
 
@@ -150,14 +153,23 @@ def open_output_store(
     return OutputStore(root, finalize, abort)
 
 
-def _verify_new_store(path: Path) -> None:
-    import zarr  # never ad.read_zarr, which would materialise X
+def _verify_new_store(root: zarr.Group, *, expected_shape: tuple[int, int] | None = None) -> None:
+    # never ad.read_zarr here, which would materialise X
+    import zarr
 
-    root = zarr.open_group(str(path), mode="r")
+    from annizarr._core._zarr import shape_attr
+
     if root.attrs.get("encoding-type") != "anndata":
-        raise StorageError(f"Refusing to finalize '{path}': missing anndata root encoding-type.")
+        raise StorageError("Refusing to finalize: missing anndata root encoding-type.")
     if "X" not in root:
-        raise StorageError(f"Refusing to finalize '{path}': no X in the written store.")
+        raise StorageError("Refusing to finalize: no X in the written store.")
+    if expected_shape is None:
+        return
+    x = root["X"]
+    actual = x.shape if isinstance(x, zarr.Array) else shape_attr(x)
+    actual_shape = (int(actual[0]), int(actual[1]))
+    if actual_shape != expected_shape:
+        raise StorageError(f"X shape mismatch: expected {expected_shape}, got {actual_shape}.")
 
 
 def open_store_rw(

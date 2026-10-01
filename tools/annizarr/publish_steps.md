@@ -39,6 +39,7 @@ git checkout AnniZarr
 git branch -D main && git branch -m main
 git branch | grep -v '^\* main' | xargs -r git branch -D     # stale monorepo branches
 git tag -l | xargs -r git tag -d                              # monorepo tags, none are ours
+git rm -r -q tools && git commit -q -m "drop the retired tool stubs"   # history of the old tools is kept
 ls        # expect pyproject.toml pixi.toml src tests .github/workflows README.md ...
 ```
 
@@ -93,8 +94,8 @@ version-file = "src/annizarr/_version.py"
 
 Delete the checked-in `src/annizarr/_version.py` and add it to `.gitignore` (hatch writes it at
 build time; `annizarr/__init__.py` keeps importing `__version__` from it). Update
-`CITATION.cff` `repository-code` to `https://github.com/<you>/annizarr` and the `0.1.0` date in
-`CHANGELOG.md`. Commit, then tag:
+`CITATION.cff` `repository-code` and the two link lines at the bottom of `CHANGELOG.md` to
+`https://github.com/<you>/annizarr`, and the `0.1.0` date in `CHANGELOG.md`. Commit, then tag:
 
 ```bash
 git tag v0.1.0 && git push --tags

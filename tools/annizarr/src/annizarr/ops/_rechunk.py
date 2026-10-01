@@ -77,7 +77,9 @@ def rechunk(
 
     ad.settings.zarr_write_format = 3
     commit_message = message or f"annizarr rechunk {array} → {store_name(output)}"
-    out = open_output_store(output, cfg, commit_message=commit_message, branch=branch)
+    out = open_output_store(
+        output, cfg, commit_message=commit_message, branch=branch, expected_shape=_matrix_shape(src["X"])
+    )
     try:
         dst = out.root
         dst.attrs.update(dict(src.attrs))

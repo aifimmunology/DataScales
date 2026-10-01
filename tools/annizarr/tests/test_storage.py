@@ -77,7 +77,9 @@ def test_open_output_store_finalize_is_idempotent(tmp_path: Path) -> None:
 
     pytest.importorskip("icechunk")
     out_ic = open_output_store(tmp_path / "repo.icechunk", AppConfig(io=IOConfig(backend="icechunk")))
-    out_ic.root.attrs["marker"] = 1
+    out_ic.root.attrs["encoding-type"] = "anndata"
+    out_ic.root.attrs["encoding-version"] = "0.1.0"
+    out_ic.root.require_array("X", shape=(1, 1), dtype="float32")
     first = out_ic.finalize()
     second = out_ic.finalize()
     assert first is not None

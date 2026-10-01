@@ -1,31 +1,18 @@
 [io]
 overwrite = false
 consolidate_metadata = false
-# x_storage: "csr" (default), "csc" (force CSC), "dense" (force dense)
-x_storage = "csr"
-# backed: true (stream h5ad input), false (load eagerly). Commented out = auto (default):
-# peek X's on-disk size and pick backed when it exceeds eager_max_bytes, else eager.
-# backed = false
+x_storage = "csr"  # "csr" (default), "csc", or "dense"
+# backed = false   # commented out = auto (peek X's on-disk size vs eager_max_bytes)
 eager_max_bytes = 2147483648
-# backend: "zarr" (default, plain on-disk) or "icechunk" (transactional/versioned repo,
-# one commit per conversion). icechunk requires eager input (not backed) for now.
-# An icechunk target is a local path or an s3://bucket/prefix URL (AWS env credentials).
-backend = "zarr"
+backend = "zarr"  # "zarr" (default) or "icechunk" (one commit per op); icechunk needs eager input
 
 [chunks]
 x_row_chunk = 1000
 x_col_chunk = 1000
 sparse_flat_chunk = 1000000
 cpus = 1
-# Pack dense X inner chunks into shards of (x_row_chunk, x_col_chunk) * factor. 1 = no sharding.
-# Use >1 with small chunks to keep read granularity fine while cutting file/object count (dense X only).
-x_shard_factor = 1
-# Shard our own 1-D sparse arrays (data/indices of X, layers, raw.X, and the
-# add-expr/rechunk/sort-created ones) with zarr's shards="auto", and auto-shard anndata's own
-# writes (obs/var/obsm/uns/...) via ad.settings.auto_shard_zarr_v3. Dense X is unaffected (it
-# keeps the explicit x_shard_factor above). See benchmarking_results/autoshard/README.md for
-# the read-latency measurement behind this default.
-auto_shard = false
+x_shard_factor = 1  # pack this many dense-X chunks per shard; 1 = no sharding
+auto_shard = false  # shard our 1-D sparse arrays + anndata's own writes with shards="auto"
 
 [validation]
 reject_spatial = true
@@ -33,19 +20,9 @@ require_non_empty = true
 min_obs = 1
 min_vars = 1
 
-# Sort + partition X by obs columns (convert, csr or dense, eager only). When enabled, rows
-# are physically sorted by sort_by (primary key first) so each distinct key tuple is a
-# contiguous block. Output is a plain sorted AnnData with no tool-specific metadata: read a
-# subset by deriving the contiguous range from the (now sorted) obs column and slicing
-# X[start:end] with stock anndata/zarr — no annizarr dependency needed to query the store.
 [grouping]
 enabled = false
-sort_by = ["AIFI_L1", "batch_id"]
+sort_by = ["AIFI_L1", "batch_id"]  # physically sort+partition X by these obs columns (convert only)
 
-# obs-column policy when converting several h5ad files at once (multiple inputs to convert =
-# concat). Empty (default) requires an identical obs schema across all inputs. A non-empty
-# list keeps only those obs columns (each input must contain them; obs is projected to
-# exactly these, others dropped). A kept categorical column must have identical categories
-# across inputs, else it's a hard error (concat would degrade it to a slow string array).
 [concat]
-obs_columns = []
+obs_columns = []  # empty = require identical obs schema across inputs; else project to this subset
