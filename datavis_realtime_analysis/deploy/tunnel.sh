@@ -1,4 +1,5 @@
 #!/bin/bash
+
 set -eu
 
 GPU_INSTANCE=""

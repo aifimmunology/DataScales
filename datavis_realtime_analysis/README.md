@@ -103,10 +103,18 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 Set `GPU_INSTANCE` and `GPU_ZONE` at the top of `deploy/tunnel.sh`, then:
 
 ```bash
+<<<<<<< HEAD
 deploy/tunnel.sh    # IAP ssh tunnel → http://localhost:8000
 ```
 
 ### 4. Troubleshoot
+=======
+deploy/tunnel.sh          # IAP TCP tunnel → http://localhost:8000
+deploy/tunnel.sh --ssh    # fallback: forward over plain gcloud ssh — needs only ssh access
+```
+
+The IAP tunnel needs `roles/iap.tunnelResourceAccessor` plus a firewall rule allowing `35.235.240.0/20 → tcp:8000` (an IAP `4033: not authorized` means the role is missing). Without those, the `--ssh` fallback port-forwards over the ssh access you already have.
+>>>>>>> 916e262 (adding script to open port access to local viewer)
 
 - A red **GPU runs** rail badge shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing.
 - Logs: `docker compose logs -f backend`. Stop: `docker compose down`.
