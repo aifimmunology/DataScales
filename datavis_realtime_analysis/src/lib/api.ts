@@ -49,8 +49,7 @@ export type GpuHealth = {
   checked_at?: string | null
 }
 
-// Temp while GPU dispatch rides ssh: cached backend probe of the permission chain
-// (backend GCS creds, ssh to the box, store write from the box). refresh forces a re-probe.
+// Cached backend probe: store credential + GPU visible in the backend container. refresh forces a re-probe.
 export async function fetchGpuHealth(refresh = false): Promise<GpuHealth | null> {
   const res = await fetch(`/api/gpu/health${refresh ? '?refresh=1' : ''}`)
   if (!res.ok) return null

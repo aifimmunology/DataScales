@@ -25,9 +25,9 @@
     "vite": "^5.0.0"
   },
   "scripts": {
-    "dev": "concurrently -n vite,api -c blue,green \"vite\" \"uvicorn server.main:app --reload\"",
+    "dev": "concurrently -n vite,api -c blue,green \"vite\" \"pixi run --manifest-path server/pixi.toml uvicorn server.main:app --reload\"",
     "dev:frontend": "vite",
-    "dev:api": "uvicorn server.main:app --reload",
+    "dev:api": "pixi run --manifest-path server/pixi.toml uvicorn server.main:app --reload",
     "build": "tsc && vite build",
     "preview": "vite preview"
   }

@@ -12,7 +12,8 @@ app = FastAPI(redoc_url=None)  # /docs = interactive API console
 
 @app.get("/")
 def root():
-    return {"this": "datavis backend API", "app_ui": "http://localhost:3000",
+    return {"this": "datavis backend API",
+            "app_ui": "nginx on :8000 (deployed) / vite on :3000 (dev)",
             "api_console": "/docs", "health": "/api/health"}
 
 
@@ -39,6 +40,11 @@ def submit(artifact: dict):
 @app.get("/api/jobs")
 def jobs():
     return gpu.list_jobs()
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str):
+    return gpu.cancel(job_id)
 
 
 @app.get("/api/gpu/health")
