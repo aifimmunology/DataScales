@@ -1,21 +1,18 @@
-"""scizarr-ic — git-like version control for Zarr stores, backed by Icechunk.
+"""scizarr-ic: git-like version control for Zarr stores, backed by Icechunk.
 
-Python API entry point is :class:`Repo`::
+Everything goes through :class:`Repo`, from a notebook or a script::
 
     from scizarr_ic import Repo
-    repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store
+    repo = Repo.init("data.zarr", "data.icechunk")      # import a zarr store
     g = repo.open_zarr("w"); ...; repo.commit("edit obs")  # stage + commit
-    repo.checkout("experiment", create=True)           # branch
-    for snap in repo.log(): print(snap.id, snap.message)
+    repo.checkout("experiment", create=True)              # branch
+    repo.log(); repo.branches(); repo.tree()              # history, shown git-style
 
-    # a read-only local mirror: read it in place, write to the bucket behind it
-    repo = Repo("/mnt/store", origin="s3://bucket/store")
-
-The command line (``scizarr-ic`` / ``scz``) exposes ``init``, ``log``, ``tree``,
-``checkout``, ``cherrypick`` and ``copy``; ``commit`` is Python-API only.
+    Repo("gs://bucket/store", anonymous=True)             # public bucket, no credentials
+    Repo("/mnt/store", origin="s3://bucket/store")        # read a mirror, write to the bucket
 """
 from .errors import ScizarrError
 from .repo import DEFAULT_BRANCH, Repo
 
 __all__ = ["Repo", "ScizarrError", "DEFAULT_BRANCH"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

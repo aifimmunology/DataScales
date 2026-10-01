@@ -91,13 +91,14 @@ def test_checkout_missing_branch_errors(src_zarr, repo_path):
         repo.checkout("ghost")
 
 
-def test_head_persists_across_reopen(src_zarr, repo_path):
+def test_reopen_lands_on_main_unless_branch_given(src_zarr, repo_path):
     path, _ = src_zarr
-    repo = Repo.init(path, repo_path)
-    repo.checkout("dev", create=True)
+    Repo.init(path, repo_path).checkout("dev", create=True)   # checkout is in-process only
 
-    reopened = Repo(repo_path)
-    assert reopened.branch == "dev"
+    assert Repo(repo_path).branch == "main"
+    assert Repo(repo_path, branch="dev").branch == "dev"
+    with pytest.raises(ScizarrError, match="No branch 'ghost'"):
+        Repo(repo_path, branch="ghost")
 
 
 def test_cherrypick_resets_branch_state(src_zarr, repo_path):
@@ -138,9 +139,9 @@ def test_tree_lists_all_branches(src_zarr, repo_path):
     repo.checkout("main")
     repo.checkout("b2", create=True)
 
-    tree = repo.tree()
-    assert set(tree) == {"main", "b1", "b2"}
-    assert all(len(v) >= 1 for v in tree.values())
+    assert set(repo.branches()) == {"main", "b1", "b2"}
+    shown = repr(repo.tree())
+    assert shown.startswith("On branch b2\n") and all(b in shown for b in ("main", "b1", "b2"))
 
 
 def test_create_empty_repo_and_exists(tmp_path):
@@ -177,3 +178,31 @@ def test_open_zarr_modes_and_snapshot_rules(src_zarr, repo_path):
         repo.open_zarr("w", snapshot_id=first)
     with pytest.raises(ScizarrError, match="mode must be 'r' or 'w'"):
         repo.open_zarr("a")
+
+
+def test_reprs_read_git_like(src_zarr, repo_path):
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path, message="import")
+    repo.checkout("dev", create=True)
+    repo.open_zarr("w").attrs["k"] = 1
+    snap = repo.commit("edit k")
+
+    shown = repr(repo)
+    assert shown.splitlines()[0] == f"Repo({str(repo_path)!r})"
+    assert "  branch: dev" in shown and f"  tip:    {snap[:12]}" in shown and shown.endswith("edit k")
+    assert repr(repo.branches()).splitlines() == ["* dev", "  main"]
+    log = repr(repo.log()).splitlines()
+    assert len(log) == 3 and log[0].startswith(snap[:12]) and log[0].endswith("  edit k")
+    assert log[-1].endswith("Repository initialized")
+
+    root = repo.open_zarr("r")
+    head, *members = repr(root).splitlines()
+    assert head == f"<Group '/' at {repo_path}  branch dev  snapshot {snap[:12]}  read-only>"
+    assert members == ["  arrays: X", "  groups: obs, var"]
+    assert "detached" in repr(repo.open_zarr("r", snapshot_id=snap))
+
+    repo.open_zarr("w").attrs["j"] = 2
+    assert "writable, uncommitted changes>" in repr(repo.open_zarr("w")).splitlines()[0]
+    assert repr(repo).endswith("  staged: uncommitted changes")
+    repo.discard()
+    assert "staged" not in repr(repo)

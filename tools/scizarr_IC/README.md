@@ -3,107 +3,81 @@
 Git-like version control for Zarr stores, backed by [Icechunk](https://icechunk.io).
 
 Point it at an existing zarr store and it becomes a versioned Icechunk repository:
-commit changes, branch, inspect history, and reset the store to any past snapshot —
-with a CLI that reads similar to git and a small Python API for scripted edits. Repos live
-in a local directory or an object store (`s3://bucket/prefix`, `gs://bucket/prefix`).
+commit changes, branch, inspect history, and reset the store to any past snapshot, from
+a notebook or a script. Repos live in a local directory or an object store
+(`s3://bucket/prefix`, `gs://bucket/prefix`).
 
 ## Install
 
 ```bash
-pip install .            # from tools/scizarr_IC; gives the `scizarr-ic` / `scz` commands
-pip install '.[s3]'      # adds boto3, only needed for `copy` to/from s3://
+pip install .            # from tools/scizarr_IC
+pip install '.[s3]'      # adds boto3, only needed for Repo.copy to/from s3://
 ```
 
-Needs Python 3.10–3.12, Icechunk 2.1.2+ and Zarr v3 (pulled in automatically).
+Needs Python 3.12+, Icechunk 2.2.2+ and Zarr v3 (pulled in automatically).
 
-## CLI
+## Usage
 
-```bash
-scizarr-ic init SRC.zarr OUT.icechunk -m "import atlas v1"   # seed a repo from a zarr store
-scizarr-ic log     -C OUT.icechunk [--oneline] [-b BRANCH]   # history of a branch, newest first
-scizarr-ic tree    -C OUT.icechunk                           # every branch + its commits
-scizarr-ic checkout -C OUT.icechunk BRANCH [-b]              # switch branch (-b to create)
-scizarr-ic cherrypick -C OUT.icechunk SNAPSHOT_ID           # reset current branch to a snapshot
-scizarr-ic copy    -C OUT.icechunk DEST                      # clone (all branches, ids intact)
-```
-
-The current branch is remembered per repo,
-so `-C` is all you need between commands. Repo paths may be local directories or
-`s3://` / `gs://` URIs; object-store credentials come from the environment (`AWS_*`
-variables, a profile, or an instance/container role).
-
-`commit` is **Python-API only** — Icechunk stages edits in a session's memory, so there
-is nothing for a fresh CLI process to commit.
-
-
-## Python API
-
-Writes land on the **current branch** (shared with the CLI via a persisted HEAD) — in a
-script, pin it up front: `Repo(path, branch="MY_BRANCH")` opens there or errors.
+A `Repo` is one Icechunk repository opened on a branch (`main` unless you say
+otherwise). `branches()`, `log()` and `tree()` return data but display git-style, so a
+bare expression in a notebook cell and `print()` in a script show the same thing.
 
 ```python
 from scizarr_ic import Repo
 
-repo = Repo.init("data.zarr", "data.icechunk")   # import a zarr store (one commit on main)
-repo = Repo.create("s3://bucket/empty") 
-repo = Repo('s3://bucket/store', branch='MY_BRANCH/main')     # open previous store
-#repo = Repo("/mnt/store", origin="s3://bucket/store")   #Special case when writing location to repo is different from reading
+repo = Repo.init("data.zarr", "data.icechunk")    # import a zarr store (one commit on main)
+repo = Repo.create("s3://bucket/empty")           # or start empty
+repo = Repo("s3://bucket/store", branch="dev")    # open an existing repo on a branch
+repo = Repo("gs://bucket/store", anonymous=True)  # public bucket, no credentials needed
+Repo.exists("s3://bucket/empty")                  # True / False
 
-Repo.exists("s3://bucket/empty")                 # True or false
+repo                                              # location, branch, tip commit
+repo.branches()                                   # one per line, * marks the current branch
+repo.log()                                        # one commit per line, newest first
+repo.log()[0].id                                  # ... and still a list of icechunk SnapshotInfo
+repo.tree()                                       # every branch as one commit graph
 
-z = repo.open_zarr("w")                          # writable zarr.Group for this repo/branch
-z.attrs["step"] = "lognorm"                      # edit like any zarr group ...
-repo.commit("created and normalized branch for l3 labels") 
+z = repo.open_zarr("w")                           # writable zarr.Group at the branch tip
+z.attrs["step"] = "lognorm"                       # edit like any zarr group ...
+repo.commit("normalize")                          # ... then commit once
 
-repo.checkout("experiment", create=True)         # branch off the current tip
+repo.checkout("experiment", create=True)          # branch off the current tip (this object only)
 z = repo.open_zarr("w"); z["X"][:] *= 2
-repo.commit("scaled X... other comments here for commit"). #commit to branch, for others to see, and be tracked
+repo.commit("scaled X")
 
-for snap in repo.log():                          # show commits log of repo
-    print(snap.id, snap.message)
-
-repo.cherrypick(some_snapshot_id)                # reset current branch to a snapshot
 root = repo.open_zarr("r")                        # read-only zarr.Group at the branch tip
-old  = repo.open_zarr("r", snapshot_id=some_id)   # ... or read a past snapshot (r only)
+root                                              # prints location, branch, snapshot, members (subgroups keep zarr's repr)
+old  = repo.open_zarr("r", snapshot_id=some_id)   # or a past snapshot (read-only)
+repo.cherrypick(some_id)                          # reset the current branch to a snapshot
 
-mine = repo.copy("/work/store")                  # or clone it somewhere writable
+mine = repo.copy("/work/store")                   # clone (all branches, ids intact)
 ```
 
-Batch writes into **few, large commits** — a commit per chunk/row-batch is pathological
-for Icechunk. `open_zarr("w")` reuses one open session until you `commit()` or `discard()`.
+Batch writes into **few, large commits**; a commit per chunk/row-batch is pathological for
+Icechunk. `open_zarr("w")` reuses one open session until you `commit()` or `discard()`.
 
+### Credentials
+
+Object-store credentials come from the environment: `gcloud auth application-default login`
+for `gs://`, `aws sso login` / `AWS_*` variables / an instance role for `s3://`.
+`anonymous=True` reads a public bucket unsigned. A credentials problem at open raises a
+`ScizarrError` that says so, rather than "no repository".
 
 ### Read here, write there
 
-When the path you read is not the place you can write — a read-only local mirror of an
-`s3://` prefix, for instance — name the writable location with `--origin` (or
-`SCIZARR_IC_ORIGIN`). Reads stay on the path; `checkout -b`, `cherrypick` and
-`Repo.commit` go to the origin, which then also serves reads in that process, since a
-mirror can lag behind fresh writes.
-
-```bash
-scizarr-ic log      -C /mnt/store                                   # reads, no credentials
-scizarr-ic checkout -C /mnt/store dev -b --origin s3://bucket/store # writes go to S3
-export SCIZARR_IC_ORIGIN=s3://bucket/store                          # same, for a whole session
-```
-
-A read-only path with no origin is reads-only; `copy` takes a fully writable clone
-(`scizarr-ic copy -C /mnt/store /work/store`, or to an `s3://` prefix with boto3).
-
-HEAD lives locally, like git's: a `scizarr_head` file inside a *writable* local repo,
-otherwise a per-user sidecar under `$SCIZARR_IC_HOME` (default `~/.cache/scizarr_ic`),
-keyed by the repo's origin. Nothing is ever written into a read-only repo.
-
+When the path you read is not the place you can write, such as a read-only local mirror of
+an `s3://` prefix, name the writable location: `Repo("/mnt/store", origin="s3://bucket/store")`.
+Reads stay on the path; `checkout(create=True)`, `cherrypick` and `commit` go to the origin,
+which then also serves reads in that process, since a mirror can lag behind fresh writes.
+A read-only path with no origin is reads-only; `repo.copy(dest)` takes a fully writable clone.
 
 ## Notes
 
-- Icechunk **2.1.2+** and Zarr **v3**. `init` copies the source store's layout
-  (chunks, shards, codecs, fill value, attrs) verbatim and streams data in
-  chunk-aligned bands, so the import stays memory-bounded and anndata-readable.
-- `copy` replicates the repo's object tree byte for byte (Icechunk is
-  content-addressed), so every branch and snapshot id is preserved. Local→local
-  needs nothing; anything touching `s3://` needs `boto3`.
+- `init` copies the source store's layout (chunks, shards, codecs, fill value, attrs)
+  verbatim and streams data in chunk-aligned bands, so the import stays memory-bounded
+  and anndata-readable.
+- `copy` replicates the repo's object tree byte for byte (Icechunk is content-addressed),
+  so every branch and snapshot id is preserved. Local→local needs nothing; anything
+  touching `s3://` needs `boto3`.
 - One repo == one store. Writes are single-writer (in-process session); concurrent /
   distributed writes are not wired up yet.
-- This tool is meant to compose with the other DataScale tools (e.g. `zarrsmith`,
-  which can already write directly to an Icechunk backend).

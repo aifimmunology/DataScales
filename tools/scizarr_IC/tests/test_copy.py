@@ -1,4 +1,4 @@
-"""copy_group (init's zarr import) and Repo.copy / `scizarr-ic copy` (repo clone)."""
+"""copy_group (init's zarr import) and Repo.copy (repo clone)."""
 from __future__ import annotations
 
 import numpy as np
@@ -6,9 +6,7 @@ import pytest
 import zarr
 
 from scizarr_ic import Repo, ScizarrError
-from scizarr_ic.cli import main
 from scizarr_ic.copy import copy_group
-from scizarr_ic.head import HEAD_FILE
 
 from conftest import snapshot_tree
 
@@ -44,7 +42,6 @@ def test_copy_repo_is_faithful_and_independent(src_zarr, repo_path, tmp_path):
     assert b.branch == "dev" and set(b.branches()) == {"main", "dev"}
     for br in ("main", "dev"):
         assert [s.id for s in b.log(branch=br)] == [s.id for s in a.log(branch=br)]
-    assert (tmp_path / "b.icechunk" / HEAD_FILE).is_file()
     b.checkout("feature", create=True)
     b.open_zarr("w").attrs["mine"] = 1
     b.commit("edit the copy")
@@ -64,11 +61,8 @@ def test_copy_refuses_bad_destinations(src_zarr, repo_path, tmp_path, monkeypatc
         repo.copy("s3://bucket/prefix")  # checked before any network I/O
 
 
-def test_cli_copy(src_zarr, repo_path, tmp_path, capsys):
+def test_copy_then_branch_in_copy_only(src_zarr, repo_path, tmp_path):
     path, _ = src_zarr
-    main(["init", str(path), str(repo_path)])
-    dest = tmp_path / "cli-copy.icechunk"
-    assert main(["copy", "-C", str(repo_path), str(dest)]) == 0
-    assert "Copied" in capsys.readouterr().out
-    assert main(["checkout", "-C", str(dest), "-b", "work"]) == 0
-    assert "work" in Repo(dest).branches() and "work" not in Repo(repo_path).branches()
+    copy = Repo.init(path, repo_path).copy(tmp_path / "copy.icechunk")
+    copy.checkout("work", create=True)
+    assert "work" in Repo(copy.path).branches() and "work" not in Repo(repo_path).branches()

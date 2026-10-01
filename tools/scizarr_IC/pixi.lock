@@ -1160,16 +1160,16 @@ packages:
   requires_python: '>=3.10'
 - pypi: ./
   name: scizarr-ic
-  version: 0.2.0
-  sha256: 8587648468d1e711055aae2d2d0e9102ae944781452fbc6356438f0ccd572774
+  version: 0.3.0
+  sha256: f1ea1f5dfb27aebc47b0c36554b19ecaa141eaaca11433b26c6b2149b13c60ea
   requires_dist:
-  - icechunk>=2.1.2,<3
+  - icechunk>=2.2.2,<3
   - zarr>=3.3.0,<4
   - boto3>=1.28 ; extra == 's3'
   - pytest>=8.0 ; extra == 'dev'
   - numpy>=1.24.0,<2.5 ; extra == 'dev'
   - boto3>=1.28 ; extra == 'dev'
-  requires_python: '>=3.10,<3.13'
+  requires_python: '>=3.12'
 - pypi: https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl
   name: six
   version: 1.17.0

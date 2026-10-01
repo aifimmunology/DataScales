@@ -19,7 +19,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .errors import ScizarrError
-from .head import HEAD_FILE
 from .storage import is_remote
 
 BAND_BYTES = 128 * 1024**2
@@ -38,12 +37,11 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
     """Copy the repo object tree at ``src`` to ``dst`` (local dirs and/or ``s3://``).
 
     Local→local uses ``shutil``; anything involving ``s3://`` goes through boto3 with
-    credentials from the environment, ``workers`` objects in flight at a time. The
-    local HEAD file is never copied. Callers run :func:`check_copyable` and make sure
-    ``dst`` is a fresh location.
+    credentials from the environment, ``workers`` objects in flight at a time. Callers
+    run :func:`check_copyable` and make sure ``dst`` is a fresh location.
     """
     if not (is_remote(src) or is_remote(dst)):
-        shutil.copytree(src, dst, ignore=shutil.ignore_patterns(HEAD_FILE), dirs_exist_ok=True)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
         return
 
     import boto3
@@ -82,7 +80,7 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
         jobs = [
             (lambda f=f: s3.upload_file(str(f), db, f"{dp}/{f.relative_to(root).as_posix()}"))
             for f in root.rglob("*")
-            if f.is_file() and f.name != HEAD_FILE
+            if f.is_file()
         ]
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:

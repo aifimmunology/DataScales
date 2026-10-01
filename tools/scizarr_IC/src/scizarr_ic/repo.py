@@ -1,18 +1,15 @@
 """Git-like wrapper around an icechunk repository.
 
-One ``Repo`` == one icechunk repository (local dir or s3://—gs:// URI).
+One ``Repo`` == one icechunk repository (local dir or s3://, gs:// URI), opened on a
+branch: ``main`` unless ``branch=`` says otherwise. ``checkout`` switches branches for
+this object only; icechunk has no notion of a current branch, so nothing is persisted.
 
-**Read/write split.** Reads (``log``, ``tree``, ``open_zarr("r")``...) go through ``path`` as
-given. Writes go to ``origin`` when one is given (``Repo(path, origin=...)``, CLI
-``--origin``, or ``SCIZARR_IC_ORIGIN``) — e.g. the ``s3://`` prefix behind a read-only
-local mirror — and to ``path`` otherwise. The origin is opened lazily on the first
-write, with credentials from the environment; once opened it also serves reads in this
-process, since a mirror can lag behind fresh writes. A read-only ``path`` with no
-origin is reads-only.
-
-**HEAD.** The current branch persists across CLI invocations locally: a
-``scizarr_head`` file for writable local repos, a per-user sidecar under
-``$SCIZARR_IC_HOME`` otherwise (see ``head.py``).
+**Read/write split.** Reads (``log``, ``tree``, ``open_zarr("r")``...) go through ``path``
+as given. Writes go to ``origin`` when one is given (``Repo(path, origin=...)``, e.g. the
+``s3://`` prefix behind a read-only local mirror) and to ``path`` otherwise. The origin is
+opened lazily on the first write, with credentials from the environment; once opened it
+also serves reads in this process, since a mirror can lag behind fresh writes. A
+read-only ``path`` with no origin is reads-only.
 
 Icechunk sessions stage changes in memory: ``open_zarr("w")`` opens a session on the
 current branch, and ``commit()`` makes the staged changes durable as one snapshot.
@@ -21,17 +18,21 @@ Batch writes into few, large commits.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .errors import ScizarrError
-from .head import HeadStore
-from .storage import ENV_ORIGIN, canonical_location, is_readonly_path, is_remote, storage_for
+from .storage import (
+    canonical_location,
+    explain_open_failure,
+    is_readonly_path,
+    is_remote,
+    open_repository,
+    storage_for,
+)
 
 if TYPE_CHECKING:
-    import zarr
-    from icechunk import SnapshotInfo
+    from ._display import Branches, Group, Log, Tree
 
 DEFAULT_BRANCH = "main"
 
@@ -46,7 +47,7 @@ def _fresh_destination(location: str | Path) -> str:
 
     out = str(location)
     if is_readonly_path(out):
-        raise ScizarrError(f"Destination '{out}' is read-only — use a writable path or s3://bucket/prefix.")
+        raise ScizarrError(f"Destination '{out}' is read-only: use a writable path or s3://bucket/prefix.")
     if is_remote(out):
         if icechunk.Repository.exists(storage_for(out)):
             raise ScizarrError(f"Destination already holds an icechunk repo: {out}")
@@ -59,7 +60,11 @@ def _fresh_destination(location: str | Path) -> str:
 
 
 class Repo:
-    """Open an existing repo; use :meth:`init` / :meth:`create` to make one."""
+    """Open an existing repo on a branch; use :meth:`init` / :meth:`create` to make one.
+
+    ``anonymous=True`` reads a public bucket with unsigned requests; otherwise
+    credentials come from the environment. Writes always use the environment.
+    """
 
     def __init__(
         self,
@@ -67,40 +72,35 @@ class Repo:
         *,
         branch: str | None = None,
         origin: str | None = None,
+        anonymous: bool = False,
     ) -> None:
-        import icechunk
-
         self.path = str(path)
-        try:
-            self._reader = icechunk.Repository.open(storage_for(self.path))
-        except Exception as exc:
-            raise ScizarrError(f"No icechunk repository at '{self.path}': {exc}") from exc
+        self.anonymous = anonymous
+        self._reader = open_repository(self.path, anonymous=anonymous)
         self._writer: Any = None
         self._session: Any = None
 
         self.readonly_path = is_readonly_path(self.path)
-        self.origin = str(origin or os.environ.get(ENV_ORIGIN) or "") or (
-            None if self.readonly_path else self.path
-        )
-        self._head = HeadStore(
-            key=canonical_location(self.origin or self.path),
-            in_repo_dir=self.path if self.origin == self.path and not is_remote(self.path) else None,
-        )
+        self.origin = str(origin) if origin else (None if self.readonly_path else self.path)
+        self._branch = branch or DEFAULT_BRANCH
+        if not self._branch_exists(self._branch):
+            raise ScizarrError(f"No branch '{self._branch}' in '{self.path}'")
 
-        requested = branch or self._head.load()
-        if requested is not None and self._branch_exists(requested):
-            self._branch = requested
-        elif branch is not None:
-            raise ScizarrError(f"Branch '{branch}' does not exist in '{self.path}'")
-        elif self._branch_exists(DEFAULT_BRANCH, consult_origin=False):
-            if requested is not None:
-                print(
-                    f"warning: HEAD branch '{requested}' is gone, falling back to '{DEFAULT_BRANCH}'",
-                    file=sys.stderr,
-                )
-            self._branch = DEFAULT_BRANCH
-        else:
-            raise ScizarrError(f"No '{DEFAULT_BRANCH}' branch in '{self.path}'")
+    def __repr__(self) -> str:
+        from ._display import fmt_snapshot
+
+        lines = [f"Repo({self.path!r})", f"  branch: {self._branch}"]
+        try:
+            tip = next(self._repo.ancestry(branch=self._branch), None)
+        except Exception:
+            tip = None
+        if tip is not None:
+            lines.append(f"  tip:    {fmt_snapshot(tip)}")
+        if self.resolved:
+            lines.append(f"  writes: {self.origin}")
+        if self._dirty:
+            lines.append("  staged: uncommitted changes")
+        return "\n".join(lines)
 
     # -- creating ------------------------------------------------------------
 
@@ -117,9 +117,7 @@ class Repo:
             icechunk.Repository.create(storage_for(out))
         except Exception as exc:
             raise ScizarrError(f"Could not create icechunk repository at '{out}': {exc}") from exc
-        repo = cls(out)
-        repo._head.save(repo._branch)
-        return repo
+        return cls(out)
 
     @classmethod
     def init(
@@ -143,7 +141,7 @@ class Repo:
         return repo
 
     @classmethod
-    def exists(cls, path: str | Path) -> bool:
+    def exists(cls, path: str | Path, *, anonymous: bool = False) -> bool:
         """Does an icechunk repo exist at ``path``? Never creates anything."""
         import icechunk
 
@@ -151,16 +149,16 @@ class Repo:
         if not is_remote(p) and not os.path.exists(p):
             return False
         try:
-            return bool(icechunk.Repository.exists(storage_for(p)))
+            return bool(icechunk.Repository.exists(storage_for(p, anonymous=anonymous)))
         except Exception as exc:
-            raise ScizarrError(f"Could not check for a repository at '{p}': {exc}") from exc
+            raise explain_open_failure(p, exc) from exc
 
     def copy(self, dest: str | Path) -> "Repo":
-        """Copy this repo — every branch and snapshot, ids intact — to a fresh ``dest``.
+        """Copy this repo, every branch and snapshot with ids intact, to a fresh ``dest``.
 
         Local dir or ``s3://`` prefix (the latter needs ``boto3``). Reads come from
-        ``path`` as given; nothing is written into the source. The current branch
-        carries over when the copy has it.
+        ``path`` as given; nothing is written into the source. The copy opens on the
+        current branch when it has it.
         """
         from .copy import check_copyable, copy_repo
 
@@ -171,8 +169,6 @@ class Repo:
         repo = type(self)(dest)
         if self._branch in repo.branches():
             repo.checkout(self._branch)
-        else:
-            repo._head.save(repo._branch)
         return repo
 
     # -- location ------------------------------------------------------------
@@ -191,40 +187,48 @@ class Repo:
         """Name of the current branch."""
         return self._branch
 
-    def branches(self) -> list[str]:
-        return sorted(self._repo.list_branches())
+    def branches(self) -> "Branches":
+        """Sorted branch names (a list); shown one per line, ``*`` on the current branch."""
+        from ._display import Branches
+
+        return Branches(sorted(self._repo.list_branches()), current=self._branch)
 
     def checkout(self, branch: str, *, create: bool = False) -> str:
-        """Switch the current branch (persisted locally); return its tip snapshot.
+        """Switch this object to ``branch`` and return its tip snapshot id.
 
         ``create=True`` branches off the current tip when ``branch`` doesn't exist.
+        Switching needs no write access; creating does.
         """
         self._reject_uncommitted()
         if not self._branch_exists(branch):
             if not create:
-                raise ScizarrError(f"No branch '{branch}' (pass create=True / -b to create it)")
+                raise ScizarrError(f"No branch '{branch}' (pass create=True to create it)")
             writer = self._writer_repo()
             writer.create_branch(branch, writer.lookup_branch(self._branch))
         self._branch = branch
         self._session = None
-        self._head.save(branch)
         return self._repo.lookup_branch(branch)
 
     # -- reading & writing ---------------------------------------------------
 
-    def open_zarr(self, mode: str, *, snapshot_id: str | None = None) -> "zarr.Group":
-        """Open the store's zarr group — ``mode="r"`` (read) or ``mode="w"`` (write).
+    def open_zarr(self, mode: str, *, snapshot_id: str | None = None) -> "Group":
+        """Open the store's root zarr group: ``mode="r"`` (read) or ``mode="w"`` (write).
 
         ``"r"`` returns a read-only group at the current branch tip, or at
         ``snapshot_id`` when given (time-travel to a past commit). ``"w"`` returns a
         writable group on a session at the branch tip: edits stage in memory until
         :meth:`commit`, and repeated ``"w"`` calls reuse the one open session. Writes
-        only ever go to the branch tip, so ``snapshot_id`` is rejected with ``"w"`` —
+        only ever go to the branch tip, so ``snapshot_id`` is rejected with ``"w"``:
         read a past snapshot with ``"r"``, or :meth:`cherrypick` to reset the branch
         there first. (``"w"`` opens an *editable* session, like zarr ``mode="a"``; it
         never truncates the store.)
+
+        The returned root is a ``zarr.Group`` whose repr shows location, branch,
+        snapshot and top-level members instead of icechunk's session dump.
         """
         import zarr
+
+        from ._display import Group
 
         if mode == "r":
             session = (
@@ -232,18 +236,25 @@ class Repo:
                 if snapshot_id is not None
                 else self._repo.readonly_session(branch=self._branch)
             )
-            return zarr.open_group(store=session.store, mode="r")
-        if mode == "w":
+            group = zarr.open_group(store=session.store, mode="r")
+        elif mode == "w":
             if snapshot_id is not None:
                 raise ScizarrError(
-                    'snapshot_id is read-only — writes go to the branch tip, not a past '
+                    'snapshot_id is read-only: writes go to the branch tip, not a past '
                     'snapshot. Read it with open_zarr("r", snapshot_id=...), or cherrypick() '
                     "to reset the branch there first."
                 )
             if self._session is None or self._session.read_only:
                 self._session = self._writer_repo().writable_session(self._branch)
-            return zarr.open_group(store=self._session.store, mode="a")
-        raise ScizarrError(f"open_zarr mode must be 'r' or 'w', got {mode!r}")
+            group = zarr.open_group(store=self._session.store, mode="a")
+        else:
+            raise ScizarrError(f"open_zarr mode must be 'r' or 'w', got {mode!r}")
+        location = self.origin if self._writer is not None and self.resolved else self.path
+        return Group(
+            group._async_group,
+            _location=location,
+            _branch="" if snapshot_id is not None else self._branch,
+        )
 
     def commit(
         self,
@@ -254,7 +265,7 @@ class Repo:
     ) -> str:
         """Commit the open writable session to the current branch; return the snapshot id."""
         if self._session is None or self._session.read_only:
-            raise ScizarrError('No writable session — call open_zarr("w") and make changes first')
+            raise ScizarrError('No writable session: call open_zarr("w") and make changes first')
         try:
             snapshot_id = self._session.commit(message, metadata, allow_empty=allow_empty)
         except Exception as exc:
@@ -270,16 +281,21 @@ class Repo:
 
     # -- history -------------------------------------------------------------
 
-    def log(self, *, branch: str | None = None) -> list["SnapshotInfo"]:
-        """Snapshots on the current (or given) branch, newest first."""
+    def log(self, *, branch: str | None = None) -> "Log":
+        """Snapshots on the current (or given) branch, newest first (a list of
+        ``SnapshotInfo``); shown one commit per line."""
+        from ._display import Log
+
         target = branch or self._branch
         if not self._branch_exists(target):
             raise ScizarrError(f"No branch '{target}' in '{self.path}'")
-        return list(self._repo.ancestry(branch=target))
+        return Log(self._repo.ancestry(branch=target))
 
-    def tree(self) -> dict[str, list["SnapshotInfo"]]:
-        """All branches mapped to their snapshots, newest first."""
-        return {b: list(self._repo.ancestry(branch=b)) for b in self.branches()}
+    def tree(self) -> "Tree":
+        """Every branch's history as one plain-text commit graph (display only)."""
+        from ._display import Tree
+
+        return Tree(self._branch, str(self._repo.ancestry_graph(plain=True)))
 
     def cherrypick(self, snapshot_id: str) -> str:
         """Point the current branch at ``snapshot_id`` (history reset, like git reset --hard)."""
@@ -300,38 +316,36 @@ class Repo:
         """Repository used for reads: the origin once opened (authoritative), else ``path``."""
         return self._writer if self._writer is not None else self._reader
 
+    @property
+    def _dirty(self) -> bool:
+        return (
+            self._session is not None
+            and not self._session.read_only
+            and self._session.has_uncommitted_changes
+        )
+
     def _writer_repo(self):
         """Repository at the writable origin, opened on first use."""
         if self._writer is not None:
             return self._writer
         if self.origin is None:
             raise ScizarrError(
-                f"'{self.path}' is read-only and no writable origin was given. Pass "
-                f"origin=... (CLI: --origin s3://bucket/prefix, or {ENV_ORIGIN}), or take a "
-                f"writable copy: scizarr-ic copy -C {self.path} DEST"
+                f"'{self.path}' is read-only and no writable origin was given. Open it as "
+                f"Repo(path, origin='s3://bucket/prefix') to write to the location behind "
+                f"it, or take a writable copy with repo.copy(dest)."
             )
         if not self.resolved:
             self._writer = self._reader
             return self._writer
-
-        import icechunk
-
         try:
-            self._writer = icechunk.Repository.open(storage_for(self.origin))
-        except Exception as exc:
-            hint = ""
-            if is_remote(self.origin):
-                hint = (
-                    " Object-store credentials come from the environment (AWS_* variables, "
-                    "a profile, or an instance/container role) — check this process has "
-                    "write access to the bucket."
-                )
+            self._writer = open_repository(self.origin)
+        except ScizarrError as exc:
             raise ScizarrError(
-                f"Cannot open the writable origin '{self.origin}' (for '{self.path}'): {exc}.{hint}"
+                f"Cannot open the writable origin '{self.origin}' (for '{self.path}'): {exc}"
             ) from exc
         return self._writer
 
-    def _branch_exists(self, name: str, *, consult_origin: bool = True) -> bool:
+    def _branch_exists(self, name: str) -> bool:
         """Is ``name`` a branch? Falls back to the origin when the read view may be stale.
 
         A read-only mirror is a cached view of the origin: a branch created moments ago
@@ -340,7 +354,7 @@ class Repo:
         """
         if name in self._repo.list_branches():
             return True
-        if consult_origin and self.resolved and self._writer is None:
+        if self.resolved and self._writer is None:
             try:
                 writer = self._writer_repo()
             except ScizarrError:
@@ -349,11 +363,7 @@ class Repo:
         return False
 
     def _reject_uncommitted(self) -> None:
-        if (
-            self._session is not None
-            and not self._session.read_only
-            and self._session.has_uncommitted_changes
-        ):
+        if self._dirty:
             raise ScizarrError(
-                f"Uncommitted changes on '{self._branch}' — commit() or discard() first"
+                f"Uncommitted changes on '{self._branch}': commit() or discard() first"
             )

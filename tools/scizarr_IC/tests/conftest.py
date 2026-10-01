@@ -57,20 +57,17 @@ def snapshot_tree(root: Path) -> dict[str, int]:
 
 
 @pytest.fixture
-def mirror(src_zarr, tmp_path, monkeypatch):
+def mirror(src_zarr, tmp_path):
     """(mirror_path, origin_path, mirror_tree_before): a repo and a stale copy of it.
 
-    Stands in for a read-only mirror of an s3:// prefix — reads go to the copy, writes
-    to the origin passed explicitly. HEAD sidecars go under tmp_path/home.
+    Stands in for a read-only mirror of an s3:// prefix: reads go to the copy, writes
+    to the origin passed explicitly.
     """
     from scizarr_ic import Repo
 
     path, _ = src_zarr
     origin = tmp_path / "origin.icechunk"
     Repo.init(path, origin, message="import")
-    (origin / "scizarr_head").unlink()
     mirror = tmp_path / "mirror.icechunk"
     shutil.copytree(origin, mirror)
-    monkeypatch.setenv("SCIZARR_IC_HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("SCIZARR_IC_ORIGIN", raising=False)
     return mirror, origin, snapshot_tree(mirror)
