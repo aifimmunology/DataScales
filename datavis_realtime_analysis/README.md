@@ -39,11 +39,11 @@ In the app: lasso a cell selection, name it, and hit "Generate New UMAP". The ba
 
 ## Local dev
 
-### Python setup (first time)
+### Backend env (first time)
 
 ```bash
 cd datavis_realtime_analysis
-pip install -r server/requirements.txt
+pixi install --manifest-path server/pixi.toml   # CPU-only backend; the GPU image builds its own env from the same file
 ```
 
 ### dev Run
@@ -62,7 +62,7 @@ To run the servers separately:
 
 ```bash
 bun run dev:frontend
-DATA_DIR=./data/soundlife-other-tiny.zarr uvicorn server.main:app --reload
+DATA_DIR=./data/soundlife-other-tiny.zarr bun run dev:api
 ```
 
 ---
@@ -81,6 +81,8 @@ gcloud auth application-default login --no-launch-browser
 The second command writes `~/.config/gcloud/application_default_credentials.json`, which compose mounts into the backend — that is the app's GCS credential. Your account needs `roles/storage.objectAdmin` on the bucket. The org policy expires these credentials roughly weekly: re-run both commands and `docker compose restart backend`.
 
 ### 2. Run
+
+The backend image ships the CUDA 13.4 runtime and RAPIDS 26.6 (`cu13` wheels, pinned in `server/pixi.lock`). The host needs an NVIDIA driver ≥ 580 (CUDA 13) and a Volta-or-newer GPU — check `nvidia-smi` before the build.
 
 Once per VM: docker + compose plugin, and the NVIDIA container toolkit:
 
@@ -103,18 +105,10 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 Set `GPU_INSTANCE` and `GPU_ZONE` at the top of `deploy/tunnel.sh`, then:
 
 ```bash
-<<<<<<< HEAD
 deploy/tunnel.sh    # IAP ssh tunnel → http://localhost:8000
 ```
 
 ### 4. Troubleshoot
-=======
-deploy/tunnel.sh          # IAP TCP tunnel → http://localhost:8000
-deploy/tunnel.sh --ssh    # fallback: forward over plain gcloud ssh — needs only ssh access
-```
-
-The IAP tunnel needs `roles/iap.tunnelResourceAccessor` plus a firewall rule allowing `35.235.240.0/20 → tcp:8000` (an IAP `4033: not authorized` means the role is missing). Without those, the `--ssh` fallback port-forwards over the ssh access you already have.
->>>>>>> 916e262 (adding script to open port access to local viewer)
 
 - A red **GPU runs** rail badge shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing.
 - Logs: `docker compose logs -f backend`. Stop: `docker compose down`.

@@ -48,7 +48,7 @@ you can script a sweep of near-identical runs without editing source:
         --data-path /path/to/sorted.zarr \
         --subset-column cell_type --subset-value "T cell" --subset-dir-name tcell
 
-Key correctness notes (see CLAUDE.md):
+Key correctness notes:
   * ZARR CONFIG REACHES THE WORKERS. `zarr.config` is a *runtime* (donfig) setting,
     not an env var, so setting it in the client process does NOT propagate to the
     dask-cuda worker processes — and the lazy chunk reads happen ON the workers.
@@ -79,7 +79,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime
 
 # Pin host BLAS/OpenMP threads so N worker processes don't each spawn N BLAS
-# threads (CLAUDE.md silent perf killer #1). These are ENV VARS, read at library
+# threads (N×N contention). These are ENV VARS, read at library
 # init in each process — set here at module top so the dask-cuda worker children
 # inherit them. Deliberate + recorded in provenance. Host BLAS is not the GPU
 # pipeline's bottleneck, so pinning to 1 costs ~nothing and prevents N×N contention.

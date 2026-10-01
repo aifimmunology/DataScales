@@ -5,8 +5,7 @@ single-cell (and future multimodal) genomic data on Zarr — with Icechunk versi
 Dask streaming, and RAPIDS GPU analysis.
 
 This is a monorepo: each tool under `tools/` is its own installable package with its own
-pixi environment; each project folder holds a README and its scripts. A single agent
-(`.claude/` + `CLAUDE.md`) at the root spans every tool and project.
+pixi environment; each project folder holds a README and its scripts.
 
 ## Tools (`tools/`)
 
