@@ -1,0 +1,45 @@
+# inert while inside the monorepo (GitHub only runs workflows from the repo root); becomes
+# live after `git filter-repo` splits this directory out into its own repository.
+# Manual publish for the annizarr package. workflow_dispatch only for now —
+# switch to `push: tags: ['v*']` after the repo split.
+name: annizarr-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_pypi:
+        description: 'Publish to TestPyPI instead of PyPI'
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install build twine
+
+      - run: python -m build
+
+      - run: twine check dist/*
+
+      - name: Publish to TestPyPI
+        if: ${{ inputs.test_pypi }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.test_pypi }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
