@@ -28,18 +28,18 @@ from scizarr_ic import Repo
 repo = Repo.init("data.zarr", "data.icechunk")    # import a zarr store (one commit on main)
 repo = Repo.create("s3://bucket/empty")           # or start empty
 repo = Repo("s3://bucket/store", branch="dev")    # open an existing repo on a branch
-repo = Repo("gs://bucket/store", anonymous=True)  # public bucket, no credentials needed
+#repo = Repo("gs://bucket/store", anonymous=True)  # public bucket, no credentials needed
 Repo.exists("s3://bucket/empty")                  # True / False
 
 repo                                              # location, branch, tip commit
-repo.branches()                                   # one per line, * marks the current branch
-repo.log()                                        # one commit per line, newest first
-repo.log()[0].id                                  # ... and still a list of icechunk SnapshotInfo
+repo.branches()                                   # list branches, * marks the current branch
+repo.log()                                        # all commits from the current branch
+repo.log()[0].id                                 
 repo.tree()                                       # every branch as one commit graph
 
 z = repo.open_zarr("w")                           # writable zarr.Group at the branch tip
-z.attrs["step"] = "lognorm"                       # edit like any zarr group ...
-repo.commit("normalize")                          # ... then commit once
+z.attrs["step"] = "lognorm"                       # edit like any zarr group
+repo.commit("normalize")                        
 
 repo.checkout("experiment", create=True)          # branch off the current tip (this object only)
 z = repo.open_zarr("w"); z["X"][:] *= 2
