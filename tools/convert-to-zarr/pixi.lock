@@ -4059,8 +4059,8 @@ packages:
   timestamp: 1769155978578
 - pypi: ./
   name: convert-to-zarr
-  version: 0.1.0
-  sha256: cdf10cc0b1c728a83b24ef59d597cfde4d4eefaf95418570a016cf88321a16fa
+  version: 0.3.0
+  sha256: 08a5db2be7b477a01f6ef728258b8853f02ec304a21616b8767f41d0a6bfe9ee
   requires_dist:
   - anndata>=0.12.10,<0.13
   - zarr>=3.0.0
@@ -4068,7 +4068,7 @@ packages:
   - scipy>=1.10.0
   - pyyaml>=6.0
   - scanpy>=1.9.0
-  - dask[array]>=2023.1.0
+  - dask[array]>=2026.3
   - icechunk>=2.0.6
   - pytest>=8.0 ; extra == 'dev'
   requires_python: '>=3.10,<3.13'
