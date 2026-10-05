@@ -1,6 +1,7 @@
 # zarrsmith (merged)
 
-Merged into [`tools/annizarr`](../annizarr/README.md) (2026-09).
+This tool was folded into **AnniZarr**, a bigger and more polished tool that now lives in its own
+repository: https://github.com/A-Jolly-Holly/annizarr (`pip install annizarr` once it is published).
 
 Command mapping:
 - `add-expr --store S` → `annizarr add-expr S`

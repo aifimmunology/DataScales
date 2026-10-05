@@ -9,9 +9,11 @@ pixi environment; each project folder holds a README and its scripts.
 
 ## Tools (`tools/`)
 
-- **[annizarr](tools/annizarr/README.md)** — AnnData zarr stores: convert (`.h5ad`/10x → streaming
-  dense/sparse, multi-h5ad concat), edit in place (add-expr, rechunk, sort, append), and version
-  with Icechunk, all through one CLI (`annizarr`/`anz`).
+- **[annizarr](https://github.com/A-Jolly-Holly/annizarr)** — now its own repository (`pip install annizarr` once published):
+  AnnData zarr stores: convert (`.h5ad`/10x → streaming dense/sparse, mixed-input concat), edit in
+  place (add-expr, rechunk, sort, append), and version with Icechunk, through one CLI
+  (`annizarr`/`anz`) and a Python API. It grew out of `tools/convert-to-zarr`, `tools/zarrsmith`
+  and `tools/scizarr_IC`, whose READMEs map the old commands to the new ones.
 - **[zarr-query-bench](tools/zarr-query-bench/README.md)** — query-time benchmark for a store's
   `X` (row/column, sequential/random/cell-type; dense vs CSR/CSC).
 - **[rapids-benchmark](tools/rapids-benchmark/README.md)** — per-step GPU single-cell pipeline

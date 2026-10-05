@@ -1,6 +1,7 @@
 # convert-to-zarr (merged)
 
-Merged into [`tools/annizarr`](../annizarr/README.md) (2026-09).
+This tool was folded into **AnniZarr**, a bigger and more polished tool that now lives in its own
+repository: https://github.com/A-Jolly-Holly/annizarr (`pip install annizarr` once it is published).
 
 Command mapping:
 - `convert-h5ad --input X --output Y` → `annizarr convert X -o Y`
