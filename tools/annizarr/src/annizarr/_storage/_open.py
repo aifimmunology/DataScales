@@ -76,7 +76,7 @@ def open_output_store(
         repo = Repo(str(output_path)) if exists else Repo.create(str(output_path))
         if branch is not None and branch != repo.branch:
             repo.checkout(branch, create=True)
-        root = repo.open_zarr("w", truncate=True)  # truncate: a re-run must not append to old data
+        root: zarr.Group = repo.open_zarr("w", truncate=True)  # truncate: a re-run must not append to old data
         committed: str | None = None
 
         def finalize_icechunk() -> str | None:
@@ -183,7 +183,7 @@ def open_store_rw(
         repo = Repo(str(store_path))
         if branch is not None and branch != repo.branch:
             repo.checkout(branch, create=True)
-        root = repo.open_zarr("w")
+        root: zarr.Group = repo.open_zarr("w")
         committed: str | None = None
 
         def finalize_icechunk() -> str | None:

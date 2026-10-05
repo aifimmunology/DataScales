@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from annizarr._core._config import AppConfig
-from annizarr._sources._h5ad import close_backed_if_needed
+from annizarr._sources._h5ad import close_lazy_if_needed
 from annizarr.typing import PathLike
 
 if TYPE_CHECKING:
@@ -21,12 +21,12 @@ class Source:
 
     adata: AnnData
     kind: str
-    backed: bool
+    lazy: bool
     warnings: tuple[str, ...]
 
     def close(self) -> None:
         """Close a backed h5 handle; a no-op for an eager or in-memory source."""
-        close_backed_if_needed(self.adata)
+        close_lazy_if_needed(self.adata)
 
 
 # Loader/Sniffer are plain Callable aliases; a custom kind is not restricted to the

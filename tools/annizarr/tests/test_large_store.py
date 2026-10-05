@@ -121,11 +121,13 @@ def large_h5ad(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def eager_max_bytes_config(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A low eager_max_bytes so convert's backed=None auto-select picks backed (X is
-    ~120MB on disk here; well above this threshold)."""
-    path = tmp_path_factory.mktemp("large_store_cfg") / "low_eager.toml"
-    path.write_text("[io]\neager_max_bytes = 50000000\n")
+def cpus1_config(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Pins chunks.cpus=1 for the two subcommands (add-expr, append) with no --cpus flag of
+    their own, so these steps stay single-threaded regardless of the host's core count (the
+    default is now all cores — see item 2 — which would otherwise make peak RSS, and this
+    test, a function of the runner's core count)."""
+    path = tmp_path_factory.mktemp("large_store_cfg") / "cpus1.toml"
+    path.write_text("[chunks]\ncpus = 1\n")
     return path
 
 
@@ -134,7 +136,7 @@ def _sample_rows(n: int, k: int, seed: int) -> np.ndarray:
 
 
 def test_large_store_pipeline_is_memory_bounded(
-    tmp_path_factory: pytest.TempPathFactory, large_h5ad: Path, eager_max_bytes_config: Path
+    tmp_path_factory: pytest.TempPathFactory, large_h5ad: Path, cpus1_config: Path
 ) -> None:
     out_dir = tmp_path_factory.mktemp("large_store_out")
     csr_store = out_dir / "csr.zarr"
@@ -151,10 +153,14 @@ def test_large_store_pipeline_is_memory_bounded(
         )
         return r
 
-    # 1. convert -> csr (backed, auto-selected via the low eager_max_bytes config)
+    # cpus pinned to 1 throughout: the CEILINGS below were tuned for a single-threaded band
+    # pass, independent of however many cores the host running this test actually has (the
+    # default is now all cores — see item 2 — which would otherwise make peak RSS, and this
+    # test, a function of the runner's core count).
+    # 1. convert -> csr (lazy is the default, so no flag/config needed)
     _step(
         "convert_csr",
-        ["-q", "convert", str(large_h5ad), "-o", str(csr_store), "--config", str(eager_max_bytes_config)],
+        ["-q", "convert", str(large_h5ad), "-o", str(csr_store), "--cpus", "1"],
     )
     rows = _sample_rows(N_OBS, 5, seed=42)
     with h5py.File(large_h5ad) as f:
@@ -162,28 +168,19 @@ def test_large_store_pipeline_is_memory_bounded(
     got = sparse_dataset(zarr.open_group(str(csr_store), mode="r")["X"])[rows].toarray()
     np.testing.assert_array_equal(got, expected)
 
-    # 2. convert --x-storage csc (backed CSR -> csc: the new streamed transpose, never
+    # 2. convert --x-storage csc (lazy CSR -> csc: the new streamed transpose, never
     #    materialising X — see write_transposed_sparse)
     _step(
         "convert_csc",
-        [
-            "-q",
-            "convert",
-            str(large_h5ad),
-            "-o",
-            str(csc_store),
-            "--config",
-            str(eager_max_bytes_config),
-            "--x-storage",
-            "csc",
-        ],
+        ["-q", "convert", str(large_h5ad), "-o", str(csc_store), "--x-storage", "csc", "--cpus", "1"],
     )
     got_csc = sparse_dataset(zarr.open_group(str(csc_store), mode="r")["X"])[rows].toarray()
     np.testing.assert_array_equal(got_csc, expected)
 
     # 3. add-expr --format csc on the csr store (streamed lognorm CSR -> csc via the same
-    #    write_transposed_sparse engine, with row_scale)
-    _step("add_expr_csc", ["-q", "add-expr", str(csr_store), "--format", "csc"])
+    #    write_transposed_sparse engine, with row_scale); add-expr has no --cpus flag of its
+    #    own, so --config pins chunks.cpus=1 instead.
+    _step("add_expr_csc", ["-q", "add-expr", str(csr_store), "--format", "csc", "--config", str(cpus1_config)])
     root = zarr.open_group(str(csr_store), mode="r")
     gexp = sparse_dataset(root["layers/gexp"])[rows].toarray()
     x_rows = sparse_dataset(root["X"])[rows].toarray().astype(np.float64)
@@ -196,7 +193,7 @@ def test_large_store_pipeline_is_memory_bounded(
     #    a lone gexp layer on the sorted output)
     _step(
         "sort",
-        ["-q", "sort", str(csr_store), "-o", str(sorted_store), "--by", "cell_type"],
+        ["-q", "sort", str(csr_store), "-o", str(sorted_store), "--by", "cell_type", "--cpus", "1"],
     )
     sorted_root = zarr.open_group(str(sorted_store), mode="r")
     from anndata.io import read_elem
@@ -215,11 +212,12 @@ def test_large_store_pipeline_is_memory_bounded(
     var = pd.DataFrame(index=[f"gene_{i}" for i in range(N_VARS)])
     ad.AnnData(X=X_extra, obs=obs_extra, var=var).write_h5ad(extra_h5ad)
     extra_store = out_dir / "extra.zarr"
-    assert _run_cli_measured(["-q", "convert", str(extra_h5ad), "-o", str(extra_store)])["rc"] == 0
+    assert _run_cli_measured(["-q", "convert", str(extra_h5ad), "-o", str(extra_store), "--cpus", "1"])["rc"] == 0
 
+    # append has no --cpus flag of its own either; --config pins chunks.cpus=1.
     _step(
         "append",
-        ["-q", "append", str(csr_store), str(extra_store), "--drop-derived"],
+        ["-q", "append", str(csr_store), str(extra_store), "--drop-derived", "--config", str(cpus1_config)],
     )
     appended_root = zarr.open_group(str(csr_store), mode="r")
     n_obs_after, _ = appended_root["X"].attrs["shape"]

@@ -16,10 +16,10 @@ import zarr
 from annizarr._core._runtime import configure_runtime, stage
 from annizarr._core._validation import validate_single_cell_anndata
 from annizarr._core._zarr import get_array
-from annizarr._sources._matrix import get_indptr
+from annizarr._sources._readers import ConcatReader, CSRZarrReader, as_reader
 from annizarr._storage import open_output_store
-from annizarr._writers._concat import _write_concatenated_csr
 from annizarr._writers._encoding import autoshard_setting, make_sparse_group, set_array_attrs, write_elem
+from annizarr._writers._matrix import write_matrix
 from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
@@ -62,10 +62,9 @@ def maybe_sort_adata(adata: ad.AnnData, cfg: AppConfig) -> ad.AnnData:
     sort_by = cfg.grouping.sort_by
     if cfg.io.x_storage not in ("csr", "dense"):
         raise ConversionError(f"grouping (sort_by) requires x_storage='csr' or 'dense'; got '{cfg.io.x_storage}'.")
-    if cfg.io.backed:
+    if cfg.io.lazy:
         raise ConversionError(
-            "grouping (sort_by) requires an eager (in-memory) load; not supported with "
-            "--backed yet. Omit --backed to sort."
+            "grouping (sort_by) requires an eager (in-memory) load; not supported with --lazy yet. Omit --lazy to sort."
         )
 
     perm, ranges_df = compute_sort(adata.obs, sort_by)
@@ -79,27 +78,26 @@ def maybe_sort_adata(adata: ad.AnnData, cfg: AppConfig) -> ad.AnnData:
     return adata
 
 
-def _write_sorted_backed(
+def _write_sorted_lazy(
     adata: ad.AnnData, output_path: Path, cfg: AppConfig, *, branch: str | None = None, message: str | None = None
 ) -> str | None:
     # streams X into temp per-group CSR stores (peak RAM one row-batch), unlike
     # maybe_sort_adata's adata[perm].copy() (~2x X in RAM).
     if cfg.io.x_storage != "csr":
         raise ConversionError(
-            f"--backed --sort-by supports x_storage='csr' only (got '{cfg.io.x_storage}'). "
-            "Omit --backed to sort dense/CSC eagerly."
+            f"--lazy --sort-by supports x_storage='csr' only (got '{cfg.io.x_storage}'). "
+            "Omit --lazy to sort dense/CSC eagerly."
         )
     if adata.layers or adata.raw is not None or len(adata.obsp) > 0:
         raise ConversionError(
-            "--backed --sort-by does not reorder layers/raw/obsp yet (they are obs-aligned and "
-            "would need their own streamed reorder). Omit --backed to sort eagerly, or drop them."
+            "--lazy --sort-by does not reorder layers/raw/obsp yet (they are obs-aligned and "
+            "would need their own streamed reorder). Omit --lazy to sort eagerly, or drop them."
         )
     x = adata.X
     if sp.issparse(x) or getattr(x, "format", None) != "csr":
         got = "in-memory " + type(x).__name__ if sp.issparse(x) else (getattr(x, "format", None) or type(x).__name__)
         raise ConversionError(
-            f"--backed --sort-by requires the backed input's X to be CSR on disk; got {got}. "
-            "Omit --backed to sort eagerly."
+            f"--lazy --sort-by requires the lazy input's X to be CSR on disk; got {got}. Omit --lazy to sort eagerly."
         )
 
     validation_result = validate_single_cell_anndata(adata, cfg.validation)
@@ -139,12 +137,11 @@ def stream_sorted_store(
     branch: str | None = None,
     after_write: Callable[[zarr.Group], None] | None = None,
 ) -> str | None:
-    from anndata.io import sparse_dataset
-
     from annizarr._core import _layout
 
     configure_runtime(cfg.chunks.cpus)
 
+    src_reader = as_reader(x, cfg=cfg)
     n_obs, n_vars = x.shape
     x_dtype = x.dtype
     indices_dtype = np.int32  # matches the rest of the writers (fits unless > 2^31 cols)
@@ -161,7 +158,7 @@ def stream_sorted_store(
         group_of_source[rows] = gi
         group_rows.append(rows)
 
-    row_nnz = np.diff(get_indptr(x)).astype(np.int64)
+    row_nnz = np.diff(src_reader.indptr).astype(np.int64)
     n_rows_each = [int(r.size) for r in group_rows]
     indptr_each = [np.concatenate([[0], np.cumsum(row_nnz[r])]).astype(np.int64) for r in group_rows]
     nnz_each = [int(ip[-1]) for ip in indptr_each]
@@ -198,12 +195,10 @@ def stream_sorted_store(
         bpm = max(1, nnz_total // max(1, n_obs)) * (np.dtype(x_dtype).itemsize + np.dtype(indices_dtype).itemsize)
         batch_size = max(1_000, min(200_000, _layout.BATCH_BYTES // bpm))
         cursors = [0] * n_groups  # nnz write cursor per group
-        with stage(f"Bucketing {n_obs} rows into {n_groups} groups (backed, streamed)"):
+        with stage(f"Bucketing {n_obs} rows into {n_groups} groups (lazy, streamed)"):
             for b0 in range(0, n_obs, batch_size):
                 b1 = min(b0 + batch_size, n_obs)
-                batch = x[b0:b1]  # backed CSR slice -> in-memory scipy CSR (one batch bounds RAM)
-                if not sp.isspmatrix_csr(batch):
-                    batch = batch.tocsr()
+                batch = src_reader.csr_rows(b0, b1)  # -> in-memory scipy CSR (one batch bounds RAM)
                 g_batch = group_of_source[b0:b1]
                 order = np.argsort(g_batch, kind="stable")
                 sorted_g = g_batch[order]
@@ -243,9 +238,9 @@ def stream_sorted_store(
                     write_elem(store, "obsp", {})  # empty (non-empty obsp is rejected by callers)
                     write_elem(store, "varp", dict(varp))
 
-                temp_mats = [sparse_dataset(tg) for tg in temp_groups]
+                concat_reader = ConcatReader([CSRZarrReader(tg) for tg in temp_groups])
                 with stage(f"Writing X (n_obs={n_obs}, n_vars={n_vars}, csr, concat {n_groups} groups)"):
-                    _write_concatenated_csr(store, "X", temp_mats, n_rows_each, n_vars, x_dtype, cfg)
+                    write_matrix(store, "X", concat_reader, cfg)
                 if after_write is not None:
                     after_write(store)
             snapshot_id = out.finalize()
@@ -253,11 +248,12 @@ def stream_sorted_store(
             out.abort()
             raise
     finally:
+        src_reader.close()
         shutil.rmtree(tmp_root, ignore_errors=True)
 
     logger.info(f"Done in {time.perf_counter() - t0:.1f}s")
     logger.info(
-        f"Rows sorted by {list(sort_by)} into {n_groups} contiguous groups via backed streamed "
+        f"Rows sorted by {list(sort_by)} into {n_groups} contiguous groups via lazy streamed "
         "bucketing (X never fully materialised); obs/obsm reordered to match. Store is a plain "
         "sorted AnnData (no tool index)."
     )

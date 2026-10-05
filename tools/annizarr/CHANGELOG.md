@@ -4,6 +4,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `--backed` / `io.backed` renamed `--lazy` / `io.lazy`; lazy is the default and
+  `--eager` loads the whole input first.
+- `cpus` defaults to all cores (`--cpus N` overrides); h5py reads align to the source chunk grid.
+- Matrix I/O goes through one reader protocol: every input layout (dense, CSR, CSC; eager or
+  lazy) writes every `--x-storage`, so lazy dense input streams to CSR/CSC instead of erroring and
+  a multi-input `convert` accepts mixed h5ad/10x inputs of any layout, including CSC output.
+- Lazy h5py input into an Icechunk repo streams through a read-ahead pipeline (reader processes
+  feed the writer threads) instead of erroring.
+- `--auto-shard` leaves a config file's `auto_shard = true` in force when omitted.
+
+### Added
+
+- `Repo(..., anonymous=True)` / `Repo.exists(..., anonymous=True)` for public buckets; open
+  failures distinguish a missing repo from missing credentials and name the fix.
+- Git-style reprs for `Repo`, `branches()`, `log()`, `tree()` (icechunk's commit graph) and the
+  root group from `open_zarr()`, which anndata's `read_elem`/`write_elem` still accept.
+
+### Removed
+
+- **Breaking:** the `ic` CLI (`init|log|tree|checkout|cherrypick|copy`) and HEAD persistence
+  (`annizarr_head`, `$ANNIZARR_HOME`, `$ANNIZARR_ORIGIN`). The branch lives on the `Repo` object:
+  `Repo(path)` opens `main`, `branch=` pins, `checkout` switches in-process. `convert --ic`,
+  `--branch` and `-m` on the ops are unchanged.
+- `io.eager_max_bytes` and the size-based eager/lazy auto-select.
+
+### Fixed
+
+- `az.convert(adata)` on a backed AnnData with sparse output loaded the whole matrix.
+- Output verification before the atomic rename / Icechunk commit now checks X's shape.
+- zarr thread sizing is applied on every op, not only the first in a process.
+
 ## [0.1.0] - 2026-09-29
 
 Merges `convert-to-zarr`, `zarrsmith`, and `scizarr_IC` into one package, `annizarr`.
@@ -16,7 +49,7 @@ Merges `convert-to-zarr`, `zarrsmith`, and `scizarr_IC` into one package, `anniz
 - `rechunk`: rewrite one matrix element with new chunking; stream-copy the rest as-is.
 - `sort`: physically sort a store's rows by obs column(s) into a new store.
 - `append`: append another store's cells in place, with a loss plan for derived elements.
-- `ic init|log|tree|checkout|cherrypick|copy`: git-like Icechunk version control.
+- `annizarr.ic.Repo`: git-like Icechunk version control from Python.
 - `--branch`/`-m` on every write op; one Icechunk commit per op.
 - `io.eager_max_bytes` auto-select between eager and streamed (backed) input.
 

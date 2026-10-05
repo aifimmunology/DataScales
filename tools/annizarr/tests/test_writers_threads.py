@@ -8,6 +8,7 @@ axis (with a ragged last one) and compare the two cpu counts file-for-file, not 
 from __future__ import annotations
 
 import filecmp
+import itertools
 import math
 import threading
 import time
@@ -24,6 +25,7 @@ import zarr
 import annizarr._core._layout as _layout
 from _readable import assert_anndata_readable
 from annizarr._core._runtime import run_parallel
+from annizarr._writers._sparse import flat_segments
 from annizarr.config import AppConfig, ChunkConfig, IOConfig, ValidationConfig
 from annizarr.ops import append, concat, convert_adata, rechunk
 
@@ -32,6 +34,45 @@ def _rand_dense(n_obs: int, n_vars: int, *, seed: int, density: float) -> np.nda
     rng = np.random.default_rng(seed)
     mask = rng.random((n_obs, n_vars)) < density
     return (mask * rng.random((n_obs, n_vars))).astype(np.float32)
+
+
+def _assert_contiguous_coverage(segments: list[tuple[int, int]], nnz_total: int) -> None:
+    assert segments[0][0] == 0
+    assert segments[-1][1] == nnz_total
+    for (_, end), (start, _) in itertools.pairwise(segments):
+        assert end == start  # no gap or overlap
+
+
+def test_flat_segments_without_grain_sizes_to_a_multiple_of_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 100)
+    segments = flat_segments(nnz_total=250, step=7, bytes_per_nnz=1)
+    _assert_contiguous_coverage(segments, 250)
+    seg_size = segments[0][1] - segments[0][0]
+    assert seg_size % 7 == 0
+    assert seg_size * 1 <= 100
+
+
+def test_flat_segments_with_grain_aligns_to_lcm_when_it_fits_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 1000)
+    # nnz_total well above one segment's size, so segments[0] isn't clipped short by the end
+    # of the array (which would no longer look like a multiple of anything in particular).
+    segments = flat_segments(nnz_total=5000, step=4, bytes_per_nnz=1, grain=6)
+    _assert_contiguous_coverage(segments, 5000)
+    seg_size = segments[0][1] - segments[0][0]
+    assert seg_size % math.lcm(4, 6) == 0
+
+
+def test_flat_segments_with_grain_falls_back_to_step_when_lcm_exceeds_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_layout, "BATCH_BYTES", 50)
+    # lcm(4, 7) = 28; 28 * bytes_per_nnz(10) = 280 > the 50-byte budget, so grain is dropped
+    # and the segment stays a plain multiple of step alone.
+    segments = flat_segments(nnz_total=500, step=4, bytes_per_nnz=10, grain=7)
+    _assert_contiguous_coverage(segments, 500)
+    seg_size = segments[0][1] - segments[0][0]
+    assert seg_size % 4 == 0
+    assert seg_size % 7 != 0
 
 
 def _adata(dense: np.ndarray, *, sparse: bool, seed: int) -> ad.AnnData:

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from annizarr._storage._backends import is_icechunk_repo, require_icechunk, storage_for
+from annizarr._storage._backends import (
+    explain_open_failure,
+    is_icechunk_repo,
+    open_repository,
+    require_icechunk,
+    storage_for,
+)
 from annizarr._storage._open import check_output_target, open_input_group, open_output_store, open_store_rw
 from annizarr._storage._uri import (
     bucket_prefix,
@@ -16,11 +22,13 @@ __all__ = [
     "bucket_prefix",
     "canonical_location",
     "check_output_target",
+    "explain_open_failure",
     "is_icechunk_repo",
     "is_readonly_path",
     "is_remote",
     "open_input_group",
     "open_output_store",
+    "open_repository",
     "open_store_rw",
     "prepare_output_path",
     "require_icechunk",

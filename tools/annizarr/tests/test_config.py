@@ -1,10 +1,10 @@
+import os
 from pathlib import Path
 
 import pytest
 
 from annizarr._core._config import resolve_backend_cfg
-from annizarr.config import AppConfig, IOConfig, apply_cli_overrides, load_config
-from annizarr.errors import ConversionError
+from annizarr.config import AppConfig, ChunkConfig, IOConfig, apply_cli_overrides, load_config
 
 
 def test_defaults() -> None:
@@ -13,32 +13,24 @@ def test_defaults() -> None:
     assert cfg.chunks.x_row_chunk == 2048
     assert cfg.io.x_storage == "csr"
     assert cfg.chunks.auto_shard is False
-    assert cfg.io.backed is None  # auto-select
-    assert cfg.io.eager_max_bytes == 2 * 1024**3
+    assert cfg.io.lazy is True
+    assert cfg.chunks.cpus == (os.cpu_count() or 1)
 
 
-def test_eager_max_bytes_toml_validation(tmp_path: Path) -> None:
-    bad = tmp_path / "bad.toml"
-    bad.write_text("[io]\neager_max_bytes = -1\n")
-    with pytest.raises(ValueError, match="eager_max_bytes"):
-        load_config(str(bad))
+def test_resolve_backend_cfg_leaves_lazy_untouched_for_every_backend() -> None:
+    # icechunk no longer forces eager or rejects lazy input: a lazy, not-thread-safe reader
+    # into an icechunk session runs the read-ahead pipeline at write time instead (see
+    # writer_parallel_mode / test_features.py's icechunk-lazy roundtrip).
+    for backend in ("zarr", "icechunk"):
+        for lazy in (True, False):
+            resolved = resolve_backend_cfg(AppConfig(io=IOConfig(backend=backend, lazy=lazy)))
+            assert resolved.io.lazy == lazy
 
-    good = tmp_path / "config.toml"
-    good.write_text("[io]\neager_max_bytes = 1000\n")
-    assert load_config(str(good)).io.eager_max_bytes == 1000
 
-
-def test_resolve_backend_cfg_branches(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level("INFO", logger="annizarr")
-    resolved = resolve_backend_cfg(AppConfig(io=IOConfig(backend="icechunk", backed=None)))
-    assert resolved.io.backed is False  # auto-selects eager
-    assert any("auto-selecting eager" in r.message for r in caplog.records)
-
-    with pytest.raises(ConversionError, match="does not support --backed"):
-        resolve_backend_cfg(AppConfig(io=IOConfig(backend="icechunk", backed=True)))
-
-    resolved = resolve_backend_cfg(AppConfig(io=IOConfig(backend="zarr", backed=None)))
-    assert resolved.io.backed is None  # zarr backend: left untouched
+def test_resolve_backend_cfg_warns_on_shard_factor_with_sparse_storage(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("WARNING", logger="annizarr")
+    resolve_backend_cfg(AppConfig(chunks=ChunkConfig(x_shard_factor=2), io=IOConfig(x_storage="csr")))
+    assert any("only applies to dense X" in r.message for r in caplog.records)
 
 
 def test_toml_load_and_section_guards(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""Read from one location, write to another: ``origin=`` / ``--origin`` / ANNIZARR_ORIGIN.
+"""Read from one location, write to another: ``Repo(path, origin=...)``.
 
 The typical case is a read-only local mirror of an s3:// prefix; here the mirror is a
 stale local copy and the origin a local dir, which exercises the same code paths.
@@ -11,10 +11,8 @@ import os
 import pytest
 from _ic_helpers import snapshot_tree
 
-from annizarr._cli import main
 from annizarr.errors import RepoError
 from annizarr.ic import Repo
-from annizarr.ic._head import HEAD_FILE
 
 
 def test_reads_stay_on_path_writes_land_at_origin(mirror, tmp_path, monkeypatch):
@@ -41,23 +39,7 @@ def test_reads_stay_on_path_writes_land_at_origin(mirror, tmp_path, monkeypatch)
     assert origin_repo.log()[0].id == snap and origin_repo.open_zarr("r").attrs["note"] == "via mirror"
     assert repo.open_zarr("r").attrs["note"] == "via mirror"  # origin is authoritative once opened
     assert snapshot_tree(mirror_path) == before  # nothing written into the mirror
-    assert not (mirror_path / HEAD_FILE).exists()  # HEAD went to the sidecar
-    assert repo._head.is_sidecar and Repo(mirror_path, origin=str(origin)).branch == "dev"
-
-
-def test_origin_from_env_and_cli_flag(mirror, capsys, monkeypatch):
-    mirror_path, origin, before = mirror
-    monkeypatch.setenv("ANNIZARR_ORIGIN", str(origin))
-    Repo(mirror_path).checkout("via-env", create=True)
-    assert "via-env" in Repo(origin).branches()
-
-    monkeypatch.delenv("ANNIZARR_ORIGIN")
-    assert main(["ic", "checkout", str(mirror_path), "--origin", str(origin), "-b", "via-flag"]) == 0
-    captured = capsys.readouterr()
-    assert "Created and switched to branch 'via-flag'" in captured.err
-    assert f"note: writing to {origin}" in captured.err
-    assert "via-flag" in Repo(origin).branches()
-    assert snapshot_tree(mirror_path) == before
+    assert Repo(mirror_path, origin=str(origin), branch="dev").branch == "dev"  # found at the origin
 
 
 def test_stale_mirror_finds_branch_at_origin(mirror):
@@ -66,7 +48,7 @@ def test_stale_mirror_finds_branch_at_origin(mirror):
     repo = Repo(mirror_path, origin=str(origin))
     assert "feature" not in repo._reader.list_branches()  # the copy never saw it
     repo.checkout("feature")  # found at the origin
-    assert repo.branch == "feature" and "feature" in repo.tree()
+    assert repo.branch == "feature" and "feature" in repo.branches()
 
 
 def test_readonly_path_without_origin_reads_only(mirror, monkeypatch):
@@ -81,7 +63,7 @@ def test_readonly_path_without_origin_reads_only(mirror, monkeypatch):
         lambda: repo.checkout("x", create=True),
         lambda: repo.cherrypick(repo.log()[0].id),
     ):
-        with pytest.raises(RepoError, match=r"--origin.*annizarr ic copy"):
+        with pytest.raises(RepoError, match=r"origin=.*copy"):
             op()
     assert snapshot_tree(mirror_path) == before
 

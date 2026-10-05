@@ -49,13 +49,11 @@ def test_convert_flag_mappings(tmp_path: Path) -> None:
     assert main(["convert", str(h5_10x), "-o", str(out_from), "--from", "10x"]) == 0
     assert ad.read_zarr(str(out_from)).n_vars == 3
 
-    # --eager overrides auto-select even when eager_max_bytes would otherwise pick backed
+    # --eager overrides the lazy-by-default behaviour
     h5 = make_h5ad(tmp_path, "in.h5ad")
-    cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text("[io]\neager_max_bytes = 0\n")
     out_eager = tmp_path / "eager.zarr"
     with patch("anndata.read_h5ad", wraps=ad.read_h5ad) as mocked:
-        assert main(["convert", str(h5), "-o", str(out_eager), "--eager", "--config", str(cfg_file)]) == 0
+        assert main(["convert", str(h5), "-o", str(out_eager), "--eager"]) == 0
     assert "backed" not in mocked.call_args_list[0].kwargs
 
     # --auto-shard shards the sparse X arrays
@@ -74,7 +72,7 @@ def test_convert_arg_guards(tmp_path: Path) -> None:
     assert exc.value.code == 2
 
     with pytest.raises(SystemExit) as exc:
-        main(["convert", str(h5), "-o", str(tmp_path / "out2.zarr"), "--backed", "--eager"])
+        main(["convert", str(h5), "-o", str(tmp_path / "out2.zarr"), "--lazy", "--eager"])
     assert exc.value.code == 2
 
 
@@ -216,16 +214,15 @@ def test_help_usage_names_annizarr(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out.startswith("usage: annizarr")
 
 
-def test_no_auto_shard_flag_overrides_config_file(tmp_path: Path) -> None:
-    """A config file's auto_shard = true is overridable per run with --no-auto-shard."""
+def test_config_auto_shard_applies_without_the_flag(tmp_path: Path) -> None:
+    """Omitting --auto-shard leaves a config file's auto_shard = true in force."""
     h5 = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=30, n_vars=20))
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text("[chunks]\nauto_shard = true\n")
     out = tmp_path / "out.zarr"
-    args = ["convert", str(h5), "-o", str(out), "--config", str(cfg_file), "--no-auto-shard"]
-    assert main(args) == 0
+    assert main(["convert", str(h5), "-o", str(out), "--config", str(cfg_file)]) == 0
     root = zarr.open_group(str(out), mode="r")
-    assert root["X"]["data"].shards is None
+    assert root["X"]["data"].shards is not None
 
 
 def test_cli_import_leaves_numpy_unimported() -> None:

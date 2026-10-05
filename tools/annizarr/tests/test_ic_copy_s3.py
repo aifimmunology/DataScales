@@ -20,7 +20,6 @@ pytest.importorskip("moto")
 from moto.server import ThreadedMotoServer  # noqa: E402
 
 from annizarr.ic import Repo, copy_repo  # noqa: E402
-from annizarr.ic._head import HEAD_FILE  # noqa: E402
 
 
 @pytest.fixture
@@ -61,7 +60,7 @@ def _make_repo(tmp_path: Path) -> Path:
 
 
 def _local_objects(root: Path) -> dict[str, bytes]:
-    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file() and p.name != HEAD_FILE}
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
 def _s3_objects(client: object, bucket: str, prefix: str) -> dict[str, bytes]:

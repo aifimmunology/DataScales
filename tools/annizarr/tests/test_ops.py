@@ -192,7 +192,7 @@ def test_sort_store_and_guards(tmp_path, caplog):
     out2 = tmp_path / "sorted.zarr"
     with caplog.at_level("INFO", logger="annizarr"):
         sort(str(out), output=str(out2), by=("cell_type",), cfg=_cfg())
-    assert any("contiguous groups via backed streamed bucketing" in m for m in _messages(caplog))
+    assert any("contiguous groups via lazy streamed bucketing" in m for m in _messages(caplog))
     assert_anndata_readable(out2)
     got = ad.read_zarr(str(out2))
     codes = got.obs["cell_type"].cat.codes.to_numpy()

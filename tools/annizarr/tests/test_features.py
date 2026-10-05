@@ -1,6 +1,5 @@
 """Tests for the icechunk backend (Feature A) and sort/partition (Feature B)."""
 
-from dataclasses import replace
 from pathlib import Path
 
 import anndata as ad
@@ -95,14 +94,17 @@ def _self_serve_subset(g, **keys):
 # ---------------------------------------------------------------------------
 
 
-def test_icechunk_roundtrip_eager_and_op_result_snapshot_ids(tmp_path: Path) -> None:
+def test_icechunk_roundtrip_eager_and_op_result_snapshot_ids(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     pytest.importorskip("icechunk")
     from annizarr.ops import add_expr
 
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "repo.icechunk"
+    # lazy=False pinned explicitly: this test is about icechunk snapshot_id plumbing, not
+    # about the lazy-input read-ahead pipeline (see test_lazy_h5ad_into_icechunk_runs_pipeline
+    # below), so it stays eager regardless of io.lazy's own default.
     cfg = AppConfig(
-        io=IOConfig(overwrite=True, backend="icechunk"),
+        io=IOConfig(overwrite=True, backend="icechunk", lazy=False),
         chunks=_chunks(),
         validation=ValidationConfig(),
     )
@@ -119,14 +121,9 @@ def test_icechunk_roundtrip_eager_and_op_result_snapshot_ids(tmp_path: Path) -> 
     assert g.attrs["encoding-type"] == "anndata"
     assert list(read_elem(g["obs"])["cell_type"]) == ["B", "A", "A", "B", "A", "B"]
 
-    # icechunk never supports backed input
-    cfg_backed = replace(cfg, io=replace(cfg.io, backed=True))
-    with pytest.raises(ConversionError, match="does not support --backed"):
-        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "repo2.icechunk"), cfg=cfg_backed)
-
     # a plain-zarr OpResult carries no snapshot_id; an icechunk one always does, and each op
     # gets its own distinct snapshot
-    plain_cfg = AppConfig(io=IOConfig(overwrite=True), chunks=_chunks(), validation=ValidationConfig())
+    plain_cfg = AppConfig(io=IOConfig(overwrite=True, lazy=False), chunks=_chunks(), validation=ValidationConfig())
     plain_result = convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "plain.zarr"), cfg=plain_cfg)
     assert plain_result.snapshot_id is None
 
@@ -135,14 +132,49 @@ def test_icechunk_roundtrip_eager_and_op_result_snapshot_ids(tmp_path: Path) -> 
     assert expr_result.snapshot_id != ic_result.snapshot_id
 
 
+def test_lazy_h5ad_into_icechunk_runs_the_read_ahead_pipeline(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A lazy (h5py-backed) input feeding an Icechunk session (a non-local store, in-process
+    only) is not safe to reopen from a worker process, so the writer runs the read-ahead
+    pipeline (item 4) instead: a process pool reads bands/segments ahead while this process's
+    own threads write them into the session. Covers both dense and csr output."""
+    pytest.importorskip("icechunk")
+
+    for x_storage in ("csr", "dense"):
+        _labelled_h5ad(tmp_path / "in.h5ad")
+        out = tmp_path / f"repo_{x_storage}.icechunk"
+        cfg = AppConfig(
+            io=IOConfig(overwrite=True, backend="icechunk", lazy=True, x_storage=x_storage),
+            chunks=_chunks(cpus=2),
+            validation=ValidationConfig(),
+        )
+        caplog.clear()
+        with caplog.at_level("INFO", logger="annizarr"):
+            result = convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out), cfg=cfg)
+        assert isinstance(result.snapshot_id, str) and result.snapshot_id
+
+        messages = _messages(caplog)
+        assert any("reader processes feed the writer threads" in m for m in messages)
+        assert not any("single-threaded" in m for m in messages)
+
+        g = open_input_group(str(out), branch="main")
+        if x_storage == "dense":
+            id_col = np.asarray(g["X"][:, 0]).ravel()
+        else:
+            from anndata.io import sparse_dataset
+
+            id_col = np.asarray(sparse_dataset(g["X"])[:][:, 0].todense()).ravel()
+        assert np.array_equal(id_col.astype(int), np.arange(1, 7))
+
+
 # ---------------------------------------------------------------------------
 # Feature B — sort/partition (self-serve subset reads with stock anndata/zarr)
 # ---------------------------------------------------------------------------
 
 
 def _sorted_cfg(backend: str = "zarr") -> AppConfig:
+    # lazy=False: this is the eager baseline compared against _lazy_sorted_cfg() below.
     return AppConfig(
-        io=IOConfig(overwrite=True, backend=backend),
+        io=IOConfig(overwrite=True, backend=backend, lazy=False),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
@@ -188,12 +220,14 @@ def test_sort_dense_writes_contiguous_ranges_and_rejects_unsupported_x_storage(t
     """Dense X supports --sort-by: rows are physically sorted so each key tuple is a
     contiguous run derivable from the sorted obs and read directly via X[start:end]
     (stock zarr, no annizarr, no index). --sort-by also requires x_storage='csr' or 'dense'
-    in general, and further requires 'csr' specifically when combined with --backed
+    in general, and further requires 'csr' specifically when combined with --lazy
     (streamed bucketing is csr-only; dense sort still works eagerly, as above)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
     out = tmp_path / "sorted_dense.zarr"
+    # lazy=False pinned: dense --sort-by is the eager (maybe_sort_adata) path, not the
+    # lazy-streamed (csr-only) one, regardless of io.lazy's own default.
     cfg = AppConfig(
-        io=IOConfig(overwrite=True, x_storage="dense"),
+        io=IOConfig(overwrite=True, x_storage="dense", lazy=False),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
@@ -223,8 +257,10 @@ def test_sort_dense_writes_contiguous_ranges_and_rejects_unsupported_x_storage(t
             assert (obs_full["cell_type"].to_numpy()[s:i] == keys[s][0]).all()
             s = i
 
+    # lazy=False: this exercises maybe_sort_adata's own x_storage guard, not the lazy-streamed
+    # path's stricter csr-only one (covered separately by cfg_lazy_dense just below).
     cfg_csc = AppConfig(
-        io=IOConfig(overwrite=True, x_storage="csc"),
+        io=IOConfig(overwrite=True, x_storage="csc", lazy=False),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
@@ -232,47 +268,47 @@ def test_sort_dense_writes_contiguous_ranges_and_rejects_unsupported_x_storage(t
     with pytest.raises(ConversionError, match="requires x_storage='csr' or 'dense'"):
         convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o1.zarr"), cfg=cfg_csc)
 
-    cfg_backed_dense = AppConfig(
-        io=IOConfig(overwrite=True, backed=True, x_storage="dense"),
+    cfg_lazy_dense = AppConfig(
+        io=IOConfig(overwrite=True, lazy=True, x_storage="dense"),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type",)),
     )
     with pytest.raises(ConversionError, match="csr"):
-        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o2.zarr"), cfg=cfg_backed_dense)
+        convert_h5ad(str(tmp_path / "in.h5ad"), output=str(tmp_path / "o2.zarr"), cfg=cfg_lazy_dense)
 
 
-def _backed_sorted_cfg() -> AppConfig:
+def _lazy_sorted_cfg() -> AppConfig:
     return AppConfig(
-        io=IOConfig(overwrite=True, backed=True, x_storage="csr"),
+        io=IOConfig(overwrite=True, lazy=True, x_storage="csr"),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
     )
 
 
-def test_sort_backed_streamed_matches_eager(tmp_path: Path) -> None:
-    """--backed --sort-by (streamed bucketing, Option C) yields the SAME sorted csr
+def test_sort_lazy_streamed_matches_eager(tmp_path: Path) -> None:
+    """--lazy --sort-by (streamed bucketing, Option C) yields the SAME sorted csr
     store as the eager path — same row order, X values, and reordered obsm — without ever
     materialising X in full."""
     _labelled_h5ad(tmp_path / "in.h5ad")
-    out_backed = tmp_path / "backed.zarr"
+    out_lazy = tmp_path / "lazy.zarr"
     out_eager = tmp_path / "eager.zarr"
 
     convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out_eager), cfg=_sorted_cfg())
-    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out_backed), cfg=_backed_sorted_cfg())
+    convert_h5ad(str(tmp_path / "in.h5ad"), output=str(out_lazy), cfg=_lazy_sorted_cfg())
 
-    a_backed = ad.read_zarr(str(out_backed))
+    a_lazy = ad.read_zarr(str(out_lazy))
     a_eager = ad.read_zarr(str(out_eager))
     # A/x(2,5), A/y(3), B/x(4), B/y(1,6): the same permutation the eager test asserts.
-    assert list(np.asarray(a_backed.X[:, 0].todense()).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
-    assert np.array_equal(np.asarray(a_backed.X.todense()), np.asarray(a_eager.X.todense()))
-    assert list(a_backed.obs["cell_type"]) == list(a_eager.obs["cell_type"])
-    assert np.array_equal(a_backed.obsm["coords"], a_eager.obsm["coords"])
-    assert "zarrsmith_sort_index" not in a_backed.uns
+    assert list(np.asarray(a_lazy.X[:, 0].todense()).ravel().astype(int)) == [2, 5, 3, 4, 1, 6]
+    assert np.array_equal(np.asarray(a_lazy.X.todense()), np.asarray(a_eager.X.todense()))
+    assert list(a_lazy.obs["cell_type"]) == list(a_eager.obs["cell_type"])
+    assert np.array_equal(a_lazy.obsm["coords"], a_eager.obsm["coords"])
+    assert "zarrsmith_sort_index" not in a_lazy.uns
 
-    # Self-serve subset reads (stock anndata/zarr) work on the backed-sorted store too.
-    g = open_input_group(str(out_backed))
+    # Self-serve subset reads (stock anndata/zarr) work on the lazy-sorted store too.
+    g = open_input_group(str(out_lazy))
     assert _id_set(_self_serve_subset(g, cell_type="A")[0]) == {2, 3, 5}
     assert _id_set(_self_serve_subset(g, demographic="x")[0]) == {2, 4, 5}
 
@@ -282,26 +318,24 @@ def test_sort_backed_streamed_matches_eager(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_backed_sort_default_commit_message_names_sort_columns(tmp_path: Path) -> None:
-    """_write_sorted_backed's default commit message names the sort columns (item 9), so a
-    sorted convert is distinguishable in `ic log`. Exercised directly against an icechunk
-    cfg, since --backed + backend=icechunk is otherwise rejected upstream (icechunk never
-    supports backed input) before it would reach this code path."""
+def test_lazy_sort_default_commit_message_names_sort_columns(tmp_path: Path) -> None:
+    """_write_sorted_lazy's default commit message names the sort columns (item 9), so a
+    sorted convert is distinguishable in `ic log`."""
     pytest.importorskip("icechunk")
-    from annizarr._core._sorting import _write_sorted_backed
+    from annizarr._core._sorting import _write_sorted_lazy
     from annizarr.ic import Repo
 
     _labelled_h5ad(tmp_path / "in.h5ad")
     adata = ad.read_h5ad(tmp_path / "in.h5ad", backed="r")
     out = tmp_path / "repo.icechunk"
     cfg = AppConfig(
-        io=IOConfig(overwrite=True, backed=True, x_storage="csr", backend="icechunk"),
+        io=IOConfig(overwrite=True, lazy=True, x_storage="csr", backend="icechunk"),
         chunks=_chunks(),
         validation=ValidationConfig(),
         grouping=GroupingConfig(enabled=True, sort_by=("cell_type", "demographic")),
     )
     try:
-        _write_sorted_backed(adata, out, cfg)
+        _write_sorted_lazy(adata, out, cfg)
     finally:
         adata.file.close()
 
@@ -370,13 +404,13 @@ def test_dense_sharding_metadata_roundtrip_and_object_count(tmp_path: Path) -> N
     assert np.array_equal(np.asarray(ad.read_zarr(str(plain)).X), expected)
 
 
-def test_sharding_backed_dense_parallel_roundtrip(tmp_path: Path) -> None:
-    """Backed input + cpus>1 fans densify-bands across processes; each band must write
+def test_sharding_lazy_dense_parallel_roundtrip(tmp_path: Path) -> None:
+    """Lazy input + cpus>1 fans dense-band writes across processes; each band must write
     whole shards (no read-modify-write, no inter-worker shard sharing)."""
     _labelled_h5ad(tmp_path / "in.h5ad")
-    out = tmp_path / "backed_sharded.zarr"
+    out = tmp_path / "lazy_sharded.zarr"
     cfg = AppConfig(
-        io=IOConfig(overwrite=True, x_storage="dense", backed=True),
+        io=IOConfig(overwrite=True, x_storage="dense", lazy=True),
         chunks=_chunks(x_shard_factor=2, cpus=2),
         validation=ValidationConfig(),
     )
@@ -465,24 +499,23 @@ def test_parallel_write_roundtrip_inmem_and_concat_seam(tmp_path: Path) -> None:
         assert np.array_equal(_read_X(out), np.vstack([a, b]))
 
 
-def test_concat_backed_csc_input_above_eager_max_bytes_raises(tmp_path: Path) -> None:
-    """concat's ensure_csr refuses a backed CSC input whose on-disk X is bigger than
-    io.eager_max_bytes (item 5) instead of silently loading it whole into memory; the error
-    hints at converting that input to csr first."""
-    _rand_h5ad(tmp_path / "a.h5ad", n_obs=50, n_vars=40, seed=1)
-    _rand_h5ad(tmp_path / "b.h5ad", n_obs=50, n_vars=40, seed=2)
+def test_concat_lazy_csc_input_streams_without_materializing(tmp_path: Path) -> None:
+    """A lazy (h5py-backed) CSC input to concat is streamed through as_reader's CSC->CSR
+    transpose, never loaded whole into memory."""
+    a = _rand_h5ad(tmp_path / "a.h5ad", n_obs=50, n_vars=40, seed=1)
+    b = _rand_h5ad(tmp_path / "b.h5ad", n_obs=50, n_vars=40, seed=2)
     b_adata = ad.read_h5ad(tmp_path / "b.h5ad")
     b_adata.X = sp.csc_matrix(b_adata.X)  # b's X is CSC on disk; a stays CSR
     b_adata.write_h5ad(tmp_path / "b.h5ad")
 
     out = tmp_path / "out.zarr"
     cfg = AppConfig(
-        io=IOConfig(overwrite=True, x_storage="csr", backed=True, eager_max_bytes=64),
+        io=IOConfig(overwrite=True, x_storage="csr", lazy=True),
         chunks=ChunkConfig(x_row_chunk=16, x_col_chunk=40, sparse_flat_chunk=500),
         validation=ValidationConfig(),
     )
-    with pytest.raises(ConversionError, match="annizarr convert --x-storage csr"):
-        concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(out), cfg=cfg)
+    concat([str(tmp_path / "a.h5ad"), str(tmp_path / "b.h5ad")], output=str(out), cfg=cfg)
+    assert np.array_equal(_read_X(out), np.vstack([a, b]))
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,14 @@
+"""Copy routines.
+
+* :func:`copy_group` — stream a zarr hierarchy into another root group. Used by
+  ``Repo.init`` to seed a repo from a zarr store: arrays are re-created with the source
+  layout (chunks, shards, codecs, fill value, attrs) and data is copied in
+  chunk-grid-aligned bands along axis 0 so memory stays bounded.
+* :func:`copy_repo` — replicate a whole icechunk repo (every branch and snapshot) to a
+  new location byte for byte. Icechunk's object tree is content-addressed, so a plain
+  file copy is a faithful clone. Used by ``Repo.copy``.
+"""
+
 from __future__ import annotations
 
 import importlib.util
@@ -11,13 +22,12 @@ from urllib.parse import urlparse
 
 from annizarr._storage import is_remote
 from annizarr.errors import RepoError
-from annizarr.ic._head import HEAD_FILE
 
 BAND_BYTES = 128 * 1024**2
 
 
 def check_copyable(src: str, dst: str) -> None:
-    # raises unless src -> dst is a copy this module can perform (no I/O)
+    """Raise unless ``src`` -> ``dst`` is a copy this module can perform (no I/O)."""
     for loc in (src, dst):
         if is_remote(loc) and urlparse(loc).scheme != "s3":
             raise RepoError(f"copy supports local paths and s3:// only, got '{loc}'")
@@ -26,9 +36,14 @@ def check_copyable(src: str, dst: str) -> None:
 
 
 def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
-    # local HEAD file is never copied; callers run check_copyable() first.
+    """Copy the repo object tree at ``src`` to ``dst`` (local dirs and/or ``s3://``).
+
+    Local->local uses ``shutil``; anything involving ``s3://`` goes through boto3 with
+    credentials from the environment, ``workers`` objects in flight at a time. Callers
+    run :func:`check_copyable` and make sure ``dst`` is a fresh location.
+    """
     if not (is_remote(src) or is_remote(dst)):
-        shutil.copytree(src, dst, ignore=shutil.ignore_patterns(HEAD_FILE), dirs_exist_ok=True)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
         return
 
     import boto3
@@ -67,7 +82,7 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
         jobs = [
             (lambda f=f: s3.upload_file(str(f), db, f"{dp}/{f.relative_to(root).as_posix()}"))
             for f in root.rglob("*")
-            if f.is_file() and f.name != HEAD_FILE
+            if f.is_file()
         ]
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -77,7 +92,7 @@ def copy_repo(src: str, dst: str, *, workers: int = 16) -> None:
 
 
 def copy_group(src: Any, dst: Any, *, band_bytes: int = BAND_BYTES) -> int:
-    # replicates src (groups, arrays, attrs, layout) into dst; returns the array count
+    """Replicate ``src`` (groups, arrays, attrs, layout) into ``dst``; return array count."""
     import zarr
 
     dst.update_attributes(dict(src.attrs))

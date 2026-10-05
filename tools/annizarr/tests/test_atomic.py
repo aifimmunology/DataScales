@@ -143,7 +143,7 @@ def test_sort_temp_buckets_cleaned_up_on_success_and_failure(tmp_path: Path, mon
 
     import annizarr._core._sorting as _sorting_mod
 
-    monkeypatch.setattr(_sorting_mod, "_write_concatenated_csr", _boom)
+    monkeypatch.setattr(_sorting_mod, "write_matrix", _boom)
     sorted_out2 = tmp_path / "sorted2.zarr"
     with pytest.raises(RuntimeError, match="boom"):
         sort(str(store), output=str(sorted_out2), by=("cell_type",), cfg=_cfg())

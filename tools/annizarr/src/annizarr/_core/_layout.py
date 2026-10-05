@@ -9,7 +9,19 @@ if TYPE_CHECKING:
 # read as `_layout.BATCH_BYTES` (module attribute, not a `from`-import) so tests can monkeypatch it.
 BATCH_BYTES = 256 * 1024 * 1024
 
-__all__ = ["BATCH_BYTES", "DenseLayout", "band_plan", "dense_shards", "write_grid", "x_compressors"]
+# per-job payload budget for the read-ahead pipeline (item 4): smaller than BATCH_BYTES so a
+# pickled payload crossing the process/thread boundary stays modest even when BATCH_BYTES is large.
+PIPELINE_BATCH_BYTES = 64 * 1024 * 1024
+
+__all__ = [
+    "BATCH_BYTES",
+    "PIPELINE_BATCH_BYTES",
+    "DenseLayout",
+    "band_plan",
+    "dense_shards",
+    "write_grid",
+    "x_compressors",
+]
 
 
 def write_grid(arr: zarr.Array[Any]) -> tuple[int, ...]:

@@ -120,9 +120,9 @@ def test_detect_guards_unrecognised_and_missing_inputs(tmp_path: Path) -> None:
 
 def test_open_source_dispatches_by_kind_and_rejects_unknown(tmp_path: Path) -> None:
     h5ad_path = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=4, n_vars=3))
-    src = open_source(str(h5ad_path), _cfg())
+    src = open_source(str(h5ad_path), _cfg(lazy=False))
     assert isinstance(src, Source)
-    assert src.kind == "h5ad" and src.adata.n_obs == 4 and not src.backed
+    assert src.kind == "h5ad" and src.adata.n_obs == 4 and not src.lazy
     src.close()
     src.close()  # safe twice
 
@@ -134,7 +134,7 @@ def test_open_source_dispatches_by_kind_and_rejects_unknown(tmp_path: Path) -> N
 
     adata = ad.AnnData(X=sp.csr_matrix(np.eye(3, dtype=np.float32)))
     src = open_source(adata, _cfg())
-    assert src.kind == "anndata" and not src.backed
+    assert src.kind == "anndata" and not src.lazy
     assert src.adata is adata
     src.close()
 
@@ -142,54 +142,34 @@ def test_open_source_dispatches_by_kind_and_rejects_unknown(tmp_path: Path) -> N
         open_source(str(h5ad_path), _cfg(), fmt="not-a-kind")
 
 
-def test_open_source_anndata_reflects_backed_state(tmp_path: Path) -> None:
-    """The AnnData-passthrough source (load_anndata) must read the backed state off the
-    object itself, not hardcode eager."""
+def test_open_source_anndata_reflects_lazy_state(tmp_path: Path) -> None:
+    """The AnnData-passthrough source (load_anndata) must read the lazy (backed) state off
+    the object itself, not hardcode eager."""
     h5ad_path = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=4, n_vars=3))
 
-    backed = ad.read_h5ad(h5ad_path, backed="r")
-    src = open_source(backed, _cfg())
-    assert src.backed is True
+    lazy_adata = ad.read_h5ad(h5ad_path, backed="r")
+    src = open_source(lazy_adata, _cfg())
+    assert src.lazy is True
     src.close()
 
     eager = ad.AnnData(X=sp.csr_matrix(np.eye(3, dtype=np.float32)))
     src = open_source(eager, _cfg())
-    assert src.backed is False
+    assert src.lazy is False
     src.close()
 
 
-def test_open_source_h5ad_auto_selects_eager_or_backed_by_threshold(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """backed=None (default): a huge threshold picks eager (X is tiny), a zero threshold
-    picks backed (any X exceeds it) -- asserted both via caplog and via Source.backed."""
-    caplog.set_level("INFO", logger="annizarr")
+def test_open_source_h5ad_respects_explicit_lazy_flag(tmp_path: Path) -> None:
+    """lazy=True (the default) streams (backed); lazy=False loads eagerly."""
     p = make_h5ad(tmp_path, "in.h5ad", adata=make_adata(n_obs=4, n_vars=3))
 
-    src = open_source(str(p), _cfg(backed=None, eager_max_bytes=2 * 1024**3))
-    assert not src.backed
-    assert any("Auto-selected eager load" in r.message for r in caplog.records)
+    src = open_source(str(p), _cfg(lazy=False))
+    assert not src.lazy
     src.close()
 
-    caplog.clear()
-    src = open_source(str(p), _cfg(backed=None, eager_max_bytes=0))
-    assert src.backed
+    src = open_source(str(p), _cfg(lazy=True))
+    assert src.lazy
     assert src.adata.isbacked
-    assert any("Auto-selected backed load" in r.message for r in caplog.records)
     src.close()
-
-
-def test_load_h5ad_no_x_raises_conversion_error(tmp_path: Path) -> None:
-    """load_h5ad's auto-select peek (_peek_x_nbytes) raises ConversionError, not a bare
-    KeyError, for an h5ad-shaped file with no X."""
-    from annizarr._sources._h5ad import load_h5ad
-
-    p = tmp_path / "no_x.h5ad"
-    with h5py.File(p, "w") as f:
-        f.create_group("obs")
-        f.create_group("var")
-    with pytest.raises(ConversionError, match="has no X"):
-        load_h5ad(p, _cfg(backed=None, eager_max_bytes=2 * 1024**3))
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +183,7 @@ def _toy_sniffer(path: Path) -> str | None:
 
 def _toy_loader(path, cfg) -> Source:
     adata = ad.AnnData(X=sp.csr_matrix(np.eye(5, 3, dtype=np.float32)))
-    return Source(adata=adata, kind="toy", backed=False, warnings=("toy loaded",))
+    return Source(adata=adata, kind="toy", lazy=False, warnings=("toy loaded",))
 
 
 def test_registered_source_round_trips_through_convert(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -245,13 +225,9 @@ def test_convert_dispatch_single_multi_and_anndata_inputs(tmp_path: Path) -> Non
     assert result.snapshot_id is None
 
 
-def test_convert_rejects_mixed_formats_empty_sequence_and_existing_store(tmp_path: Path) -> None:
-    a = make_h5ad(tmp_path, "a.h5ad")
-    b = tmp_path / "b_matrix.h5"
-    _make_10x_v3(b)
-    with pytest.raises(ConversionError, match="concat supports h5ad inputs only"):
-        convert([str(a), str(b)], output=str(tmp_path / "out.zarr"), cfg=_cfg())
-
+def test_convert_rejects_empty_sequence_and_existing_store(tmp_path: Path) -> None:
+    # mixed-format concat (e.g. h5ad + 10x) is exercised in test_concat_matrix.py; this is
+    # just the input-count/target guards that are independent of input kind.
     with pytest.raises(ConversionError, match="at least one input"):
         convert([], output="unused.zarr", cfg=_cfg())
 

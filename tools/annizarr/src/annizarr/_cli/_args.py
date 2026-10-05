@@ -39,7 +39,7 @@ def add_branch_arg(parser: argparse.ArgumentParser) -> None:
         "--branch",
         default=None,
         metavar="B",
-        help="Icechunk branch to read/write (default: current HEAD, falling back to 'main'); ignored for plain zarr",
+        help="Icechunk branch to read/write, created off main if missing (default: main); ignored for plain zarr",
     )
 
 
@@ -54,8 +54,7 @@ def add_message_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def add_cpus_arg(parser: argparse.ArgumentParser) -> None:
-    defaults = ChunkConfig()
-    parser.add_argument("--cpus", type=int, help=f"parallel workers for matrix chunk writes (default: {defaults.cpus})")
+    parser.add_argument("--cpus", type=int, help="parallel band workers (default: all cores)")
 
 
 def add_chunk_args(parser: argparse.ArgumentParser) -> None:
@@ -80,11 +79,10 @@ def add_autoshard_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--auto-shard",
         dest="auto_shard",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=None,
-        help="shard the anndata-written elements and the 1-D sparse arrays with zarr's "
-        "automatic shard shape; default is off (unsharded). --no-auto-shard overrides a "
-        "config file's auto_shard = true for this run",
+        help="shard the anndata-written elements and the 1-D sparse arrays with zarr's automatic shard shape "
+        "(default: off)",
     )
 
 
@@ -103,7 +101,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         x_shard_factor=getattr(args, "x_shard_factor", None),
         auto_shard=getattr(args, "auto_shard", None),
         cpus=getattr(args, "cpus", None),
-        backed=getattr(args, "backed", None),
+        lazy=getattr(args, "lazy", None),
         backend=("icechunk" if getattr(args, "ic", False) else None),
         sort_by=getattr(args, "sort_by", None),
         obs_columns=getattr(args, "obs_columns", None),

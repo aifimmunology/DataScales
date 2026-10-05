@@ -53,10 +53,12 @@ def _assert_stores_equal(expected_root: Path, actual_root: Path) -> None:
 
 
 def _build_cfg(case: dict[str, Any]) -> Any:
+    # case.json's "backed" key is baked into the (un-regenerated) golden tarballs verbatim;
+    # map it onto the renamed apply_cli_overrides(lazy=) kwarg here rather than touching them.
     return apply_cli_overrides(
         load_config(),
         x_storage=case["x_storage"],
-        backed=case.get("backed", False),
+        lazy=case.get("backed", False),
         cpus=case.get("cpus"),
         x_row_chunk=case.get("x_row_chunk"),
         x_col_chunk=case.get("x_col_chunk"),

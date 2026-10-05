@@ -13,7 +13,6 @@ _LOGGER_NAME = "annizarr"
 def _build_parser() -> argparse.ArgumentParser:
     from annizarr._cli._convert import add_parser as add_convert_parser
     from annizarr._cli._edit import add_add_expr_parser, add_append_parser, add_rechunk_parser, add_sort_parser
-    from annizarr._cli._ic import add_ic_parser
 
     parser = argparse.ArgumentParser(
         prog="annizarr", description="AnnData zarr stores: convert, edit, and version with Icechunk."
@@ -29,7 +28,6 @@ def _build_parser() -> argparse.ArgumentParser:
     add_rechunk_parser(sub)
     add_sort_parser(sub)
     add_append_parser(sub)
-    add_ic_parser(sub)
     return parser
 
 

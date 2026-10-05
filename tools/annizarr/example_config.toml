@@ -2,15 +2,14 @@
 overwrite = false
 consolidate_metadata = false
 x_storage = "csr"  # "csr" (default), "csc", or "dense"
-# backed = false   # commented out = auto (peek X's on-disk size vs eager_max_bytes)
-eager_max_bytes = 2147483648
-backend = "zarr"  # "zarr" (default) or "icechunk" (one commit per op); icechunk needs eager input
+lazy = true  # stream input band by band (default); false loads it whole into memory first
+backend = "zarr"  # "zarr" (default) or "icechunk" (one commit per op)
 
 [chunks]
 x_row_chunk = 1000
 x_col_chunk = 1000
 sparse_flat_chunk = 1000000
-cpus = 1
+# cpus = 8  # default: all cores
 x_shard_factor = 1  # pack this many dense-X chunks per shard; 1 = no sharding
 auto_shard = false  # shard our 1-D sparse arrays + anndata's own writes with shards="auto"
 

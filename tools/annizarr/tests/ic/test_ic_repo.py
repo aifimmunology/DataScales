@@ -24,22 +24,21 @@ def test_init_imports_store_faithfully(src_zarr, repo_path):
     assert set(root["obs"].array_keys()) == {"_index"}
 
 
-def test_init_rejects_nonempty_output_and_open_rejects_missing_repo(src_zarr, repo_path, tmp_path):
+def test_init_rejects_nonempty_output(src_zarr, repo_path):
     path, _ = src_zarr
     Repo.init(path, repo_path)
     with pytest.raises(RepoError):
         Repo.init(path, repo_path)
 
+
+def test_open_missing_repo_errors(tmp_path):
     with pytest.raises(RepoError):
         Repo(tmp_path / "nope.icechunk")
 
 
-def test_commit_records_snapshot_and_requires_a_staged_session(src_zarr, repo_path):
+def test_commit_records_snapshot(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
-
-    with pytest.raises(RepoError):
-        repo.commit("nothing staged")
 
     g = repo.open_zarr("w")
     g.attrs["note"] = "edited"
@@ -50,6 +49,13 @@ def test_commit_records_snapshot_and_requires_a_staged_session(src_zarr, repo_pa
     assert log[0].id == snapshot_id
     assert log[0].message == "add note"
     assert repo.open_zarr("r").attrs["note"] == "edited"
+
+
+def test_commit_without_session_errors(src_zarr, repo_path):
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path)
+    with pytest.raises(RepoError):
+        repo.commit("nothing staged")
 
 
 def test_log_newest_first(src_zarr, repo_path):
@@ -80,16 +86,24 @@ def test_checkout_create_branches_and_isolates_commits(src_zarr, repo_path):
     assert set(repo.branches()) == {"main", "experiment"}
 
 
-def test_head_persists_across_reopen(src_zarr, repo_path):
+def test_checkout_missing_branch_errors(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
-    repo.checkout("dev", create=True)
-
-    reopened = Repo(repo_path)
-    assert reopened.branch == "dev"
+    with pytest.raises(RepoError):
+        repo.checkout("ghost")
 
 
-def test_cherrypick_resets_branch_state_and_rejects_unknown_snapshot(src_zarr, repo_path):
+def test_reopen_lands_on_main_unless_branch_given(src_zarr, repo_path):
+    path, _ = src_zarr
+    Repo.init(path, repo_path).checkout("dev", create=True)  # checkout is in-process only
+
+    assert Repo(repo_path).branch == "main"
+    assert Repo(repo_path, branch="dev").branch == "dev"
+    with pytest.raises(RepoError, match="No branch 'ghost'"):
+        Repo(repo_path, branch="ghost")
+
+
+def test_cherrypick_resets_branch_state(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
     first = repo.log()[0].id
@@ -102,16 +116,17 @@ def test_cherrypick_resets_branch_state_and_rejects_unknown_snapshot(src_zarr, r
     assert "v" not in repo.open_zarr("r").attrs
     assert repo.log()[0].id == first
 
+
+def test_cherrypick_unknown_snapshot_errors(src_zarr, repo_path):
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path)
     with pytest.raises(RepoError):
         repo.cherrypick("deadbeef")
 
 
-def test_checkout_missing_branch_and_uncommitted_changes_both_block_checkout(src_zarr, repo_path):
+def test_uncommitted_changes_block_checkout(src_zarr, repo_path):
     path, _ = src_zarr
     repo = Repo.init(path, repo_path)
-    with pytest.raises(RepoError):
-        repo.checkout("ghost")
-
     repo.open_zarr("w").attrs["dirty"] = True
     with pytest.raises(RepoError):
         repo.checkout("other", create=True)
@@ -126,9 +141,9 @@ def test_tree_lists_all_branches(src_zarr, repo_path):
     repo.checkout("main")
     repo.checkout("b2", create=True)
 
-    tree = repo.tree()
-    assert set(tree) == {"main", "b1", "b2"}
-    assert all(len(v) >= 1 for v in tree.values())
+    assert set(repo.branches()) == {"main", "b1", "b2"}
+    shown = repr(repo.tree())
+    assert shown.startswith("On branch b2\n") and all(b in shown for b in ("main", "b1", "b2"))
 
 
 def test_create_empty_repo_and_exists(tmp_path):
@@ -165,3 +180,66 @@ def test_open_zarr_modes_and_snapshot_rules(src_zarr, repo_path):
         repo.open_zarr("w", snapshot_id=first)
     with pytest.raises(RepoError, match="mode must be 'r' or 'w'"):
         repo.open_zarr("a")
+
+
+def test_open_zarr_write_truncate_replaces_branch_contents(src_zarr, repo_path):
+    """annizarr-only: ``truncate=True`` drops old data instead of editing it in place,
+    used by ``open_output_store`` so a re-run of an op never appends to stale output."""
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path)
+    repo.open_zarr("w").attrs["stale"] = True
+    repo.commit("first write")
+
+    root = repo.open_zarr("w", truncate=True)
+    assert "stale" not in root.attrs
+    root.attrs["fresh"] = True
+    repo.commit("second write")
+
+    assert "stale" not in repo.open_zarr("r").attrs
+    assert repo.open_zarr("r").attrs["fresh"] is True
+
+
+def test_reprs_read_git_like(src_zarr, repo_path):
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path, message="import")
+    repo.checkout("dev", create=True)
+    repo.open_zarr("w").attrs["k"] = 1
+    snap = repo.commit("edit k")
+
+    shown = repr(repo)
+    assert shown.splitlines()[0] == f"Repo({str(repo_path)!r})"
+    assert "  branch: dev" in shown and f"  tip:    {snap[:12]}" in shown and shown.endswith("edit k")
+    assert repr(repo.branches()).splitlines() == ["* dev", "  main"]
+    log = repr(repo.log()).splitlines()
+    assert len(log) == 3 and log[0].startswith(snap[:12]) and log[0].endswith("  edit k")
+    assert log[-1].endswith("Repository initialized")
+
+    root = repo.open_zarr("r")
+    head, *members = repr(root).splitlines()
+    assert head == f"<Group '/' at {repo_path}  branch dev  snapshot {snap[:12]}  read-only>"
+    assert members == ["  arrays: X", "  groups: obs, var"]
+    assert "detached" in repr(repo.open_zarr("r", snapshot_id=snap))
+
+    repo.open_zarr("w").attrs["j"] = 2
+    assert "writable, uncommitted changes>" in repr(repo.open_zarr("w")).splitlines()[0]
+    assert repr(repo).endswith("  staged: uncommitted changes")
+    repo.discard()
+    assert "staged" not in repr(repo)
+
+
+@pytest.mark.filterwarnings("ignore:zarr v3 autosharding:UserWarning")  # bare write_elem, no autoshard setting
+@pytest.mark.filterwarnings("ignore::anndata.ImplicitModificationWarning")  # fixture has an int index
+def test_root_group_works_with_anndata_io(src_zarr, repo_path):
+    """anndata dispatches on the exact store type; the display Group must still read and write."""
+    import anndata as ad
+    import pandas as pd
+    from anndata.io import read_elem, write_elem
+
+    path, _ = src_zarr
+    repo = Repo.init(path, repo_path)
+    write_elem(repo.open_zarr("w"), "obs", pd.DataFrame({"k": range(12)}, index=[str(i) for i in range(12)]))
+    repo.commit("obs")
+    root = repo.open_zarr("r")
+    assert "branch main" in repr(root)
+    adata = read_elem(root)
+    assert isinstance(adata, ad.AnnData) and adata.n_obs == 12 and list(adata.obs["k"])[:3] == [0, 1, 2]

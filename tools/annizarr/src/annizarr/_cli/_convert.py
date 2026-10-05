@@ -26,7 +26,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         "inputs",
         nargs="+",
         metavar="INPUT",
-        help="input file(s); two or more h5ad inputs are concatenated",
+        help="input file(s); two or more inputs are concatenated (any mix of registered kinds)",
     )
     p.add_argument("-o", "--output", required=True, help="output store path or URI")
     p.add_argument(
@@ -35,20 +35,20 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         choices=("h5ad", "10x"),
         help="override content-based format detection",
     )
-    backed_group = p.add_mutually_exclusive_group()
-    backed_group.add_argument(
-        "--backed",
-        dest="backed",
+    lazy_group = p.add_mutually_exclusive_group()
+    lazy_group.add_argument(
+        "--lazy",
+        dest="lazy",
         action="store_true",
         default=None,
-        help="stream h5ad input instead of loading it eagerly (default: auto, based on X's on-disk size)",
+        help="stream the input band by band (default)",
     )
-    backed_group.add_argument(
+    lazy_group.add_argument(
         "--eager",
-        dest="backed",
+        dest="lazy",
         action="store_false",
         default=None,
-        help="load h5ad input eagerly, overriding auto-select for a large file",
+        help="load the whole input in memory first; faster for small files",
     )
     p.add_argument(
         "--x-storage",

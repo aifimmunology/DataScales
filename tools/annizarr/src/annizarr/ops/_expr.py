@@ -14,6 +14,7 @@ from annizarr._core._config import load_config
 from annizarr._core._layout import x_compressors
 from annizarr._core._runtime import configure_runtime, stage
 from annizarr._core._zarr import get_array, get_group, shape_attr
+from annizarr._sources._readers import as_reader
 from annizarr._storage import open_store_rw
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
 from annizarr._writers._sparse import _local_tmp_dir, write_transposed_sparse
@@ -168,8 +169,12 @@ def write_expr_layer(
     if fmt == "csc":
         factors = _lognorm_factors(data_arr, indptr, target_sum, row_step, n_obs)
         layer_cfg = replace(cfg, chunks=replace(cfg.chunks, sparse_flat_chunk=chunk_elems))
-        with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
-            g = write_transposed_sparse(layers, layer, x, layer_cfg, row_scale=factors, target="csc")
+        x_reader = as_reader(x, cfg=layer_cfg, tmp_dir=_local_tmp_dir(layers))
+        try:
+            with stage(f"Writing layers/{layer} (csc, nnz={nnz})"):
+                g = write_transposed_sparse(layers, layer, x_reader, layer_cfg, row_scale=factors, target="csc")
+        finally:
+            x_reader.close()
         g.attrs[_TARGET_SUM_ATTR] = float(target_sum)
         return
 

@@ -6,17 +6,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import scipy.sparse as sp
 import zarr
 
 from annizarr._core import _layout
 from annizarr._core._layout import write_grid, x_compressors
-from annizarr._core._runtime import progress, run_parallel
-from annizarr._core._zarr import get_array, shape_attr
-from annizarr._sources._matrix import get_indptr, is_backed
+from annizarr._core._runtime import ArrayTarget, pipeline_parallel, progress, run_parallel, writer_parallel_mode
 from annizarr._writers._encoding import make_sparse_group, set_array_attrs, sparse_shards, suppress_autoshard_warning
-from annizarr._writers._workers import _copy_sparse_segment
-from annizarr.errors import ConversionError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,58 +20,104 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from annizarr._core._config import AppConfig
+    from annizarr._sources._readers import Reader
+
+type _CsrPayload = tuple[int, int, NDArray[Any], NDArray[Any]]
 
 
-def flat_segments(nnz_total: int, step: int, bytes_per_nnz: int) -> list[tuple[int, int]]:
-    # step is the output's write grid (not the raw chunk size), so segments never share one
+def _segment_size(step: int, bytes_per_nnz: int, budget: int, grain: int | None) -> int:
+    # always a multiple of the output write grid; also of the source chunk when that fits the budget
+    base = step
+    if grain is not None and grain > 0:
+        import math
+
+        unit = math.lcm(step, grain)
+        if unit * bytes_per_nnz <= budget:
+            base = unit
+    return max(1, budget // max(1, base * bytes_per_nnz)) * base
+
+
+def flat_segments(nnz_total: int, step: int, bytes_per_nnz: int, *, grain: int | None = None) -> list[tuple[int, int]]:
     if nnz_total <= 0:
         return []
-    seg = max(1, _layout.BATCH_BYTES // max(1, step * bytes_per_nnz)) * step
+    seg = _segment_size(step, bytes_per_nnz, _layout.BATCH_BYTES, grain)
     return [(s, min(s + seg, nnz_total)) for s in range(0, nnz_total, seg)]
 
 
-def _write_flat_segment(
-    data_arr: zarr.Array[Any],
-    indices_arr: zarr.Array[Any],
-    data: Any,
-    indices: Any,
+def _no_tick() -> None:
+    pass
+
+
+def _csr_job(
+    data_target: ArrayTarget,
+    indices_target: ArrayTarget,
+    reader: Reader,
     s0: int,
     s1: int,
     indices_dtype: Any,
     tick: Callable[[], None],
 ) -> None:
-    data_arr[s0:s1] = data[s0:s1]
-    indices_arr[s0:s1] = np.asarray(indices[s0:s1], dtype=indices_dtype)
-    tick()
+    try:
+        data_arr = data_target.resolve()
+        indices_arr = indices_target.resolve()
+        data, indices = reader.flat(s0, s1)
+        data_arr[s0:s1] = data
+        indices_arr[s0:s1] = np.asarray(indices, dtype=indices_dtype)
+        tick()
+    finally:
+        if data_target.in_worker:
+            reader.close()
 
 
-def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppConfig, csr: bool) -> None:
-    n_rows, n_cols = matrix.shape
-    n_major = n_rows if csr else n_cols
+def _csr_pipeline_produce(reader: Reader, s0: int, s1: int) -> _CsrPayload:
+    try:
+        data, indices = reader.flat(s0, s1)
+        return s0, s1, data, indices
+    finally:
+        reader.close()
 
-    # backed _CSRDataset/_CSCDataset doesn't expose .indptr directly — read the h5py group.
-    if sp.issparse(matrix):
-        indptr_full = np.asarray(matrix.indptr)
-    elif hasattr(matrix, "indptr"):
-        indptr_full = np.asarray(matrix.indptr[:])
-    elif hasattr(matrix, "group"):
-        indptr_full = np.asarray(matrix.group["indptr"][:])
-    else:
-        raise ConversionError(f"Cannot locate indptr on sparse input of type {type(matrix).__name__}")
+
+def _local_tmp_dir(group: zarr.Group) -> str | None:
+    from zarr.storage import LocalStore
+
+    store = group.store_path.store
+    return str(store.root) if isinstance(store, LocalStore) else None
+
+
+def write_csr(group: zarr.Group, key: str, reader: Reader, cfg: AppConfig) -> None:
+    _write_compressed(group, key, reader, cfg, csr=True, shape=reader.shape)
+
+
+def write_csc(group: zarr.Group, key: str, reader: Reader, cfg: AppConfig) -> None:
+    if reader.lazy:
+        write_transposed_sparse(group, key, reader, cfg, target="csc")
+        return
+    from annizarr._sources._readers import CSRMemoryReader
+
+    # in memory: scipy's tocsc, then the parallel flat copy over the column-major view (.T is zero-copy)
+    n_rows = reader.shape[0]
+    columns = CSRMemoryReader(reader.csr_rows(0, n_rows).tocsc().T)
+    columns.cpus = reader.cpus
+    _write_compressed(group, key, columns, cfg, csr=False, shape=reader.shape)
+
+
+def _write_compressed(
+    group: zarr.Group, key: str, reader: Reader, cfg: AppConfig, *, csr: bool, shape: tuple[int, int]
+) -> None:
+    # reader is major-axis ordered: rows of a CSR output, columns of a CSC output
+    n_major = reader.shape[0]
+    indptr_full = reader.indptr
     nnz_total = int(indptr_full[-1])
+    indices_dtype = np.int32  # matches scipy's default; values fit unless > 2^31 along the minor axis
 
-    backed = is_backed(matrix)
-    indices_dtype = np.int32  # match scipy default; values fit unless > 2^31 cols/rows
-
-    sp_group = make_sparse_group(group, key, csr=csr, shape=(n_rows, n_cols))
-
+    sp_group = make_sparse_group(group, key, csr=csr, shape=shape)
     flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz_total))
     shards = sparse_shards(cfg.chunks.auto_shard)
     with suppress_autoshard_warning(cfg.chunks.auto_shard):
         data_arr = sp_group.require_array(
             "data",
             shape=(nnz_total,),
-            dtype=matrix.dtype,
+            dtype=reader.dtype,
             chunks=(flat_chunk,),
             shards=shards,
             compressors=x_compressors(),
@@ -91,87 +132,73 @@ def _write_sparse_streaming(group: zarr.Group, matrix: Any, key: str, cfg: AppCo
             compressors=x_compressors(),
             overwrite=True,
         )
+    indptr_dtype = np.int64 if nnz_total > np.iinfo(np.int32).max else np.int32
     indptr_arr = sp_group.require_array(
-        "indptr",
-        shape=(n_major + 1,),
-        dtype=indptr_full.dtype,
-        chunks=(n_major + 1,),
-        overwrite=True,
+        "indptr", shape=(n_major + 1,), dtype=indptr_dtype, chunks=(n_major + 1,), overwrite=True
     )
     for a in (data_arr, indices_arr, indptr_arr):
         set_array_attrs(a)
+    indptr_arr[:] = indptr_full.astype(indptr_dtype)
 
-    indptr_arr[:] = indptr_full
-
-    bytes_per_nnz = np.dtype(matrix.dtype).itemsize + np.dtype(indices_dtype).itemsize
-    step = write_grid(data_arr)[0]
-
-    if backed:
-        from zarr.storage import LocalStore
-
-        # h5py is not thread-safe, so backed segments copy in worker processes instead.
-        src = matrix.group
-        store = data_arr.store_path.store
-        assert isinstance(store, LocalStore), "backed sparse write requires a local zarr store"
-        out_root = store.root
-        jobs = [
-            (
-                out_root,
-                data_arr.store_path.path,
-                indices_arr.store_path.path,
-                src.file.filename,
-                src.name,
-                s0,
-                s1,
-                indices_dtype,
-            )
-            for s0, s1 in flat_segments(nnz_total, step, bytes_per_nnz)
-        ]
-        run_parallel(_copy_sparse_segment, jobs, cfg.chunks.cpus, mode="processes")
+    if nnz_total == 0:
         return
 
-    segments = flat_segments(nnz_total, step, bytes_per_nnz)
+    bytes_per_nnz = np.dtype(reader.dtype).itemsize + np.dtype(indices_dtype).itemsize
+    step = write_grid(data_arr)[0]
+    segments = flat_segments(nnz_total, step, bytes_per_nnz, grain=reader.grain)
+    mode = writer_parallel_mode(reader, data_arr.store_path.store)
+
+    if mode == "processes":
+        data_target = ArrayTarget.detached(data_arr)
+        indices_target = ArrayTarget.detached(indices_arr)
+        jobs = [(data_target, indices_target, reader, s0, s1, indices_dtype, _no_tick) for s0, s1 in segments]
+        run_parallel(_csr_job, jobs, cfg.chunks.cpus, mode="processes")
+        return
+
+    if mode == "pipeline":
+        budget = min(_layout.BATCH_BYTES, _layout.PIPELINE_BATCH_BYTES)
+        pipeline_seg = _segment_size(step, bytes_per_nnz, budget, reader.grain)
+        pipeline_jobs = [(reader, s0, min(s0 + pipeline_seg, nnz_total)) for s0 in range(0, nnz_total, pipeline_seg)]
+
+        def consume(payload: _CsrPayload) -> None:
+            ps0, ps1, data, indices = payload
+            data_arr[ps0:ps1] = data
+            indices_arr[ps0:ps1] = np.asarray(indices, dtype=indices_dtype)
+
+        pipeline_parallel(_csr_pipeline_produce, consume, pipeline_jobs, cfg.chunks.cpus)
+        return
+
     tick = progress(len(segments), f"Writing {key}")
-    thread_jobs = [
-        (data_arr, indices_arr, matrix.data, matrix.indices, s0, s1, indices_dtype, tick) for s0, s1 in segments
-    ]
-    run_parallel(_write_flat_segment, thread_jobs, cfg.chunks.cpus, mode="threads")
-
-
-def _sparse_source(matrix: Any) -> tuple[Any, Any, NDArray[np.int64], tuple[int, int], Any]:
-    if isinstance(matrix, zarr.Group):
-        data = get_array(matrix, "data")
-        indices = get_array(matrix, "indices")
-        indptr = np.asarray(get_array(matrix, "indptr")[:], dtype=np.int64)
-        return data, indices, indptr, shape_attr(matrix), data.dtype
-    indptr = get_indptr(matrix).astype(np.int64, copy=False)
-    return matrix.group["data"], matrix.group["indices"], indptr, matrix.shape, matrix.dtype
-
-
-def _local_tmp_dir(group: zarr.Group) -> str | None:
-    from zarr.storage import LocalStore
-
-    store = group.store_path.store
-    return str(store.root) if isinstance(store, LocalStore) else None
+    data_target = ArrayTarget.attached(data_arr)
+    indices_target = ArrayTarget.attached(indices_arr)
+    cpus = cfg.chunks.cpus if mode == "threads" else 1
+    jobs = [(data_target, indices_target, reader, s0, s1, indices_dtype, tick) for s0, s1 in segments]
+    run_parallel(_csr_job, jobs, cpus, mode="threads")
 
 
 def write_transposed_sparse(
     group: zarr.Group,
     key: str,
-    matrix: Any,
+    reader: Reader,
     cfg: AppConfig,
     *,
     row_scale: NDArray[np.float64] | None = None,
     target: Literal["csc", "csr"],
 ) -> zarr.Group:
-    # two BATCH_BYTES-bounded passes so the whole matrix is never materialised.
-    data_src, idx_src, indptr_src, (n_rows, n_cols), src_dtype = _sparse_source(matrix)
-    n_source_major = n_rows if target == "csc" else n_cols
-    n_target_major = n_cols if target == "csc" else n_rows
-    nnz = int(indptr_src[-1])
+    # two BATCH_BYTES-bounded passes so the whole matrix is never materialised. `reader`
+    # always represents data in source-major ("row-like") terms: reader.shape[0] is the
+    # source major-axis count, reader.indptr is over it, reader.flat(...) gives (data,
+    # target-axis-index) in source-major flat order. The true output shape is reader.shape
+    # when target=="csc" (source is a normal CSR-shaped reader); when target=="csr" the
+    # source was CSC and is fed in pre-swapped (as_reader's _SwappedCSRView), so the true
+    # shape is reader.shape reversed.
+    n_source_major, n_target_major = reader.shape
+    true_shape = reader.shape if target == "csc" else (n_target_major, n_source_major)
+    indptr_src = reader.indptr
+    nnz = reader.nnz
     source_major_nnz = np.diff(indptr_src)
 
-    value_dtype = np.dtype(np.float32) if row_scale is not None else np.dtype(src_dtype)
+    value_dtype = np.dtype(np.float32) if row_scale is not None else np.dtype(reader.dtype)
     indices_dtype = np.int32  # source-major positions in the output; matches scipy's default
     indptr_dtype = np.int64 if nnz > np.iinfo(np.int32).max else np.int32
 
@@ -179,7 +206,8 @@ def write_transposed_sparse(
     flat_step = max(cfg.chunks.sparse_flat_chunk, _layout.BATCH_BYTES // 8)
     for s0 in range(0, nnz, flat_step):
         s1 = min(s0 + flat_step, nnz)
-        target_nnz += np.bincount(np.asarray(idx_src[s0:s1]), minlength=n_target_major)
+        _, idx = reader.flat(s0, s1)
+        target_nnz += np.bincount(idx, minlength=n_target_major)
     target_indptr = np.concatenate([[0], np.cumsum(target_nnz)]).astype(np.int64)
 
     bytes_per_entry = value_dtype.itemsize + 16
@@ -215,8 +243,7 @@ def write_transposed_sparse(
         for b0 in bands:
             b1 = min(b0 + source_step, n_source_major)
             s0, s1 = int(indptr_src[b0]), int(indptr_src[b1])
-            data_band = np.asarray(data_src[s0:s1])
-            tgt_band = np.asarray(idx_src[s0:s1], dtype=np.int32)
+            data_band, tgt_band = reader.flat(s0, s1)
             src_pos = np.repeat(np.arange(b0, b1, dtype=np.int32), source_major_nnz[b0:b1])
             if row_scale is not None:
                 factor = np.repeat(row_scale[b0:b1], source_major_nnz[b0:b1])
@@ -238,7 +265,7 @@ def write_transposed_sparse(
                 cursors[bi] = c + hi - lo
             tick()
 
-        sp_group = make_sparse_group(group, key, csr=(target == "csr"), shape=(n_rows, n_cols))
+        sp_group = make_sparse_group(group, key, csr=(target == "csr"), shape=true_shape)
         flat_chunk = min(cfg.chunks.sparse_flat_chunk, max(1, nnz))
         shards = sparse_shards(cfg.chunks.auto_shard)
         with suppress_autoshard_warning(cfg.chunks.auto_shard):

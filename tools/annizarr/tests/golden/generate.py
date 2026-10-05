@@ -157,10 +157,12 @@ CASES: dict[str, dict[str, Any]] = {
 
 
 def _build_cfg(case: dict[str, Any]) -> Any:
+    # case.json keeps the "backed" key name (matches the already-packed tarballs' schema,
+    # read back by test_golden_writers.py); map it onto apply_cli_overrides(lazy=) here.
     return apply_cli_overrides(
         load_config(),
         x_storage=case["x_storage"],
-        backed=case.get("backed", False),
+        lazy=case.get("backed", False),
         cpus=case.get("cpus"),
         x_row_chunk=case.get("x_row_chunk"),
         x_col_chunk=case.get("x_col_chunk"),

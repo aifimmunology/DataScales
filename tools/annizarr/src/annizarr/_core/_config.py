@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import tomllib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -45,16 +46,10 @@ class IOConfig:
         Consolidate zarr metadata into one object after writing (plain zarr only).
     x_storage
         On-disk layout for X (and layers): ``"csr"``, ``"csc"``, or ``"dense"``.
-    backed
-        Load h5ad input in backed (HDF5-streamed) mode instead of eagerly. ``None``
-        (the default) auto-selects per input: :func:`annizarr._sources._h5ad.load_h5ad`
-        peeks the on-disk size of ``X`` (no data read) and picks backed when it exceeds
-        ``eager_max_bytes``, else eager. Ignored for in-memory/10x input (always eager).
-    eager_max_bytes
-        Auto-select threshold, in bytes, used when ``backed`` is ``None``: an h5ad whose
-        on-disk ``X`` (``data``+``indices``+``indptr`` for sparse, the raw dataset for
-        dense) exceeds this loads backed instead of eagerly. Ignored when ``backed`` is
-        set explicitly.
+    lazy
+        Load h5ad input in lazy (HDF5-streamed) mode instead of eagerly. ``True`` (the
+        default) streams the input band by band; ``False`` loads it whole into memory
+        first. Ignored for in-memory/10x input (always eager).
     backend
         ``"zarr"`` writes a plain on-disk store; ``"icechunk"`` writes through a
         transactional, versioned Icechunk repository (one commit per op). Icechunk
@@ -64,9 +59,12 @@ class IOConfig:
     overwrite: bool = False
     consolidate_metadata: bool = False
     x_storage: XStorage = "csr"
-    backed: bool | None = None
-    eager_max_bytes: int = 2 * 1024**3
+    lazy: bool = True
     backend: BackendMode = "zarr"
+
+
+def _all_cpus() -> int:
+    return os.cpu_count() or 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,8 +80,10 @@ class ChunkConfig:
     sparse_flat_chunk
         Flat chunk size for sparse X ``data``/``indices``.
     cpus
-        Workers for parallel matrix chunk writes: threads for in-memory input,
-        processes when backed (h5py is not thread-safe); raise on HPC.
+        Workers for parallel matrix chunk writes: threads for a thread-safe reader
+        (in-memory or zarr-backed), processes for a lazy h5py-backed one (not thread-safe).
+        Defaults to every available CPU core (``os.cpu_count()``); pass a lower number to
+        leave headroom on a shared/HPC host.
     x_shard_factor
         Pack this many chunks per shard along each axis of dense X (``1`` = no
         sharding; sparse output ignores it). See :func:`annizarr._core._layout.dense_shards`.
@@ -103,7 +103,7 @@ class ChunkConfig:
     x_row_chunk: int = 2048
     x_col_chunk: int = 2048
     sparse_flat_chunk: int = 1_000_000
-    cpus: int = 1
+    cpus: int = field(default_factory=_all_cpus)
     x_shard_factor: int = 1
     auto_shard: bool = False
 
@@ -196,8 +196,6 @@ def _validate_config(config: AppConfig) -> AppConfig:
         raise ValidationError(
             f"chunks.x_shard_factor must be >= 1 (1 = no sharding); got {config.chunks.x_shard_factor}."
         )
-    if io.eager_max_bytes < 0:
-        raise ValidationError(f"io.eager_max_bytes must be >= 0; got {io.eager_max_bytes}.")
     return replace(config, io=io, grouping=grouping, concat=concat)
 
 
@@ -283,7 +281,7 @@ def apply_cli_overrides(
     x_shard_factor: int | None = None,
     auto_shard: bool | None = None,
     cpus: int | None = None,
-    backed: bool | None = None,
+    lazy: bool | None = None,
     backend: str | None = None,
     sort_by: list[str] | None = None,
     obs_columns: list[str] | None = None,
@@ -300,8 +298,10 @@ def apply_cli_overrides(
         io_cfg = replace(io_cfg, consolidate_metadata=consolidate_metadata)
     if x_storage is not None:
         io_cfg = replace(io_cfg, x_storage=_normalize_x_storage(x_storage))
-    if backed is not None:  # None means "don't touch it" (IOConfig.backed is itself tri-state), not "reset to auto"
-        io_cfg = replace(io_cfg, backed=backed)
+    # None means "don't touch it": --lazy/--eager default to None so a config file's own
+    # `lazy` value holds unless one of those flags is actually passed.
+    if lazy is not None:
+        io_cfg = replace(io_cfg, lazy=lazy)
     if backend is not None:
         io_cfg = replace(io_cfg, backend=_normalize_backend(backend))
     if x_row_chunk is not None:
@@ -325,21 +325,12 @@ def apply_cli_overrides(
 
 
 def resolve_backend_cfg(cfg: AppConfig) -> AppConfig:
-    from annizarr.errors import ConversionError
-
+    # lazy (io.lazy=True, the default) works into every backend: a lazy, not-thread-safe
+    # reader feeding a non-local store (e.g. an Icechunk session) runs the read-ahead
+    # pipeline instead of threads/processes (see writer_parallel_mode).
     if cfg.chunks.x_shard_factor > 1 and cfg.io.x_storage != "dense":
         logger.warning(
             f"x_shard_factor={cfg.chunks.x_shard_factor} only applies to dense X; "
             f"x_storage={cfg.io.x_storage!r} is sparse, so sharding is ignored."
-        )
-    if cfg.io.backend == "icechunk" and cfg.io.backed is None:
-        logger.info("backend='icechunk' does not support backed input; auto-selecting eager (backed=False).")
-        cfg = replace(cfg, io=replace(cfg.io, backed=False))
-    # icechunk's backed writers would need Session.fork() (not available) to reopen by path
-    if cfg.io.backend == "icechunk" and cfg.io.backed:
-        raise ConversionError(
-            "backend='icechunk' does not support --backed input yet (backed writers use "
-            "worker processes that reopen the store by path; the icechunk session is "
-            "in-process only). Convert eagerly (omit --backed), or use backend='zarr'."
         )
     return cfg
