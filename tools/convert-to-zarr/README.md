@@ -1,6 +1,12 @@
 # convert-to-zarr
 
-[![convert-to-zarr](https://github.com/aifimmunology/DataScales/actions/workflows/convert-to-zarr.yml/badge.svg?branch=main)](https://github.com/aifimmunology/DataScales/actions/workflows/convert-to-zarr.yml)
+> **Legacy copy, kept for tracking.** This tool was merged into **AnniZarr**, which now lives in its own
+> repository: https://github.com/A-Jolly-Holly/annizarr (`pip install annizarr` once it is published). The code
+> below is frozen at its last standalone version so the history and the findings under
+> `benchmarking_results/` stay reproducible; use annizarr for anything new.
+>
+> Command mapping: `convert-h5ad --input X --output Y` → `annizarr convert X -o Y`; `convert-10x-h5` →
+> `annizarr convert X -o Y` (format auto-detected); `concat-h5ads --inputs A B` → `annizarr convert A B -o Y`.
 
 A configurable converter for h5 data(currently only single cell) to Zarr stores, non-spatial single-cell AnnData.
 

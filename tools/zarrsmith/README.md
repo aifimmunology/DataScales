@@ -1,5 +1,14 @@
 # zarrsmith
 
+> **Legacy copy, kept for tracking.** This tool was merged into **AnniZarr**, which now lives in its own
+> repository: https://github.com/A-Jolly-Holly/annizarr (`pip install annizarr` once it is published). The code
+> below is frozen at its last standalone version so the history and the findings under
+> `benchmarking_results/` stay reproducible; use annizarr for anything new.
+>
+> Command mapping: `add-expr --store S` → `annizarr add-expr S`; `rechunk --store S --output O` →
+> `annizarr rechunk S -o O`; `sort --store S --output O --by C` → `annizarr sort S -o O --by C`;
+> `append --store S --cells C` → `annizarr append S C`.
+
 Edit existing AnnData Zarr v3 stores: derive expression layers, rechunk, physically sort, and
 append cells. Builds on the [convert-to-zarr](../convert-to-zarr/README.md) package for its
 shared core (readers, writers, chunk layout, config, Icechunk storage) — creating stores from

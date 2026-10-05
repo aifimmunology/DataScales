@@ -9,11 +9,15 @@ pixi environment; each project folder holds a README and its scripts.
 
 ## Tools (`tools/`)
 
-- **[convert-to-zarr](tools/convert-to-zarr/README.md)** — AnnData / `.h5ad` → anndata-readable
-  Zarr v3 (streaming dense/sparse, multi-h5ad concat, sort/partition, optional Icechunk);
-  includes a conversion benchmark vs anndata / h5py / icechunk (`benchmarking/`).
-- **[zarrsmith](tools/zarrsmith/README.md)** — edit existing AnnData zarr stores in place:
-  add-expr (lognorm gene layer), rechunk, physical sort, append; builds on convert-to-zarr's core.
+- **[annizarr](https://github.com/A-Jolly-Holly/annizarr)** — now its own repository (`pip install annizarr` once published):
+  AnnData zarr stores: convert (`.h5ad`/10x → streaming dense/sparse, mixed-input concat), edit in
+  place (add-expr, rechunk, sort, append), and version with Icechunk, through one CLI
+  (`annizarr`/`anz`) and a Python API. It grew out of `tools/convert-to-zarr`, `tools/zarrsmith`
+  and `tools/scizarr_IC`.
+- **Legacy:** [convert-to-zarr](tools/convert-to-zarr/README.md) and [zarrsmith](tools/zarrsmith/README.md)
+  stay frozen at their last standalone versions for tracking and for reproducing the findings under
+  `benchmarking_results/`; their READMEs map the old commands onto annizarr. `tools/scizarr_IC` is a
+  pointer only.
 - **[zarr-query-bench](tools/zarr-query-bench/README.md)** — query-time benchmark for a store's
   `X` (row/column, sequential/random/cell-type; dense vs CSR/CSC).
 - **[rapids-benchmark](tools/rapids-benchmark/README.md)** — per-step GPU single-cell pipeline
