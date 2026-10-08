@@ -27,8 +27,10 @@ pixi run python rapids_benchmark.py \
 Key knobs: `--gpus` (physical ids, single-sourced to cluster + NVML + client RMM),
 `--preset capacity|speed`, `--rmm-mode managed|pool`, `--zarr-concurrency`/
 `--zarr-max-workers` (applied on *every* worker), `--chunk-rows`, and the pipeline params
-(`--n-top-genes`, `--n-comps`, `--n-neighbors`, `--leiden-resolution`, `--batch-key ""` to
-skip harmony). `--subset-column`/`--subset-value` (comma-separated for multiple values,
+(`--n-top-genes`, `--n-comps`, `--n-neighbors`, `--leiden-resolution`, `--umap-n-components`,
+`--batch-key ""` to skip harmony, `--harmony-theta`/`--harmony-max-iter`, `--hvg-batch-key` for
+batch-aware HVG selection). With `--batch-key` set, neighbors/UMAP/leiden run on
+`obsm['X_pca_harmony']`; without it they run on `X_pca`. `--subset-column`/`--subset-value` (comma-separated for multiple values,
 e.g. `BR1,BR2,UP1`) run the whole pipeline on just the matching cells by slicing their
 contiguous row spans from the sorted store. By default the final step writes the UMAP
 embedding (`obsm/X_umap`) and leiden labels (`obs/leiden`) back **into the input store** as
