@@ -97,8 +97,7 @@ export default function RunsPanel({ refresh, onViewReady, onActiveChange, health
   )
 }
 
-// Temp while GPU dispatch rides ssh — surfaces the backend's permission probe
-// with fix steps so an expired credential is visible before a run dies.
+// Backend store/GPU probe with fix steps, so an expired credential shows before a run dies.
 function HealthNote({ health, onRecheck }: { health: GpuHealth | null; onRecheck: () => void }) {
   if (!health) return null
   if (health.status === 'unconfigured') {
