@@ -2,15 +2,15 @@
 
 ![Realtime Labeling Analysis App](public/realtime-labeling-analysis.png)
 
-A browser app for labeling cells on a UMAP and re-clustering any selection on a GPU, in real time, against a single AnnData zarr v3 store.
+A browser app for labeling cells on a UMAP and re-clustering any selection on a GPU, in real time, against a single AnnData zarr v3 group — a standalone store, or one modality (`mod/<name>`) of a multimodal MuData-layout store.
 
-**How it is deployed.** The app runs on a GCP GPU VM as two containers (`docker compose`): nginx serves the built React + deck.gl frontend and proxies `/api` to a FastAPI backend that owns the GPU. The backend reads and writes one store set by `DATA_DIR` — normally a private GCS bucket (`gs://bucket/store.zarr`, authenticated with the VM user's gcloud credentials), or a local path on disk. Nothing is copied: the frontend streams zarr chunks through the backend proxy, and everything the app produces (labelsets, new UMAP views, job history) is written back into the same store. You reach the app from your laptop through an IAP ssh tunnel on port **8000**.
+**How it is deployed.** The app runs on a GCP GPU VM as two containers (`docker compose`): nginx serves the built React + deck.gl frontend and proxies `/api` to a FastAPI backend that owns the GPU. The backend reads and writes one AnnData group set by `DATA_DIR` — normally a private GCS bucket (`gs://bucket/store.zarr` or `gs://bucket/store.zarr/mod/atac`, authenticated with the VM user's gcloud credentials), or a local path on disk. Nothing is copied: the frontend streams zarr chunks through the backend proxy, and the two things the app produces (labelsets, new UMAP views) are written back into the same group. You reach the app from your laptop through an IAP ssh tunnel on port **8000**.
 
 **What it does.**
 
 - **Labeling** — lasso cells, name a label, and *Save to store*. Labelsets are written onto the store's `obs` as anndata categorical columns (`-1` = unlabeled), so they are readable by scanpy/anndata immediately. Assignments travel as barcodes, so labels made inside a re-clustered view land on the root store.
-- **Re-clustering on the GPU** — lasso a selection and hit *Generate New UMAP*. The backend runs the RAPIDS single-cell pipeline (normalize → HVG → PCA → neighbors → UMAP) on just those cells and writes the result to `umap_views/<name>` in the store. This is why the backend lives on a GPU: a sub-UMAP of tens of thousands to a few million cells comes back in seconds to minutes instead of hours, so you can drill into a population, re-embed it, label the sub-structure that appears, and repeat. A warm worker process keeps the CUDA context between jobs; selections ≤ 500k cells run eagerly on one GPU, larger ones stream through a per-run dask-cuda cluster.
-- **Gene expression highlighting** — color the embedding by any gene, read from a log-normalized expression layer in the store (see [Data](#data)).
+- **Re-clustering on the GPU** — lasso a selection and hit *Generate New UMAP*. The backend runs the RAPIDS single-cell pipeline on just those cells and writes the result to `umap_views/<name>` in the store. scRNA goes normalize → HVG → PCA → neighbors → UMAP from raw counts; a store whose neighbor graph came from a stored latent space (scATAC with a PeakVI embedding in `obsm`, recorded in `uns/neighbors/params/use_rep`) skips straight to neighbors → UMAP from that latent and never reads `X`. This is why the backend lives on a GPU: a sub-UMAP of tens of thousands to a few million cells comes back in seconds to minutes instead of hours, so you can drill into a population, re-embed it, label the sub-structure that appears, and repeat. A warm worker process keeps the CUDA context between jobs; selections ≤ 500k cells run eagerly on one GPU, larger ones stream through a per-run dask-cuda cluster.
+- **Gene expression highlighting** — color the embedding by any gene, read from a log-normalized expression layer in the store (see [Data](#data)). The Genes panel only appears when the store has such a layer; an ATAC group without one simply has no gene panel.
 
 ---
 
@@ -62,7 +62,7 @@ echo DATA_DIR=gs://MY_BUCKET/path/store.zarr > .env
 docker compose up -d --build   # first build pulls the rapids env: slow once, ~6.5 GB image
 ```
 
-`DATA_DIR` is the root of the store — the prefix that contains `zarr.json`. To serve a store on the VM's disk instead, set `DATA_DIR` to that path and add a matching volume mount for the `backend` service in `docker-compose.yml` (the compose file only mounts gcloud credentials and `gpu/` by default).
+`DATA_DIR` is an AnnData group — the prefix that contains its `zarr.json`: a store root, or `…/store.zarr/mod/<name>` for one modality of a MuData-layout store (see [build_mm_multimodal](../build_mm_multimodal/BUILD_SPEC.md)). Switching modality is a redeploy with another `DATA_DIR`. To serve a store on the VM's disk instead, set `DATA_DIR` to that path and add a matching volume mount for the `backend` service in `docker-compose.yml` (the compose file only mounts gcloud credentials and `gpu/` by default).
 
 If the checkout lives on the VM's local SSD, it is wiped on every stop/start — re-clone and run this again after a restart.
 
@@ -77,24 +77,26 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 
 ## Data
 
-`DATA_DIR` points at the root of one AnnData zarr v3 store — the directory or GCS prefix containing `zarr.json`. One store serves everything the app reads and writes:
+`DATA_DIR` points at one AnnData zarr v3 group — the directory or GCS prefix containing its `zarr.json`. That group serves everything the app reads and writes:
 
 | Path | Who | What |
 |---|---|---|
 | `obsm/X_umap` | read | Coordinates the viewer renders, `(n_obs, 2)` float32 (scanpy layout) |
-| `obs/` | read + write | Cell metadata; the barcode index (`_index`) must be unique. Labelsets are added here as categorical columns |
-| `X/` | read (GPU) | Raw counts for the re-clustering pipeline — CSR is strongly preferred |
-| `layers/gexp` | read | Log-normalized expression for gene highlighting, CSC or dense. Falls back to dense `X`, then CSC `X` |
-| `umap_views/`, `groups.json` | write | Re-clustered views and the view listing |
-| `jobs/history/` | write | One JSON record per finished GPU job |
+| `obs/` | read + write | Cell metadata; the index (`_index`) must be unique. Labelsets are added here as categorical columns |
+| `X/` | read (GPU) | Raw counts for the scRNA re-clustering pipeline — CSR is strongly preferred |
+| `obsm/<latent>` + `uns/neighbors/params/use_rep` | read (GPU) | A stored latent space (e.g. PeakVI for ATAC): when present the pipeline re-embeds from it instead of `X` |
+| `layers/gexp` | read | Log-normalized expression for gene highlighting, CSC or dense. Falls back to dense `X`, then CSC `X`; absent → no Genes panel |
+| `umap_views/<slug>/` | write | Re-clustered views (small AnnData groups: `obs` + `obsm/X_umap`), labelled by a `datavis-label` root attribute |
 
-Build the store with [convert-to-zarr](../tools/convert-to-zarr/README.md) (`.h5ad` → zarr v3), then add the expression layer with **AnniZarr**'s `add-expr`, which writes a log-normalized `layers/gexp` in the column-friendly layout the gene highlighter needs:
+Views are listed by reading the `umap_views/` children, and the GPU job queue and history live in backend memory — nothing but AnnData groups and `obs` columns is ever written to the store.
+
+Build the store with [AnniZarr](https://github.com/A-Jolly-Holly/annizarr) (`annizarr convert sample.h5ad -o store.zarr`), then add the expression layer with its `add-expr`, which writes a log-normalized `layers/gexp` in the column-friendly layout the gene highlighter needs:
 
 ```bash
-annizarr add-expr gs://MY_BUCKET/path/store.zarr --format csc
+annizarr add-expr path/to/store.zarr --layout csc
 ```
 
-See the [AnniZarr README](../tools/annizarr/README.md) for format and chunking options. The store is read with plain `zarr`/`anndata`; nothing app-specific is required beyond `obsm/X_umap`, and the app creates the `umap_views/`, `groups.json`, and `jobs/` entries on first use.
+The store is read with plain `zarr`/`anndata`; nothing app-specific is required beyond `obsm/X_umap`, and the app creates `umap_views/` on first use.
 
 ---
 

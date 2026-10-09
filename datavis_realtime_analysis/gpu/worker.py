@@ -28,7 +28,7 @@ def main():
             return
         job = json.loads(line)
         try:
-            pipeline.run(job["store"], job["selection"], job["out"])
+            pipeline.run(job["store"], job["selection"], job["out"], job.get("label"))
             print(f"done: {job['id']}", flush=True)
         except Exception as e:
             print(f"error: {str(e)[:300]}", flush=True)

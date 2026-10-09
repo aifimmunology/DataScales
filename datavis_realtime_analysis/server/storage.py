@@ -1,4 +1,5 @@
-"""Store access: the zarr proxy (GET/HEAD/Range) + small JSON-object helpers.
+"""Store access: the zarr proxy (GET/HEAD/Range) + the few store operations the app
+needs beyond it (list a group's children, read a node's attributes, delete a prefix).
 
 Missing objects must 404 (zarrita reads a 404 as "chunk is all fill-value").
 HEAD + Range are required: zarrita reads sharded arrays via partial requests.
@@ -6,6 +7,7 @@ HEAD + Range are required: zarrita reads sharded arrays via partial requests.
 
 import json
 import re
+import shutil
 import threading
 from pathlib import Path
 
@@ -75,9 +77,7 @@ def serve(path: str, request: Request):
         ok = False
     if not ok:
         raise HTTPException(404, "Not found")
-    # groups.json mutates on register/delete — a cached copy resurrects deleted views
-    headers = {"Cache-Control": "no-store"} if path.endswith("groups.json") else None
-    return FileResponse(file, media_type=_media_type(path), headers=headers)
+    return FileResponse(file, media_type=_media_type(path))
 
 
 def _download(b, k: str, start=None, end=None) -> bytes:
@@ -127,41 +127,41 @@ def _gcs_response(path: str, request: Request) -> Response:
     # dense uint16 column is ~4 KB), so streaming buys nothing — benchmarked via
     # both BlobReader and a download_to_file relay, no measurable win.
     payload = _download(b, k)
-    if path.endswith("groups.json"):  # mutable listing — never let a cache serve it
-        headers["Cache-Control"] = "no-store"
     return Response(payload, media_type=media, headers=headers)
 
 
-# ── JSON-object helpers (GCS store only): the jobs queue + groups.json ─────────
+# ── store operations beyond the proxy: view listing + deletion ─────────────────
 
 
-def read_json(rel: str):
-    from google.api_core.exceptions import NotFound
+def list_children(rel: str) -> list[str]:
+    """Names of the groups directly under rel/ (empty when rel does not exist)."""
+    if SOURCE["gcs"]:
+        prefix = key(rel).rstrip("/") + "/"
+        pages = bucket().list_blobs(prefix=prefix, delimiter="/").pages
+        return sorted(p[len(prefix):].rstrip("/") for page in pages for p in page.prefixes)
+    d = _LOCAL_ROOT / rel
+    return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
 
+
+def read_attrs(rel: str) -> dict:
+    """The zarr v3 attributes of the node at rel ({} when unreadable)."""
     try:
-        return json.loads(bucket().blob(key(rel)).download_as_bytes())
-    except NotFound:
-        return None
-
-
-def write_json(rel: str, obj) -> None:
-    bucket().blob(key(rel)).upload_from_string(
-        json.dumps(obj, indent=1), content_type="application/json"
-    )
-    _size_cache.pop(key(rel), None)  # a rewritten object must not serve a stale HEAD
-
-
-def delete_object(rel: str) -> None:
-    from google.api_core.exceptions import NotFound
-
-    try:
-        bucket().blob(key(rel)).delete()
-    except NotFound:
-        pass
+        if SOURCE["gcs"]:
+            raw = _download(bucket(), key(f"{rel}/zarr.json"))
+        else:
+            raw = (_LOCAL_ROOT / rel / "zarr.json").read_bytes()
+        return json.loads(raw).get("attributes", {})
+    except (HTTPException, OSError, ValueError):
+        return {}
 
 
 def delete_prefix(rel: str) -> int:
-    """Delete every object under rel/ (batched: 100 per round-trip); returns count."""
+    """Delete every object under rel/ (GCS: batched 100 per round-trip); returns count."""
+    if not SOURCE["gcs"]:
+        d = _LOCAL_ROOT / rel
+        n = sum(1 for p in d.rglob("*") if p.is_file()) if d.is_dir() else 0
+        shutil.rmtree(d, ignore_errors=True)
+        return n
     b = bucket()
     prefix = key(rel).rstrip("/") + "/"
     blobs = list(b.list_blobs(prefix=prefix))

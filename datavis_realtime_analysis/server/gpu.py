@@ -1,7 +1,7 @@
-"""GPU jobs: in-memory queue, dispatched to a warm pipeline process
+"""GPU jobs: in-memory queue and history, dispatched to a warm pipeline process
 (gpu/worker.py) that holds imports + CUDA context between jobs and exits after
 WORKER_IDLE_S idle. Stage updates stream over the worker's stdout; the store
-only sees the finished view and one jobs/history/<id>.json record per job.
+only sees the finished view.
 """
 
 import json
@@ -64,7 +64,7 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
     rid = job["id"]
     sel = Path(f"/tmp/datavis_job_{rid}.json")
     sel.write_text(json.dumps(artifact))
-    proc = _send({"id": rid, "store": DATA_DIR, "selection": str(sel),
+    proc = _send({"id": rid, "store": DATA_DIR, "selection": str(sel), "label": job["name"],
                   "out": f"{DATA_DIR.rstrip('/')}/umap_views/{job['slug']}"})
     try:
         while True:
@@ -84,14 +84,6 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
         sel.unlink(missing_ok=True)
 
 
-def _record(job: dict, duration_s: float) -> None:
-    try:
-        storage.write_json(f"jobs/history/{job['id']}.json",
-                           {**job, "duration_s": round(duration_s, 2)})
-    except Exception:
-        pass
-
-
 def _worker() -> None:
     while True:
         job_id, artifact = JOB_QUEUE.get()
@@ -102,7 +94,7 @@ def _worker() -> None:
         t0 = time.monotonic()
         try:
             _run_gpu_job(job, artifact)
-            job["view"] = views.register_view(job["slug"], job["name"])
+            job["view"] = f"umap_views/{job['slug']}"
             job["stage"] = "done"
             job["status"] = "done"
         except _Cancelled:
@@ -112,7 +104,7 @@ def _worker() -> None:
             job["stage"] = str(e)[:200]
             job["status"] = "failed"
             _invalidate_probe()
-        _record(job, time.monotonic() - t0)
+        job["duration_s"] = round(time.monotonic() - t0, 2)
 
 
 def _ensure_worker() -> None:

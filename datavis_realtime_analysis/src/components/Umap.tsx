@@ -15,7 +15,6 @@ import {
   loadCategorical,
   gatherRootCategorical,
   loadBarcodes,
-  loadGroups,
   loadGeneNames,
   loadGeneExpression,
   loadLabelSets,
@@ -25,12 +24,11 @@ import {
   type Point,
   type Categorical,
   type Level,
-  type Group,
   type GeneExpression,
   type LabelSetInfo,
 } from '../lib/zarrData'
 import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
-import { deleteView, fetchGpuHealth, saveLabels, submitSelection, type GpuHealth } from '../lib/api'
+import { deleteView, fetchGpuHealth, fetchViews, saveLabels, submitSelection, type Group, type GpuHealth } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
 
@@ -104,7 +102,7 @@ export default function Umap() {
   useEffect(() => {
     let stale = false
     const attempt = (retriesLeft: number) => {
-      loadGroups()
+      fetchViews()
         .then(gs => {
           if (stale) return
           setGroups(gs)
@@ -160,7 +158,7 @@ export default function Umap() {
         // a view that 404s was likely deleted: re-check the listing, fall back to
         // root (listing may be down too — then just surface the coords error)
         if (group) {
-          const gs = await loadGroups().catch(() => null)
+          const gs = await fetchViews().catch(() => null)
           if (stale) return
           if (gs) {
             setGroups(gs)
@@ -534,10 +532,10 @@ export default function Umap() {
     }
   }
 
-  // a finished GPU run registered a new view in groups.json: reload the picker;
-  // the runs panel marks it ready — no automatic switch
+  // a finished GPU run wrote a new view store: reload the picker; the runs panel
+  // marks it ready — no automatic switch
   const onViewReady = () => {
-    loadGroups().then(setGroups).catch(err => console.error('Groups refresh failed:', err))
+    fetchViews().then(setGroups).catch(err => console.error('Groups refresh failed:', err))
   }
 
   // Relocate to the full store immediately, then delete behind the scrim; the
@@ -554,7 +552,7 @@ export default function Umap() {
       setNotice(`Delete failed: ${err instanceof Error ? err.message : err}`)
     } finally {
       // keep the stale list if the refresh fails — better than an empty picker
-      await loadGroups().then(setGroups).catch(err => console.error('Groups refresh failed:', err))
+      await fetchViews().then(setGroups).catch(err => console.error('Groups refresh failed:', err))
       setDeleting(false)
     }
   }
@@ -656,18 +654,17 @@ export default function Umap() {
           <span style={mutedStyle}>No saved views yet — lasso a selection and run it on the GPU.</span>
         ),
     },
-    {
-      id: 'genes',
-      icon: 'material-symbols-light:genetics',
-      title: 'Genes',
-      badge: !!gene,
-      content:
-        genes.length > 0 ? (
-          <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
-        ) : (
-          <span style={mutedStyle}>No gene-readable matrix in this store.</span>
-        ),
-    },
+    ...(genes.length > 0
+      ? [{
+          id: 'genes',
+          icon: 'material-symbols-light:genetics',
+          title: 'Genes',
+          badge: !!gene,
+          content: (
+            <GenePicker genes={genes} active={gene} range={exprData?.range ?? null} error={exprError} warning={exprData?.warning ?? null} onChange={setGene} />
+          ),
+        }]
+      : []),
     {
       id: 'runs',
       icon: 'material-symbols-light:memory',

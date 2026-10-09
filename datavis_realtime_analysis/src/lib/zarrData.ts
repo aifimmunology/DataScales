@@ -52,11 +52,13 @@ export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
   return keep.filter((c): c is LabelSetInfo => c !== null)
 }
 
-/** Color-by dropdown rule: leiden + AIFI_L* + app labelsets always, plus any
- * other categorical with < 20 categories. */
+// Color-by dropdown rule: leiden + AIFI_L* + app labelsets always, plus any other
+// categorical small enough to be a label hierarchy rather than an id column.
+const MAX_DROPDOWN_CATS = 40
+
 export function dropdownLabelSets(sets: LabelSetInfo[]): string[] {
   return sets
-    .filter(s => s.own || s.name === 'leiden' || s.name.startsWith('AIFI_L') || s.nCats < 20)
+    .filter(s => s.own || s.name === 'leiden' || s.name.startsWith('AIFI_L') || s.nCats < MAX_DROPDOWN_CATS)
     .map(s => s.name)
 }
 
@@ -157,9 +159,11 @@ export async function gatherRootCategorical(col: Level, group: string): Promise<
 // their expression comes from the root gene source gathered via obs/root_row.
 let geneNamesP: Promise<string[]> | null = null
 
-/** Gene names from the root var index column (named per its `_index` attr). */
+/** Gene names from the root var index column (named per its `_index` attr) — only
+ * when a gene-readable matrix exists; rejects otherwise so the picker stays hidden. */
 export function loadGeneNames(): Promise<string[]> {
   geneNamesP ??= (async () => {
+    await geneSource()
     const varGroup = await zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/var`), { kind: 'group' })
     const idxCol = (varGroup.attrs['_index'] as string) ?? '_index'
     const arr = await openArray(`var/${idxCol}`, '', DATA_BASE_URL)
@@ -226,7 +230,7 @@ async function resolveGeneSource(): Promise<GeneSource> {
     }
   }
   throw new Error(
-    'no gene-readable matrix (need layers/gexp or a dense/CSC X) — run `zarrsmith add-expr --format csc` on the store',
+    'no gene-readable matrix (need layers/gexp or a dense/CSC X) — run `annizarr add-expr` on the store',
   )
 }
 
@@ -336,27 +340,4 @@ export async function loadGeneExpression(geneIdx: number, group = ''): Promise<G
     ? 'raw counts (integer dtype): colors follow skewed counts — use a normalized store/layer'
     : undefined
   return { colors, range, warning }
-}
-
-// ── Groups: switchable embeddings (the root store + any nested view stores) ─────
-export type Group = { id: string; label: string; path: string }
-
-// Fallback when there's no groups.json: a single group = the served store root,
-// so the app behaves exactly as it did before this feature existed.
-const DEFAULT_GROUPS: Group[] = [{ id: 'main', label: 'Full store', path: '' }]
-
-/** groups.json at the served root lists the switchable embeddings. Missing or
- * invalid -> a single root group; transient failures (backend booting) throw so
- * callers retry instead of settling on the root-only fallback. */
-export async function loadGroups(): Promise<Group[]> {
-  // no-store: a cached listing would resurrect just-deleted views
-  const res = await fetch(`${DATA_BASE_URL}/groups.json`, { cache: 'no-store' })
-  if (res.status === 404) return DEFAULT_GROUPS
-  if (!res.ok) throw new Error(`groups.json: ${res.status} ${res.statusText}`)
-  try {
-    const gs = (await res.json()) as Group[]
-    return Array.isArray(gs) && gs.length > 0 ? gs : DEFAULT_GROUPS
-  } catch {
-    return DEFAULT_GROUPS
-  }
 }

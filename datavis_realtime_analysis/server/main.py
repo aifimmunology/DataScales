@@ -1,5 +1,5 @@
 """Route assembly. Sections live in their own modules:
-config (env), storage (zarr proxy + store JSON), views (groups.json), gpu (jobs).
+config (env), storage (zarr proxy), views (umap_views listing), gpu (jobs), labels.
 """
 
 from fastapi import FastAPI, Request
@@ -50,6 +50,11 @@ def cancel_job(job_id: str):
 @app.get("/api/gpu/health")
 def gpu_health(refresh: bool = False):
     return gpu.health(refresh)
+
+
+@app.get("/api/views")
+def list_views():
+    return views.list_views()
 
 
 @app.delete("/api/views/{view_id}")
