@@ -10,14 +10,19 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
+    user: "${APP_UID:-0}:${APP_GID:-0}"  # host uid/gid so store writes stay editable on the host, not needed
     environment:
-      DATA_DIR: ${DATA_DIR}
+      LOCAL_DATA: ${LOCAL_DATA:-}
+      GCS_DATA: ${GCS_DATA:-}
+      EMBED_METHOD: ${EMBED_METHOD:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      HOME: /tmp
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
-      # GCS credential: the ADC from `gcloud auth application-default login` on the VM
-      - ~/.config/gcloud:/root/.config/gcloud:ro
-      - ./gpu:/app/gpu:ro  # pipeline edits without an image rebuild
+      - ~/.config/gcloud:/gcloud:ro                # ADC from `gcloud auth application-default login`
+      - ./gpu:/app/gpu:ro                          # pipeline edits without an image rebuild
+      - ${LOCAL_MOUNT:-/mnt}:/data                 # host disk holding LOCAL_DATA stores
     deploy:
       resources:
         reservations:
