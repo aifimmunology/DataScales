@@ -82,6 +82,7 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 
 - Logs: `docker compose logs -f backend`
 - Stop: `docker compose down`
+- Rebuild with `docker compose up -d --build` both services
 - Pipeline edits in `gpu/` take effect without a rebuild (the directory is bind-mounted); the worker respawns on the next job after 15 min idle, or restart the backend.
 - A red **GPU runs** badge in the app shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing. Running jobs can be cancelled from the runs panel or via `DELETE /api/jobs/<id>`; views are deletable from the view picker.
 

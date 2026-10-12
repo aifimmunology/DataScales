@@ -23,7 +23,7 @@ _client = None
 _client_lock = threading.Lock()
 _size_cache: dict[str, int] = {}
 _LOCAL_ROOT = Path(SOURCE.root).resolve() if SOURCE and not SOURCE.gcs else None
-_SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_SAFE_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 
 
 class MirrorError(Exception):

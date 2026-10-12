@@ -4,7 +4,9 @@ services:
     ports:
       - "8000:80"  # the single app port — the IAP tunnel targets VM:8000 (UI + /api via nginx)
     depends_on:
-      - backend
+      backend:
+        condition: service_started
+        restart: true  # nginx resolves `backend` once at start; follow a recreated backend
 
   backend:
     build:
