@@ -39,6 +39,15 @@ export async function fetchJobs(): Promise<Job[]> {
   return res.json()
 }
 
+// A "group" is a switchable embedding: the served store root (path '') or a view
+// store nested under it (umap_views/<slug>), listed by the backend from the store.
+export type Group = { id: string; label: string; path: string }
+
+export async function fetchViews(): Promise<Group[]> {
+  const res = await request('/api/views', { cache: 'no-store' }, 'views')
+  return res.json()
+}
+
 export type GpuHealth = {
   status: 'ok' | 'error' | 'checking' | 'unconfigured'
   checking: boolean

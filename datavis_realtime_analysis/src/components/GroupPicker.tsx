@@ -1,4 +1,4 @@
-import type { Group } from '../lib/zarrData'
+import type { Group } from '../lib/api'
 import { panel, control, label } from '../lib/styles'
 
 type Props = {
