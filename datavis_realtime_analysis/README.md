@@ -4,7 +4,7 @@
 
 A browser app for labeling cells on a UMAP and re-clustering any selection on a GPU, in real time, against a single AnnData zarr v3 group — a standalone store, or one modality (`mod/<name>`) of a multimodal MuData-layout store.
 
-**How it is deployed.** The app runs on a GCP GPU VM as two containers (`docker compose`): nginx serves the built React + deck.gl frontend and proxies `/api` to a FastAPI backend that owns the GPU. The backend reads and writes one AnnData group set by `DATA_DIR` — normally a private GCS bucket (`gs://bucket/store.zarr` or `gs://bucket/store.zarr/mod/atac`, authenticated with the VM user's gcloud credentials), or a local path on disk. Nothing is copied: the frontend streams zarr chunks through the backend proxy, and the two things the app produces (labelsets, new UMAP views) are written back into the same group. You reach the app from your laptop through an IAP ssh tunnel on port **8000**.
+**How it is deployed.** The app runs on a GCP GPU VM as two containers (`docker compose`): nginx serves the built React + deck.gl frontend and proxies `/api` to a FastAPI backend that owns the GPU. The backend reads and writes one AnnData group: a private GCS bucket prefix (`GCS_DATA`, e.g. `gs://bucket/store.zarr/mod/atac`, authenticated with the VM user's gcloud credentials), a copy on the VM's disk (`LOCAL_DATA`), or both — then the local copy is served and every write is mirrored to the bucket. Nothing else is copied: the frontend streams zarr chunks through the backend proxy, and the two things the app produces (labelsets, new UMAP views) are written back into the same group. You reach the app from your laptop through an IAP ssh tunnel on port **8000**.
 
 **What it does.**
 
@@ -58,11 +58,23 @@ The second command writes `~/.config/gcloud/application_default_credentials.json
 From the checkout:
 
 ```bash
-echo DATA_DIR=gs://MY_BUCKET/path/store.zarr > .env
+# .env — one or both locations, each the prefix of an AnnData group
+LOCAL_DATA=/data/store.zarr/mod/atac          # OPTIONAL, see below. Can use MuData or regular Anndata objects
+GCS_DATA=gs://MY_BUCKET/store.zarr/mod/atac   # GCS store. Slower reads, consider using a local mirror with env var above.
+#EMBED_METHOD=latent                          # pca | latent | latent:<obsm key>; unset = per store
+```
+
+```bash
 docker compose up -d --build   # first build pulls the rapids env: slow once, ~6.5 GB image
 ```
 
-`DATA_DIR` is an AnnData group — the prefix that contains its `zarr.json`: a store root, or `…/store.zarr/mod/<name>` for one modality of a MuData-layout store (see [build_mm_multimodal](../build_mm_multimodal/BUILD_SPEC.md)). Switching modality is a redeploy with another `DATA_DIR`. To serve a store on the VM's disk instead, set `DATA_DIR` to that path and add a matching volume mount for the `backend` service in `docker-compose.yml` (the compose file only mounts gcloud credentials and `gpu/` by default).
+| `.env` | Reads | Writes (labelsets, views) |
+|---|---|---|
+| `GCS_DATA` only | bucket | bucket |
+| `LOCAL_DATA` only | VM disk | VM disk |
+| both | VM disk | VM disk, then the bucket; a save or view job reports success only once the copy is in the bucket |
+
+`EMBED_METHOD` fixes the GPU re-embedding route for every run; unset, a store that records a latent space (`uns/neighbors/params/use_rep`, e.g. PeakVI for ATAC) re-embeds from it and any other store re-runs normalize → PCA from counts.
 
 If the checkout lives on the VM's local SSD, it is wiped on every stop/start — re-clone and run this again after a restart.
 
@@ -73,11 +85,13 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 - Pipeline edits in `gpu/` take effect without a rebuild (the directory is bind-mounted); the worker respawns on the next job after 15 min idle, or restart the backend.
 - A red **GPU runs** badge in the app shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing. Running jobs can be cancelled from the runs panel or via `DELETE /api/jobs/<id>`; views are deletable from the view picker.
 
+Set `APP_UID` / `APP_GID` in `.env` to your host `id -u` / `id -g` so the backend writes store files as you rather than root. `deploy/restage_store.sh` pulls `GCS_DATA` down to `LOCAL_DATA` after a VM stop/start wipes the local SSD. 
+
 ---
 
 ## Data
 
-`DATA_DIR` points at one AnnData zarr v3 group — the directory or GCS prefix containing its `zarr.json`. That group serves everything the app reads and writes:
+`LOCAL_DATA` / `GCS_DATA` point at one AnnData zarr v3 group — the directory or GCS prefix containing its `zarr.json`. That group serves everything the app reads and writes:
 
 | Path | Who | What |
 |---|---|---|
@@ -88,7 +102,7 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 | `layers/gexp` | read | Log-normalized expression for gene highlighting, CSC or dense. Falls back to dense `X`, then CSC `X`; absent → no Genes panel |
 | `umap_views/<slug>/` | write | Re-clustered views (small AnnData groups: `obs` + `obsm/X_umap`), labelled by a `datavis-label` root attribute |
 
-Views are listed by reading the `umap_views/` children, and the GPU job queue and history live in backend memory — nothing but AnnData groups and `obs` columns is ever written to the store.
+Views are listed by reading the `umap_views/` children, and the GPU job queue and history live in backend memory — nothing but AnnData groups and `obs` columns is ever written to the store. `umap_views/` itself deliberately has no `zarr.json`: zarr v3 then never lists it as a member of the group, so `anndata.read_zarr` and `mudata.read_zarr` keep working. Never create one there.
 
 Build the store with [AnniZarr](https://github.com/A-Jolly-Holly/annizarr) (`annizarr convert sample.h5ad -o store.zarr`), then add the expression layer with its `add-expr`, which writes a log-normalized `layers/gexp` in the column-friendly layout the gene highlighter needs:
 
@@ -120,7 +134,7 @@ pixi install --manifest-path server/pixi.toml
 ### Run
 
 ```bash
-DATA_DIR=./data/my-store.zarr bun run dev
+LOCAL_DATA=./data/my-store.zarr bun run dev
 ```
 
 This starts both servers concurrently:
@@ -128,13 +142,13 @@ This starts both servers concurrently:
 - Vite (frontend) → http://localhost:3000
 - FastAPI (backend) → http://localhost:8000
 
-Frontend requests to `/api/*` are proxied to FastAPI. `DATA_DIR` can also be a `gs://` path if you have `gcloud auth application-default login` set up locally.
+Frontend requests to `/api/*` are proxied to FastAPI. Use `GCS_DATA=gs://…` instead if you have `gcloud auth application-default login` set up locally.
 
 To run the servers separately:
 
 ```bash
 bun run dev:frontend
-DATA_DIR=./data/my-store.zarr bun run dev:api
+LOCAL_DATA=./data/my-store.zarr bun run dev:api
 ```
 
 To test the full container build locally (no GPU needed for the frontend image): `docker compose build frontend`.
