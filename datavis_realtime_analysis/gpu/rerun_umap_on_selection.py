@@ -5,10 +5,9 @@ then run() per job. Standalone: `pixi run python rerun_umap_on_selection.py` dri
 RERUN_* env vars below. The result is a small self-contained "view" store — obsm/X_umap +
 obs for the selected cells, NO X — exactly what the datavis viewer reads, by row position.
 
-Two routes into neighbors → UMAP → leiden:
-  * a store whose neighbor graph was built from a stored latent space (ATAC: PeakVI in
-    obsm, named by uns/neighbors/params/use_rep) re-embeds from that representation and
-    never touches X;
+Two routes into neighbors → UMAP → leiden, chosen by `method` (see resolve_rep):
+  * a stored latent space (ATAC: PeakVI in obsm, recorded in uns/neighbors/params/use_rep)
+    is re-embedded directly and X is never touched;
   * otherwise X (raw counts) goes through normalize → HVG → scale → PCA first. Selections
     ≤ RERUN_EAGER_MAX cells run eagerly on one GPU; larger ones stream through a per-run
     dask-cuda cluster.
@@ -34,6 +33,7 @@ THREADS_PER_WORKER = int(os.environ.get("RERUN_THREADS_PER_WORKER", "12"))  # da
 ZARR_CONCURRENCY   = int(os.environ.get("RERUN_ZARR_CONCURRENCY", "64"))    # zarr fetch-dispatch semaphore
 ZARR_MAX_WORKERS   = int(os.environ.get("RERUN_ZARR_MAX_WORKERS", "12"))    # zarr decode threadpool
 EAGER_MAX      = int(os.environ.get("RERUN_EAGER_MAX", "500000"))
+METHOD         = os.environ.get("RERUN_METHOD", "")       # pca | latent | latent:<obsm key> | "" = per store
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
 BATCH_KEY      = []   # obs columns to harmony-integrate on; [] = skip harmony
@@ -131,23 +131,47 @@ def latent_rep(root):
     return rep if rep in root["obsm"] else None
 
 
+def resolve_rep(root, method: str = ""):
+    """The obsm key to embed from, or None for normalize → PCA on X.
+    method: "" picks the store's recorded latent when it has one, else PCA;
+    "pca" / "latent" force a route; "latent:<key>" names the obsm directly."""
+    kind, _, key = method.partition(":")
+    if kind not in ("", "pca", "latent"):
+        raise ValueError(f"unknown embedding method {method!r}")
+    if kind == "pca":
+        return None
+    if key:
+        if key not in root["obsm"]:
+            raise ValueError(f"obsm/{key} not in store")
+        return key
+    rep = latent_rep(root)
+    if kind == "latent" and rep is None:
+        raise ValueError("store records no latent space (uns/neighbors/params/use_rep)")
+    return rep
+
+
 def load_cells(root, obs, rows, rep, eager):
-    """The selected cells as an AnnData: the latent representation alone when there is one,
-    else X (eager CSR slice, or a lazy dask array for the cluster path) + var."""
+    """The selected cells (rows=None: every cell) as an AnnData: the latent representation
+    alone when there is one, else X (eager CSR slice, or a lazy dask array for the cluster
+    path) + var."""
     import anndata as ad
     import numpy as np
 
-    obs_sel = obs.iloc[rows].copy()
-    obs_sel["root_row"] = rows.astype(np.int32)  # view row -> source-store row (gene highlighting in views)
+    every = rows is None                   # whole-store embedding: no row indexing at all
+    obs_sel = obs.copy() if every else obs.iloc[rows].copy()
+    obs_sel["root_row"] = np.arange(len(obs), dtype=np.int32) if every else rows.astype(np.int32)  # view row -> source-store row (gene highlighting in views)
     if rep is not None:
-        return ad.AnnData(obs=obs_sel, obsm={rep: root["obsm"][rep].oindex[rows]})
+        lat = root["obsm"][rep]
+        return ad.AnnData(obs=obs_sel, obsm={rep: lat[:] if every else lat.oindex[rows]})
 
     shape = root["X"].attrs["shape"]      # [n_obs, n_vars]
     if eager:
-        X = ad.io.sparse_dataset(root["X"])[rows]
+        X = ad.io.sparse_dataset(root["X"])
+        X = X[:] if every else X[rows]
     else:
         from anndata.experimental import read_elem_lazy as read_dask
-        X = read_dask(root["X"], (ROW_CHUNK_SIZE, shape[1]))[rows]
+        X = read_dask(root["X"], (ROW_CHUNK_SIZE, shape[1]))
+        X = X if every else X[rows]
     return ad.AnnData(X=X, obs=obs_sel, var=ad.io.read_elem(root["var"]))
 
 
@@ -238,7 +262,7 @@ def write_view(adata, out, label=None):
     print(f"wrote view store: {out}  ({view.n_obs} cells)")
 
 
-def run(store: str, selection_file: str, out: str, label: str | None = None) -> str:
+def run(store: str, selection_file: str, out: str, label: str | None = None, method: str = "") -> str:
     import json
     import time
 
@@ -249,7 +273,7 @@ def run(store: str, selection_file: str, out: str, label: str | None = None) -> 
 
     selection = json.load(open(selection_file))         # {"barcodes": [...], ...}
     root = zarr.open(store, mode="r")
-    rep = latent_rep(root)
+    rep = resolve_rep(root, method)
     eager = rep is not None or len(selection["barcodes"]) <= EAGER_MAX
 
     with (nullcontext() if eager else cuda_cluster()):
@@ -268,7 +292,7 @@ def run(store: str, selection_file: str, out: str, label: str | None = None) -> 
 
 
 def main():
-    run(data_pth, SELECTION_FILE, VIEW_STORE)
+    run(data_pth, SELECTION_FILE, VIEW_STORE, method=METHOD)
 
 
 if __name__ == "__main__":
