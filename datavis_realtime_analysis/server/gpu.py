@@ -1,7 +1,7 @@
 """GPU jobs: in-memory queue and history, dispatched to a warm pipeline process
-(gpu/worker.py) that holds imports + CUDA context between jobs and exits after
-WORKER_IDLE_S idle. Stage updates stream over the worker's stdout; the store
-only sees the finished view.
+(gpu/worker.py) that keeps imports + CUDA context between jobs and exits after
+WORKER_IDLE_S idle. Stage updates stream over the worker's stdout; the store only
+sees the finished view (mirrored to GCS_DATA when configured).
 """
 
 import json
@@ -17,22 +17,26 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from . import storage, views
-from .config import DATA_DIR, MAX_JOBS, SOURCE
+from . import storage
+from .config import EMBED_METHOD, MAX_JOBS, MIRROR, SOURCE, Location
 
 WORKER_SCRIPT = Path(__file__).resolve().parents[1] / "gpu" / "worker.py"
+PROBE_TTL_S = 60
+FINISHED = ("done", "failed", "cancelled")
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: queue.Queue = queue.Queue()
 _worker_lock = threading.Lock()
 _worker_started = False
-
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
 
 
 class _Cancelled(Exception):
     pass
+
+
+# ── worker process ─────────────────────────────────────────────────────────────
 
 
 def _pipeline_proc() -> subprocess.Popen:
@@ -47,7 +51,7 @@ def _pipeline_proc() -> subprocess.Popen:
 
 def _send(req: dict) -> subprocess.Popen:
     global _proc
-    for attempt in (0, 1):  # one respawn retry: the idle worker may have just exited
+    for attempt in (0, 1):
         proc = _pipeline_proc()
         try:
             proc.stdin.write(json.dumps(req) + "\n")
@@ -64,8 +68,9 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
     rid = job["id"]
     sel = Path(f"/tmp/datavis_job_{rid}.json")
     sel.write_text(json.dumps(artifact))
-    proc = _send({"id": rid, "store": DATA_DIR, "selection": str(sel), "label": job["name"],
-                  "out": f"{DATA_DIR.rstrip('/')}/umap_views/{job['slug']}"})
+    view = f"umap_views/{job['slug']}"
+    proc = _send({"id": rid, "store": SOURCE.uri, "selection": str(sel), "label": job["name"],
+                  "out": f"{SOURCE.uri}/{view}", "method": EMBED_METHOD})
     try:
         while True:
             line = proc.stdout.readline()
@@ -77,11 +82,17 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
             if line.startswith("stage: "):
                 job["stage"] = line[len("stage: "):]
             elif line == f"done: {rid}":
-                return
+                break
             elif line.startswith("error: "):
                 raise RuntimeError(line[len("error: "):])
     finally:
         sel.unlink(missing_ok=True)
+    if MIRROR:
+        job["stage"] = "mirroring view to GCS"
+        try:
+            storage.mirror(view)
+        except storage.MirrorError as e:
+            raise RuntimeError(f"view written but not mirrored: {e}")
 
 
 def _worker() -> None:
@@ -95,11 +106,9 @@ def _worker() -> None:
         try:
             _run_gpu_job(job, artifact)
             job["view"] = f"umap_views/{job['slug']}"
-            job["stage"] = "done"
-            job["status"] = "done"
+            job["stage"] = job["status"] = "done"
         except _Cancelled:
-            job["stage"] = "cancelled"
-            job["status"] = "cancelled"
+            job["stage"] = job["status"] = "cancelled"
         except Exception as e:
             job["stage"] = str(e)[:200]
             job["status"] = "failed"
@@ -115,10 +124,11 @@ def _ensure_worker() -> None:
             _worker_started = True
 
 
+# ── API ────────────────────────────────────────────────────────────────────────
+
+
 def _config_problem() -> str | None:
-    if not SOURCE["gcs"]:
-        return "GPU jobs require a gs:// DATA_DIR store"
-    return None
+    return None if SOURCE else "no store configured: set LOCAL_DATA and/or GCS_DATA"
 
 
 def submit(artifact: dict) -> dict:
@@ -130,24 +140,17 @@ def submit(artifact: dict) -> dict:
     name = str(artifact.get("name") or f"view {job_id}").strip()[:60]
     print(f"[submit] job {job_id} '{name}': {cells} cells, group '{artifact.get('group', '')}'",
           file=sys.stderr, flush=True)
-    # evict only finished jobs — dropping a queued entry would orphan its run
     while len(JOBS) >= MAX_JOBS:
-        victim = next((k for k, j in JOBS.items()
-                       if j["status"] in ("done", "failed", "cancelled")), None)
+        victim = next((k for k, j in JOBS.items() if j["status"] in FINISHED), None)
         if victim is None:
             break
         del JOBS[victim]
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
     JOBS[job_id] = {
-        "id": job_id,
-        "name": name,
-        "slug": f"{slug}_{job_id}",
-        "cells": cells,
+        "id": job_id, "name": name, "slug": f"{slug}_{job_id}", "cells": cells,
         "group": artifact.get("group", ""),
         "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "status": "queued",
-        "stage": "queued",
-        "view": None,
+        "status": "queued", "stage": "queued", "view": None,
     }
     _ensure_worker()
     JOB_QUEUE.put((job_id, artifact))
@@ -159,14 +162,12 @@ def cancel(job_id: str) -> dict:
     if job is None:
         raise HTTPException(404, "unknown job")
     if job["status"] == "queued":
-        job["status"] = "cancelled"
-        job["stage"] = "cancelled"
+        job["status"] = job["stage"] = "cancelled"
     elif job["status"] == "running":
-        job["status"] = "cancelling"
-        job["stage"] = "cancelling"
+        job["status"] = job["stage"] = "cancelling"
         with _proc_lock:
             if _proc is not None and _proc.poll() is None:
-                _proc.kill()  # warm state is lost; the next job respawns the worker
+                _proc.kill()
     else:
         raise HTTPException(409, f"job is {job['status']}")
     return {"id": job_id, "status": job["status"]}
@@ -176,10 +177,7 @@ def list_jobs() -> list[dict]:
     return list(JOBS.values())[::-1]
 
 
-# ── GPU access probe ──────────────────────────────────────────────────────────
-# Store access (submits/views/labels ride it) + GPU visibility in this container.
-
-PROBE_TTL_S = 60
+# ── access probe: store, bucket credential, GPU visible in this container ──────
 
 _probe_lock = threading.Lock()
 _probe_state: dict = {"status": "checking", "checked_at": None}
@@ -191,50 +189,71 @@ _GPU_FIX = [
     "sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker",
     "docker compose up -d",
 ]
+_ADC_FIX = [
+    "on the VM: gcloud auth application-default login --no-launch-browser",
+    "docker compose restart backend",
+]
 
 
 def _verdict(status: str, problem: str | None = None, summary: str = "",
              detail: str = "", fix: list[str] | None = None) -> dict:
-    return {"status": status, "problem": problem, "summary": summary,
-            "detail": detail, "fix": fix or [],
-            "checked_at": datetime.now(timezone.utc).isoformat()}
+    return {"status": status, "problem": problem, "summary": summary, "detail": detail,
+            "fix": fix or [], "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
-def _probe_gpu() -> dict:
-    try:  # backend credential → store: views/labels/history ride these writes
-        storage.bucket().get_blob(storage.key("zarr.json"))
+def _probe_local() -> dict | None:
+    if SOURCE.gcs or (Path(SOURCE.root) / "zarr.json").is_file():
+        return None
+    return _verdict("error", "store", f"No zarr group at LOCAL_DATA={SOURCE.uri} (zarr.json missing).",
+                    "", ["check the /data volume mount in docker-compose.yml",
+                         "the scratch disk is wiped on stop/start: deploy/restage_store.sh"])
+
+
+def _probe_bucket(loc: Location, what: str) -> dict | None:
+    try:
+        storage.bucket(loc).get_blob(loc.key("zarr.json"))
+        return None
     except Exception as e:
         s, low = str(e), str(e).lower()
         if "403" in s or "does not have" in low or "denied" in low:
-            return _verdict("error", "bucket",
-                            "The backend can reach GCS but the credential lacks bucket access.",
-                            s[-400:],
-                            [f"your account needs roles/storage.objectAdmin on gs://{SOURCE['bucket']}"])
-        return _verdict("error", "adc",
-                        "The backend has no working GCS credential (missing or expired ADC).",
-                        s[-400:],
-                        ["on the VM: gcloud auth application-default login --no-launch-browser",
-                         "docker compose restart backend"])
+            return _verdict("error", "bucket", f"The backend reaches GCS but lacks access to the {what} bucket.",
+                            s[-400:], [f"your account needs roles/storage.objectAdmin on gs://{loc.bucket}"])
+        return _verdict("error", "adc", f"No working GCS credential for the {what} (missing or expired ADC).",
+                        s[-400:], _ADC_FIX)
+
+
+def _probe_nvidia() -> dict | None:
     try:
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
-        return _verdict("error", "gpu",
-                        "No GPU in this container (nvidia-smi missing) — submits will fail.",
-                        "", _GPU_FIX)
+        return _verdict("error", "gpu", "No GPU in this container (nvidia-smi missing).", "", _GPU_FIX)
     except subprocess.TimeoutExpired:
         return _verdict("error", "gpu", "nvidia-smi timed out.", "", _GPU_FIX)
     if r.returncode != 0:
-        return _verdict("error", "gpu", "The container cannot see a GPU.",
-                        (r.stderr or r.stdout)[-400:], _GPU_FIX)
-    n = len(r.stdout.strip().splitlines())
-    return _verdict("ok", None, f"store access + {n} GPU{'s' if n != 1 else ''} visible")
+        return _verdict("error", "gpu", "The container cannot see a GPU.", (r.stderr or r.stdout)[-400:], _GPU_FIX)
+    return None
+
+
+def _probe() -> dict:
+    checks = [_probe_local()]
+    if SOURCE.gcs:
+        checks.append(_probe_bucket(SOURCE, "store"))
+    if MIRROR:
+        checks.append(_probe_bucket(MIRROR, "mirror"))
+    checks.append(_probe_nvidia())
+    failed = next((c for c in checks if c), None)
+    if failed:
+        return failed
+    n = len(subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.strip().splitlines())
+    access = ("bucket store" if SOURCE.gcs else "local store") + (" + GCS mirror" if MIRROR else "")
+    return _verdict("ok", None, f"{access} + {n} GPU{'s' if n != 1 else ''} visible")
 
 
 def _probe_worker() -> None:
     global _probing, _probe_ts
     try:
-        v = _probe_gpu()
-    except Exception as e:  # never leave the checking flag stuck
+        v = _probe()
+    except Exception as e:
         v = _verdict("error", "probe", f"probe crashed: {e}")
     with _probe_lock:
         _probe_state.clear()
@@ -250,7 +269,6 @@ def _invalidate_probe() -> None:
 
 
 def health(refresh: bool = False) -> dict:
-    """Cached probe verdict; kicks a background re-probe when stale or forced."""
     problem = _config_problem()
     if problem:
         return {"status": "unconfigured", "summary": problem, "checking": False}

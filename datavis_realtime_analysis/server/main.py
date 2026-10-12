@@ -5,7 +5,7 @@ config (env), storage (zarr proxy), views (umap_views listing), gpu (jobs), labe
 from fastapi import FastAPI, Request
 
 from . import gpu, labels, storage, views
-from .config import DATA_DIR
+from .config import EMBED_METHOD, MIRROR, SOURCE
 
 app = FastAPI(redoc_url=None)  # /docs = interactive API console
 
@@ -24,7 +24,8 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"store": DATA_DIR}
+    return {"store": SOURCE.uri if SOURCE else "", "mirror": MIRROR.uri if MIRROR else None,
+            "embed_method": EMBED_METHOD or "auto"}
 
 
 @app.api_route("/api/data/{path:path}", methods=["GET", "HEAD"])
