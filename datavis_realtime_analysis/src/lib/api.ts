@@ -1,4 +1,5 @@
 import type { SelectionArtifact } from './selection'
+import type { RecordedParams, RunParams } from './runSettings'
 
 export type Job = {
   id: string
@@ -9,6 +10,7 @@ export type Job = {
   status: 'queued' | 'running' | 'done' | 'failed'
   stage?: string
   view?: string | null
+  params?: RecordedParams | null
 }
 
 // Shared fetch: non-2xx throws with the server's `detail` when it sent one.
@@ -29,7 +31,7 @@ const postJson = (url: string, body: unknown, what: string) =>
   }, what)
 
 // Barcodes ride along: the GPU pipeline selects cells by barcode (view-safe).
-export async function submitSelection(artifact: SelectionArtifact & { name: string }): Promise<void> {
+export async function submitSelection(artifact: SelectionArtifact & { name: string; params: RunParams }): Promise<void> {
   await postJson('/api/submit', artifact, 'submit')
 }
 
@@ -41,7 +43,7 @@ export async function fetchJobs(): Promise<Job[]> {
 
 // A "group" is a switchable embedding: the served store root (path '') or a view
 // store nested under it (umap_views/<slug>), listed by the backend from the store.
-export type Group = { id: string; label: string; path: string }
+export type Group = { id: string; label: string; path: string; params?: RecordedParams | null }
 
 export async function fetchViews(): Promise<Group[]> {
   const res = await request('/api/views', { cache: 'no-store' }, 'views')

@@ -9,7 +9,7 @@ A browser app for labeling cells on a UMAP and re-clustering any selection on a 
 **What it does.**
 
 - **Labeling** — lasso cells, name a label, and *Save to store*. Labelsets are written onto the store's `obs` as anndata categorical columns (`-1` = unlabeled), so they are readable by scanpy/anndata immediately. Assignments travel as barcodes, so labels made inside a re-clustered view land on the root store.
-- **Re-clustering on the GPU** — lasso a selection and hit *Generate New UMAP*. The backend runs the RAPIDS single-cell pipeline on just those cells and writes the result to `umap_views/<name>` in the store. scRNA goes normalize → HVG → PCA → neighbors → UMAP from raw counts; a store whose neighbor graph came from a stored latent space (scATAC with a PeakVI embedding in `obsm`, recorded in `uns/neighbors/params/use_rep`) skips straight to neighbors → UMAP from that latent and never reads `X`. This is why the backend lives on a GPU: a sub-UMAP of tens of thousands to a few million cells comes back in seconds to minutes instead of hours, so you can drill into a population, re-embed it, label the sub-structure that appears, and repeat. A warm worker process keeps the CUDA context between jobs; selections ≤ 500k cells run eagerly on one GPU, larger ones stream through a per-run dask-cuda cluster.
+- **Re-clustering on the GPU** — lasso a selection and hit *Generate New UMAP*. The backend runs the RAPIDS single-cell pipeline on just those cells and writes the result to `umap_views/<name>` in the store. scRNA goes normalize → HVG → PCA → neighbors → UMAP from raw counts; a store whose neighbor graph came from a stored latent space (scATAC with a PeakVI embedding in `obsm`, recorded in `uns/neighbors/params/use_rep`) skips straight to neighbors → UMAP from that latent and never reads `X`. The route and the run parameters (neighbors, UMAP `min_dist`, leiden resolution, an optional Harmony batch key) are set per run in the settings drawer beside the Selection panel, pre-filled with the store's defaults and remembered by the browser; every view records the parameters that produced it. This is why the backend lives on a GPU: a sub-UMAP of tens of thousands to a few million cells comes back in seconds to minutes instead of hours, so you can drill into a population, re-embed it, label the sub-structure that appears, and repeat. A warm worker process keeps the CUDA context between jobs; selections ≤ 500k cells run eagerly on one GPU, larger ones stream through a per-run dask-cuda cluster.
 - **Gene expression highlighting** — color the embedding by any gene, read from a log-normalized expression layer in the store (see [Data](#data)). The Genes panel only appears when the store has such a layer; an ATAC group without one simply has no gene panel.
 
 ---
@@ -61,7 +61,6 @@ From the checkout:
 # .env — one or both locations, each the prefix of an AnnData group
 LOCAL_DATA=/data/store.zarr/mod/atac          # OPTIONAL, see below. Can use MuData or regular Anndata objects
 GCS_DATA=gs://MY_BUCKET/store.zarr/mod/atac   # GCS store. Slower reads, consider using a local mirror with env var above.
-#EMBED_METHOD=latent                          # pca | latent | latent:<obsm key>; unset = per store
 ```
 
 ```bash
@@ -74,7 +73,6 @@ docker compose up -d --build   # first build pulls the rapids env: slow once, ~6
 | `LOCAL_DATA` only | VM disk | VM disk |
 | both | VM disk | VM disk, then the bucket; a save or view job reports success only once the copy is in the bucket |
 
-`EMBED_METHOD` fixes the GPU re-embedding route for every run; unset, a store that records a latent space (`uns/neighbors/params/use_rep`, e.g. PeakVI for ATAC) re-embeds from it and any other store re-runs normalize → PCA from counts.
 
 If the checkout lives on the VM's local SSD, it is wiped on every stop/start — re-clone and run this again after a restart.
 
@@ -101,7 +99,7 @@ Set `APP_UID` / `APP_GID` in `.env` to your host `id -u` / `id -g` so the backen
 | `X/` | read (GPU) | Raw counts for the scRNA re-clustering pipeline — CSR is strongly preferred |
 | `obsm/<latent>` + `uns/neighbors/params/use_rep` | read (GPU) | A stored latent space (e.g. PeakVI for ATAC): when present the pipeline re-embeds from it instead of `X` |
 | `layers/gexp` | read | Log-normalized expression for gene highlighting, CSC or dense. Falls back to dense `X`, then CSC `X`; absent → no Genes panel |
-| `umap_views/<slug>/` | write | Re-clustered views (small AnnData groups: `obs` + `obsm/X_umap`), labelled by a `datavis-label` root attribute |
+| `umap_views/<slug>/` | write | Re-clustered views (small AnnData groups: `obs` + `obsm/X_umap`); root attributes `datavis-label` (display name) and `datavis-params` (the run parameters and representation used) |
 
 Views are listed by reading the `umap_views/` children, and the GPU job queue and history live in backend memory — nothing but AnnData groups and `obs` columns is ever written to the store. `umap_views/` itself deliberately has no `zarr.json`: zarr v3 then never lists it as a member of the group, so `anndata.read_zarr` and `mudata.read_zarr` keep working. Never create one there.
 

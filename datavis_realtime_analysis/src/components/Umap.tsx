@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
@@ -9,6 +9,7 @@ import GenePicker from './GenePicker'
 import LabelsPanel from './LabelsPanel'
 import RunsPanel from './RunsPanel'
 import SelectionControls from './SelectionControls'
+import RunSettingsPanel from './RunSettings'
 import SideRail from './SideRail'
 import {
   loadUmapCoords,
@@ -20,6 +21,10 @@ import {
   loadLabelSets,
   dropdownLabelSets,
   colorForCode,
+  hasUnlabeled,
+  UNLABELED_CODE,
+  UNLABELED_NAME,
+  getConfig,
   getStoreId,
   type Point,
   type Categorical,
@@ -27,7 +32,8 @@ import {
   type GeneExpression,
   type LabelSetInfo,
 } from '../lib/zarrData'
-import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
+import { selectIndices } from '../lib/selection'
+import { loadSettings, saveSettings, toParams, type EmbeddingInfo, type RunSettings } from '../lib/runSettings'
 import { deleteView, fetchGpuHealth, fetchViews, saveLabels, submitSelection, type Group, type GpuHealth } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
@@ -54,6 +60,17 @@ export default function Umap() {
   const [gene, setGene] = useState<string | null>(null)
   const [exprData, setExprData] = useState<GeneExpression | null>(null)
   const [exprError, setExprError] = useState<string | null>(null)
+
+  // GPU run settings: edited in the Selection panel's settings drawer, kept in the browser
+  const [embedding, setEmbedding] = useState<EmbeddingInfo | null>(null)
+  const [runSettings, setRunSettings] = useState<RunSettings>(() => loadSettings(null))
+  useEffect(() => {
+    getConfig().then(c => c.embedding && setEmbedding(c.embedding))
+  }, [])
+  const updateRunSettings = (s: RunSettings) => {
+    setRunSettings(s)
+    saveSettings(s)
+  }
 
   // submitted-runs refresh counter (bumped on each submit)
   const [submitCount, setSubmitCount] = useState(0)
@@ -383,12 +400,13 @@ export default function Umap() {
     c.categories.forEach((name, k) => {
       if (names.has(name)) out.add(k)
     })
+    if (names.has(UNLABELED_NAME)) out.add(UNLABELED_CODE)
     return out
   }
 
   const toggleCategory = (code: number) => {
     if (!cat) return
-    const name = cat.categories[code]
+    const name = code < 0 ? UNLABELED_NAME : cat.categories[code]
     const next = new Set(selectedCats)
     if (next.has(name)) next.delete(name)
     else next.add(name)
@@ -396,6 +414,8 @@ export default function Umap() {
     setSelectedLabels(new Set())
     selectByCodes(cat.codes, codesFor(cat, next))
   }
+
+  const catHasUnlabeled = useMemo(() => (cat ? hasUnlabeled(cat) : false), [cat])
 
   // reapply the kept legend selection once the new group's cat + points both land
   useEffect(() => {
@@ -502,15 +522,6 @@ export default function Umap() {
     indices: sel.indices,
   })
 
-  const downloadCurrent = async () => {
-    if (!selection) return
-    const artifact: SelectionArtifact = {
-      ...(await selectionPayload(selection)),
-      barcodes: selection.indices.map(i => barcodes[i] ?? ''),
-    }
-    downloadSelection(artifact)
-  }
-
   const submitCurrent = async (name: string) => {
     if (!selection) return
     try {
@@ -518,6 +529,7 @@ export default function Umap() {
         ...(await selectionPayload(selection)),
         barcodes: selection.indices.map(i => barcodes[i] ?? ''),
         name,
+        params: toParams(runSettings, embedding),
       })
       setSubmitCount(c => c + 1)
       setSelecting(false)
@@ -614,11 +626,22 @@ export default function Umap() {
           selecting={selecting}
           onToggle={toggleSelecting}
           count={selection?.indices.length ?? 0}
-          onDownload={downloadCurrent}
           onSubmit={submitCurrent}
           onClear={clearSelection}
         />
       ),
+      aside: {
+        icon: 'material-symbols-light:settings-outline',
+        title: 'Run settings',
+        content: (
+          <RunSettingsPanel
+            settings={runSettings}
+            onChange={updateRunSettings}
+            embedding={embedding}
+            batchKeys={rootLabelSets.filter(s => s.nCats >= 2 && s.nCats <= 200).map(s => s.name)}
+          />
+        ),
+      },
     },
     {
       id: 'labels',
@@ -739,6 +762,7 @@ export default function Umap() {
             level={level}
             onLevelChange={setLevel}
             categories={cat?.categories ?? null}
+            unlabeled={catHasUnlabeled}
             selected={cat ? codesFor(cat, selectedCats) : new Set<number>()}
             onCategoryClick={toggleCategory}
             error={catError}

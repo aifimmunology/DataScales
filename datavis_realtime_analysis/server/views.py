@@ -8,6 +8,7 @@ from . import storage
 
 ROOT_VIEW = {"id": "main", "label": "Full store", "path": ""}
 LABEL_ATTR = "datavis-label"
+PARAMS_ATTR = "datavis-params"
 
 
 def list_views() -> list[dict]:
@@ -16,7 +17,8 @@ def list_views() -> list[dict]:
 
 def _entry(slug: str) -> dict:
     attrs = storage.read_attrs(f"umap_views/{slug}")
-    return {"id": slug, "label": attrs.get(LABEL_ATTR, slug), "path": f"umap_views/{slug}"}
+    return {"id": slug, "label": attrs.get(LABEL_ATTR, slug), "path": f"umap_views/{slug}",
+            "params": attrs.get(PARAMS_ATTR)}
 
 
 def delete_view(view_id: str) -> dict:

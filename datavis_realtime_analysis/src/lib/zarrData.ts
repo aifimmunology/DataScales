@@ -1,11 +1,12 @@
 import * as zarr from 'zarrita'
+import type { EmbeddingInfo } from './runSettings'
 
 // All zarr reads go through the backend's /api/data proxy (Vite in dev, nginx in Docker).
 export const DATA_BASE_URL = window.location.origin + '/api/data'
 
-type AppConfig = { store?: string }
+type AppConfig = { store?: string; embedding?: EmbeddingInfo }
 let cfgPromise: Promise<AppConfig> | null = null
-function getConfig(): Promise<AppConfig> {
+export function getConfig(): Promise<AppConfig> {
   cfgPromise ??= fetch(window.location.origin + '/api/config')
     .then(res => (res.ok ? res.json() : Promise.reject(new Error(`config ${res.status}`))))
     .catch(() => {
@@ -75,6 +76,18 @@ const PALETTE: RGB[] = [
 export function colorForCode(code: number): RGB {
   if (code < 0) return [130, 130, 130] // NaN / unassigned
   return PALETTE[code % PALETTE.length]
+}
+
+// Cells with no category in the active label set: code -1 in AnnData categoricals.
+// The legend offers them as a selectable "unlabeled" row keyed by a sentinel name
+// that no real category can collide with.
+export const UNLABELED_CODE = -1
+export const UNLABELED_NAME = '\u0000unlabeled'
+export const UNLABELED_SWATCH: RGB = [0, 0, 0]
+
+export function hasUnlabeled(c: Categorical): boolean {
+  for (let i = 0; i < c.codes.length; i++) if (c.codes[i] < 0) return true
+  return false
 }
 
 // Expression ramp over EXPRESSING cells: viridis-style blue -> teal -> green ->

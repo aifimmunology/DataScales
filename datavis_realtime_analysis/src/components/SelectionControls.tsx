@@ -1,25 +1,16 @@
-import { panel, control, primaryBtn } from '../lib/styles'
-
 import { useState } from 'react'
+import { panel, control, primaryBtn } from '../lib/styles'
 
 type Props = {
   selecting: boolean
   onToggle: () => void
   count: number
-  onDownload: () => void
   onSubmit: (name: string) => void
   onClear: () => void
 }
 
-// Rail section: toggle lasso mode, then download / submit / clear the selection.
-export default function SelectionControls({
-  selecting,
-  onToggle,
-  count,
-  onDownload,
-  onSubmit,
-  onClear,
-}: Props) {
+// Rail section: toggle lasso mode, then name + submit the selection to the GPU, or clear it.
+export default function SelectionControls({ selecting, onToggle, count, onSubmit, onClear }: Props) {
   const [name, setName] = useState('')
   return (
     <div style={panelStyle}>
@@ -29,12 +20,7 @@ export default function SelectionControls({
 
       {count > 0 && (
         <>
-          <div style={{ fontSize: 12, color: '#ddd' }}>
-            {count.toLocaleString()} cells selected
-          </div>
-          <button onClick={onDownload} style={btnStyle}>
-            ⬇ Download selection.json
-          </button>
+          <div style={{ fontSize: 12, color: '#ddd' }}>{count.toLocaleString()} cells selected</div>
           <input
             value={name}
             placeholder="new view name…"
