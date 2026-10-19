@@ -1,32 +1,34 @@
 import { useState } from 'react'
 import { panel, control, label as labelStyle, primaryBtn, rgb } from '../lib/styles'
 import { colorForCode, type LabelSetInfo } from '../lib/zarrData'
+import { validLabelsetName } from '../lib/labeling'
+import ComboBox from './ComboBox'
 
 type Active = { name: string; cats: string[]; counts: number[] }
 
 type Props = {
   active: Active | null
   columns: LabelSetInfo[] // every categorical obs column in this group
+  labelFor: (name: string) => string
   selectionCount: number
   saving: boolean
   saved: { name: string; labeled: number } | null // last completed save
   dirty: boolean
   selectedLabels: Set<number> // label rows currently cluster-selected
   onLabelClick: (k: number) => void
-  onStart: (name: string, seed?: string) => void
+  onStart: (name: string) => void
   onAssign: (label: string) => void
   onSave: () => void
   onCancel: () => void
   onDismissSaved: () => void
 }
 
-// Rail section: build a labelset from selections (lasso or legend cluster
-// clicks), then save it to the store as a categorical obs column. The search
-// covers every categorical obs column: own sets extend in place, anything else
-// forks into a new editable labelset seeded from it.
+// Rail section: pick any categorical obs column (or name a new one), relabel
+// selections (lasso or legend cluster clicks), then save it back in place.
 export default function LabelsPanel({
   active,
   columns,
+  labelFor,
   selectionCount,
   saving,
   saved,
@@ -39,52 +41,9 @@ export default function LabelsPanel({
   onCancel,
   onDismissSaved,
 }: Props) {
-  const [query, setQuery] = useState('')
-  const [seed, setSeed] = useState<string | null>(null) // column picked to fork from
-  const [saveAs, setSaveAs] = useState('')
   const [lab, setLab] = useState('')
 
-  const taken = (n: string) => columns.some(c => c.name === n)
-
   if (!active) {
-    if (seed) {
-      const name = saveAs.trim()
-      return (
-        <div style={panelStyle}>
-          <label style={labelStyle}>Labels — fork '{seed}'</label>
-          <input
-            value={saveAs}
-            placeholder="save new labelset as…"
-            onChange={e => setSaveAs(e.target.value)}
-            style={inputStyle}
-          />
-          {name && taken(name) && (
-            <div style={{ fontSize: 11, color: '#f88' }}>that obs column already exists</div>
-          )}
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button
-              disabled={!name || taken(name)}
-              onClick={() => {
-                onStart(name, seed)
-                setSeed(null)
-                setSaveAs('')
-                setQuery('')
-              }}
-              style={btnStyle}
-            >
-              ✎ Start from '{seed}'
-            </button>
-            <button onClick={() => setSeed(null)} style={{ ...btnStyle, color: '#888' }}>
-              back
-            </button>
-          </div>
-        </div>
-      )
-    }
-    const q = query.trim()
-    const matches = q
-      ? columns.filter(c => c.name.toLowerCase().includes(q.toLowerCase())).slice(0, 20)
-      : []
     return (
       <div style={panelStyle}>
         <label style={labelStyle}>Labels</label>
@@ -93,49 +52,21 @@ export default function LabelsPanel({
             ✓ '{saved.name}' saved — {saved.labeled.toLocaleString()} cells labeled
           </div>
         )}
-        <input
-          value={query}
-          placeholder={`Search ${columns.length} obs columns, or name a new set…`}
-          onChange={e => setQuery(e.target.value)}
-          style={inputStyle}
+        <ComboBox
+          options={columns.map(c => ({ value: c.name, label: labelFor(c.name), hint: `(${c.nCats})` }))}
+          placeholder={`Edit one of ${columns.length} columns, or name a new set…`}
+          onPick={onStart}
+          createLabel={q => (columns.some(c => c.name === q) || !validLabelsetName(q) ? null : `＋ New empty labelset '${q}'`)}
+          onCreate={onStart}
         />
-        {matches.length > 0 && (
-          <div style={listStyle}>
-            {matches.map(c => (
-              <div
-                key={c.name}
-                style={itemStyle}
-                title={c.own ? 'app labelset — extend it' : 'store column — fork an editable copy'}
-                onClick={() => {
-                  if (c.own) {
-                    onStart(c.name)
-                    setQuery('')
-                  } else {
-                    setSeed(c.name)
-                    setSaveAs(`${c.name}_edited`)
-                  }
-                }}
-              >
-                {c.name}{' '}
-                <span style={{ color: '#888' }}>
-                  ({c.nCats}) · {c.own ? 'extend' : 'fork'}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-        {q && !taken(q) && (
-          <button onClick={() => { onStart(q); setQuery('') }} style={btnStyle}>
-            ＋ New empty labelset '{q}'
-          </button>
-        )}
       </div>
     )
   }
 
+  const canAssign = !!lab.trim() && selectionCount > 0 && !saving
   return (
     <div style={panelStyle}>
-      <label style={labelStyle}>Labeling: {active.name}</label>
+      <label style={labelStyle}>Labeling: {labelFor(active.name)}</label>
       {active.cats.map((c, k) => (
         <div
           key={c}
@@ -164,12 +95,12 @@ export default function LabelsPanel({
         style={inputStyle}
       />
       <button
-        disabled={!lab.trim() || selectionCount === 0}
+        disabled={!canAssign}
         onClick={() => {
           onAssign(lab.trim())
           setLab('')
         }}
-        style={btnStyle}
+        style={canAssign ? primaryBtn : offStyle}
       >
         Assign to {selectionCount.toLocaleString()} cells
       </button>
@@ -182,7 +113,7 @@ export default function LabelsPanel({
         </div>
       ) : (
         <div style={{ display: 'flex', gap: 6 }}>
-          <button disabled={!dirty} onClick={onSave} style={dirty ? primaryBtn : btnStyle}>
+          <button disabled={!dirty} onClick={onSave} style={!dirty ? offStyle : canAssign ? btnStyle : primaryBtn}>
             💾 Save to store
           </button>
           <button onClick={onCancel} style={{ ...btnStyle, color: '#f88', borderColor: '#622' }}>
@@ -211,23 +142,11 @@ const btnStyle: React.CSSProperties = {
   textAlign: 'left',
 }
 
+const offStyle: React.CSSProperties = { ...btnStyle, opacity: 0.4, cursor: 'not-allowed' }
+
 const savedStyle: React.CSSProperties = {
   fontSize: 12,
   color: '#7f7',
-  cursor: 'pointer',
-}
-
-const listStyle: React.CSSProperties = {
-  maxHeight: 180,
-  overflowY: 'auto',
-  border: '1px solid #333',
-  borderRadius: 4,
-  background: '#1c1c1c',
-}
-
-const itemStyle: React.CSSProperties = {
-  padding: '4px 8px',
-  fontSize: 13,
   cursor: 'pointer',
 }
 

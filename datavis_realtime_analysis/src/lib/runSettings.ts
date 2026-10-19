@@ -3,6 +3,7 @@
 // parameters are summarised.
 
 export type Method = 'pca' | 'latent'
+type SentMethod = Method | 'auto' // auto = the backend picks the store's default route
 
 export type RunSettings = {
   method: Method | null // null = follow the store's default route
@@ -19,7 +20,7 @@ export type EmbeddingInfo = {
 }
 
 export type RunParams = {
-  method: Method
+  method: SentMethod
   n_neighbors: number
   min_dist: number
   resolution: number
@@ -41,8 +42,10 @@ export function effectiveMethod(s: RunSettings, info: EmbeddingInfo | null): Met
   return wanted === 'latent' && !info?.latent ? 'pca' : wanted
 }
 
+// Without embedding info (config fetch failed) the frontend can't resolve the route, so
+// the backend does — never silently fall back to PCA.
 export function toParams(s: RunSettings, info: EmbeddingInfo | null): RunParams {
-  const method = effectiveMethod(s, info)
+  const method: SentMethod = info ? effectiveMethod(s, info) : s.method ?? 'auto'
   return {
     method,
     n_neighbors: s.nNeighbors,

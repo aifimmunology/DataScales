@@ -1,8 +1,10 @@
 import { type Level, type RGB, colorForCode, UNLABELED_CODE, UNLABELED_SWATCH } from '../lib/zarrData'
-import { panel, control, label, rgb } from '../lib/styles'
+import { panel, label, rgb } from '../lib/styles'
+import ComboBox from './ComboBox'
 
 type Props = {
   levels: string[] // label sets discovered in the store (per group)
+  labelFor: (level: string) => string
   level: Level
   onLevelChange: (level: Level) => void
   categories: string[] | null
@@ -16,22 +18,17 @@ type Props = {
 // Top-right overlay: pick which label set colors the UMAP + show the key.
 // Clicking a key row toggles selecting every cell of that category (cluster select).
 // Unlabeled cells draw gray on the plot but get a black key row so they can be selected too.
-export default function Legend({ levels, level, onLevelChange, categories, unlabeled, selected, onCategoryClick, error, onRetry }: Props) {
+export default function Legend({ levels, labelFor, level, onLevelChange, categories, unlabeled, selected, onCategoryClick, error, onRetry }: Props) {
   if (levels.length === 0) return null
   return (
     <div style={panelStyle}>
       <label style={label}>Color by</label>
-      <select
+      <ComboBox
+        options={levels.map(l => ({ value: l, label: labelFor(l) }))}
         value={level}
-        onChange={e => onLevelChange(e.target.value as Level)}
-        style={control}
-      >
-        {levels.map(l => (
-          <option key={l} value={l}>
-            {l}
-          </option>
-        ))}
-      </select>
+        placeholder="search columns…"
+        onPick={v => onLevelChange(v as Level)}
+      />
 
       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
         {error ? (
@@ -84,6 +81,7 @@ const panelStyle: React.CSSProperties = {
   zIndex: 20, // above the lasso svg overlay
   maxHeight: 'calc(100vh - 24px)',
   overflowY: 'auto',
+  minWidth: 180,
 }
 
 const rowStyle: React.CSSProperties = {

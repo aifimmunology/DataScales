@@ -74,13 +74,13 @@ export async function deleteView(id: string): Promise<void> {
 export type LabelAssignment = { label: string; barcodes: string[] }
 
 // Assignments are barcode-based so labels made inside a view land on the root store.
-// `seed` names an obs column the server copies as the baseline when the labelset is
-// first created (fork-to-edit) — seeded labels never ride the payload.
+// An existing column is edited in place; categories left with no cells are dropped.
+// `group` targets a view's own column (its leiden) instead of the root's.
 export async function saveLabels(
   name: string,
   assignments: LabelAssignment[],
-  seed?: string,
+  group?: string,
 ): Promise<{ name: string; categories: string[]; labeled: number }> {
-  const res = await postJson('/api/labels', { name, assignments, ...(seed ? { seed } : {}) }, 'label save')
+  const res = await postJson('/api/labels', { name, assignments, ...(group ? { group } : {}) }, 'label save')
   return res.json()
 }
