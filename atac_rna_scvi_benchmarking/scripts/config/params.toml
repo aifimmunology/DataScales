@@ -1,0 +1,75 @@
+seed = 0
+reps = 2
+
+[paths]
+data_root = "/mnt"
+out_root = "/mnt/scvi_pca/run2"     # subsets/ models/ runs/ cache/ live here (run 1: /mnt/scvi_pca)
+results_root = "results"            # relative to repo root
+umaps_root = "umaps"
+runs_root = "runs"                  # small run.json/log.txt, relative to repo root
+
+[hvg]
+pca_n_top_genes = 2000
+pca_flavor = "seurat"
+scvi_n_top_genes = 4000
+scvi_flavor = "seurat_v3"
+scvi_batch_key = "batch_id"
+
+[subsets]
+# app-style selections on the dataset's L1 label (plot_labels[0]); regex match, unlabelled cells never selected
+label_level = 0
+all = ""
+tnk = "T cell|NK cell"
+b = "B cell"
+
+[pca]
+# mirrors dev_tools/rapids-benchmark run_pipeline: qc -> normalize -> log1p -> HVG seurat 2000 -> scale (float32)
+# -> PCA covariance_eigh -> Harmony
+n_comps = 30
+svd_solver = "covariance_eigh"
+chunk_rows = 24000
+random_seed = 5671
+
+
+[harmony]
+key = "batch_id"
+alpha = 1.0                         # locked 2026-10-15: mmrna f010 L2 purity 0.821/0.825/0.826 at a=0.2/1/2; same-batch frac 0.155/0.175/0.198
+theta = 2.0
+max_iter = 30
+
+[scvi]
+n_latent = 30
+n_layers = 2
+gene_likelihood = "nb"
+batch_key = "batch_id"
+batch_size = 1024
+
+[peakvi]
+n_latent = 40
+batch_key = "batch_id"
+batch_size = 1024
+binarize = true
+
+[epochs]
+rule = "clamp(round(cell_budget / n_cells), min_epochs, max_epochs)"
+cell_budget = 2e7
+min_epochs = 10
+max_epochs = 100                    # run 2 (run 1: 400); fixed budget, KL ramps over its first half
+early_stopping = false              # run 2: off (it fires during KL warmup as the ELBO rises)
+patience = 10
+train_size = 0.95
+
+[tail]
+n_neighbors = 20
+min_dist = 0.45
+algorithm = "ivfflat"                # rapids-benchmark default
+init_pos = "spectral"
+random_seed = 5671
+leiden = false                      # run 2: no clustering
+
+[train]
+kl_warmup_frac = 0.5                # run 2: warmed-up KL. 0 = scvi default (400 epochs scVI, 50 PeakVI); else warmup = ceil(frac × budget)
+seed_by_rep = [0, 1]                # scvi.settings.seed = seed_by_rep[rep - 1]; reps are separate fits
+latent_batch_size = 16384
+accelerator = "gpu"
+

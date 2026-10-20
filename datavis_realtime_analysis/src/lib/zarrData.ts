@@ -1,11 +1,17 @@
 import * as zarr from 'zarrita'
+import type { EmbeddingInfo } from './runSettings'
 
 // All zarr reads go through the backend's /api/data proxy (Vite in dev, nginx in Docker).
 export const DATA_BASE_URL = window.location.origin + '/api/data'
 
-type AppConfig = { store?: string }
+// Label saves rewrite store files in place: every read revalidates (a 304 when
+// unchanged), so a browser never answers from a stale cached copy.
+const REVALIDATE: RequestInit = { cache: 'no-cache' }
+const fetchStore = (url: string) => new zarr.FetchStore(url, { overrides: REVALIDATE })
+
+type AppConfig = { store?: string; embedding?: EmbeddingInfo }
 let cfgPromise: Promise<AppConfig> | null = null
-function getConfig(): Promise<AppConfig> {
+export function getConfig(): Promise<AppConfig> {
   cfgPromise ??= fetch(window.location.origin + '/api/config')
     .then(res => (res.ok ? res.json() : Promise.reject(new Error(`config ${res.status}`))))
     .catch(() => {
@@ -25,6 +31,12 @@ export async function getStoreId(): Promise<string> {
 export type Level = string
 export type LabelSetInfo = { name: string; own: boolean; nCats: number } // own = app-created (extendable)
 
+/** Every obs column name in the group (column-order), categorical or not. */
+export async function loadObsColumns(group = ''): Promise<string[]> {
+  const meta = await probe(DATA_BASE_URL, group ? `${group}/obs` : 'obs')
+  return (meta?.attrs['column-order'] as string[]) ?? []
+}
+
 /** Every categorical obs column in the group, with app-ownership and category
  * count — metadata-only (counts come from categories/zarr.json shape). Consumers
  * filter: the Color-by dropdown applies its inclusion rule; the Labels panel
@@ -38,7 +50,7 @@ export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
     cols.map(async col => {
       const p = await probe(base, `${prefix}obs/${col}`)
       if (p?.attrs['encoding-type'] !== 'categorical') return null
-      const res = await fetch(`${base}/${prefix}obs/${col}/categories/zarr.json`)
+      const res = await fetch(`${base}/${prefix}obs/${col}/categories/zarr.json`, REVALIDATE)
       if (res.status === 404) return null
       if (!res.ok) throw new Error(`obs/${col}/categories: ${res.status} ${res.statusText}`)
       const meta = await res.json()
@@ -52,13 +64,29 @@ export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
   return keep.filter((c): c is LabelSetInfo => c !== null)
 }
 
-// Color-by dropdown rule: leiden + AIFI_L* + app labelsets always, plus any other
-// categorical small enough to be a label hierarchy rather than an id column.
-const MAX_DROPDOWN_CATS = 40
+// Each view's own clustering: the one column a view reads from itself. Every other
+// column in a view is read from the root via obs/root_row (the view's copies are frozen).
+export const VIEW_NATIVE = 'leiden'
+
+export const isViewNative = (group: string, name: string) => !!group && name === VIEW_NATIVE
+
+export const columnLabel = (group: string, name: string) =>
+  isViewNative(group, name) ? `${name} (current view only)` : name
+
+/** Columns as seen from a group: the root's, with a view's own VIEW_NATIVE in place of the root's. */
+export function groupColumns(group: string, ls: LabelSetInfo[], rootLs: LabelSetInfo[]): LabelSetInfo[] {
+  if (!group) return ls
+  const own = ls.find(s => s.name === VIEW_NATIVE)
+  const cols = rootLs.flatMap(s => (s.name !== VIEW_NATIVE ? [s] : own ? [own] : []))
+  return own && !rootLs.some(s => s.name === VIEW_NATIVE) ? [...cols, own] : cols
+}
+
+// Color-by dropdown rule: any categorical with fewer than 100 categories.
+const MAX_DROPDOWN_CATS = 100
 
 export function dropdownLabelSets(sets: LabelSetInfo[]): string[] {
   return sets
-    .filter(s => s.own || s.name === 'leiden' || s.name.startsWith('AIFI_L') || s.nCats < MAX_DROPDOWN_CATS)
+    .filter(s => s.nCats < MAX_DROPDOWN_CATS)
     .map(s => s.name)
 }
 
@@ -75,6 +103,18 @@ const PALETTE: RGB[] = [
 export function colorForCode(code: number): RGB {
   if (code < 0) return [130, 130, 130] // NaN / unassigned
   return PALETTE[code % PALETTE.length]
+}
+
+// Cells with no category in the active label set: code -1 in AnnData categoricals.
+// The legend offers them as a selectable "unlabeled" row keyed by a sentinel name
+// that no real category can collide with.
+export const UNLABELED_CODE = -1
+export const UNLABELED_NAME = '\u0000unlabeled'
+export const UNLABELED_SWATCH: RGB = [0, 0, 0]
+
+export function hasUnlabeled(c: Categorical): boolean {
+  for (let i = 0; i < c.codes.length; i++) if (c.codes[i] < 0) return true
+  return false
 }
 
 // Expression ramp over EXPRESSING cells: viridis-style blue -> teal -> green ->
@@ -104,7 +144,7 @@ export const EXPR_NONE: RGB = [46, 46, 58]
 // same obsm/X_umap + obs/* paths resolve inside whichever group is active.
 async function openArray(path: string, group: string, base: string) {
   const rel = group ? `${group}/${path}` : path
-  const store = new zarr.FetchStore(`${base}/${rel}`)
+  const store = fetchStore(`${base}/${rel}`)
   return zarr.open.v3(store, { kind: 'array' })
 }
 
@@ -126,7 +166,7 @@ export async function loadUmapCoords(group = ''): Promise<Point[]> {
  * Used for the selection export. */
 export async function loadBarcodes(group = ''): Promise<string[]> {
   const rel = group ? `${group}/obs` : 'obs'
-  const obsGroup = await zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/${rel}`), { kind: 'group' })
+  const obsGroup = await zarr.open.v3(fetchStore(`${DATA_BASE_URL}/${rel}`), { kind: 'group' })
   const idxCol = (obsGroup.attrs['_index'] as string) ?? '_index'
   const arr = await openArray(`obs/${idxCol}`, group, DATA_BASE_URL)
   const data = (await zarr.get(arr)).data as ArrayLike<string>
@@ -145,12 +185,17 @@ export async function loadCategorical(col: Level, group = ''): Promise<Categoric
   return { codes, categories }
 }
 
-/** A ROOT categorical gathered into a view's row order via obs/root_row — how app
- * labelsets are read inside views: always the current root state, never the frozen
+/** A ROOT categorical gathered into a view's row order via obs/root_row — how root
+ * columns are read inside views: always the current root state, never the frozen
  * copy the pipeline baked into the view's own obs. */
 export async function gatherRootCategorical(col: Level, group: string): Promise<Categorical> {
-  const [root, rows] = await Promise.all([loadCategorical(col, ''), viewRootRows(group)])
-  const codes = new Int16Array(rows.length)
+  return gatherCategorical(await loadCategorical(col, ''), group)
+}
+
+/** An already-loaded root categorical gathered into a view's row order. */
+export async function gatherCategorical(root: Categorical, group: string): Promise<Categorical> {
+  const rows = await viewRootRows(group)
+  const codes = new Int32Array(rows.length)
   for (let i = 0; i < rows.length; i++) codes[i] = Number(root.codes[Number(rows[i])])
   return { codes, categories: root.categories }
 }
@@ -164,7 +209,7 @@ let geneNamesP: Promise<string[]> | null = null
 export function loadGeneNames(): Promise<string[]> {
   geneNamesP ??= (async () => {
     await geneSource()
-    const varGroup = await zarr.open.v3(new zarr.FetchStore(`${DATA_BASE_URL}/var`), { kind: 'group' })
+    const varGroup = await zarr.open.v3(fetchStore(`${DATA_BASE_URL}/var`), { kind: 'group' })
     const idxCol = (varGroup.attrs['_index'] as string) ?? '_index'
     const arr = await openArray(`var/${idxCol}`, '', DATA_BASE_URL)
     return Array.from((await zarr.get(arr)).data as ArrayLike<string>)
@@ -199,7 +244,7 @@ const openedArrays = new Map<string, Promise<OpenedArray>>()
 function openAt(url: string): Promise<OpenedArray> {
   let arr = openedArrays.get(url)
   if (!arr) {
-    arr = zarr.open.v3(new zarr.FetchStore(url), { kind: 'array' })
+    arr = zarr.open.v3(fetchStore(url), { kind: 'array' })
     arr.catch(() => openedArrays.delete(url))
     openedArrays.set(url, arr)
   }
@@ -209,7 +254,7 @@ function openAt(url: string): Promise<OpenedArray> {
 // null means the node genuinely doesn't exist; transient failures (backend
 // booting -> 502, etc.) throw so callers retry instead of caching "absent".
 async function probe(base: string, path: string) {
-  const res = await fetch(`${base}/${path}/zarr.json`)
+  const res = await fetch(`${base}/${path}/zarr.json`, REVALIDATE)
   if (res.status === 404) return null
   if (!res.ok) throw new Error(`${path}: ${res.status} ${res.statusText}`)
   const meta = await res.json()

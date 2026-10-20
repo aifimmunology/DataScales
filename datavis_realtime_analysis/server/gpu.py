@@ -18,7 +18,8 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from . import storage
-from .config import EMBED_METHOD, MAX_JOBS, MIRROR, SOURCE, Location
+from .config import MAX_JOBS, MIRROR, SOURCE, Location
+from .embedding import RunParams
 
 WORKER_SCRIPT = Path(__file__).resolve().parents[1] / "gpu" / "worker.py"
 PROBE_TTL_S = 60
@@ -70,7 +71,7 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
     sel.write_text(json.dumps(artifact))
     view = f"umap_views/{job['slug']}"
     proc = _send({"id": rid, "store": SOURCE.uri, "selection": str(sel), "label": job["name"],
-                  "out": f"{SOURCE.uri}/{view}", "method": EMBED_METHOD})
+                  "out": f"{SOURCE.uri}/{view}", "params": job["params"]})
     try:
         while True:
             line = proc.stdout.readline()
@@ -85,6 +86,9 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
                 break
             elif line.startswith("error: "):
                 raise RuntimeError(line[len("error: "):])
+    except BaseException:
+        _discard(view)
+        raise
     finally:
         sel.unlink(missing_ok=True)
     if MIRROR:
@@ -93,6 +97,14 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
             storage.mirror(view)
         except storage.MirrorError as e:
             raise RuntimeError(f"view written but not mirrored: {e}")
+
+
+def _discard(view: str) -> None:
+    """A failed or cancelled run leaves no partial view behind."""
+    try:
+        storage.delete_prefix(view)
+    except Exception as e:
+        print(f"[jobs] could not remove partial {view}: {e}", file=sys.stderr, flush=True)
 
 
 def _worker() -> None:
@@ -105,6 +117,9 @@ def _worker() -> None:
         t0 = time.monotonic()
         try:
             _run_gpu_job(job, artifact)
+            if job["status"] == "cancelling":
+                _discard(f"umap_views/{job['slug']}")
+                raise _Cancelled()
             job["view"] = f"umap_views/{job['slug']}"
             job["stage"] = job["status"] = "done"
         except _Cancelled:
@@ -135,6 +150,10 @@ def submit(artifact: dict) -> dict:
     problem = _config_problem()
     if problem:
         raise HTTPException(400, problem)
+    try:
+        params = RunParams.from_dict(artifact.get("params")).to_dict()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     job_id = uuid.uuid4().hex[:8]
     cells = len(artifact.get("indices", []))
     name = str(artifact.get("name") or f"view {job_id}").strip()[:60]
@@ -148,7 +167,7 @@ def submit(artifact: dict) -> dict:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
     JOBS[job_id] = {
         "id": job_id, "name": name, "slug": f"{slug}_{job_id}", "cells": cells,
-        "group": artifact.get("group", ""),
+        "group": artifact.get("group", ""), "params": params,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "status": "queued", "stage": "queued", "view": None,
     }

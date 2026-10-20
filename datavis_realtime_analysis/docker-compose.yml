@@ -16,7 +16,6 @@ services:
     environment:
       LOCAL_DATA: ${LOCAL_DATA:-}
       GCS_DATA: ${GCS_DATA:-}
-      EMBED_METHOD: ${EMBED_METHOD:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
       GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
       HOME: /tmp

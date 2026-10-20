@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
@@ -9,17 +9,27 @@ import GenePicker from './GenePicker'
 import LabelsPanel from './LabelsPanel'
 import RunsPanel from './RunsPanel'
 import SelectionControls from './SelectionControls'
+import RunSettingsPanel from './RunSettings'
 import SideRail from './SideRail'
 import {
   loadUmapCoords,
   loadCategorical,
+  loadObsColumns,
+  groupColumns,
+  columnLabel,
+  isViewNative,
   gatherRootCategorical,
+  gatherCategorical,
   loadBarcodes,
   loadGeneNames,
   loadGeneExpression,
   loadLabelSets,
   dropdownLabelSets,
   colorForCode,
+  hasUnlabeled,
+  UNLABELED_CODE,
+  UNLABELED_NAME,
+  getConfig,
   getStoreId,
   type Point,
   type Categorical,
@@ -27,7 +37,9 @@ import {
   type GeneExpression,
   type LabelSetInfo,
 } from '../lib/zarrData'
-import { selectIndices, downloadSelection, type SelectionArtifact } from '../lib/selection'
+import { selectIndices } from '../lib/selection'
+import { loadSettings, saveSettings, toParams, type EmbeddingInfo, type RunSettings } from '../lib/runSettings'
+import { countCodes, dropEmpty, MAX_LABEL_LEN, type LabelCodes } from '../lib/labeling'
 import { deleteView, fetchGpuHealth, fetchViews, saveLabels, submitSelection, type Group, type GpuHealth } from '../lib/api'
 
 type Sel = { mask: Uint8Array; indices: number[]; world: [number, number][] }
@@ -54,6 +66,17 @@ export default function Umap() {
   const [gene, setGene] = useState<string | null>(null)
   const [exprData, setExprData] = useState<GeneExpression | null>(null)
   const [exprError, setExprError] = useState<string | null>(null)
+
+  // GPU run settings: edited in the Selection panel's settings drawer, kept in the browser
+  const [embedding, setEmbedding] = useState<EmbeddingInfo | null>(null)
+  const [runSettings, setRunSettings] = useState<RunSettings>(() => loadSettings(null))
+  useEffect(() => {
+    getConfig().then(c => c.embedding && setEmbedding(c.embedding))
+  }, [])
+  const updateRunSettings = (s: RunSettings) => {
+    setRunSettings(s)
+    saveSettings(s)
+  }
 
   // submitted-runs refresh counter (bumped on each submit)
   const [submitCount, setSubmitCount] = useState(0)
@@ -85,12 +108,17 @@ export default function Umap() {
   // cluster-select (legend clicks) + labeling workspace
   const [selectedCats, setSelectedCats] = useState<Set<string>>(new Set()) // category names, not codes — survives view switches
   const [selectedLabels, setSelectedLabels] = useState<Set<number>>(new Set()) // working-label rows toggled in
-  type Labeling = { name: string; cats: string[]; counts: number[]; codes: Int16Array; seed?: string }
+  type Labeling = LabelCodes & { name: string }
   const [labeling, setLabeling] = useState<Labeling | null>(null)
   const [pending, setPending] = useState<{ label: string; indices: number[] }[]>([])
   const [labelVersion, setLabelVersion] = useState(0) // bumps fill colors on assign
   const [savingLabels, setSavingLabels] = useState(false)
   const [savedLabels, setSavedLabels] = useState<{ name: string; labeled: number } | null>(null)
+  // what the panel and plot show: the working set minus empty categories, as it will save
+  const shown = useMemo(() => (labeling ? { name: labeling.name, ...dropEmpty(labeling) } : null), [labeling])
+  const groupRef = useRef(group)
+  groupRef.current = group
+  const startToken = useRef(0) // latest startLabeling call wins
 
   const deckRef = useRef<any>(null)
   const draggingRef = useRef(false)
@@ -178,11 +206,11 @@ export default function Umap() {
     }
   }, [group, retryTick])
 
-  // Discover the group's categorical columns AND the root's: app labelsets live
-  // only on root (edited by barcode, read in views via root_row gather), so views
-  // must see them regardless of what got frozen into their own obs at creation.
+  // Discover the group's categorical columns AND the root's: a view shows the root's
+  // columns (read live via root_row gather) plus its own leiden — see groupColumns.
   const [rootLabelSets, setRootLabelSets] = useState<LabelSetInfo[]>([])
-  const rootOwn = rootLabelSets.filter(s => s.own)
+  const columns = useMemo(() => groupColumns(group, labelSets, rootLabelSets), [group, labelSets, rootLabelSets])
+  const labelFor = (name: string) => columnLabel(group, name)
   // Discovery failures retry silently (a 502 during backend boot must not hide
   // the legend for the whole session); retryTick lets the UMAP Retry button
   // re-run discovery too, since both fail together when the backend is down.
@@ -194,10 +222,7 @@ export default function Umap() {
           if (stale) return
           setLabelSets(ls)
           setRootLabelSets(rootLs ?? ls)
-          // legend options: the group's columns plus root labelsets (root wins on
-          // name clashes — a view's copy is frozen at creation time)
-          const ownNames = (rootLs ?? ls).filter(s => s.own).map(s => s.name)
-          const names = [...new Set([...dropdownLabelSets(ls), ...ownNames])]
+          const names = dropdownLabelSets(groupColumns(group, ls, rootLs ?? ls))
           setLevel(l => (names.includes(l) ? l : names.includes('AIFI_L1') ? 'AIFI_L1' : names[0] ?? ''))
         })
         .catch(err => {
@@ -232,10 +257,15 @@ export default function Umap() {
     setCat(null)
     setCatError(null)
     if (!level) return // group has no categorical columns
-    // app labelsets in a view read the CURRENT root state via root_row gather
-    const fromRoot = group !== '' && rootOwn.some(s => s.name === level)
+    // views read the CURRENT root column via root_row, except their own leiden;
+    // a view without root_row falls back to its frozen copy
+    const fromRoot = group !== '' && !isViewNative(group, level)
+    const load = () =>
+      fromRoot
+        ? gatherRootCategorical(level, group).catch(() => loadCategorical(level, group))
+        : loadCategorical(level, group)
     const attempt = (retriesLeft: number) => {
-      ;(fromRoot ? gatherRootCategorical(level, group) : loadCategorical(level, group))
+      load()
         .then(c => {
           if (!stale) setCat(c)
         })
@@ -383,12 +413,13 @@ export default function Umap() {
     c.categories.forEach((name, k) => {
       if (names.has(name)) out.add(k)
     })
+    if (names.has(UNLABELED_NAME)) out.add(UNLABELED_CODE)
     return out
   }
 
   const toggleCategory = (code: number) => {
     if (!cat) return
-    const name = cat.categories[code]
+    const name = code < 0 ? UNLABELED_NAME : cat.categories[code]
     const next = new Set(selectedCats)
     if (next.has(name)) next.delete(name)
     else next.add(name)
@@ -396,6 +427,8 @@ export default function Umap() {
     setSelectedLabels(new Set())
     selectByCodes(cat.codes, codesFor(cat, next))
   }
+
+  const catHasUnlabeled = useMemo(() => (cat ? hasUnlabeled(cat) : false), [cat])
 
   // reapply the kept legend selection once the new group's cat + points both land
   useEffect(() => {
@@ -411,48 +444,62 @@ export default function Umap() {
     else next.add(k)
     setSelectedLabels(next)
     setSelectedCats(new Set())
-    selectByCodes(labeling.codes, next)
+    selectByCodes(shown!.codes, next)
   }
 
-  // ---- labeling: build a labelset from selections, save as an obs categorical ----
-  // seedFrom forks any ROOT categorical into a new labelset: local codes seed from
-  // it here; at save the backend copies the same column as the stored baseline.
-  // Labeling always operates in root space — in a view, seeds are gathered from
-  // the current root column via root_row (never the view's frozen copy).
-  const startLabeling = async (name: string, seedFrom?: string) => {
+  // ---- labeling: edit a ROOT categorical in place (or start a new one) ----
+  // In a view, codes are gathered from the current root column via root_row, and
+  // `outside` keeps each category's root cells beyond the view so emptiness is
+  // judged store-wide.
+  const startLabeling = async (name: string) => {
+    const token = ++startToken.current
+    const g = group
+    const n = points.length
     setSavedLabels(null)
-    const codes = new Int16Array(points.length).fill(-1)
+    let codes = new Int32Array(n).fill(-1)
     let cats: string[] = []
-    const src = seedFrom ?? (rootOwn.some(s => s.name === name) ? name : undefined)
-    if (src) {
-      try {
-        const existing = group ? await gatherRootCategorical(src, group) : await loadCategorical(src, '')
-        cats = existing.categories
-        for (let i = 0; i < codes.length; i++) codes[i] = existing.codes[i]
-      } catch {
-        // seed column unreadable (e.g. a pre-root_row view) — start empty
+    let outside: number[] = []
+    try {
+      if (isViewNative(g, name)) {
+        const own = await loadCategorical(name, g)
+        cats = own.categories
+        codes = Int32Array.from(own.codes)
+      } else if ((await loadObsColumns('')).includes(name)) {
+        const root = await loadCategorical(name, '').catch(() => {
+          throw new Error(`'${name}' is an obs column but not a categorical one`)
+        })
+        const here = g ? await gatherCategorical(root, g) : root
+        cats = root.categories
+        codes = Int32Array.from(here.codes)
+        const inView = countCodes(codes, cats.length)
+        outside = countCodes(root.codes, cats.length).map((c, k) => c - inView[k])
       }
+    } catch (err) {
+      if (token === startToken.current) setNotice(`Could not load '${name}': ${err instanceof Error ? err.message : err}`)
+      return
     }
-    const counts = new Array(cats.length).fill(0)
-    for (let i = 0; i < codes.length; i++) if (codes[i] >= 0) counts[codes[i]]++
-    setLabeling({ name, cats, counts, codes, seed: seedFrom })
+    if (token !== startToken.current || groupRef.current !== g) return
+    setLabeling({ name, cats, counts: countCodes(codes, cats.length), outside, codes })
     setPending([])
     setSelectedLabels(new Set())
     setLabelVersion(v => v + 1)
   }
 
-  const assignLabel = (label: string) => {
-    if (!labeling || !selection) return
+  const assignLabel = (raw: string) => {
+    if (!labeling || !selection || savingLabels) return
+    const label = raw.slice(0, MAX_LABEL_LEN)
     const cats = labeling.cats.includes(label) ? labeling.cats : [...labeling.cats, label]
     const k = cats.indexOf(label)
     const counts = [...labeling.counts]
     while (counts.length < cats.length) counts.push(0)
+    const outside = [...labeling.outside]
+    while (outside.length < cats.length) outside.push(0)
     for (const i of selection.indices) {
       if (labeling.codes[i] >= 0) counts[labeling.codes[i]]--
       labeling.codes[i] = k
       counts[k]++
     }
-    setLabeling({ ...labeling, cats, counts })
+    setLabeling({ ...labeling, cats, counts, outside })
     setPending(p => [...p, { label, indices: selection.indices }])
     setSelection(null)
     setSelectedCats(new Set())
@@ -463,7 +510,9 @@ export default function Umap() {
 
   const saveLabeling = async () => {
     if (!labeling || pending.length === 0) return
+    const g = group
     setSavingLabels(true)
+    let res: Awaited<ReturnType<typeof saveLabels>>
     try {
       // barcodes make the assignment group-agnostic: the backend maps them to
       // root-store rows, so view labels land on the full store
@@ -471,20 +520,31 @@ export default function Umap() {
         label: p.label,
         barcodes: p.indices.map(i => barcodes[i] ?? ''),
       }))
-      const res = await saveLabels(labeling.name, assignments, labeling.seed)
-      setSavedLabels({ name: res.name, labeled: res.labeled })
-      setLabeling(null)
-      setPending([])
-      setSelectedLabels(new Set())
-      setLabelVersion(v => v + 1)
-      // the saved set lives on root: refresh both lists so it joins Color by here too
-      const [ls, rootLs] = await Promise.all([loadLabelSets(group), group ? loadLabelSets('') : null])
+      res = await saveLabels(labeling.name, assignments, isViewNative(g, labeling.name) ? g : undefined)
+    } catch (err) {
+      // a mirror failure still saved locally: re-read so Color by shows what's served
+      setNotice(`Label save failed: ${err instanceof Error ? err.message : err}`)
+      setSavingLabels(false)
+      if (groupRef.current === g) setCatTick(t => t + 1)
+      return
+    }
+    setSavedLabels({ name: res.name, labeled: res.labeled })
+    setSavingLabels(false)
+    if (groupRef.current !== g) return // the new group's discovery already read the saved store
+    setLabeling(null)
+    setPending([])
+    setSelectedLabels(new Set())
+    setLabelVersion(v => v + 1)
+    // the saved set lives on root: refresh both lists, then show it in Color by
+    try {
+      const [ls, rootLs] = await Promise.all([loadLabelSets(g), g ? loadLabelSets('') : null])
+      if (groupRef.current !== g) return
       setLabelSets(ls)
       setRootLabelSets(rootLs ?? ls)
+      setLevel(res.name)
+      setCatTick(t => t + 1)
     } catch (err) {
-      setNotice(`Label save failed: ${err instanceof Error ? err.message : err}`)
-    } finally {
-      setSavingLabels(false)
+      setNotice(`Saved '${res.name}', but refreshing the column lists failed — reload the page (${err instanceof Error ? err.message : err})`)
     }
   }
 
@@ -502,15 +562,6 @@ export default function Umap() {
     indices: sel.indices,
   })
 
-  const downloadCurrent = async () => {
-    if (!selection) return
-    const artifact: SelectionArtifact = {
-      ...(await selectionPayload(selection)),
-      barcodes: selection.indices.map(i => barcodes[i] ?? ''),
-    }
-    downloadSelection(artifact)
-  }
-
   const submitCurrent = async (name: string) => {
     if (!selection) return
     try {
@@ -518,6 +569,7 @@ export default function Umap() {
         ...(await selectionPayload(selection)),
         barcodes: selection.indices.map(i => barcodes[i] ?? ''),
         name,
+        params: toParams(runSettings, embedding),
       })
       setSubmitCount(c => c + 1)
       setSelecting(false)
@@ -575,10 +627,10 @@ export default function Umap() {
       // Millions of overlapping points need low alpha to read as density; small
       // views need near-solid dots or they look fuzzy.
       let alpha = points.length > 300_000 ? 90 : 180
-      if (labeling) {
+      if (shown) {
         // labeled cells show their working label; the rest keep the underlying
         // coloring, dimmed, so unlabeled structure stays visible while labeling
-        const wc = labeling.codes[d.index]
+        const wc = shown!.codes[d.index]
         if (wc >= 0) {
           base = colorForCode(wc)
           alpha = 235
@@ -614,11 +666,22 @@ export default function Umap() {
           selecting={selecting}
           onToggle={toggleSelecting}
           count={selection?.indices.length ?? 0}
-          onDownload={downloadCurrent}
           onSubmit={submitCurrent}
           onClear={clearSelection}
         />
       ),
+      aside: {
+        icon: 'material-symbols-light:settings-outline',
+        title: 'Run settings',
+        content: (
+          <RunSettingsPanel
+            settings={runSettings}
+            onChange={updateRunSettings}
+            embedding={embedding}
+            batchKeys={rootLabelSets.filter(s => s.nCats >= 2 && s.nCats <= 200).map(s => s.name)}
+          />
+        ),
+      },
     },
     {
       id: 'labels',
@@ -627,12 +690,13 @@ export default function Umap() {
       badge: !!labeling,
       content: (
         <LabelsPanel
-          active={labeling ? { name: labeling.name, cats: labeling.cats, counts: labeling.counts } : null}
-          columns={rootLabelSets /* labeling operates in root space, even inside views */}
+          active={shown}
+          columns={columns}
+          labelFor={labelFor}
           selectionCount={selection?.indices.length ?? 0}
           saving={savingLabels}
           saved={savedLabels}
-          dirty={pending.length > 0 || !!labeling?.seed}
+          dirty={pending.length > 0}
           selectedLabels={selectedLabels}
           onLabelClick={toggleLabelCat}
           onStart={startLabeling}
@@ -735,10 +799,12 @@ export default function Umap() {
         {/* legend tracks the actual coloring mode, not the picked gene */}
         {!exprData && (
           <Legend
-            levels={[...new Set([...dropdownLabelSets(labelSets), ...rootOwn.map(s => s.name)])]}
+            levels={dropdownLabelSets(columns)}
+            labelFor={labelFor}
             level={level}
             onLevelChange={setLevel}
             categories={cat?.categories ?? null}
+            unlabeled={catHasUnlabeled}
             selected={cat ? codesFor(cat, selectedCats) : new Set<number>()}
             onCategoryClick={toggleCategory}
             error={catError}

@@ -1,0 +1,9 @@
+# pixi env (rebuilt from scripts/pixi.lock)
+.pixi/
+scripts/.pixi/
+__pycache__/
+*.egg-info/
+# per-run logs and samples written when the pipeline is rerun
+runs/
+runs_explore/
+results/stage_samples/

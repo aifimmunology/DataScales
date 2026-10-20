@@ -1,0 +1,56 @@
+# Source stores are never written. Pulled stores live at /mnt/<store>.zarr.
+
+[mmrna]
+store = "/mnt/mm_multimodal.zarr/mod/rna"
+modality = "rna"
+labels = ["AIFI_L1", "AIFI_L2", "AIFI_L3"]
+plot_labels = ["AIFI_L1", "AIFI_L2", "AIFI_L3"]
+batch_col = "batch_id"
+sample_col = "specimen.specimenGuid"
+stored_latent = ""                  # none; X_scVI comes from our setup run
+batch_umap_cols = ["batch_id", "pool_id", "chip_id", "well_id", "subject.subjectGuid", "cohort.cohortGuid"]
+
+[mmatac]
+store = "/mnt/mm_multimodal.zarr/mod/atac"
+modality = "atac"
+labels = ["L1", "L2", "L2.5"]
+plot_labels = ["L1", "L2", "L2.5"]  # color=L2.5, legend=L2, labels=L1
+batch_col = "batch_id"
+sample_col = "Sample"
+stored_latent = "peakVI_umap"       # obsm key; 40-d PeakVI latent (misnamed)
+batch_umap_cols = ["batch_id", "pool_id", "chip_id", "well_id", "Sample", "nFrags", "TSSEnrichment"]
+continuous_cols = ["nFrags", "TSSEnrichment"]
+
+[rna5m]
+store = "/mnt/5M_sparse_sorted_9.zarr"
+gcs = "gs://imm-zarr-poc/5M_sparse_sorted_9.zarr"
+modality = "rna"
+# store has aifi_l1/aifi_l3 swapped (checked against rna13m vocab); labels[i] is the column holding AIFI_L{i+1}
+labels = ["aifi_l3", "aifi_l2", "aifi_l1"]
+plot_labels = ["AIFI_L1", "AIFI_L2", "AIFI_L3"]
+batch_col = "batch_id"
+sample_col = "specimen.specimenGuid"
+stored_latent = ""
+batch_umap_cols = ["batch_id", "pool_id", "chip_id", "well_id", "subject.subjectGuid", "cohort.cohortGuid"]
+
+[rna13m]
+store = "/mnt/13M_50M_pbmc_soundlife.zarr"
+gcs = "gs://imm-zarr-poc/13M_50M_pbmc_soundlife.zarr"
+modality = "rna"
+labels = ["AIFI_L1", "AIFI_L2", "AIFI_L3"]
+plot_labels = ["AIFI_L1", "AIFI_L2", "AIFI_L3"]
+batch_col = "batch_id"
+sample_col = "specimen.specimenGuid"
+stored_latent = ""
+batch_umap_cols = ["batch_id", "pool_id", "chip_id", "well_id", "subject.subjectGuid", "cohort.cohortGuid"]
+
+[covatac]
+store = "/mnt/covid_scatac.zarr"
+modality = "atac"
+labels = ["L1", "L2", "L2.5"]
+plot_labels = ["L1", "L2", "L2.5"]
+batch_col = "batch_id"
+sample_col = "Sample"
+stored_latent = "peakVI_umap"
+batch_umap_cols = ["batch_id", "pool_id", "chip_id", "well_id", "Sample", "nFrags", "TSSEnrichment"]
+continuous_cols = ["nFrags", "TSSEnrichment"]
