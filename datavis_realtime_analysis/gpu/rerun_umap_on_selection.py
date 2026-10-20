@@ -5,7 +5,7 @@ then run() per job. Standalone: `pixi run python rerun_umap_on_selection.py` dri
 RERUN_* env vars below. The result is a small self-contained "view" store — obsm/X_umap +
 obs for the selected cells, NO X — exactly what the datavis viewer reads, by row position.
 
-Two routes into neighbors → UMAP → leiden, chosen by `method` (see resolve_rep):
+Two routes into neighbors → UMAP → leiden, chosen by RunParams.method (see resolve_rep):
   * a stored latent space (ATAC: PeakVI in obsm, recorded in uns/neighbors/params/use_rep)
     is re-embedded directly and X is never touched;
   * otherwise X (raw counts) goes through normalize → HVG → scale → PCA first. Selections
@@ -20,6 +20,8 @@ Module level here must stay trivial and all cluster/pipeline code lives inside f
 import os
 from contextlib import contextmanager, nullcontext
 
+from run_params import RunParams
+
 # Pin host BLAS/OpenMP threads (env vars inherit into dask-cuda worker children) so
 # worker threads don't each spawn a full BLAS pool — same as rapids-benchmark.
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -33,11 +35,11 @@ THREADS_PER_WORKER = int(os.environ.get("RERUN_THREADS_PER_WORKER", "12"))  # da
 ZARR_CONCURRENCY   = int(os.environ.get("RERUN_ZARR_CONCURRENCY", "64"))    # zarr fetch-dispatch semaphore
 ZARR_MAX_WORKERS   = int(os.environ.get("RERUN_ZARR_MAX_WORKERS", "12"))    # zarr decode threadpool
 EAGER_MAX      = int(os.environ.get("RERUN_EAGER_MAX", "500000"))
-METHOD         = os.environ.get("RERUN_METHOD", "")       # pca | latent | latent:<obsm key> | "" = per store
 ROW_CHUNK_SIZE = 24_000
 RANDOM_SEED    = 4242
-BATCH_KEY      = []   # obs columns to harmony-integrate on; [] = skip harmony
-LABEL_ATTR     = "datavis-label"  # view root attribute the backend lists views by
+N_PCS          = 30
+LABEL_ATTR     = "datavis-label"   # view root attributes the backend lists views by
+PARAMS_ATTR    = "datavis-params"
 
 _gpu_ready = False
 
@@ -131,21 +133,13 @@ def latent_rep(root):
     return rep if rep in root["obsm"] else None
 
 
-def resolve_rep(root, method: str = ""):
-    """The obsm key to embed from, or None for normalize → PCA on X.
-    method: "" picks the store's recorded latent when it has one, else PCA;
-    "pca" / "latent" force a route; "latent:<key>" names the obsm directly."""
-    kind, _, key = method.partition(":")
-    if kind not in ("", "pca", "latent"):
-        raise ValueError(f"unknown embedding method {method!r}")
-    if kind == "pca":
+def resolve_rep(root, method: str = "auto"):
+    """The obsm key to embed from, or None for normalize → PCA on X. "auto" takes the
+    store's recorded latent when it has one, else PCA; "pca" / "latent" force a route."""
+    if method == "pca":
         return None
-    if key:
-        if key not in root["obsm"]:
-            raise ValueError(f"obsm/{key} not in store")
-        return key
     rep = latent_rep(root)
-    if kind == "latent" and rep is None:
+    if method == "latent" and rep is None:
         raise ValueError("store records no latent space (uns/neighbors/params/use_rep)")
     return rep
 
@@ -175,8 +169,8 @@ def load_cells(root, obs, rows, rep, eager):
     return ad.AnnData(X=X, obs=obs_sel, var=ad.io.read_elem(root["var"]))
 
 
-def reduce_counts(adata, eager):
-    """normalize → HVG → scale → PCA (→ harmony) on X; returns the obsm key to embed from."""
+def reduce_counts(adata, eager, batch_key=None):
+    """normalize → HVG → scale → PCA (→ harmony on batch_key) on X; returns the obsm key to embed from."""
     import numpy as np
     import rapids_singlecell as rsc
 
@@ -211,34 +205,34 @@ def reduce_counts(adata, eager):
     if not eager:
         adata.obsm["X_pca"] = adata.obsm["X_pca"].persist().compute()
 
-    rep = "X_pca"
-    if BATCH_KEY:
-        adata.obs[BATCH_KEY] = adata.obs[BATCH_KEY].astype("category")
-        rsc.pp.harmony_integrate(adata, key=BATCH_KEY,
-                                 basis="X_pca", adjusted_basis="X_pca_harmony")
-        rep = "X_pca_harmony"
-    return adata, rep
+    if not batch_key:
+        return adata, "X_pca"
+    print(f"stage: harmony ({batch_key})", flush=True)
+    adata.obs[batch_key] = adata.obs[batch_key].astype("category")
+    rsc.pp.harmony_integrate(adata, key=batch_key, basis="X_pca", adjusted_basis="X_pca_harmony")
+    return adata, "X_pca_harmony"
 
 
-def embed(adata, rep, eager):
+def embed(adata, rep, eager, p=RunParams()):
     """neighbors → UMAP → leiden from `rep` (a stored latent space, else PCA computed here)."""
     import cupy as cp
     import rapids_singlecell as rsc
 
     if rep is None:
-        adata, rep = reduce_counts(adata, eager)
-        n_pcs = 30
+        adata, rep = reduce_counts(adata, eager, p.batch_key)
+        n_pcs = N_PCS
     else:
         adata.obsm[rep] = cp.asarray(adata.obsm[rep], dtype=cp.float32)
         n_pcs = None
 
     print(f"stage: neighbors + UMAP + leiden ({rep})", flush=True)
-    rsc.pp.neighbors(adata, n_neighbors=20, n_pcs=n_pcs, use_rep=rep,
+    rsc.pp.neighbors(adata, n_neighbors=p.n_neighbors, n_pcs=n_pcs, use_rep=rep,
                      algorithm="brute", random_state=RANDOM_SEED)
-    rsc.tl.umap(adata, min_dist=0.45, init_pos="spectral", n_components=2,
+    rsc.tl.umap(adata, min_dist=p.min_dist, init_pos="spectral", n_components=2,
                 random_state=RANDOM_SEED)
-    rsc.tl.leiden(adata, resolution=1.1, n_iterations=100, random_state=RANDOM_SEED)
+    rsc.tl.leiden(adata, resolution=p.resolution, n_iterations=100, random_state=RANDOM_SEED)
     print("clusters:", len(adata.obs["leiden"].cat.categories))
+    adata.uns["rep"] = rep
     return adata
 
 
@@ -251,18 +245,21 @@ def umap_coords(adata):
     return np.asarray(umap, dtype=np.float32)
 
 
-def write_view(adata, out, label=None):
+def write_view(adata, out, label=None, params=None):
     import anndata as ad
     import zarr
 
     ad.settings.zarr_write_format = 3               # zarrita (the viewer) reads v3 only
     view = ad.AnnData(obs=adata.obs.copy(), obsm={"X_umap": umap_coords(adata)})
     view.write_zarr(out)                            # gs:// or local, via zarr's store resolution
-    zarr.open_group(out, mode="r+").update_attributes({LABEL_ATTR: label or os.path.basename(out)})
+    attrs = {LABEL_ATTR: label or os.path.basename(out)}
+    if params is not None:
+        attrs[PARAMS_ATTR] = {**params.to_dict(), "rep": adata.uns.get("rep")}
+    zarr.open_group(out, mode="r+").update_attributes(attrs)
     print(f"wrote view store: {out}  ({view.n_obs} cells)")
 
 
-def run(store: str, selection_file: str, out: str, label: str | None = None, method: str = "") -> str:
+def run(store: str, selection_file: str, out: str, label: str | None = None, params: dict | None = None) -> str:
     import json
     import time
 
@@ -273,7 +270,8 @@ def run(store: str, selection_file: str, out: str, label: str | None = None, met
 
     selection = json.load(open(selection_file))         # {"barcodes": [...], ...}
     root = zarr.open(store, mode="r")
-    rep = resolve_rep(root, method)
+    p = RunParams.from_dict(params)
+    rep = resolve_rep(root, p.method)
     eager = rep is not None or len(selection["barcodes"]) <= EAGER_MAX
 
     with (nullcontext() if eager else cuda_cluster()):
@@ -284,15 +282,15 @@ def run(store: str, selection_file: str, out: str, label: str | None = None, met
         rows = selected_rows(obs, selection["barcodes"])
         adata = load_cells(root, obs, rows, rep, eager)
         print("Selected cells:", adata.shape, f"rep={rep}" if rep else "(eager)" if eager else "(dask)")
-        adata = embed(adata, rep, eager)
+        adata = embed(adata, rep, eager, p)
         print("stage: writing view store", flush=True)
-        write_view(adata, out, label)
+        write_view(adata, out, label, p)
         print(f"wall (load → pipeline → write): {time.perf_counter() - t0:.2f}s")
     return out
 
 
 def main():
-    run(data_pth, SELECTION_FILE, VIEW_STORE, method=METHOD)
+    run(data_pth, SELECTION_FILE, VIEW_STORE)
 
 
 if __name__ == "__main__":

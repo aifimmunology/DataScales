@@ -1,11 +1,14 @@
-import { type Level, colorForCode } from '../lib/zarrData'
-import { panel, control, label, rgb } from '../lib/styles'
+import { type Level, type RGB, colorForCode, UNLABELED_CODE, UNLABELED_SWATCH } from '../lib/zarrData'
+import { panel, label, rgb } from '../lib/styles'
+import ComboBox from './ComboBox'
 
 type Props = {
   levels: string[] // label sets discovered in the store (per group)
+  labelFor: (level: string) => string
   level: Level
   onLevelChange: (level: Level) => void
   categories: string[] | null
+  unlabeled: boolean // the active label set leaves some cells without a category
   selected: Set<number> // category codes currently cluster-selected
   onCategoryClick: (code: number) => void
   error: string | null
@@ -14,22 +17,18 @@ type Props = {
 
 // Top-right overlay: pick which label set colors the UMAP + show the key.
 // Clicking a key row toggles selecting every cell of that category (cluster select).
-export default function Legend({ levels, level, onLevelChange, categories, selected, onCategoryClick, error, onRetry }: Props) {
+// Unlabeled cells draw gray on the plot but get a black key row so they can be selected too.
+export default function Legend({ levels, labelFor, level, onLevelChange, categories, unlabeled, selected, onCategoryClick, error, onRetry }: Props) {
   if (levels.length === 0) return null
   return (
     <div style={panelStyle}>
       <label style={label}>Color by</label>
-      <select
+      <ComboBox
+        options={levels.map(l => ({ value: l, label: labelFor(l) }))}
         value={level}
-        onChange={e => onLevelChange(e.target.value as Level)}
-        style={control}
-      >
-        {levels.map(l => (
-          <option key={l} value={l}>
-            {l}
-          </option>
-        ))}
-      </select>
+        placeholder="search columns…"
+        onPick={v => onLevelChange(v as Level)}
+      />
 
       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
         {error ? (
@@ -43,27 +42,33 @@ export default function Legend({ levels, level, onLevelChange, categories, selec
         ) : categories === null ? (
           <span style={{ color: '#888', fontSize: 12 }}>Loading…</span>
         ) : (
-          categories.map((name, code) => (
-            <div
-              key={name}
-              onClick={() => onCategoryClick(code)}
-              title="click to select these cells"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                cursor: 'pointer',
-                padding: '1px 4px',
-                borderRadius: 3,
-                background: selected.has(code) ? '#3a3411' : 'transparent',
-              }}
-            >
-              <span style={{ ...swatchStyle, background: rgb(colorForCode(code)) }} />
-              <span style={{ fontSize: 12, color: selected.has(code) ? '#ffe94d' : '#ddd' }}>{name}</span>
-            </div>
-          ))
+          <>
+            {categories.map((name, code) => (
+              <Row key={name} name={name} color={colorForCode(code)} active={selected.has(code)} onClick={() => onCategoryClick(code)} />
+            ))}
+            {unlabeled && (
+              <Row
+                name="unlabeled"
+                color={UNLABELED_SWATCH}
+                active={selected.has(UNLABELED_CODE)}
+                onClick={() => onCategoryClick(UNLABELED_CODE)}
+                title="click to select every cell without a label"
+              />
+            )}
+          </>
         )}
       </div>
+    </div>
+  )
+}
+
+type RowProps = { name: string; color: RGB; active: boolean; onClick: () => void; title?: string }
+
+function Row({ name, color, active, onClick, title = 'click to select these cells' }: RowProps) {
+  return (
+    <div onClick={onClick} title={title} style={{ ...rowStyle, background: active ? '#3a3411' : 'transparent' }}>
+      <span style={{ ...swatchStyle, background: rgb(color) }} />
+      <span style={{ fontSize: 12, color: active ? '#ffe94d' : '#ddd' }}>{name}</span>
     </div>
   )
 }
@@ -76,6 +81,16 @@ const panelStyle: React.CSSProperties = {
   zIndex: 20, // above the lasso svg overlay
   maxHeight: 'calc(100vh - 24px)',
   overflowY: 'auto',
+  minWidth: 180,
+}
+
+const rowStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  cursor: 'pointer',
+  padding: '1px 4px',
+  borderRadius: 3,
 }
 
 const swatchStyle: React.CSSProperties = {

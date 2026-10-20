@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { fetchJobs, type GpuHealth, type Job } from '../lib/api'
+import { describeParams } from '../lib/runSettings'
 import { DIVIDER, panel } from '../lib/styles'
 
 const STATUS: Record<Job['status'], { icon: string; color: string }> = {
@@ -79,6 +80,7 @@ export default function RunsPanel({ refresh, onViewReady, onActiveChange, health
               <span style={{ color: STATUS[j.status].color }}>{STATUS[j.status].icon}</span>
               <span style={{ color: '#ddd' }}>{j.name || `#${j.id}`}</span>
               <span>{j.cells.toLocaleString()} cells</span>
+              {j.params && <span title="run parameters">— {describeParams(j.params)}</span>}
               {(j.status === 'running' || j.status === 'queued') && (
                 <span style={{ color: '#ffe94d' }}>{fmtElapsed(j.submitted_at)}</span>
               )}

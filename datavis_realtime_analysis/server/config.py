@@ -2,7 +2,6 @@
 
 LOCAL_DATA    AnnData zarr group on disk, served and written directly
 GCS_DATA      the same group in a bucket: alone it is the store, with LOCAL_DATA it is the mirror
-EMBED_METHOD  pca | latent | latent:<obsm key>; empty lets the pipeline pick per store
 """
 
 import os
@@ -46,5 +45,4 @@ if GCS and not GCS.gcs:
 
 SOURCE = LOCAL or GCS
 MIRROR = GCS if LOCAL and GCS else None
-EMBED_METHOD = os.environ.get("EMBED_METHOD", "")
 MAX_JOBS = 50

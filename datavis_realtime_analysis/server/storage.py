@@ -5,6 +5,7 @@ Missing objects must 404 (zarrita reads a 404 as "chunk is all fill-value").
 HEAD + Range are required: zarrita reads sharded arrays via partial requests.
 """
 
+import hashlib
 import json
 import re
 import shutil
@@ -18,6 +19,7 @@ from fastapi.responses import FileResponse, Response
 from .config import MIRROR, SOURCE, Location
 
 MIRROR_THREADS = 16
+EAGER_BYTES = 8 << 20  # whole-file reads under this size: a label save swapping the file can't break them
 
 _client = None
 _client_lock = threading.Lock()
@@ -75,7 +77,24 @@ def serve(path: str, request: Request):
         ok = False
     if not ok:
         raise HTTPException(404, "Not found")
-    return FileResponse(file, media_type=_media_type(path))
+    try:
+        st = file.stat()
+    except FileNotFoundError:
+        raise HTTPException(404, "Not found")
+    headers = {"ETag": _etag(st), "Cache-Control": "no-cache"}
+    if headers["ETag"] in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers=headers)
+    if st.st_size <= EAGER_BYTES and "range" not in request.headers:
+        try:
+            return Response(file.read_bytes(), media_type=_media_type(path), headers=headers)
+        except FileNotFoundError:
+            raise HTTPException(404, "Not found")
+    return FileResponse(file, media_type=_media_type(path), headers=headers, stat_result=st)
+
+
+def _etag(st) -> str:
+    """Labelset saves rewrite files in place, so every read revalidates against mtime+size."""
+    return f'"{hashlib.md5(f"{st.st_mtime_ns}-{st.st_size}".encode(), usedforsecurity=False).hexdigest()}"'
 
 
 def _download(loc: Location, rel: str, start=None, end=None) -> bytes:
@@ -110,7 +129,7 @@ def _gcs_response(path: str, request: Request) -> Response:
         else:
             start, end = int(rng[1]), int(rng[2]) if rng[2] else None
 
-    headers = {"Accept-Ranges": "bytes"}
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-cache"}
     if start is not None:
         payload = _download(SOURCE, path, start=start, end=end)
         if start >= 0:
@@ -143,10 +162,10 @@ def read_attrs(rel: str) -> dict:
 
 
 def delete_prefix(rel: str) -> int:
-    n = _delete_gcs_prefix(SOURCE, rel) if SOURCE.gcs else _delete_local_prefix(rel)
+    """Mirror first: if it fails, the local copy is still listed and the delete can be retried."""
     if MIRROR:
         _delete_gcs_prefix(MIRROR, rel)
-    return n
+    return _delete_gcs_prefix(SOURCE, rel) if SOURCE.gcs else _delete_local_prefix(rel)
 
 
 def _delete_local_prefix(rel: str) -> int:
@@ -172,10 +191,14 @@ def _delete_gcs_prefix(loc: Location, rel: str) -> int:
 
 
 def mirror(*rels: str) -> int:
-    """Copy local files or directories at `rels` to MIRROR; blocks, raises MirrorError."""
+    """Copy local files or directories at `rels` to MIRROR; blocks, raises MirrorError.
+    Chunks go before metadata, deepest zarr.json first, so a bucket reader never finds
+    a node whose data hasn't landed."""
     if MIRROR is None:
         return 0
     files = [f for rel in rels for f in _local_files(rel)]
+    chunks = [f for f in files if f.name != "zarr.json"]
+    metas = sorted((f for f in files if f.name == "zarr.json"), key=lambda f: -len(f.parts))
     try:
         b = bucket(MIRROR)
 
@@ -184,10 +207,28 @@ def mirror(*rels: str) -> int:
             b.blob(MIRROR.key(rel)).upload_from_filename(str(f), content_type=_media_type(rel))
 
         with ThreadPoolExecutor(MIRROR_THREADS) as pool:
-            list(pool.map(upload, files))
+            list(pool.map(upload, chunks))
+        for f in metas:
+            upload(f)
     except Exception as e:
         raise MirrorError(f"{len(files)} files -> {MIRROR.uri}: {e}") from e
     return len(files)
+
+
+def remirror(rel: str) -> int:
+    """Replace MIRROR's copy of the local directory `rel`: upload, then drop objects it no longer has."""
+    if MIRROR is None:
+        return 0
+    n = mirror(rel)
+    keep = {MIRROR.key(f.relative_to(_LOCAL_ROOT).as_posix()) for f in _local_files(rel)}
+    try:
+        stale = [blob for blob in bucket(MIRROR).list_blobs(prefix=MIRROR.key(rel).rstrip("/") + "/")
+                 if blob.name not in keep]
+        for blob in stale:
+            blob.delete()
+    except Exception as e:
+        raise MirrorError(f"pruning {MIRROR.uri}/{rel}: {e}") from e
+    return n
 
 
 def _local_files(rel: str) -> list[Path]:
