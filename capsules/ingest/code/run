@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Code Ocean entrypoint. App-panel parameters arrive positionally; an empty value keeps the
+# environment variable or default (see ingest/.env.example).
+#   1  samples            comma-separated .h5/.h5ad paths, or one directory of them
+#   2  store              icechunk repo (data asset, local path, s3://bucket/prefix) or a .zarr path
+#   3  origin             writable s3://bucket/prefix behind a read-only icechunk data asset
+#   4  celltypist models  model names in code/models (default: AIFI L1, L2, L3) or .pkl paths, comma-separated
+#   5  create             true to start a new store at the store path
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/ingest"
+exec python -u main.py --samples "${1:-}" --store "${2:-}" --origin "${3:-}" \
+    --celltypist-models "${4:-}" --create "${5:-}"

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+apt-get update
+apt-get install -y --no-install-recommends g++
+rm -rf /var/lib/apt/lists/*
+pip3 install --no-cache-dir "annoy==1.17.3" "scrublet==0.2.3"
+
+curl -fsSL https://claude.ai/install.sh | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc

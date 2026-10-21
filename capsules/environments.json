@@ -1,10 +1,24 @@
 {
   "about": [
-    "Source of truth for each capsule's environment. Code Ocean does not read this file.",
-    "Copy a capsule's pip3 list into installers.pip3.packages, and its apt list into installers.apt.packages, of that capsule's .codeocean/environment.json (or enter them on its environment page), then rebuild.",
-    "Change this file first, in the same PR as the environment.json edits. Packages under 'core' must keep identical versions in every capsule, because all four read and write the same store. Each capsule's pip3 list is 'core' followed by its own packages.",
-    "process also has a post_install command: run it in that capsule's environment/postInstall, because torch must come from PyTorch's CUDA 12.9 index (see spec \u00a77.2)."
+    "Source of truth for every capsule's environment. Code Ocean does not read this file.",
+    "Run ./build_env.py to write each capsule's .codeocean/environment.json (the environment page) and environment/postInstall from it, then ./mirror.sh <capsule> to copy them into a capsule checkout.",
+    "A capsule's pip3 list is 'core' followed by its own packages. 'core' versions are identical everywhere, because all four capsules read and write the same store.",
+    "post_install lines run in environment/postInstall, after the page's pip packages: ingest compiles annoy there (it needs g++ and has no wheel), and process installs torch from PyTorch's CUDA 12.9 index (spec section 7.2). common.post_install runs last in every capsule."
   ],
+  "common": {
+    "base_image": "codeocean/mambaforge3:24.5.0-0-python3.12.4-ubuntu22.04",
+    "options": {"registry_host_arg": true, "git_ask_pass": true, "mount_secrets": true},
+    "vscode": {"version": "4.100.3", "packages": [
+      {"name": "ms-python.python", "version": "2025.14.0"},
+      {"name": "ms-toolsai.jupyter", "version": "2025.4.1"},
+      {"name": "reditorsupport.r", "version": "2.8.6"},
+      {"name": "saoudrizwan.claude-dev", "version": "3.35.1"}
+    ]},
+    "post_install": [
+      "curl -fsSL https://claude.ai/install.sh | bash",
+      "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc"
+    ]
+  },
   "core": [
     {"name": "annizarr", "version": "0.2.3"},
     {"name": "icechunk", "version": "2.3.0"},
@@ -21,42 +35,21 @@
   "capsules": {
     "ingest": {
       "pip3": [
-        {"name": "annizarr", "version": "0.2.3"},
-        {"name": "icechunk", "version": "2.3.0"},
-        {"name": "boto3", "version": "1.43.114"},
-        {"name": "zarr", "version": "3.4.1"},
-        {"name": "anndata", "version": "0.13.4"},
-        {"name": "numpy", "version": "2.4.6"},
-        {"name": "pandas", "version": "3.0.6"},
-        {"name": "scipy", "version": "1.18.1"},
-        {"name": "h5py", "version": "3.16.0"},
-        {"name": "awscli", "version": "1.46.1"},
-        {"name": "pytest", "version": "9.1.1"},
         {"name": "scanpy", "version": "1.12.4"},
-        {"name": "scrublet", "version": "0.2.3"},
-        {"name": "annoy", "version": "1.17.3"},
         {"name": "celltypist", "version": "1.7.1"},
         {"name": "leidenalg", "version": "0.12.0"},
         {"name": "igraph", "version": "1.0.0"},
         {"name": "umap-learn", "version": "0.5.12"}
       ],
-      "apt": [
-        {"name": "g++", "reason": "annoy ships no wheel and compiles at install"}
+      "post_install": [
+        "apt-get update",
+        "apt-get install -y --no-install-recommends g++",
+        "rm -rf /var/lib/apt/lists/*",
+        "pip3 install --no-cache-dir \"annoy==1.17.3\" \"scrublet==0.2.3\""
       ]
     },
     "qc_check": {
       "pip3": [
-        {"name": "annizarr", "version": "0.2.3"},
-        {"name": "icechunk", "version": "2.3.0"},
-        {"name": "boto3", "version": "1.43.114"},
-        {"name": "zarr", "version": "3.4.1"},
-        {"name": "anndata", "version": "0.13.4"},
-        {"name": "numpy", "version": "2.4.6"},
-        {"name": "pandas", "version": "3.0.6"},
-        {"name": "scipy", "version": "1.18.1"},
-        {"name": "h5py", "version": "3.16.0"},
-        {"name": "awscli", "version": "1.46.1"},
-        {"name": "pytest", "version": "9.1.1"},
         {"name": "scanpy", "version": "1.12.4"},
         {"name": "leidenalg", "version": "0.12.0"},
         {"name": "igraph", "version": "1.0.0"},
@@ -64,41 +57,16 @@
         {"name": "pyarrow", "version": "26.0.0"},
         {"name": "matplotlib", "version": "3.11.2"},
         {"name": "seaborn", "version": "0.13.2"}
-      ],
-      "apt": []
+      ]
     },
     "qc_apply": {
       "pip3": [
-        {"name": "annizarr", "version": "0.2.3"},
-        {"name": "icechunk", "version": "2.3.0"},
-        {"name": "boto3", "version": "1.43.114"},
-        {"name": "zarr", "version": "3.4.1"},
-        {"name": "anndata", "version": "0.13.4"},
-        {"name": "numpy", "version": "2.4.6"},
-        {"name": "pandas", "version": "3.0.6"},
-        {"name": "scipy", "version": "1.18.1"},
-        {"name": "h5py", "version": "3.16.0"},
-        {"name": "awscli", "version": "1.46.1"},
-        {"name": "pytest", "version": "9.1.1"},
         {"name": "pyarrow", "version": "26.0.0"}
-      ],
-      "apt": []
+      ]
     },
     "process": {
-      "base_image": "a Code Ocean CUDA 12 GPU environment with Python 3.12; host NVIDIA driver >= 525.60.13 (>= 550 preferred)",
-      "post_install": "pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu129 \"torch==2.13.0+cu129\" \"scvi-tools==1.5.1\" \"lightning==2.6.6\" \"torchmetrics==1.9.0\" \"scikit-misc==0.5.3\"",
+      "base_image": "",
       "pip3": [
-        {"name": "annizarr", "version": "0.2.3"},
-        {"name": "icechunk", "version": "2.3.0"},
-        {"name": "boto3", "version": "1.43.114"},
-        {"name": "zarr", "version": "3.4.1"},
-        {"name": "anndata", "version": "0.13.4"},
-        {"name": "numpy", "version": "2.4.6"},
-        {"name": "pandas", "version": "3.0.6"},
-        {"name": "scipy", "version": "1.18.1"},
-        {"name": "h5py", "version": "3.16.0"},
-        {"name": "awscli", "version": "1.46.1"},
-        {"name": "pytest", "version": "9.1.1"},
         {"name": "rapids-singlecell-cu12", "version": "0.18.1"},
         {"name": "cudf-cu12", "version": "26.10.0"},
         {"name": "cuml-cu12", "version": "26.10.0"},
@@ -110,7 +78,10 @@
         {"name": "scanpy", "version": "1.12.4"},
         {"name": "matplotlib", "version": "3.11.2"}
       ],
-      "apt": []
+      "post_install": [
+        "pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu129 \"torch==2.13.0+cu129\" \"scvi-tools==1.5.1\" \"lightning==2.6.6\" \"torchmetrics==1.9.0\" \"scikit-misc==0.5.3\""
+      ],
+      "base_image_note": "a Code Ocean CUDA 12 GPU image with Python 3.12; host NVIDIA driver >= 525.60.13 (>= 550 preferred). Set base_image to its name before generating."
     }
   }
 }

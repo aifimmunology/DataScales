@@ -1,0 +1,111 @@
+{
+	"version": 1,
+	"base_image": "codeocean/mambaforge3:24.5.0-0-python3.12.4-ubuntu22.04",
+	"post_install": true,
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true,
+		"mount_secrets": true
+	},
+	"installers": {
+		"pip3": {
+			"packages": [
+				{
+					"name": "annizarr",
+					"version": "0.2.3"
+				},
+				{
+					"name": "icechunk",
+					"version": "2.3.0"
+				},
+				{
+					"name": "boto3",
+					"version": "1.43.114"
+				},
+				{
+					"name": "zarr",
+					"version": "3.4.1"
+				},
+				{
+					"name": "anndata",
+					"version": "0.13.4"
+				},
+				{
+					"name": "numpy",
+					"version": "2.4.6"
+				},
+				{
+					"name": "pandas",
+					"version": "3.0.6"
+				},
+				{
+					"name": "scipy",
+					"version": "1.18.1"
+				},
+				{
+					"name": "h5py",
+					"version": "3.16.0"
+				},
+				{
+					"name": "awscli",
+					"version": "1.46.1"
+				},
+				{
+					"name": "pytest",
+					"version": "9.1.1"
+				},
+				{
+					"name": "scanpy",
+					"version": "1.12.4"
+				},
+				{
+					"name": "leidenalg",
+					"version": "0.12.0"
+				},
+				{
+					"name": "igraph",
+					"version": "1.0.0"
+				},
+				{
+					"name": "umap-learn",
+					"version": "0.5.12"
+				},
+				{
+					"name": "pyarrow",
+					"version": "26.0.0"
+				},
+				{
+					"name": "matplotlib",
+					"version": "3.11.2"
+				},
+				{
+					"name": "seaborn",
+					"version": "0.13.2"
+				}
+			],
+			"options": {},
+			"pre_install_options": {}
+		},
+		"vscode": {
+			"packages": [
+				{
+					"name": "ms-python.python",
+					"version": "2025.14.0"
+				},
+				{
+					"name": "ms-toolsai.jupyter",
+					"version": "2025.4.1"
+				},
+				{
+					"name": "reditorsupport.r",
+					"version": "2.8.6"
+				},
+				{
+					"name": "saoudrizwan.claude-dev",
+					"version": "3.35.1"
+				}
+			],
+			"version": "4.100.3"
+		}
+	}
+}

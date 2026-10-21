@@ -1,0 +1,9 @@
+/data/
+/results/
+/scratch/
+.vscode
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+code/DataScales/
+code/standardized_notebooks/

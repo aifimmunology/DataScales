@@ -44,7 +44,8 @@ per-user permissions.
 | 03 dataset QC | `qc_check` | Same idea: downsample, then HVG/PCA/UMAP/leiden on CPU, plus grouped plots |
 | 05 apply QC filters | `qc_check` + `qc_apply` | Same rules and order; see the table below |
 | 10 rapids GPU analysis | `process` | Same steps and defaults, as a capsule |
-| 02 ambient RNA, 06–09 | — | Not covered (§4.8) |
+| 02 ambient RNA | `qc_check` | Detection only (§4.5); correction needs raw droplets, not in v1 |
+| 06–09 | — | Not covered (§4.9) |
 
 Deliberate differences from notebook 05:
 
@@ -53,7 +54,7 @@ Deliberate differences from notebook 05:
 | Column names | `pct_counts_mito`, `predicted_doublet` | the store's `pct_counts_mt`, `predicted_doublets` |
 | Gene count | prefers `n_genes` if present | always `n_genes_by_counts`; the store's `n_genes` is a different HISE field |
 | Scrublet NA | dropped (`== False` is false for NA) | **kept**, and counted per sample as "doublet status unknown" |
-| Per-cell-type thresholds | none | optional overrides (§4.5), off by default |
+| Per-cell-type thresholds | none | optional overrides (§4.6), off by default |
 
 The default thresholds (`min_genes 200`, `max_genes 5000`, `max_mito 10`) are **PBMC defaults**.
 
@@ -64,14 +65,16 @@ The default thresholds (`min_genes 200`, `max_genes 5000`, `max_mito 10`) are **
 ```
 capsules/
 ├── spec.md                 this file
-├── environments.json       every capsule's packages (§7.2)
+├── environments.json       every capsule's environment (§7.2)
+├── build_env.py            writes each capsule's environment.json + postInstall from it
+├── mirror.sh               copies a capsule's code and environment files into a capsule checkout
 ├── ingest/                 ┐
 ├── qc_check/               │ each folder is one complete capsule root
 ├── qc_apply/               │
 └── process/                ┘
     ├── code/               run (entrypoint), <package>/, tests/
-    ├── environment/        postInstall (and the Dockerfile Code Ocean generates)
-    ├── .codeocean/         environment.json (the environment page), resources.json
+    ├── environment/        postInstall (generated); Code Ocean generates its own Dockerfile
+    ├── .codeocean/         environment.json (the environment page, generated), resources.json
     ├── metadata/
     └── .gitignore
 ```
@@ -125,7 +128,7 @@ Written per sample by the ingest:
 | Total UMIs | `total_counts` | float64 |
 | Mito % | `pct_counts_mt` | float64 |
 | Doublet score / call | `scrublet_score`, `predicted_doublets` | float64 / Int64. NA = Scrublet failed or found no threshold |
-| Cell-type label | `celltypist_label`, `celltypist_prob`, `celltypist_model` | categorical / float64 / categorical |
+| Cell-type labels | `<model>_label`, `<model>_prob` per CellTypist model; by default `pbmc_clean_AIFI_L1_2024`, `_L2_2024`, `_L3_2024` | categorical / float64 |
 | Hashing / ADT QC (report only) | `hto_category` (multiplexed pools), `adt_qc_flag` (CITE-seq) | categorical. Empty for samples without hashing or CITE-seq |
 
 Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` or `obsm/X_scVI` (if integrated), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/process`.
@@ -149,26 +152,38 @@ Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` or `obsm/
 
 ---
 
-## 3. `ingest` — append samples only
+## 3. `ingest` — append samples only (built)
 
-### 3.1 What changes from today
-- **Removed:**
-  - all whole-store analysis: `derive.py`, `run_derived`, `working_copy`, `write_derived`;
-  - `leiden` from the schema;
-  - `n_clusters` from the summary;
-  - creating the `lognorm` layer (`ensure_layer`).
-- **Kept:**
-  - per sample: read → QC metrics → CellTypist → Scrublet → project to the contract → append;
-  - all appends staged on one `Repo` with `commit=False` and committed once per run;
-  - the bootstrap seed commit on a new store.
-- **Effect:** memory is set by the largest single sample, since annizarr streams the append. `main` holds only X (raw counts), obs and var, with no derived elements, so `append` never needs `drop_derived` or `extend_layers`.
-- **Scrublet:** when it finds no threshold, `predicted_doublets` is NA and the scores are kept. This is done, and tested.
+The source is `capsules/ingest/`. `capsules/mirror.sh ingest` copies its `code/` into a capsule checkout (`/root/capsule/code`), so the capsule keeps working once this repo is gone. The README there describes it in full.
 
-### 3.2 Outputs
+### 3.1 What it does
+- **Store:** an icechunk repo (one commit per run, plus a seed commit when a run creates the store), or a path ending in `.zarr` for a plain AnnData zarr appended in place.
+- **Per sample, one in memory at a time:** read (HISE / 10x / h5ad), QC metrics, CellTypist, Scrublet, project onto the contract, stage as a zarr. Samples with no cells are skipped with a warning.
+- **The store is touched only after every sample is staged,** so a failing sample leaves either kind unchanged.
+  - On icechunk, a failed append discards the run.
+  - A plain zarr can't roll back, which the README states.
+- **`main` holds only X (raw counts), obs and var.** There is no whole-store analysis, so memory depends on the largest sample.
+- **Scrublet:** NA calls when it fails or finds no threshold; scores are kept when it only finds no threshold.
+- **Create:** explicit.
+  - It refuses a path that already holds a store, and a non-empty folder that isn't one.
+  - An empty repo left by a failed create run can be reused.
+- **Read-only locations are refused before any work:** an icechunk repo without an `origin`, or an unwritable zarr.
+
+### 3.2 App panel
+`samples`, `store`, `origin`, `celltypist models`, `create`. Every other setting is an environment variable named after its `Settings` field, in upper case.
+
+### 3.3 Outputs
 - **The commit on `main`:** its metadata records `pipeline`, `annizarr` version, `appended_samples`, `n_cells` and `n_samples`.
 - **`/results`:**
-  - `ingest_summary.csv`, per sample: cells, mean genes, mean mito %, doublets, whether Scrublet scored it, number of cell types, model;
-  - `ingest_run.json`.
+  - `ingest_summary.csv`, per appended sample: cells, mean genes, mean mito %, doublets, whether Scrublet scored it, number of cell types, model;
+  - `ingest_run.json`: store, kind, snapshot ids, appended samples, totals, annizarr version, peak memory, settings.
+
+### 3.4 Verified
+- 57 tests: unit tests, plus end-to-end runs on both store kinds covering mixed inputs, CellTypist (a locally trained model) and Scrublet, failure and rerun semantics, read-only and create guards, and config parsing.
+- The five real B092 samples (127,800 cells) on both kinds, with Scrublet. Stored counts, barcodes and HISE obs match each source file exactly, and the icechunk history is one commit per run.
+- The bundled AIFI L1/L2/L3 models on real samples: labels and probabilities identical to running CellTypist directly, as `06-label_h5s.py` does.
+- **CellTypist:** several models per store (default AIFI L1, L2, L3, bundled in `code/models` with a `SOURCE.json` of commit and checksums), columns `<model>_label` / `<model>_prob`. The model set is part of the schema.
+- **HISE layouts:** tenx-scrna-pipeline's observation names (`Batch`, `Pool`, `Chip`, `uuid`, …) are mapped onto the older HISE ones; labels already in a file are recomputed.
 
 ---
 
@@ -178,11 +193,11 @@ Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` or `obsm/
 | # | Parameter | Default | Notes |
 |---|---|---|---|
 | 1 | input | — | icechunk repo (reads `main`) or plain zarr |
-| 2 | decisions | *(none)* | A `qc_decisions.json` (attached data asset). None → defaults, plus the decisions on the curation branch (§4.6) |
-| 3 | branch | `qc` | icechunk only: the curation branch whose decisions are carried forward (§4.6) |
+| 2 | decisions | *(none)* | A `qc_decisions.json` (attached data asset). None → defaults, plus the decisions on the curation branch (§4.7) |
+| 3 | branch | `qc` | icechunk only: the curation branch whose decisions are carried forward (§4.7) |
 | 4 | group columns | `batch_id,pool_id,chip_id` | A column that's absent or has a single value is skipped |
-| 5 | per-cell-type QC | `false` | Optional in v1. Turns on §4.5 and the `cell_types` overrides |
-| 6 | label column | `celltypist_label` | Used only when per-cell-type QC is on |
+| 5 | per-cell-type QC | `false` | Optional in v1. Turns on §4.6 and the `cell_types` overrides |
+| 6 | label column | `pbmc_clean_AIFI_L1_2024_label` | Groups cells for the ambient indicator (§4.5) and, when on, per-cell-type QC (§4.6); any `<model>_label` column works |
 | 7 | compute missing metrics | `false` | Allow the X-based metrics fallback (§4.3) |
 
 The sample column is fixed to `sample_id`, the store's own column.
@@ -262,6 +277,7 @@ This file is the contract between `qc_check` and `qc_apply`.
     - Needs at least 5 samples.
     - The MAD has a floor of 5% of the median.
     - Fail % is never a flag input.
+  - `ambient:<set>`: a marker set at ≥ 1.5× the cohort median (§4.5).
 - **Plots** (PNG, Agg backend, dpi 120, figures closed after saving):
   - Box plots of genes, UMIs and mito % per sample, from quantiles of all cells, with threshold lines.
     - At most 50 samples per figure, as pages.
@@ -280,49 +296,76 @@ This follows notebook 03: a small, fixed-size embedding that shows batch structu
   - Cells of a sample are stored contiguously, so the sampling is **chunk-aware**: take the needed cells from one or two randomly chosen storage chunks per sample, instead of scattering reads across every chunk.
 - **Steps (scanpy, CPU):** `normalize_total(1e4)` → `log1p` → HVG (2,000, `seurat`) → `scale(max_value=10)` → PCA (50) → neighbors (15, 30 PCs) → UMAP → leiden (1.0).
 - **Plots:**
-  - UMAP coloured by sample, by each group column, by fail reason, and by `celltypist_label`;
+  - UMAP coloured by sample, by each group column, by fail reason, and by `pbmc_clean_AIFI_L1_2024_label`;
   - UMAP split by each group column, plus density maps (raw and mean-subtracted), as in notebook 03;
   - leiden composition per cluster, by sample and by each group column (batch mixing). A cluster made almost entirely of one sample or chip points to a batch effect, or to a sample-specific population.
 - **No batch correction, on purpose.** The embedding is meant to show batch effects as they are; Harmony or scVI here would hide exactly what the reviewer is looking for. Correction happens in `process`, on curated cells.
 - **Use:** report only. It helps decide whether `process` needs integration and on which column.
 
-### 4.5 Per-cell-type section (optional in v1)
+### 4.5 Ambient RNA indicator (on by default)
+This is **detection, not correction**: no counts are changed. Correction (SoupX, notebook 02) needs each sample's raw droplet matrix, which the store doesn't hold (§4.9). This step flags samples whose cells carry an unusual amount of another lineage's highly expressed transcripts, the typical signature of ambient RNA, so the reviewer can exclude them or give them stricter thresholds.
+
+- **Cells used:**
+  - the downsampled cells of §4.4, so no extra X reads;
+  - predicted doublets are left out, because a doublet shows another lineage's genes for its own reason;
+  - cells are grouped by the label column (parameter 6, default `pbmc_clean_AIFI_L1_2024_label`).
+- **Marker sets** (fixed in v1, PBMC). Each is measured in cells that shouldn't express it:
+
+  | Set | Genes | Measured in |
+  |---|---|---|
+  | `monocyte` | `LYZ`, `S100A8`, `S100A9` | T cell, B cell, NK cell |
+  | `hemoglobin` | `HBB`, `HBA1`, `HBA2` | every cell not labelled Erythrocyte |
+  | `immunoglobulin` | `IGKC`, `IGHM`, `IGLC2` | T cell, NK cell, Monocyte |
+
+- **Per sample, per set** (columns in `sample_qc.csv`):
+  - `ambient_<set>_pct`: the median, over those cells, of the set's share of each cell's UMIs, in %;
+  - `ambient_<set>_p90`: the 90th percentile;
+  - `ambient_<set>_ratio`: the median divided by the cohort's median.
+- **Flag** `ambient:<set>` when the ratio is **≥ 1.5**. It needs at least 5 samples, and is advisory like every other flag. A relative rule, because absolute levels depend on chemistry and tissue.
+- **Skipped,** with a warning in the summary, when the label column is absent or a set has none of its genes in `var`. A set missing only some genes uses the rest, and the report names the missing ones.
+- **Plots:** per-sample bars of each set's median, flagged samples first, with the 1.5× line; and a heatmap of the ratios (sets × samples).
+- **Measured on the five B092 samples:**
+  - monocyte-gene medians were 0.02–0.03% for four samples and 0.045% for SP02423 (1.8×);
+  - its hemoglobin and immunoglobulin ratios were about 1.5×;
+  - SP02423 also has the highest mito % and the fewest genes per cell, so all three sets would flag it and nothing else.
+
+### 4.6 Per-cell-type section (optional in v1)
 - **Off (default):** skipped silently.
 - **On, but the label column is absent:**
   - the section is skipped;
-  - a warning goes to the log and the top of `report_summary.txt`: *"No `celltypist_label` column; per-cell-type QC skipped. Re-ingest with CellTypist on, or set a label column."*;
+  - a warning goes to the log and the top of `report_summary.txt`: *"No `pbmc_clean_AIFI_L1_2024_label` column; per-cell-type QC skipped. Re-ingest with CellTypist on, or set a label column."*;
   - the run still succeeds.
 - **On, with labels** (`celltype_qc.csv`, plus plots):
   - per label: cell count, medians and MADs, per-rule fail %;
   - a heatmap of fail % per label × sample;
   - box plots of genes and mito % per label, with that label's effective thresholds;
-  - `celltypist_prob` per label.
+  - the label probability (`<model>_prob`) per label.
 - **Caveat:** labels are provisional and least reliable in low-quality cells. QC never changes labels.
 
-### 4.6 Incremental runs (icechunk)
+### 4.7 Incremental runs (icechunk)
 - **The curation branch (parameter 3, default `qc`) is the starting point,** if it exists. Its `uns/qc/decisions` (JSON string) supplies the decisions, and reviewed samples keep their entries.
 - **New samples on `main`** are flagged or accepted as described in §4.2.
 - **If a decisions file is passed:** it overrides key by key.
 - **The summary's first line says whether `qc` is current:** *"qc covers 3 of 5 samples on main (curated 2026-10-20 from 1CECHNKR); 2 new samples (1 flagged, pending: SP0010)."*
 
-### 4.7 Outputs (`/results`)
+### 4.8 Outputs (`/results`)
 ```
 qc_decisions.json      the effective decisions (edit and rerun, or hand to qc_apply)
 cell_qc.parquet        one row per cell in store order: sample (dict), qc_pass (bool),
                        qc_fail_reason (dict); plus the three metrics (float32) only if the
                        fallback computed them. zstd, ~1M-row groups
-sample_qc.csv          §4.3
-celltype_qc.csv        §4.5 (absent when skipped)
+sample_qc.csv          §4.3, plus the ambient columns of §4.5
+celltype_qc.csv        §4.6 (absent when skipped)
 embedding.parquet      the downsampled cells: row position, UMAP, leiden
-plots/samples/  plots/groups/  plots/embedding/  plots/celltypes/
+plots/samples/  plots/groups/  plots/embedding/  plots/ambient/  plots/celltypes/
 report_summary.txt     curation status, headline counts, warnings, flags, pending samples
 run.json
 ```
 - **`cell_qc.parquet`'s file metadata** holds the input fingerprint and the SHA-256 of the canonical `qc_decisions.json`.
 - **To feed `qc_apply`:** capture the reviewed run's results as a data asset.
 
-### 4.8 Not in v1
-- **Ambient RNA (notebook 02, SoupX):** it needs each sample's raw droplet matrix, which the store doesn't hold. If wanted, it belongs before or inside the ingest.
+### 4.9 Not in v1
+- **Ambient RNA correction (notebook 02, SoupX):** it needs each sample's raw droplet matrix, which the store doesn't hold. If wanted, it belongs before or inside the ingest. If it's added, estimate the contamination fraction with Scrublet's doublets left out (they inflate it), then re-score doublets on the corrected counts. §4.5 detects ambient RNA in the meantime.
 - **Ribosomal and hemoglobin %:** later. Adding them means a new ingest column and a backfill of existing cells.
 - **Adaptive per-sample thresholds:** cutoffs computed automatically from each sample's own distribution (e.g. median ± 3 MADs). No review is needed, but cutoffs differ per sample in ways that are harder to explain. v1 uses global thresholds plus overrides for flagged samples.
 - **Integration:** belongs to `process`, not QC.
@@ -441,7 +484,7 @@ Fixed in v1, with the notebook's values:
 
    The neighbor graph (`obsp`) isn't written in v1, because it's large and recomputable.
 9. **`/results`:**
-   - UMAP PNGs coloured by `leiden`, `sample_id`, the batch keys and `celltypist_label`;
+   - UMAP PNGs coloured by `leiden`, `sample_id`, the batch keys and `pbmc_clean_AIFI_L1_2024_label`;
    - `cluster_summary.csv` (cells per cluster, by sample);
    - `run.json` with per-step timings and peak GPU and host memory.
 
@@ -463,8 +506,36 @@ commit. The derived elements are replaced, and the previous result stays in the 
     - It's verified to carry X, obs, var, layers, obsm, varm, obsp and uns, from both a plain zarr and an icechunk branch.
     - `convert` refuses a store as input.
 
----|---|
-  | ingest | scanpy, scrublet, annoy (apt `g++` to compile it), celltypist |
+---
+
+## 7. Environments
+
+### 7.1 How a capsule's environment is built
+- **The environment page and `.codeocean/environment.json` are the same data.**
+- **Code Ocean generates `environment/Dockerfile` from it.** It has one `RUN pip3 install …` per installer, then `COPY postInstall` + `RUN /postInstall`. Its `# hash:` line is Code Ocean's own, so the Dockerfile is never edited by hand.
+- **Everything installs into the Docker image at build time,** into its conda Python. A change takes effect only after a rebuild.
+- **The page's pip packages install before `postInstall` runs.** Anything that needs a system package to build (annoy needs `g++`) goes in `postInstall`.
+- **Hand edits:** a changed `environment.json` (e.g. through a mirror or a subtree push) should show up on the page. Verify this on the first rebuild.
+
+### 7.2 One source, generated files: `capsules/environments.json`
+- **`environments.json` holds every environment once:**
+  - `common`: the base image, build options, VS Code extensions, and the Claude Code install;
+  - `core`: the pinned packages every capsule shares;
+  - `capsules.<name>`: each capsule's own `pip3` packages, `post_install` lines, and a `base_image` override (for `process`).
+- **`./build_env.py [name ...]` writes, for each capsule:**
+  - `capsules/<name>/.codeocean/environment.json`, in Code Ocean's own layout, with pip3 = `core` + the capsule's packages;
+  - `capsules/<name>/environment/postInstall`: the capsule's lines, then the common ones.
+
+  Both are generated; never edit them by hand. `process` is skipped until its `base_image` is set.
+- **`./mirror.sh <name> [/root/capsule]`** copies the capsule's `code/`, `.codeocean/environment.json`, `.codeocean/resources.json` and `environment/postInstall` into a capsule checkout. It leaves data assets, secrets, reference clones, and the Dockerfile alone.
+- **`core` versions are identical in every capsule,** because all four read and write the same store.
+- **Extras are listed explicitly.** `annizarr[icechunk]` = `annizarr` + `icechunk` + `boto3`.
+- **Transitive dependencies aren't locked.** A released image is built once and frozen; if a rebuild breaks, pin the offending package.
+- **What each capsule adds:**
+
+  | Capsule | Adds |
+  |---|---|
+  | ingest | scanpy, celltypist (+ leidenalg, igraph, umap-learn, which they need, pinned); `g++`, annoy, scrublet in `postInstall` |
   | qc_check | scanpy, leidenalg, igraph, umap-learn (downsampled embedding); pyarrow, matplotlib, seaborn |
   | qc_apply | pyarrow |
   | process | rapids-singlecell-cu12, cudf/cuml/cugraph/cuvs/rmm-cu12, dask-cuda, cupy-cuda12x, scanpy, matplotlib (page); torch + scvi-tools stack (`postInstall`) |
@@ -494,16 +565,16 @@ commit. The derived elements are replaced, and the previous result stays in the 
   - The pip wheels bring their own CUDA 12.9 runtime libraries, so the image's own CUDA toolkit version doesn't matter much.
   - The host **NVIDIA driver** must be at least 525.60.13 (the CUDA 12 minimum), and 550 or newer is preferred.
   - CUDA minor-version compatibility lets the 12.9 runtime run on older 12.x drivers, but JIT-compiled (PTX) kernels won't, so a newer driver avoids surprises.
-- **annizarr:** 0.2.3 from PyPI. It's published, imports on Python 3.12 (the `TypeIs` fix is in), and the ingest's 20 tests pass against it.
+- **annizarr:** 0.2.3 from PyPI. It's published, imports on Python 3.12 (the `TypeIs` fix is in), and the ingest's 57 tests pass against it with numpy 2.4.6.
 
 ### 7.4 Dev tooling (every image)
 - **On the page:** `pytest` (in `core`) and the VS Code extensions already listed.
-- **In `postInstall`:** only Claude Code, pinned: `curl -fsSL https://claude.ai/install.sh | bash -s <version>`.
+- **In `postInstall`:** Claude Code, from `common.post_install`, run last in every capsule.
 
 ### 7.5 Resource classes
 | Capsule | Class |
 |---|---|
-| ingest | `small`; it depends on the largest sample, not the store |
+| ingest | `small`; it depends on the largest sample, not the store. About 1 minute per 30k-cell sample with CellTypist and Scrublet |
 | qc_check | `small` up to about 1M cells; 16–32 GB around 10M. The embedding is fixed-size |
 | qc_apply | I/O-bound; give it cores rather than memory. Roughly 12 minutes per 1M cells from local disk, slower from S3 |
 | process | One GPU with ≥ 15 GB VRAM handled 5M cells in about 15 minutes in the notebook's benchmark; above about 13M cells, ≥ 30 GB VRAM. Host RAM must absorb the spill |
@@ -532,6 +603,7 @@ commit. The derived elements are replaced, and the previous result stays in the 
 - only the listed obs columns are read;
 - the plain-zarr fingerprint is stable, and changes when cells are added or obs is rewritten;
 - chunk-aware sampling reads at most two storage chunks per sample;
+- the ambient indicator: per-set medians on a synthetic store with known marker shares, doublets excluded, the 1.5× flag, the 5-sample minimum, and skipping with a warning when labels or genes are missing;
 - the embedding is deterministic for a seed;
 - the input is never written.
 
