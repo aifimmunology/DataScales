@@ -47,10 +47,6 @@
 					"version": "3.16.0"
 				},
 				{
-					"name": "awscli",
-					"version": "1.46.1"
-				},
-				{
 					"name": "pytest",
 					"version": "9.1.1"
 				},
@@ -61,18 +57,6 @@
 				{
 					"name": "celltypist",
 					"version": "1.7.1"
-				},
-				{
-					"name": "leidenalg",
-					"version": "0.12.0"
-				},
-				{
-					"name": "igraph",
-					"version": "1.0.0"
-				},
-				{
-					"name": "umap-learn",
-					"version": "0.5.12"
 				}
 			],
 			"options": {},
@@ -83,18 +67,6 @@
 				{
 					"name": "ms-python.python",
 					"version": "2025.14.0"
-				},
-				{
-					"name": "ms-toolsai.jupyter",
-					"version": "2025.4.1"
-				},
-				{
-					"name": "reditorsupport.r",
-					"version": "2.8.6"
-				},
-				{
-					"name": "saoudrizwan.claude-dev",
-					"version": "3.35.1"
 				}
 			],
 			"version": "4.100.3"
