@@ -7,7 +7,7 @@ each one on its own (QC metrics, CellTypist labels, Scrublet doublet scores), an
 cells to an [AnnData](https://anndata.readthedocs.io) store. The store is either an
 [Icechunk](https://icechunk.io) repository, where every run lands as one commit, or a plain
 AnnData `.zarr`. Nothing is filtered and nothing is computed across the whole store. QC
-thresholds, embeddings and clusters come later, from the `qc_check`, `qc_apply` and `process`
+thresholds, embeddings and clusters come later, from the `qc` and `process`
 capsules, on curated cells. All store operations go through
 [annizarr](https://pypi.org/project/annizarr/).
 
@@ -145,9 +145,10 @@ code/models/          the bundled CellTypist models and their SOURCE.json
 
 ## Environment
 
-Generated from `capsules/environments.json` by `capsules/build_env.py`; don't edit either file by hand.
-- **`.codeocean/environment.json`** is the environment page. It pins the shared core packages
-  plus scanpy, CellTypist and their compiled dependencies.
+Both files are edited by hand; the shared pins (annizarr, icechunk, zarr, anndata, numpy, …) match
+the other capsules' (spec §6.2).
+- **`.codeocean/environment.json`** is the environment page. It pins the shared packages plus
+  scanpy, CellTypist and their compiled dependencies.
 - **`environment/postInstall`** installs `g++` and then annoy and Scrublet, because annoy has no
   wheel and the page installs packages before `postInstall` runs. It ends with the Claude Code
   install shared by every capsule.
