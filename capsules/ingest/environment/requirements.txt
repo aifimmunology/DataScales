@@ -1,0 +1,13 @@
+annizarr==0.2.3
+icechunk==2.3.0
+boto3==1.43.114
+zarr==3.4.1
+anndata==0.13.4
+numpy==2.4.6
+pandas==3.0.6
+scipy==1.18.1
+h5py==3.16.0
+pytest==9.1.1
+scanpy==1.12.4
+celltypist==1.7.1
+scrublet==0.2.3

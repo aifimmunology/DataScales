@@ -239,3 +239,6 @@ __marimo__/
 
 # Keep raw benchmark-run JSONs in the findings dirs (overrides *0*.json above)
 !benchmarking_results/**/*.json
+
+# capsule pixi.toml files are kept without a lock
+capsules/**/pixi.lock
