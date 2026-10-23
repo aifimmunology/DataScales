@@ -1,0 +1,5 @@
+channels:
+  - conda-forge
+dependencies:
+  - gh=2.102.1
+  - python-annoy=1.17.3

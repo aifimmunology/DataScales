@@ -1,0 +1,26 @@
+# Same packages as requirements.txt and environment.yml, for use outside Code Ocean.
+# Code Ocean installs from the environment page; keep the three in step (see ../../README.md).
+[workspace]
+name = "datascales-ingest"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+python = "3.12.*"
+gh = "==2.102.1"
+python-annoy = "==1.17.3"
+
+[pypi-dependencies]
+annizarr = "==0.2.3"
+icechunk = "==2.3.0"
+boto3 = "==1.43.114"
+zarr = "==3.4.1"
+anndata = "==0.13.4"
+numpy = "==2.4.6"
+pandas = "==3.0.6"
+scipy = "==1.18.1"
+h5py = "==3.16.0"
+pytest = "==9.1.1"
+scanpy = "==1.12.4"
+celltypist = "==1.7.1"
+scrublet = "==0.2.3"

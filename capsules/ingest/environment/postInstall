@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prebuilt annoy (scrublet dependency) from conda-forge: no apt, no g++ compile.
-mamba install -y --freeze-installed -c conda-forge "python-annoy=1.17.3" "gh=2.102.1"
-mamba clean -afy
-pip3 install --no-cache-dir "scrublet==0.2.3"
-
 curl -fsSL https://claude.ai/install.sh | bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 echo 'export CLAUDE_CONFIG_DIR=/root/capsule/code/.claude' >> ~/.bashrc

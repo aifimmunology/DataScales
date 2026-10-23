@@ -70,14 +70,14 @@ capsules/
 ├── qc/                     │ each folder is one complete capsule root
 └── process/                ┘
     ├── code/               run (entrypoint), <package>/, tests/
-    ├── environment/        postInstall; Code Ocean generates its own Dockerfile
-    ├── .codeocean/         environment.json (the environment page), resources.json
+    ├── environment/        requirements.txt, environment.yml (if conda is needed), pixi.toml, postInstall
+    ├── .codeocean/         resources.json
     ├── metadata/
     └── .gitignore
 ```
 
 - **Development:** develop in a full DataScales clone (branch `codeocean_capsules`), where every capsule is visible side by side.
-- **Updating a capsule checkout during development:** copy the capsule's `code/` entries, its `.codeocean/environment.json` and `environment/postInstall`, and `.codeocean/resources.json` over their namesakes in the checkout (e.g. `/root/capsule`). Data assets, secrets, reference clones and the Dockerfile are left alone. No reset is needed; an environment change applies on the next restart (rebuild).
+- **Updating a capsule checkout during development:** copy the capsule's `code/` entries, `environment/postInstall` and `.codeocean/resources.json` over their namesakes in the checkout (e.g. `/root/capsule`), and load `requirements.txt` / `environment.yml` onto the page with **Edit Bulk**. Data assets, secrets, reference clones and the Dockerfile are left alone. No reset is needed; an environment change applies on the next restart (rebuild).
 - **Deployment:** each folder goes to its own capsule with `git subtree push --prefix=capsules/<name> co-<name> master`. Edits made inside Code Ocean come back with `git subtree pull`.
 - **Shared code:** there is no shared package. Each capsule depends on `annizarr` for store I/O and keeps its own copy of the few column names it needs (§2.2).
 - **Clutter:** inside the deployed capsules, git-ignore any reference clones (`code/DataScales/`, `code/standardized_notebooks/`).
@@ -532,12 +532,12 @@ commit. The derived elements are replaced, and the previous result stays in the 
 ## 6. Environments
 
 ### 6.1 How a capsule's environment is built
-- **Files, edited by hand.** Each capsule's environment is its own `.codeocean/environment.json` (the environment page; the two are the same data) and `environment/postInstall`. There is no generator.
-- **Code Ocean generates `environment/Dockerfile` from them.** It has one `RUN pip3 install …` per page installer, then `COPY postInstall` + `RUN /postInstall`. Its `# hash:` line is Code Ocean's own, so the Dockerfile is never edited by hand.
+- **Files, edited by hand.** Each capsule's packages are `environment/requirements.txt` (pip) and, when conda packages are needed, `environment/environment.yml`. They are loaded onto the environment page with the page's bulk editor (gear icon → **Edit Bulk**, paste or drop the file). `environment/postInstall` installs only Claude Code. The base image and VS Code extensions are set on the page. There is no generator.
+- **Code Ocean generates `environment/Dockerfile` from them.** It has one `RUN` per page installer, in this order: `conda install -y …` (conda-forge on the mambaforge image), `pip3 install -U …`, the VS Code extensions, then `COPY postInstall` + `RUN /postInstall`. Its `# hash:` line is Code Ocean's own, so the Dockerfile is never edited by hand.
 - **Only `postInstall` is copied into the build.** Nothing else from the capsule exists there, so anything it needs (e.g. a pinned package list) is written inside the script.
-- **Everything installs into the Docker image at build time.** A change takes effect only after a rebuild (a restart). The page's pip packages install before `postInstall` runs; anything that needs a system package to build (annoy needs `g++`) goes in `postInstall`.
+- **Everything installs into the Docker image at build time.** A change takes effect only after a rebuild (a restart). The page's packages install before `postInstall` runs. Prefer a prebuilt conda package over a pip source build: `annoy` has no Linux wheel, so it comes from conda (`python-annoy`) before pip installs scrublet, and no `g++` is needed.
 - **Same path, different storage.** A build installs into the image's Python (`/opt/conda` on the CPU image, `/opt/venv` on the GPU image) as read-only image layers. A `pip install` in a running capsule goes to the same path but lands in the container's writable layer: about 5 GB, reset every run, and absent from Reproducible Runs. So image size is not bounded by that 5 GB, and anything a capsule needs goes in its environment, never a runtime install or `/scratch`.
-- **Hand edits:** a changed `environment.json` (copied into the checkout or subtree-pushed) should show up on the page. Verify this on the first rebuild.
+- **Hand edits:** copying a changed `environment.json` into a running capsule's checkout does **not** change the page (verified 2026-10-22: the rebuild used the page, and the checkout file was overwritten). Make changes on the page, then update the capsule's `requirements.txt` / `environment.yml` to match (see `README.md`). The repo keeps no copy of `environment.json`.
 - **Getting them into a capsule:** copy them into the checkout as in §1, or subtree-push the capsule folder.
 
 ### 6.2 Packages
@@ -546,17 +546,17 @@ commit. The derived elements are replaced, and the previous result stays in the 
 
   | Capsule | Installed by | Adds |
   |---|---|---|
-  | ingest | page; `postInstall` | scanpy, celltypist (+ leidenalg, igraph, umap-learn, pinned); `g++`, annoy, scrublet in `postInstall` |
-  | qc | page | scanpy, leidenalg, igraph, umap-learn (downsampled embedding); pyarrow, matplotlib, seaborn |
-  | process | `postInstall` only | the full pinned list below |
+  | ingest | page (`requirements.txt`, `environment.yml`) | scanpy, celltypist, scrublet (pip); `python-annoy`, `gh` (conda) |
+  | qc | page (`requirements.txt`) | scanpy, leidenalg, igraph, umap-learn (downsampled embedding); pyarrow, matplotlib, seaborn |
+  | process | page (`requirements.txt`) | RAPIDS, torch and scvi-tools, pinned as below; squidpy, spatialdata, omnipath for the tutorial notebooks |
 
 - **CPU capsules:** transitive dependencies aren't locked. A released image is built once and frozen; if a rebuild breaks, pin the offending package on the page.
-- **`process`: CUDA 13, fully pinned, from PyPI only.**
-  - `process/environment/requirements.in` lists the top-level packages: the shared pins, RAPIDS 26.10 cu13 (`cudf`, `cuml`, `cugraph`, `cuvs`, `rmm`, `dask-cuda`), `rapids-singlecell-cu13 0.18.1`, `cupy-cuda13x`, scanpy, matplotlib, torch, `scvi-tools 1.5.1`, scikit-misc, ipykernel.
-  - Its first lines hold the `uv pip compile` command that pins it for Python 3.13 on x86-64 Linux, wheels only (except `docrep`, a pure-Python scvi-tools dependency with no wheel). The result, 205 packages (torch 2.14.1, CUDA toolkit wheels 13.0, numpy 2.4.6, dask 2026.7.1), is pasted into `postInstall`, which installs it with `uv pip install --python /opt/venv/bin/python --no-cache`.
-  - The target is explicit because the build shell may not have the terminal's `VIRTUAL_ENV`, and a bare `pip` would then install into the image's other Python (`/usr/local`).
-  - Nothing goes on the page, so one resolver run decides every version.
-  - **Not yet installed or run on a GPU.** After the first build, check `torch.cuda.get_arch_list()` includes `sm_75` (the T4) and `torch.cuda.is_available()`.
+- **`process`: CUDA 13, from PyPI only, on the page.**
+  - `process/environment/requirements.txt` pins exact versions of the shared pins, RAPIDS 26.10 cu13 (`cudf`, `cuml`, `cugraph`, `cuvs`, `rmm`, `dask-cuda`), `rapids-singlecell-cu13 0.18.1`, scanpy, matplotlib, torch, `scvi-tools 1.5.1`, scikit-misc and ipykernel. It also pins the CUDA-stack packages that must agree: `numba`, `numba-cuda`, `cupy-cuda13x`, `cuda-toolkit`, `dask` and `distributed`.
+  - Everything else is resolved at build time. On 2026-10-23 the list resolved (`uv pip compile`, Python 3.13, x86-64 Linux) to the same 205 packages as the earlier full lock.
+  - The page's `pip3` on this image is `/opt/venv/bin/pip3` (verified 2026-10-23), so page packages land in the venv the code runs in.
+  - **Built and working on the GPU capsule** (user-tested 2026-10-23, before the spatial packages were added). squidpy 1.8.3, spatialdata 0.8.0 and omnipath 1.0.12 resolve with the pins (247 packages); not yet built.
+  - **Tutorial notebooks** in `process/code/notebooks/`: `rapids_scrna_out_of_core_dask` and `rapids_spatial_atera_breast_cancer`, from rapids-singlecell's tutorials `06_out-of-core` and `08_atera_demo`, adapted for one T4. Interactive only, not App Panel runs. Each reads its input from a data asset and states the format it needs.
 - **numpy 2.4.6 everywhere:** cudf 26.10 needs `numba < 0.65`, and numba 0.64 supports only `numpy < 2.5`. The CPU capsules resolve with it too.
 
 ### 6.3 Base images
@@ -567,7 +567,7 @@ commit. The derived elements are replaced, and the previous result stays in the 
 - **annizarr:** 0.2.3 from PyPI. It imports on Python 3.12 (the `TypeIs` fix is in), and the ingest's 63 tests pass against it with numpy 2.4.6.
 
 ### 6.4 Dev tooling (every image)
-- **On the page:** `pytest` and the VS Code extensions (CPU capsules); `process` gets `pytest` from its pinned list.
+- **On the page:** `pytest` (every capsule's `requirements.txt`) and the VS Code extensions.
 - **In `postInstall`, last in every capsule:** Claude Code.
   - `postInstall` runs at image build time, before `/root/capsule` is mounted, so anything it writes under `/root/capsule` is hidden at runtime. The binary therefore installs to the image's `~/.local/bin`.
   - `~` is part of the image layer and is reset every run, so Claude Code's state (settings, history, sessions) goes to `CLAUDE_CONFIG_DIR=/root/capsule/code/.claude`, exported in `~/.bashrc`, on the persistent capsule volume. Git-ignore `code/.claude/` in a deployed capsule.
@@ -641,5 +641,5 @@ commit. The derived elements are replaced, and the previous result stays in the 
 
 ## 9. Open questions
 - **annizarr 0.2.4:** `subset(store, *, output, keep, branch, commit)` mirrors `rechunk`'s streaming copy with a row mask; `Repo.garbage_collect(older_than)` wraps icechunk's. Both keep the capsule free of store internals (no private `_writer_repo()`).
-- **First GPU run:** the CUDA 13 list resolves but hasn't been installed. The first `process` build needs a real test of torch and RAPIDS loading in the same environment on the T4, and of the scVI subprocess handoff.
-- **Using RAPIDS in other capsules:** the same `postInstall` could serve a capsule with its own environment by installing into a separate venv (`/opt/rapids`) with a Jupyter kernel. Untested whether Code Ocean exposes the GPU to a non-GPU base image.
+- **First GPU run:** the environment builds and works on the T4. Still to test: the scVI subprocess handoff, once `process` code exists.
+- **Using RAPIDS in other capsules:** a capsule with its own environment could install `process/environment/requirements.txt` into a separate venv (`/opt/rapids`) from `postInstall`, with a Jupyter kernel. Untested whether Code Ocean exposes the GPU to a non-GPU base image.
