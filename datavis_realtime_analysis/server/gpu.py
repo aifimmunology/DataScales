@@ -1,7 +1,6 @@
 """GPU jobs: in-memory queue and history, dispatched to a warm pipeline process
-(gpu/worker.py) that keeps imports + CUDA context between jobs and exits after
-WORKER_IDLE_S idle. Stage updates stream over the worker's stdout; the store only
-sees the finished view (mirrored to GCS_DATA when configured).
+(gpu/worker.py) that keeps imports + CUDA context between jobs. Stage updates stream
+over the worker's stdout; the store only sees the finished view (mirrored when configured).
 """
 
 import json
@@ -16,14 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
+from run_params import RunParams
 
 from . import storage
 from .config import MAX_JOBS, MIRROR, SOURCE, Location
-from .embedding import RunParams
 
 WORKER_SCRIPT = Path(__file__).resolve().parents[1] / "gpu" / "worker.py"
 PROBE_TTL_S = 60
-FINISHED = ("done", "failed", "cancelled")
+FINISHED = ("done", "failed")
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: queue.Queue = queue.Queue()
@@ -31,13 +30,6 @@ _worker_lock = threading.Lock()
 _worker_started = False
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
-
-
-class _Cancelled(Exception):
-    pass
-
-
-# ── worker process ─────────────────────────────────────────────────────────────
 
 
 def _pipeline_proc() -> subprocess.Popen:
@@ -65,27 +57,27 @@ def _send(req: dict) -> subprocess.Popen:
                 raise RuntimeError("pipeline worker won't start (docker compose logs backend)")
 
 
-def _run_gpu_job(job: dict, artifact: dict) -> None:
-    rid = job["id"]
-    sel = Path(f"/tmp/datavis_job_{rid}.json")
-    sel.write_text(json.dumps(artifact))
+def _follow(proc: subprocess.Popen, job: dict) -> None:
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"pipeline worker died (rc={proc.poll()})")
+        line = line.strip()
+        if line.startswith("stage: "):
+            job["stage"] = line[len("stage: "):]
+        elif line == f"done: {job['id']}":
+            return
+        elif line.startswith("error: "):
+            raise RuntimeError(line[len("error: "):])
+
+
+def _run_gpu_job(job: dict, barcodes: list[str]) -> None:
+    sel = Path(f"/tmp/datavis_job_{job['id']}.json")
+    sel.write_text(json.dumps({"barcodes": barcodes}))
     view = f"umap_views/{job['slug']}"
-    proc = _send({"id": rid, "store": SOURCE.uri, "selection": str(sel), "label": job["name"],
-                  "out": f"{SOURCE.uri}/{view}", "params": job["params"]})
     try:
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                if job["status"] == "cancelling":
-                    raise _Cancelled()
-                raise RuntimeError(f"pipeline worker died (rc={proc.poll()})")
-            line = line.strip()
-            if line.startswith("stage: "):
-                job["stage"] = line[len("stage: "):]
-            elif line == f"done: {rid}":
-                break
-            elif line.startswith("error: "):
-                raise RuntimeError(line[len("error: "):])
+        _follow(_send({"id": job["id"], "store": SOURCE.uri, "selection": str(sel), "label": job["name"],
+                       "out": f"{SOURCE.uri}/{view}", "params": job["params"]}), job)
     except BaseException:
         _discard(view)
         raise
@@ -100,7 +92,6 @@ def _run_gpu_job(job: dict, artifact: dict) -> None:
 
 
 def _discard(view: str) -> None:
-    """A failed or cancelled run leaves no partial view behind."""
     try:
         storage.delete_prefix(view)
     except Exception as e:
@@ -109,21 +100,16 @@ def _discard(view: str) -> None:
 
 def _worker() -> None:
     while True:
-        job_id, artifact = JOB_QUEUE.get()
+        job_id, barcodes = JOB_QUEUE.get()
         job = JOBS.get(job_id)
-        if job is None or job["status"] == "cancelled":
+        if job is None:
             continue
         job["status"] = "running"
         t0 = time.monotonic()
         try:
-            _run_gpu_job(job, artifact)
-            if job["status"] == "cancelling":
-                _discard(f"umap_views/{job['slug']}")
-                raise _Cancelled()
+            _run_gpu_job(job, barcodes)
             job["view"] = f"umap_views/{job['slug']}"
             job["stage"] = job["status"] = "done"
-        except _Cancelled:
-            job["stage"] = job["status"] = "cancelled"
         except Exception as e:
             job["stage"] = str(e)[:200]
             job["status"] = "failed"
@@ -139,26 +125,25 @@ def _ensure_worker() -> None:
             _worker_started = True
 
 
-# ── API ────────────────────────────────────────────────────────────────────────
-
-
 def _config_problem() -> str | None:
     return None if SOURCE else "no store configured: set LOCAL_DATA and/or GCS_DATA"
 
 
-def submit(artifact: dict) -> dict:
+def submit(payload: dict) -> dict:
+    """Queue a re-embedding of the cells named by payload["barcodes"]."""
     problem = _config_problem()
     if problem:
         raise HTTPException(400, problem)
+    barcodes = [str(b) for b in payload.get("barcodes") or []]
+    if not barcodes:
+        raise HTTPException(400, "empty selection")
     try:
-        params = RunParams.from_dict(artifact.get("params")).to_dict()
+        params = RunParams.from_dict(payload.get("params")).to_dict()
     except ValueError as e:
         raise HTTPException(400, str(e))
     job_id = uuid.uuid4().hex[:8]
-    cells = len(artifact.get("indices", []))
-    name = str(artifact.get("name") or f"view {job_id}").strip()[:60]
-    print(f"[submit] job {job_id} '{name}': {cells} cells, group '{artifact.get('group', '')}'",
-          file=sys.stderr, flush=True)
+    name = str(payload.get("name") or f"view {job_id}").strip()[:60]
+    print(f"[submit] job {job_id} '{name}': {len(barcodes)} cells", file=sys.stderr, flush=True)
     while len(JOBS) >= MAX_JOBS:
         victim = next((k for k, j in JOBS.items() if j["status"] in FINISHED), None)
         if victim is None:
@@ -166,37 +151,18 @@ def submit(artifact: dict) -> dict:
         del JOBS[victim]
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
     JOBS[job_id] = {
-        "id": job_id, "name": name, "slug": f"{slug}_{job_id}", "cells": cells,
-        "group": artifact.get("group", ""), "params": params,
+        "id": job_id, "name": name, "slug": f"{slug}_{job_id}", "cells": len(barcodes), "params": params,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "status": "queued", "stage": "queued", "view": None,
     }
     _ensure_worker()
-    JOB_QUEUE.put((job_id, artifact))
+    JOB_QUEUE.put((job_id, barcodes))
     return {"job_id": job_id, "status": "submitted"}
-
-
-def cancel(job_id: str) -> dict:
-    job = JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(404, "unknown job")
-    if job["status"] == "queued":
-        job["status"] = job["stage"] = "cancelled"
-    elif job["status"] == "running":
-        job["status"] = job["stage"] = "cancelling"
-        with _proc_lock:
-            if _proc is not None and _proc.poll() is None:
-                _proc.kill()
-    else:
-        raise HTTPException(409, f"job is {job['status']}")
-    return {"id": job_id, "status": job["status"]}
 
 
 def list_jobs() -> list[dict]:
     return list(JOBS.values())[::-1]
 
-
-# ── access probe: store, bucket credential, GPU visible in this container ──────
 
 _probe_lock = threading.Lock()
 _probe_state: dict = {"status": "checking", "checked_at": None}
@@ -221,11 +187,11 @@ def _verdict(status: str, problem: str | None = None, summary: str = "",
 
 
 def _probe_local() -> dict | None:
-    if SOURCE.gcs or (Path(SOURCE.root) / "zarr.json").is_file():
+    if SOURCE.gcs or (Path(SOURCE.uri) / "zarr.json").is_file():
         return None
     return _verdict("error", "store", f"No zarr group at LOCAL_DATA={SOURCE.uri} (zarr.json missing).",
                     "", ["check the /data volume mount in docker-compose.yml",
-                         "the scratch disk is wiped on stop/start: deploy/restage_store.sh"])
+                         "the scratch disk is wiped on stop/start: copy the store back to LOCAL_DATA"])
 
 
 def _probe_bucket(loc: Location, what: str) -> dict | None:
@@ -241,29 +207,29 @@ def _probe_bucket(loc: Location, what: str) -> dict | None:
                         s[-400:], _ADC_FIX)
 
 
-def _probe_nvidia() -> dict | None:
+def _probe_nvidia() -> tuple[dict | None, int]:
     try:
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
-        return _verdict("error", "gpu", "No GPU in this container (nvidia-smi missing).", "", _GPU_FIX)
+        return _verdict("error", "gpu", "No GPU in this container (nvidia-smi missing).", "", _GPU_FIX), 0
     except subprocess.TimeoutExpired:
-        return _verdict("error", "gpu", "nvidia-smi timed out.", "", _GPU_FIX)
+        return _verdict("error", "gpu", "nvidia-smi timed out.", "", _GPU_FIX), 0
     if r.returncode != 0:
-        return _verdict("error", "gpu", "The container cannot see a GPU.", (r.stderr or r.stdout)[-400:], _GPU_FIX)
-    return None
+        return _verdict("error", "gpu", "The container cannot see a GPU.", (r.stderr or r.stdout)[-400:], _GPU_FIX), 0
+    return None, len(r.stdout.strip().splitlines())
 
 
 def _probe() -> dict:
+    gpu_problem, n = _probe_nvidia()
     checks = [_probe_local()]
     if SOURCE.gcs:
         checks.append(_probe_bucket(SOURCE, "store"))
     if MIRROR:
         checks.append(_probe_bucket(MIRROR, "mirror"))
-    checks.append(_probe_nvidia())
+    checks.append(gpu_problem)
     failed = next((c for c in checks if c), None)
     if failed:
         return failed
-    n = len(subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.strip().splitlines())
     access = ("bucket store" if SOURCE.gcs else "local store") + (" + GCS mirror" if MIRROR else "")
     return _verdict("ok", None, f"{access} + {n} GPU{'s' if n != 1 else ''} visible")
 
@@ -288,6 +254,7 @@ def _invalidate_probe() -> None:
 
 
 def health(refresh: bool = False) -> dict:
+    """Cached store/credential/GPU probe; a stale or forced check runs in the background."""
     problem = _config_problem()
     if problem:
         return {"status": "unconfigured", "summary": problem, "checking": False}

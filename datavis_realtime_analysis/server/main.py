@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from . import embedding, gpu, labels, storage, views
 from .config import MIRROR, SOURCE
 
-app = FastAPI(redoc_url=None)  # /docs = interactive API console
+app = FastAPI(redoc_url=None)
 
 
 @app.get("/")
@@ -34,18 +34,13 @@ def data(path: str, request: Request):
 
 
 @app.post("/api/submit")
-def submit(artifact: dict):
-    return gpu.submit(artifact)
+def submit(payload: dict):
+    return gpu.submit(payload)
 
 
 @app.get("/api/jobs")
 def jobs():
     return gpu.list_jobs()
-
-
-@app.delete("/api/jobs/{job_id}")
-def cancel_job(job_id: str):
-    return gpu.cancel(job_id)
 
 
 @app.get("/api/gpu/health")
