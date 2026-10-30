@@ -6,7 +6,7 @@ Three Code Ocean capsules that take HISE scRNA samples from raw files to a curat
 |---|---|---|---|---|
 | 1 | `ingest/` | CPU, sized to the largest **sample** | `main` | Per-sample QC metrics, CellTypist, Scrublet; append to the raw store. No whole-store analysis |
 | 2 | `qc/` | CPU; I/O-bound when applying | nothing by default; with `apply`, the `qc` branch or a new zarr | QC report for proposed thresholds, with a downsampled embedding. With `apply` and reviewed decisions, writes the passing cells as the curated object |
-| 3 | `process/` | **GPU, CUDA 13** (rapids-singlecell + Dask, scvi-tools) | a commit on the `qc` branch, or a new zarr | HVG, PCA, optional Harmony or scVI, neighbors, UMAP and leiden over the curated cells |
+| 3 | `process/` | **GPU, CUDA 13** (rapids-singlecell + Dask, scvi-tools) | a commit on the `qc` branch, or a new zarr | The shared RAPIDS environment, with guide notebooks (out-of-core, spatial) and a command-line run (`code/run`, no App Panel) of HVG, PCA, optional Harmony or scVI, neighbors, UMAP and leiden over the curated cells |
 
 ```
 samples ─► ingest ─► main (raw, all cells)
@@ -130,7 +130,7 @@ Written per sample by the ingest:
 | Cell-type labels | `<model>_label`, `<model>_prob` per CellTypist model; by default `pbmc_clean_AIFI_L1_2024`, `_L2_2024`, `_L3_2024` | categorical / float64 |
 | Hashing / ADT QC (report only) | `hto_category` (multiplexed pools), `adt_qc_flag` (CITE-seq) | categorical. Empty for samples without hashing or CITE-seq |
 
-Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` or `obsm/X_scVI` (if integrated), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/process`.
+Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` (if integrated; `X_scVI` will come from the scVI step), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/process`.
 
 ### 2.3 Entrypoint and code style
 - **Entrypoint:**
@@ -445,22 +445,29 @@ Apply runs also write `apply_summary.csv` (per sample: before, after, removed by
 
 This follows `standardized_notebooks/scRNA/rapids-sc/10-Rapids_GPU_Analysis.ipynb`, plus an optional scVI path.
 
-### 5.1 App panel
-| # | Parameter | Default | Notes |
-|---|---|---|---|
-| 1 | input | — | Any location in §2.1: an icechunk repo, or a curated plain zarr |
-| 2 | branch | `qc` | icechunk only: the curation branch to process |
-| 3 | origin | *(none)* | icechunk only: the writable location behind a read-only mount |
-| 4 | integration | `none` | `none`, `harmony` or `scvi` |
-| 5 | batch keys | *(none)* | Comma-separated obs columns (e.g. `chip_id`). Required unless integration is `none` |
-| 6 | output mode | `results-only` | Read-only plain zarr only (§5.4): `results-only` or `full` |
-| 7 | leiden resolution | `1.1` | ≈ scanpy 1.0, per the notebook |
+**What the capsule is for.** Mainly the RAPIDS GPU environment, to use here or copy elsewhere
+(`code/environment/`), plus guide notebooks. The pipeline below runs from a terminal with
+`code/run --input … [--flag value …]`; there is no App Panel. Every setting is a flag
+(`./run --help`) and also an environment variable named after it in upper case.
 
-Fixed in v1, with the notebook's values:
+### 5.1 Settings
+| Flag | Default | Notes |
+|---|---|---|
+| `--input` | — | Any location in §2.1: an icechunk repo, or a curated plain zarr. Either may be AnnData or SpatialData-shaped (§5.5) |
+| `--table` | `table` | SpatialData only: which `tables/<name>` to process |
+| `--branch` | `qc` | icechunk only: the curation branch to process |
+| `--origin` | *(none)* | icechunk only: the writable location behind a read-only mount |
+| `--integration` | `none` | `none` or `harmony`; `scvi` is next (§5.2 step 5) |
+| `--batch-keys` | *(none)* | Comma-separated obs columns (e.g. `chip_id`). Required unless integration is `none` |
+| `--output-mode` | `full` | Plain zarr (§5.4): `full`, or `results-only` (always a copy) |
+| `--output` | *(none)* | Plain zarr: copy to this path instead of writing in place |
+| `--leiden-resolution` | `1.1` | ≈ scanpy 1.0, per the notebook |
+
+The rest default to the notebook's values:
 
 | Setting | Value |
 |---|---|
-| Rows per Dask chunk | 24,000, rounded to a multiple of the storage row chunk |
+| Rows per Dask chunk | 24,000 (annizarr CSR stores chunk by nnz, so there is no row chunk to round to) |
 | HVG | 2,000, `seurat` flavor (the only one that works with Dask) |
 | Scale | `zero_center=False`, `max_value=10`, float64 for this step |
 | PCA | 50 components |
@@ -494,7 +501,7 @@ Fixed in v1, with the notebook's values:
        - save the model to `/results/scvi_model/` for reuse (e.g. scANVI at the labeling stage).
      - **After:** the main process reads `X_scVI` back.
 6. **Graph and clusters** (single GPU, no Dask needed): neighbors on `X_pca`, `X_pca_harmony` or `X_scVI`, then UMAP, then leiden. `rsc.pp.harmony_integrate` accepts the batch keys as a list directly.
-7. **lognorm layer:** `annizarr.add_expr(layout="csr", layer="lognorm", target_sum=1e4)`, streaming on CPU. It's there for the labeling stage (markers, dotplots).
+7. **lognorm layer:** the GPU normalization (`target_sum=1e4`, log1p) streamed block by block into `layers/lognorm`, with a `target_sum` attr. annizarr 0.2.4 dropped normalization (`add_expr` became the copy-only `add_layer`), so this is the only place lognorm is made. It's there for the labeling stage (markers, dotplots).
 8. **Write** (where: §5.4):
    - `obsm/X_pca`, `obsm/X_pca_harmony` or `obsm/X_scVI`, `obsm/X_umap`;
    - `obs/leiden` (categorical, added to `column-order`);
@@ -505,7 +512,6 @@ Fixed in v1, with the notebook's values:
 
    The neighbor graph (`obsp`) isn't written in v1, because it's large and recomputable.
 9. **`/results`:**
-   - UMAP PNGs coloured by `leiden`, `sample_id`, the batch keys and `pbmc_clean_AIFI_L1_2024_label`;
    - `cluster_summary.csv` (cells per cluster, by sample);
    - `run.json` with per-step timings and peak GPU and host memory.
 
@@ -514,20 +520,40 @@ Rerunning `process` on the same branch, for example with a different integration
 commit. The derived elements are replaced, and the previous result stays in the branch's history.
 
 ### 5.4 Where results go
-- **icechunk:** one commit on the given branch, through `Repo(input, origin=origin)` with `open_zarr("w")` and `add_expr(..., commit=False)`. A read-only repo without an `origin` is refused.
-- **Writable plain zarr:** in place. The new elements are written into the input zarr, replacing earlier `process` results; nothing else is touched.
-- **Read-only plain zarr:** a new zarr at `/results/<input stem>.processed.zarr`.
-  - **`results-only` (default):**
-    - holds `obs` (all columns), `var`, the new `obsm`, `obs/leiden`, `var/highly_variable`, `layers/lognorm` and `uns/process`;
+- **icechunk:** one commit on the given branch, through `Repo(input, origin=origin)` and `open_zarr("w")`. `layers/lognorm` streams from the GPU normalization. A read-only repo without an `origin` is refused.
+- **Writable plain zarr:** in place, unless `--output` or `results-only` asks for a copy. The new elements replace earlier `process` results; nothing else is touched. Consolidated metadata is dropped before the first change and rewritten after the last, so a run that dies midway leaves a store that reads truthfully (without `uns/process`). A change to the input during the run (obs index, X) is caught by its fingerprint, and nothing is written.
+- **Read-only plain zarr:** a new zarr at `/results/<input stem>.processed.zarr`. A failed write deletes it; an output that appeared during the run is left alone.
+- **Remote plain zarr:** refused by `process` (no s3fs, and annizarr's in-place ops are local-only); use icechunk on S3.
+  - **`results-only`:**
+    - holds everything in the input except X, `layers` and `raw`, plus the results;
     - has **no X**, which anndata reads back as `X=None`;
     - is small apart from `lognorm`;
     - `uns/process/source` records the input it pairs with.
-  - **`full`:** first a full streamed copy of the input with `annizarr.rechunk(input, output=…)`, then the results written onto it. It's a self-contained object, at the cost of a full copy of X.
+  - **`full` (default):** first a full streamed copy of the input with `annizarr.rechunk(input, output=…)`, then the results written onto it. It's a self-contained object, at the cost of a full copy of X.
     - `rechunk` rewrites X with the configured chunking and stream-copies everything else.
     - It's verified to carry X, obs, var, layers, obsm, varm, obsp and uns, from both a plain zarr and an icechunk branch.
     - `convert` refuses a store as input.
 
 ---
+
+### 5.5 SpatialData
+A SpatialData store keeps its AnnData at `tables/<name>`; `process` finds it there when the root has no
+`X`, and writes only that group. Images, labels, points and shapes are never changed; only a read-only
+full copy copies them.
+
+- **Plain SpatialData `.zarr`:** in place, or (read-only) a full copy of the whole store with the results in
+  its table; `results-only` copies just the table without counts, as an AnnData zarr.
+- **icechunk repo laid out like a SpatialData store:** one commit whose diff touches only `/tables/<name>`
+  (tested). This is the way to edit a SpatialData table without rewriting the rest, with history.
+
+Limits as of spatialdata 0.8.0 (checked against earthmover's `2026-scverse/icechunk-SpatialData` notes):
+- `sdata.write()`/`sd.read_zarr()` don't take an icechunk store; that needs unmerged spatialdata PR #1107
+  plus patches. spatialdata's element writers do work on an icechunk session for images, labels, tables
+  and zarr-encoded shapes; points and GeoParquet shapes don't.
+- So build the repo with the element writers (or `write_elem` for the table), and read the table with
+  `anndata.io.read_elem(root["tables/<name>"])`. Anything needing the whole SpatialData object (napari,
+  `sd.read_zarr`) still wants a plain `.zarr`; keeping that next to an icechunk repo for the table also works.
+- annizarr's ops assume the AnnData at the repo root, so `process` writes the table's `lognorm` itself.
 
 ## 6. Environments
 
@@ -552,11 +578,11 @@ commit. The derived elements are replaced, and the previous result stays in the 
 
 - **CPU capsules:** transitive dependencies aren't locked. A released image is built once and frozen; if a rebuild breaks, pin the offending package on the page.
 - **`process`: CUDA 13, from PyPI only, on the page.**
-  - `process/environment/requirements.txt` pins exact versions of the shared pins, RAPIDS 26.10 cu13 (`cudf`, `cuml`, `cugraph`, `cuvs`, `rmm`, `dask-cuda`), `rapids-singlecell-cu13 0.18.1`, scanpy, matplotlib, torch, `scvi-tools 1.5.1`, scikit-misc and ipykernel. It also pins the CUDA-stack packages that must agree: `numba`, `numba-cuda`, `cupy-cuda13x`, `cuda-toolkit`, `dask` and `distributed`.
+  - `process/code/environment/requirements.txt` (with `pixi.toml` beside it, kept in `code/` so people can take them from the capsule) pins exact versions of the shared pins, RAPIDS 26.10 cu13 (`cudf`, `cuml`, `cugraph`, `cuvs`, `rmm`, `dask-cuda`), `rapids-singlecell-cu13 0.18.1`, scanpy, matplotlib, torch, `scvi-tools 1.5.1`, scikit-misc and ipykernel. It also pins the CUDA-stack packages that must agree: `numba`, `numba-cuda`, `cupy-cuda13x`, `cuda-toolkit`, `dask` and `distributed`.
   - Everything else is resolved at build time. On 2026-10-23 the list resolved (`uv pip compile`, Python 3.13, x86-64 Linux) to the same 205 packages as the earlier full lock.
   - The page's `pip3` on this image is `/opt/venv/bin/pip3` (verified 2026-10-23), so page packages land in the venv the code runs in.
-  - **Built and working on the GPU capsule** (user-tested 2026-10-23, before the spatial packages were added). squidpy 1.8.3, spatialdata 0.8.0 and omnipath 1.0.12 resolve with the pins (247 packages); not yet built.
-  - **Tutorial notebooks** in `process/code/notebooks/`: `rapids_scrna_out_of_core_dask` and `rapids_spatial_atera_breast_cancer`, from rapids-singlecell's tutorials `06_out-of-core` and `08_atera_demo`, adapted for one T4. Interactive only, not App Panel runs. Each reads its input from a data asset and states the format it needs.
+  - **Built and working on the GPU capsule** (user-tested 2026-10-23, before the spatial packages were added). squidpy 1.8.3, spatialdata 0.8.0 and omnipath 1.0.12 resolve with the pins (246 packages, re-checked 2026-10-27); to be added on the page.
+  - **Tutorial notebooks** in `process/code/notebooks/`: `rapids_scrna_out_of_core_dask` and `rapids_spatial_atera_breast_cancer`, from rapids-singlecell's tutorials `06_out-of-core` and `08_atera_demo`, adapted for one T4. Interactive only. Each reads its input from a data asset and states the format it needs.
 - **numpy 2.4.6 everywhere:** cudf 26.10 needs `numba < 0.65`, and numba 0.64 supports only `numpy < 2.5`. The CPU capsules resolve with it too.
 
 ### 6.3 Base images
@@ -636,10 +662,11 @@ commit. The derived elements are replaced, and the previous result stays in the 
 3. `qc`, report mode: icechunk first, then plain zarr. Review the report on the rebuilt store.
 4. annizarr 0.2.4: `subset` (streaming row filter, both store kinds, int64 `indptr`, drops `obsp`) and `Repo.garbage_collect(older_than)`.
 5. `qc`, apply mode: icechunk first, then plain zarr.
-6. `process` on a GPU capsule, against the first `qc` branch.
+6. `process` on a GPU capsule, against the first `qc` branch. **Built without scVI and plots**, with SpatialData tables (38 tests, synthetic stores, annizarr 0.2.3 and 0.2.4); scVI next. Change log: `process/spec.md`.
 7. Subtree-push each capsule to its own Code Ocean capsule.
 
 ## 9. Open questions
-- **annizarr 0.2.4:** `subset(store, *, output, keep, branch, commit)` mirrors `rechunk`'s streaming copy with a row mask; `Repo.garbage_collect(older_than)` wraps icechunk's. Both keep the capsule free of store internals (no private `_writer_repo()`).
+- **annizarr 0.2.4 shipped without `subset` and `Repo.garbage_collect`** (checked 2026-10-30). It renamed `add_expr` to `add_layer`, which now only copies a matrix in another layout (no normalization), split the matrix copy into `_writers/_copy.py`, and caps its CPU count by the cgroup quota. `process` works on it unchanged; qc apply still needs the two below, now for a later release.
+- **Planned for annizarr:** `subset(store, *, output, keep, branch, commit)` mirrors `rechunk`'s streaming copy with a row mask; `Repo.garbage_collect(older_than)` wraps icechunk's. Both keep the capsule free of store internals (no private `_writer_repo()`).
 - **First GPU run:** the environment builds and works on the T4. Still to test: the scVI subprocess handoff, once `process` code exists.
-- **Using RAPIDS in other capsules:** a capsule with its own environment could install `process/environment/requirements.txt` into a separate venv (`/opt/rapids`) from `postInstall`, with a Jupyter kernel. Untested whether Code Ocean exposes the GPU to a non-GPU base image.
+- **Using RAPIDS in other capsules:** a capsule with its own environment could install `process/code/environment/requirements.txt` into a separate venv (`/opt/rapids`) from `postInstall`, with a Jupyter kernel. Untested whether Code Ocean exposes the GPU to a non-GPU base image.
