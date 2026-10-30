@@ -1,13 +1,24 @@
-# scvi_pca — re-clustering a cell selection: scVI vs PCA (RNA), PeakVI vs LSI (ATAC)
+# Re-clustering a cell selection: scVI vs PCA (RNA), PeakVI vs LSI (ATAC)
 
 When a datavis user selects cells, the app re-embeds just that selection and redraws its UMAP. This benchmark asks
 whether a learned latent (scVI for RNA, PeakVI for ATAC) beats the current linear path (PCA + Harmony for RNA, LSI
-for ATAC) on **runtime** and on **biological signal kept while batch effects are removed**, and whether it is worth
-adding to the pipeline.
+for ATAC) on **runtime** and on **biology kept while batch effects are removed**.
+
+This folder is a findings record, not a runnable pipeline. The pipeline code and environment were removed. What's left
+is the parameters ([`config/`](config/)), the plotting code for reference ([`plotting/`](plotting/)), and the grid
+UMAPs ([`umaps/`](umaps/)).
+
+## Short answer
+
+- **RNA:** keep **PCA + Harmony** as the default. It keeps as much biology as scVI or more and removes much more batch
+  effect. A stored scVI latent is only worth adding as a **fast mode** for big selections: 1.2M B cells out of 13.8M
+  take 8 s, versus 10 min for PCA. Retraining scVI per selection is not worth its cost.
+- **ATAC:** **train PeakVI once per store and slice its latent.** It beats uncorrected LSI on cell-type purity at
+  every selection and takes 1–18 s. Retraining per selection takes 2–14 min for little gain.
+- **Stores:** sorting by cell type would cut PCA selection time on large stores. rna13m is unsorted, so a B-cell
+  selection still reads nearly every chunk (10 min, versus 21 s on the sorted mmrna).
 
 ## What was run
-
-**Datasets** (local zarr stores, one A100 80 GB, 167 GB host RAM):
 
 | Dataset | Modality | Cells | Labels (coarse / fine) |
 |---|---|---|---|
@@ -16,99 +27,103 @@ adding to the pipeline.
 | mmatac | ATAC | 618,673 | L2 / L2.5 |
 | covatac | ATAC | 2,718,917 | L2 / L2.5 |
 
-**Selections**, picked by the store's L1 label the way a user would select in the app:
-`all` (every cell), `tnk` (L1 matches "T cell" or "NK cell"), `b` (L1 = "B cell").
-
-**Methods** for each selection:
+The hardware was one A100 80 GB with 167 GB of host RAM, reading local zarr stores. Selections were picked by the L1
+label the way a user would select in the app: `all`, `tnk` (T cell | NK cell) and `b` (B cell).
 
 | Method | RNA | ATAC |
 |---|---|---|
 | `latent` | slice of a scVI latent trained once on the full dataset | slice of a PeakVI latent trained once on the full dataset |
-| `pca` | normalize → log1p → HVG 2000 → scale → PCA 30 → Harmony on `batch_id`, following `dev_tools/rapids-benchmark` | — |
+| `pca` | normalize → log1p → HVG → scale → PCA → Harmony on `batch_id` | — |
 | `retrain` | scVI trained from scratch on the selection | PeakVI trained from scratch on the selection |
-| `unintegrated` | (reference only) PCA without Harmony | (reference only) TF-IDF + LSI without batch correction |
+| `unintegrated` | (reference) PCA without Harmony | (reference) TF-IDF + LSI, no batch correction |
 
-Every method then runs the same tail: rapids-singlecell neighbors (ivfflat, k = 20) → UMAP (min_dist 0.45). No
-clustering. scVI / PeakVI train a fixed `clamp(2e7 / cells, 10, 100)` epochs with the KL weight warmed up over the
-first half (batch_size 1024, scVI n_latent 30 on 4,000 seurat_v3 HVGs, PeakVI n_latent 40 on binarised peaks).
-Each run was done twice in a fresh process (rep 1, rep 2); `retrain` on `all` is the full-data model that `latent`
-slices.
+Every method then runs the same tail: rapids-singlecell neighbors → UMAP, with no clustering. Each run was done twice in a
+fresh process, and the numbers below are from rep 2.
 
-**Short answer**
-- **RNA:** PCA + Harmony keeps as much biology as scVI or more and removes much more batch effect, so keep it as the
-  default. The stored scVI latent is the only fast path on big stores (1.2M B cells of 13.8M: 8 s vs 10 min for
-  PCA), so it is worth adding only as a fast mode. Retraining scVI per selection is not worth its cost.
-- **ATAC:** PeakVI beats uncorrected LSI on biology at every selection. Train it once per store and slice its latent
-  (1–18 s); retraining per selection takes 2–14 min for little gain.
+### Key parameters ([`config/params.toml`](config/params.toml))
 
-Full numbers and caveats: [`report/report.md`](report/report.md).
-
-## umaps/
-
-Rendered from each run's saved UMAP (rep 2) and the store's labels; one PNG per plot, with a `.params.json` beside
-each single plot recording the run id, cell count and plot settings.
-
-| File | What it shows |
+| Section | Setting |
 |---|---|
-| `umaps/aifi/<ds>/grid_subset_x_strategy.png` | **Start here.** Rows = selection (all / T + NK / B), columns = method. Coloured by the finest label (AIFI_L3 or L2.5), legend grouped by coarse label, L1 names placed on the clusters. Compare along a row to see methods, down a column to see how a selection's structure opens up. |
-| `umaps/aifi/<ds>/<method>/<selection>.png` | The same plots one at a time, larger. |
-| `umaps/batch/<ds>/<column>/grid.png` | Same grid layout, coloured by a technical or donor column instead of cell type. Well-mixed colours = batch effect removed; colour islands = residual batch effect. RNA columns: `batch_id`, `pool_id`, `chip_id`, `well_id`, `subject.subjectGuid`, `cohort.cohortGuid`. ATAC: `batch_id`, `pool_id`, `chip_id`, `well_id`, `Sample`, `nFrags`, `TSSEnrichment` (the last two continuous, viridis). |
+| `[hvg]` | PCA: 2,000 `seurat` HVGs · scVI: 4,000 `seurat_v3` HVGs, batch-aware on `batch_id` |
+| `[pca]` / `[harmony]` | 30 comps, `covariance_eigh` · Harmony on `batch_id`, alpha 1.0, theta 2.0 |
+| `[scvi]` / `[peakvi]` | n_latent 30 (scVI, 2 layers, NB) / 40 (PeakVI, binarised peaks) · batch_size 1024 |
+| `[epochs]` / `[train]` | `clamp(2e7 / n_cells, 10, 100)` epochs, no early stopping · KL warmed up over the first half |
+| `[tail]` | k = 20 neighbors (ivfflat), UMAP min_dist 0.45, spectral init |
 
-`<ds>` is mmrna, rna13m, mmatac or covatac; `<method>` is latent, pca or retrain; `<selection>` is all, tnk or b.
+[`config/datasets.toml`](config/datasets.toml) maps each dataset to its store, label columns, batch/sample columns and
+any stored latent.
 
-## results/
+## Runtime (read → UMAP)
 
-| File | Contents |
+| Dataset | Selection | Cells | Stored latent | PCA + Harmony | Retrain |
+|---|---|---|---|---|---|
+| mmrna | all | 2.37M | 22.6 s | 1.6 min | 5.3 min |
+| | T + NK | 1.54M | 9.6 s | 1.3 min | 4.3 min |
+| | B | 149k | 1.3 s | 21.1 s | 3.1 min |
+| rna13m | all | 13.8M | 4.3 min | 15.5 min | 32.8 min |
+| | T + NK | 9.85M | 1.6 min | 14.2 min | 24.2 min |
+| | B | 1.21M | 7.9 s | 10.2 min | 9.0 min |
+| mmatac | all | 619k | 3.7 s | — | 10.0 min |
+| | T + NK | 413k | 2.6 s | — | 10.1 min |
+| | B | 32k | 0.9 s | — | 1.7 min |
+| covatac | all | 2.72M | 18.3 s | — | 14.2 min |
+| | T + NK | 1.69M | 10.9 s | — | 11.1 min |
+| | B | 151k | 1.3 s | — | 7.6 min |
+
+Training the full-data model is a one-off cost: 5.2 min for mmrna, 30.5 min for rna13m, 9.9 min for mmatac and 13.9 min for covatac.
+
+## Quality
+
+The scores come from scib-metrics on coarse labels, written as **bio conservation / batch correction**, where higher is
+better for both. All methods within a selection were scored on the same cells, using every labelled cell or a
+sample-stratified sample of 500k.
+
+| Dataset | Method | all | T + NK | B |
+|---|---|---|---|---|
+| mmrna | scVI latent | .58 / .44 | .56 / .54 | .55 / .49 |
+| | PCA + Harmony | **.60 / .61** | **.56 / .59** | **.59 / .56** |
+| | scVI retrain | .58 / .44 | .55 / .53 | .49 / .53 |
+| rna13m | scVI latent | .61 / .51 | .57 / .49 | .54 / .46 |
+| | PCA + Harmony | **.68 / .62** | **.64 / .65** | **.60 / .68** |
+| | scVI retrain | .60 / .51 | .54 / .48 | .52 / .48 |
+| mmatac | PeakVI latent | .66 / .45 | .62 / .44 | .61 / .43 |
+| | PeakVI retrain | .65 / .45 | .63 / .46 | .59 / .64 |
+| | LSI (uncorrected) | .64 / .43 | .62 / .43 | .75 / .41 |
+| covatac | PeakVI latent | .66 / .52 | .64 / .53 | .70 / .52 |
+| | PeakVI retrain | .65 / .53 | .66 / .54 | .67 / .57 |
+| | LSI (uncorrected) | .63 / .52 | .58 / .52 | .60 / .53 |
+
+- **RNA:** PCA + Harmony leads on both axes in every selection, and the pattern holds on fine labels. Local kNN
+  cell-type purity is split: scVI is ahead on mmrna (0.69 vs 0.63 on all cells), and PCA is ahead inside rna13m's
+  selections (B cells 0.86 vs 0.81).
+- **ATAC:** PeakVI's kNN cell-type purity is +0.03–0.12 over LSI (up to +0.15 on fine types), and its graph
+  connectivity is higher. Retraining only helps batch removal on the small mmatac B-cell selection.
+- **Caveats:** scib's PCR comparison is 0 for most ATAC runs, so it tells us nothing there. The ATAC labels likely
+  came from an LSI-style clustering, which flatters LSI on KMeans ARI/NMI. That explains its .75 bio score on mmatac B
+  cells.
+
+## UMAPs
+
+The **cell-type grids** have one row per selection (all / T + NK / B) and one column per method. Each cell is coloured by
+its finest label, the legend is grouped by coarse label, and L1 names are placed on the clusters.
+
+| mmrna | rna13m |
 |---|---|
-| `runs.parquet` | One row per run (60 rows): `run_id` = `<ds>-<method>-<selection>-r<rep>`, `n_cells`, status, and timings in seconds. **`t_e2e` is the headline runtime** (read data → UMAP). It splits into `t_read` (reading counts or the latent), `t_pre_ex_read` (the embedding step itself), `t_neighbors` and `t_umap`. Peak GPU memory (`*_vram_gb`, device-wide) and host memory (`*_rss_gb`) are given per stage and per run. Leiden columns are empty (not run). |
-| `setup.parquet` | The full-data model fits behind `latent`, two reps per dataset: training time (`train_s`, `t_pre_s`), epochs, steps, model and latent size on disk, model load time. |
-| `metrics/<ds>.parquet` | Quality metrics in long format: `subset`, `strategy` (method, plus `unintegrated` as reference), `level` (`coarse` / `fine` label, blank for label-free rows), `metric`, `value`, `n_eval` (cells scored). |
-| `subsets_manifest.parquet` | Cells per L1 label in each selection. |
+| ![mmrna](umaps/mmrna/aifi_grid.png) | ![rna13m](umaps/rna13m/aifi_grid.png) |
 
-Metrics, all computed on the same cells for every method of one selection (every labelled cell, or a
-sample-stratified 500k when larger):
-- **Bio conservation** (higher = more cell-type signal kept): `purity_macro_coarse` / `purity_macro_fine` (share of
-  each cell's 20 nearest neighbours with its own label, averaged per cell type), and scib-metrics
-  `Isolated labels`, `KMeans NMI`, `KMeans ARI`, `Silhouette label`, `cLISI`, aggregated as `Bio conservation`.
-- **Batch removal** (higher = batch effect removed): scib-metrics `BRAS`, `iLISI`, `KBET`, `Graph connectivity`,
-  `PCR comparison` (vs the uncorrected embedding), aggregated as `Batch correction`; plus `same_batch` (share of
-  neighbours from the cell's own `batch_id`, lower = more mixed; `same_batch_random` is the random-neighbour value).
-- **`scib:Total`** = 0.6 × bio conservation + 0.4 × batch correction (scib's default weighting).
-
-## report/
-
-- `report.md` — findings, then per dataset: runtime table and every metric at both label levels.
-- `compare_run2.html` — the same results as interactive charts (runtime per selection, bio vs batch scatter, metric
-  picker, full table); open in a browser. Built from `compare_run2.json`, `compare_run2_template.html` and
-  `compare_run2_findings.html`.
-
-## scripts/
-
-Self-contained: the `scvi_pca` package (`src/`), parameters and dataset definitions (`config/params.toml`,
-`config/datasets.toml`) and the pixi environment (`pixi.toml`, `pixi.lock`; default env for the pipeline, `metrics`
-env for scib-metrics/JAX) all live here. Large intermediate files go to `/mnt/scvi_pca/run2/` (subsets, models,
-embeddings, UMAP coordinates, metric caches).
-
-| Step | Script |
+| mmatac | covatac |
 |---|---|
-| Build selections | `01_make_subsets.py <ds> ...` |
-| Full-data model (setup) | `02_train_full.py <ds> <rep>` |
-| One run / a list of runs | `10_run_one.py <run_id>`, `11_run_matrix.sh`, `12_run_list.py` |
-| Everything for one dataset | `13_run_dataset.sh <ds>` (setup, runs, metrics, plots; resumable) |
-| Metrics | `20_metrics.py <ds>` (+ `21_scib_worker.py` in the metrics env) |
-| UMAPs | `30_plots.py <ds>` |
-| Report | `40_report.py`, then `41_compare_data.py` and `42_build_compare.py` for the HTML |
+| ![mmatac](umaps/mmatac/aifi_grid.png) | ![covatac](umaps/covatac/aifi_grid.png) |
 
-```bash
-cd scvi_pca/scripts
-pixi install -a                      # both envs, from pixi.lock
-pixi run python 01_make_subsets.py mmrna rna13m mmatac covatac
-# detached so it survives the terminal closing; reruns skip finished runs
-setsid nohup bash -c 'for ds in mmatac covatac mmrna rna13m; do bash 13_run_dataset.sh $ds; done' \
-  > /mnt/scvi_pca/run2/logs/campaign.log 2>&1 < /dev/null &
-pixi run python 40_report.py && pixi run python 41_compare_data.py && pixi run python 42_build_compare.py
-```
+The **batch grids** use the same layout, coloured by a technical or donor column. Well-mixed colours mean the batch
+effect was removed, and colour islands mean some remains. `sample` is `subject.subjectGuid` for RNA and `Sample` for ATAC.
 
-The pipeline imports `datavis_realtime_analysis/gpu` and `dev_tools/rapids-benchmark` from this repo, needs the GPU
-to itself (stop the datavis backend first), and serialises GPU steps through `/mnt/scvi_pca/gpu.lock`. A full run
-took about 17 h, about 7 h of it scib metrics.
+| Dataset | batch_id | sample | pool_id | well_id |
+|---|---|---|---|---|
+| mmrna | [png](umaps/mmrna/batch_id.png) | [png](umaps/mmrna/sample.png) | [png](umaps/mmrna/pool_id.png) | [png](umaps/mmrna/well_id.png) |
+| rna13m | [png](umaps/rna13m/batch_id.png) | [png](umaps/rna13m/sample.png) | [png](umaps/rna13m/pool_id.png) | [png](umaps/rna13m/well_id.png) |
+| mmatac | [png](umaps/mmatac/batch_id.png) | [png](umaps/mmatac/sample.png) | [png](umaps/mmatac/pool_id.png) | [png](umaps/mmatac/well_id.png) |
+| covatac | [png](umaps/covatac/batch_id.png) | [png](umaps/covatac/sample.png) | [png](umaps/covatac/pool_id.png) | [png](umaps/covatac/well_id.png) |
+
+`plotting/30_plots.py` with `plotting/grids.py` and `batch_umaps.py` rendered these from each run's saved UMAP
+coordinates. They're kept for reference only and won't run here, because they import the removed `scvi_pca` package.
