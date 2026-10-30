@@ -1,5 +1,13 @@
 # scizarr-ic
 
+> **Legacy copy, kept for tracking.** This tool was merged into **AnniZarr**, which now lives in its own
+> repository: https://github.com/A-Jolly-Holly/annizarr (`pip install annizarr` once it is published). The code
+> below is frozen at its last standalone version (0.3.0) so the history stays reproducible; use annizarr
+> for anything new.
+>
+> Mapping: `from scizarr_ic import Repo` → `from annizarr.ic import Repo` (same API; `ScizarrError` →
+> `annizarr.errors.RepoError`). Writes from the shell go through `annizarr convert --ic` / `--branch` / `-m`.
+
 Git-like version control for Zarr stores, backed by [Icechunk](https://icechunk.io).
 
 Point it at an existing zarr store and it becomes a versioned Icechunk repository:

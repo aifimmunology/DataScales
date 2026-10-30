@@ -1,11 +1,11 @@
 """Route assembly. Sections live in their own modules:
-config (env), storage (zarr proxy + store JSON), views (groups.json), gpu (jobs).
+config (env), storage (zarr proxy), views (umap_views listing), gpu (jobs), labels.
 """
 
 from fastapi import FastAPI, Request
 
-from . import gpu, labels, storage, views
-from .config import DATA_DIR
+from . import embedding, gpu, labels, storage, views
+from .config import MIRROR, SOURCE
 
 app = FastAPI(redoc_url=None)  # /docs = interactive API console
 
@@ -24,7 +24,8 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"store": DATA_DIR}
+    return {"store": SOURCE.uri if SOURCE else "", "mirror": MIRROR.uri if MIRROR else None,
+            "embedding": embedding.describe()}
 
 
 @app.api_route("/api/data/{path:path}", methods=["GET", "HEAD"])
@@ -50,6 +51,11 @@ def cancel_job(job_id: str):
 @app.get("/api/gpu/health")
 def gpu_health(refresh: bool = False):
     return gpu.health(refresh)
+
+
+@app.get("/api/views")
+def list_views():
+    return views.list_views()
 
 
 @app.delete("/api/views/{view_id}")

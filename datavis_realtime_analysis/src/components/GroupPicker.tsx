@@ -1,4 +1,5 @@
-import type { Group } from '../lib/zarrData'
+import type { Group } from '../lib/api'
+import { describeParams } from '../lib/runSettings'
 import { panel, control, label } from '../lib/styles'
 
 type Props = {
@@ -14,6 +15,7 @@ type Props = {
 export default function GroupPicker({ groups, active, onChange, onDelete }: Props) {
   if (groups.length < 2) return null
   const activeEntry = groups.find(g => g.path === active)
+  const params = describeParams(activeEntry?.params)
   return (
     <div style={panel}>
       <label style={label}>View</label>
@@ -35,9 +37,12 @@ export default function GroupPicker({ groups, active, onChange, onDelete }: Prop
           </button>
         )}
       </div>
+      {params && <div style={paramsStyle}>{params}</div>}
     </div>
   )
 }
+
+const paramsStyle: React.CSSProperties = { fontSize: 11, color: '#888', marginTop: 6 }
 
 const deleteStyle: React.CSSProperties = {
   background: 'none',
