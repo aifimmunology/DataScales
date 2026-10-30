@@ -1,7 +1,9 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Icon } from '@iconify/react'
 import { DIVIDER } from '../lib/styles'
 import { HEADER_HEIGHT } from './Header'
+
+export type RailAside = { icon: string; title: string; content: ReactNode }
 
 export type RailSection = {
   id: string
@@ -10,14 +12,19 @@ export type RailSection = {
   badge?: boolean // e.g. a GPU run is active
   badgeColor?: string // overrides the default yellow, e.g. red for a GPU access problem
   content: ReactNode
+  aside?: RailAside // optional second drawer, opened from a small tab under the content
 }
 
 type Props = { sections: RailSection[] }
 
-// Spatial-explorer-style icon rail: one section open at a time; the drawer
-// overlays the canvas (no deck resize) so the plot and legend stay put.
+const DRAWER_WIDTH = 320
+
+// Spatial-explorer-style icon rail: one section open at a time; drawers overlay
+// the canvas (no deck resize) so the plot and legend stay put.
 export default function SideRail({ sections }: Props) {
   const [active, setActive] = useState<string | null>(null)
+  const [asideOpen, setAsideOpen] = useState(false)
+  useEffect(() => setAsideOpen(false), [active])
   const current = sections.find(s => s.id === active)
   return (
     <>
@@ -37,19 +44,39 @@ export default function SideRail({ sections }: Props) {
         ))}
       </div>
       {current && (
-        <div style={drawerStyle}>
-          <div style={drawerHeaderStyle}>
-            <span style={{ fontSize: 14, fontWeight: 600 }}>{current.title}</span>
-            <button onClick={() => setActive(null)} title="Close panel" style={closeBtnStyle}>
-              <Icon icon="material-symbols-light:left-panel-close" width={22} height={22} />
+        <Drawer title={current.title} left={HEADER_HEIGHT} onClose={() => setActive(null)}>
+          {current.content}
+          {current.aside && (
+            <button
+              title={current.aside.title}
+              onClick={() => setAsideOpen(o => !o)}
+              style={{ ...asideTabStyle, ...(asideOpen ? railBtnActiveStyle : {}) }}
+            >
+              <Icon icon={current.aside.icon} width={20} height={20} />
             </button>
-          </div>
-          <div style={{ overflowY: 'auto', padding: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {current.content}
-          </div>
-        </div>
+          )}
+        </Drawer>
+      )}
+      {current?.aside && asideOpen && (
+        <Drawer title={current.aside.title} left={HEADER_HEIGHT + DRAWER_WIDTH} onClose={() => setAsideOpen(false)}>
+          {current.aside.content}
+        </Drawer>
       )}
     </>
+  )
+}
+
+function Drawer({ title, left, onClose, children }: { title: string; left: number; onClose: () => void; children: ReactNode }) {
+  return (
+    <div style={{ ...drawerStyle, left }}>
+      <div style={drawerHeaderStyle}>
+        <span style={{ fontSize: 14, fontWeight: 600 }}>{title}</span>
+        <button onClick={onClose} title="Close panel" style={closeBtnStyle}>
+          <Icon icon="material-symbols-light:left-panel-close" width={22} height={22} />
+        </button>
+      </div>
+      <div style={drawerBodyStyle}>{children}</div>
+    </div>
   )
 }
 
@@ -80,6 +107,18 @@ const railBtnActiveStyle: React.CSSProperties = {
   background: 'rgba(255, 255, 255, 0.08)',
 }
 
+const asideTabStyle: React.CSSProperties = {
+  alignSelf: 'flex-start',
+  background: 'none',
+  border: `1px solid ${DIVIDER}`,
+  borderRadius: 6,
+  color: '#aaa',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  padding: 4,
+}
+
 const badgeStyle: React.CSSProperties = {
   position: 'absolute',
   top: 12,
@@ -90,13 +129,11 @@ const badgeStyle: React.CSSProperties = {
   background: '#ffe94d',
 }
 
-// Overlays the canvas, anchored beside the rail.
 const drawerStyle: React.CSSProperties = {
   position: 'absolute',
-  left: HEADER_HEIGHT,
   top: 0,
   bottom: 0,
-  width: 320,
+  width: DRAWER_WIDTH,
   zIndex: 25,
   background: 'rgba(18, 18, 18, 0.97)',
   borderRight: `1px solid ${DIVIDER}`,
@@ -111,6 +148,14 @@ const drawerHeaderStyle: React.CSSProperties = {
   justifyContent: 'space-between',
   padding: '8px 8px 8px 12px',
   borderBottom: `1px solid ${DIVIDER}`,
+}
+
+const drawerBodyStyle: React.CSSProperties = {
+  overflowY: 'auto',
+  padding: 10,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
 }
 
 const closeBtnStyle: React.CSSProperties = {

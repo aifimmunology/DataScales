@@ -1,6 +1,6 @@
 """Warm pipeline worker, spawned by the backend on first submit. Does the heavy
 imports + CUDA init once, then runs one job per stdin JSON line
-({id, store, selection, out, label, method}), reporting `stage:` / `done:` / `error:` lines on
+({id, store, selection, out, label, params}), reporting `stage:` / `done:` / `error:` lines on
 stdout. Exits after WORKER_IDLE_S without a job so GPU memory frees when idle.
 """
 
@@ -28,7 +28,7 @@ def main():
             return
         job = json.loads(line)
         try:
-            pipeline.run(job["store"], job["selection"], job["out"], job.get("label"), job.get("method", ""))
+            pipeline.run(job["store"], job["selection"], job["out"], job.get("label"), job.get("params"))
             print(f"done: {job['id']}", flush=True)
         except Exception as e:
             print(f"error: {str(e)[:300]}", flush=True)

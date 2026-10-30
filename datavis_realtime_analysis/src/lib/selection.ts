@@ -1,6 +1,6 @@
 import type { Point } from './zarrData'
 
-// The artifact the RAPIDS side consumes. See data/selection.example.json.
+// The artifact the RAPIDS side consumes.
 //   store       - the datavis-app store the selection was drawn against (provenance)
 //   group       - the active view/embedding path the indices refer to ('' = root)
 //   lasso_world - the polygon the user drew, in UMAP coords (the shape)
@@ -35,15 +35,4 @@ export function selectIndices(points: Point[], poly: [number, number][]): number
     if (pointInPolygon(x, y, poly)) out.push(points[i].index)
   }
   return out
-}
-
-// Trigger a browser download of selection.json.
-export function downloadSelection(artifact: SelectionArtifact): void {
-  const blob = new Blob([JSON.stringify(artifact, null, 2)], { type: 'application/json' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = 'selection.json'
-  a.click()
-  URL.revokeObjectURL(url)
 }
