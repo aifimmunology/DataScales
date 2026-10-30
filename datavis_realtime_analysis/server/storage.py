@@ -19,12 +19,12 @@ from fastapi.responses import FileResponse, Response
 from .config import MIRROR, SOURCE, Location
 
 MIRROR_THREADS = 16
-EAGER_BYTES = 8 << 20  # whole-file reads under this size: a label save swapping the file can't break them
+EAGER_BYTES = 8 << 20
 
 _client = None
 _client_lock = threading.Lock()
 _size_cache: dict[str, int] = {}
-_LOCAL_ROOT = Path(SOURCE.root).resolve() if SOURCE and not SOURCE.gcs else None
+_LOCAL_ROOT = Path(SOURCE.uri).resolve() if SOURCE and not SOURCE.gcs else None
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 
 
@@ -44,7 +44,6 @@ def gcs_client():
                     client = storage.Client()
                 except Exception as e:
                     raise HTTPException(503, f"GCS auth failed: {e}")
-                # a page load fans out far wider than the default 10-connection pool
                 client._http.mount("https://", HTTPAdapter(pool_connections=64, pool_maxsize=64))
                 _client = client
     return _client
@@ -56,9 +55,6 @@ def bucket(loc: Location):
 
 def _media_type(path: str) -> str:
     return "application/json" if path.endswith(".json") else "application/octet-stream"
-
-
-# ── proxy ──────────────────────────────────────────────────────────────────────
 
 
 def serve(path: str, request: Request):
@@ -93,7 +89,6 @@ def serve(path: str, request: Request):
 
 
 def _etag(st) -> str:
-    """Labelset saves rewrite files in place, so every read revalidates against mtime+size."""
     return f'"{hashlib.md5(f"{st.st_mtime_ns}-{st.st_size}".encode(), usedforsecurity=False).hexdigest()}"'
 
 
@@ -136,9 +131,6 @@ def _gcs_response(path: str, request: Request) -> Response:
             headers["Content-Range"] = f"bytes {start}-{start + len(payload) - 1}/*"
         return Response(payload, status_code=206, media_type=media, headers=headers)
     return Response(_download(SOURCE, path), media_type=media, headers=headers)
-
-
-# ── listing, attributes, deletes ───────────────────────────────────────────────
 
 
 def list_children(rel: str) -> list[str]:
@@ -185,9 +177,6 @@ def _delete_gcs_prefix(loc: Location, rel: str) -> int:
     for k in [k for k in _size_cache if k.startswith(prefix)]:
         del _size_cache[k]
     return len(blobs)
-
-
-# ── mirror ─────────────────────────────────────────────────────────────────────
 
 
 def mirror(*rels: str) -> int:
