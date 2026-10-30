@@ -1,25 +1,27 @@
 import { useState } from 'react'
 import { control } from '../lib/styles'
 
-export type ComboOption = { value: string; label?: string; hint?: string }
+type ComboOption = { value: string; label?: string; hint?: string }
 
 type Props = {
   options: ComboOption[]
-  value?: string // shown while closed
+  value?: string
   placeholder?: string
+  limit?: number
   onPick: (value: string) => void
-  createLabel?: (query: string) => string | null // extra row for a typed name not in options
+  createLabel?: (query: string) => string | null
   onCreate?: (query: string) => void
 }
 
-/** Searchable dropdown: focusing lists every option, typing filters them. */
-export default function ComboBox({ options, value = '', placeholder, onPick, createLabel, onCreate }: Props) {
+/** Searchable dropdown: focusing lists the options (up to `limit`), typing filters them;
+ * `createLabel` offers an extra row for a typed name that is not an option. */
+export default function ComboBox({ options, value = '', placeholder, limit = Infinity, onPick, createLabel, onCreate }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
 
   const q = query.trim()
   const shownValue = options.find(o => o.value === value)?.label ?? value
-  const matches = q ? options.filter(o => (o.label ?? o.value).toLowerCase().includes(q.toLowerCase())) : options
+  const matches = (q ? options.filter(o => (o.label ?? o.value).toLowerCase().includes(q.toLowerCase())) : options).slice(0, limit)
   const create = q && onCreate && createLabel ? createLabel(q) : null
 
   const close = () => {
@@ -50,7 +52,7 @@ export default function ComboBox({ options, value = '', placeholder, onPick, cre
         style={inputStyle}
       />
       {open && (matches.length > 0 || create) && (
-        <div style={listStyle} onMouseDown={e => e.preventDefault() /* keep focus through the click */}>
+        <div style={listStyle} onMouseDown={e => e.preventDefault()}>
           {matches.map(o => (
             <div
               key={o.value}

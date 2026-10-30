@@ -1,23 +1,20 @@
-import { type Level, type RGB, colorForCode, UNLABELED_CODE, UNLABELED_SWATCH } from '../lib/zarrData'
+import { type RGB, colorForCode, UNLABELED_CODE, UNLABELED_SWATCH } from '../lib/palette'
 import { panel, label, rgb } from '../lib/styles'
 import ComboBox from './ComboBox'
 
 type Props = {
-  levels: string[] // label sets discovered in the store (per group)
+  levels: string[]
   labelFor: (level: string) => string
-  level: Level
-  onLevelChange: (level: Level) => void
+  level: string
+  onLevelChange: (level: string) => void
   categories: string[] | null
-  unlabeled: boolean // the active label set leaves some cells without a category
-  selected: Set<number> // category codes currently cluster-selected
+  unlabeled: boolean
+  selected: Set<number>
   onCategoryClick: (code: number) => void
   error: string | null
   onRetry: () => void
 }
 
-// Top-right overlay: pick which label set colors the UMAP + show the key.
-// Clicking a key row toggles selecting every cell of that category (cluster select).
-// Unlabeled cells draw gray on the plot but get a black key row so they can be selected too.
 export default function Legend({ levels, labelFor, level, onLevelChange, categories, unlabeled, selected, onCategoryClick, error, onRetry }: Props) {
   if (levels.length === 0) return null
   return (
@@ -27,7 +24,7 @@ export default function Legend({ levels, labelFor, level, onLevelChange, categor
         options={levels.map(l => ({ value: l, label: labelFor(l) }))}
         value={level}
         placeholder="search columns…"
-        onPick={v => onLevelChange(v as Level)}
+        onPick={onLevelChange}
       />
 
       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -78,7 +75,7 @@ const panelStyle: React.CSSProperties = {
   position: 'absolute',
   top: 12,
   right: 12,
-  zIndex: 20, // above the lasso svg overlay
+  zIndex: 20,
   maxHeight: 'calc(100vh - 24px)',
   overflowY: 'auto',
   minWidth: 180,

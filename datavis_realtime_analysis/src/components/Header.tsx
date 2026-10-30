@@ -1,9 +1,5 @@
-import { DIVIDER } from '../lib/styles'
+import { DIVIDER, HEADER_HEIGHT } from '../lib/styles'
 
-export const HEADER_HEIGHT = 55 // also the side rail width, matching the spatial explorer
-
-// Always-black top bar in the spatial-data-explorer style: logo + slash-path
-// title with the brand-color pulsing segment.
 export default function Header() {
   return (
     <div style={barStyle}>

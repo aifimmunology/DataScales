@@ -1,7 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Icon } from '@iconify/react'
-import { DIVIDER } from '../lib/styles'
-import { HEADER_HEIGHT } from './Header'
+import { DIVIDER, HEADER_HEIGHT } from '../lib/styles'
 
 export type RailAside = { icon: string; title: string; content: ReactNode }
 
