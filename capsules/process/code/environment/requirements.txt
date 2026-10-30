@@ -1,4 +1,4 @@
-annizarr==0.2.3
+annizarr==0.2.4
 icechunk==2.3.0
 boto3==1.43.114
 zarr==3.4.1
@@ -27,6 +27,7 @@ scvi-tools==1.5.1
 matplotlib==3.11.2
 scikit-misc==0.5.3
 ipykernel==7.4.0
+jupyter==1.1.1
 squidpy==1.8.3
 spatialdata==0.8.0
 omnipath==1.0.12
