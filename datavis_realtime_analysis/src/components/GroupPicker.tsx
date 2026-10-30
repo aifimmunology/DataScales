@@ -1,38 +1,33 @@
 import type { Group } from '../lib/api'
 import { describeParams } from '../lib/runSettings'
-import { panel, control, label } from '../lib/styles'
+import { panel, control, label, muted } from '../lib/styles'
 
 type Props = {
   groups: Group[]
-  active: string // active group path
+  active: string
   onChange: (path: string) => void
   onDelete: (id: string) => void
 }
 
-// Rail section: pick which embedding ("group") to view — the root store or any
-// nested view store (e.g. a re-clustered cell subset). Hidden when there's nothing
-// to switch between (a single group), so it stays out of the way by default.
 export default function GroupPicker({ groups, active, onChange, onDelete }: Props) {
-  if (groups.length < 2) return null
-  const activeEntry = groups.find(g => g.path === active)
-  const params = describeParams(activeEntry?.params)
+  if (groups.length < 2) {
+    return <span style={muted}>No saved views yet — lasso a selection and run it on the GPU.</span>
+  }
+  const current = groups.find(g => g.path === active)
+  const params = describeParams(current?.params)
   return (
     <div style={panel}>
       <label style={label}>View</label>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <select value={active} onChange={e => onChange(e.target.value)} style={control}>
+        <select value={active} onChange={e => onChange(e.target.value)} style={{ ...control, flex: 1, minWidth: 0 }}>
           {groups.map(g => (
             <option key={g.id} value={g.path}>
               {g.label}
             </option>
           ))}
         </select>
-        {activeEntry?.path && (
-          <button
-            onClick={() => onDelete(activeEntry.id)}
-            style={deleteStyle}
-            title="Delete this view from the store"
-          >
+        {current?.path && (
+          <button onClick={() => onDelete(current.id)} style={deleteStyle} title="Delete this view from the store">
             ✕
           </button>
         )}

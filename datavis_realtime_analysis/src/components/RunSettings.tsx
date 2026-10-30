@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { DIVIDER, control, label, panel } from '../lib/styles'
+import { column, control, ghostBtn, label } from '../lib/styles'
 import { defaultSettings, effectiveMethod, type EmbeddingInfo, type Method, type RunSettings } from '../lib/runSettings'
 
 type Props = {
@@ -9,14 +9,12 @@ type Props = {
   batchKeys: string[]
 }
 
-// Secondary drawer beside the Selection panel: the GPU pipeline parameters applied
-// to the next "Generate New UMAP". Pre-filled from the store's defaults.
 export default function RunSettingsPanel({ settings, onChange, embedding, batchKeys }: Props) {
   const method = effectiveMethod(settings, embedding)
   const latent = embedding?.latent
   const set = (patch: Partial<RunSettings>) => onChange({ ...settings, ...patch })
   return (
-    <div style={panelStyle}>
+    <div style={column(10)}>
       <Field name="Embedding">
         <select value={method} onChange={e => set({ method: e.target.value as Method })} style={selectStyle}>
           <option value="pca">Normalize → PCA from counts</option>
@@ -46,7 +44,7 @@ export default function RunSettingsPanel({ settings, onChange, embedding, batchK
           ))}
         </select>
       </Field>
-      <button onClick={() => onChange(defaultSettings(embedding))} style={resetStyle}>
+      <button onClick={() => onChange(defaultSettings(embedding))} style={{ ...ghostBtn, fontSize: 12, padding: '3px 10px' }}>
         Reset to defaults
       </button>
     </div>
@@ -67,7 +65,6 @@ function Field({ name, hint, children }: { name: string; hint?: string; children
 
 type NumberProps = { name: string; value: number; min?: number; max?: number; step: number; onCommit: (v: number) => void }
 
-// Edits a draft string so partial input ("0.") is allowed; commits on blur/Enter when valid.
 function NumberField({ name, value, min, max, step, onCommit }: NumberProps) {
   const [draft, setDraft] = useState(String(value))
   useEffect(() => setDraft(String(value)), [value])
@@ -94,16 +91,5 @@ function NumberField({ name, value, min, max, step, onCommit }: NumberProps) {
   )
 }
 
-const panelStyle: React.CSSProperties = { ...panel, display: 'flex', flexDirection: 'column', gap: 10 }
 const inputStyle: React.CSSProperties = { ...control, width: '100%', boxSizing: 'border-box' }
 const selectStyle: React.CSSProperties = { ...control, width: '100%' }
-const resetStyle: React.CSSProperties = {
-  alignSelf: 'flex-start',
-  background: 'none',
-  border: `1px solid ${DIVIDER}`,
-  color: '#aaa',
-  borderRadius: 6,
-  padding: '3px 10px',
-  fontSize: 12,
-  cursor: 'pointer',
-}

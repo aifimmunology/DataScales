@@ -24,10 +24,6 @@ class Location:
     def prefix(self) -> str:
         return self.uri[len("gs://"):].partition("/")[2]
 
-    @property
-    def root(self) -> str:
-        return self.uri
-
     def key(self, rel: str) -> str:
         return f"{self.prefix}/{rel}" if self.prefix else rel
 

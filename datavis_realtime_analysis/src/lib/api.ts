@@ -1,11 +1,9 @@
-import type { SelectionArtifact } from './selection'
 import type { RecordedParams, RunParams } from './runSettings'
 
 export type Job = {
   id: string
   name?: string
   cells: number
-  group: string
   submitted_at: string
   status: 'queued' | 'running' | 'done' | 'failed'
   stage?: string
@@ -13,42 +11,7 @@ export type Job = {
   params?: RecordedParams | null
 }
 
-// Shared fetch: non-2xx throws with the server's `detail` when it sent one.
-async function request(url: string, init: RequestInit | undefined, what: string): Promise<Response> {
-  const res = await fetch(url, init)
-  if (!res.ok) {
-    const detail = (await res.json().catch(() => null))?.detail
-    throw new Error(detail ?? `${what} failed: ${res.status}`)
-  }
-  return res
-}
-
-const postJson = (url: string, body: unknown, what: string) =>
-  request(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  }, what)
-
-// Barcodes ride along: the GPU pipeline selects cells by barcode (view-safe).
-export async function submitSelection(artifact: SelectionArtifact & { name: string; params: RunParams }): Promise<void> {
-  await postJson('/api/submit', artifact, 'submit')
-}
-
-export async function fetchJobs(): Promise<Job[]> {
-  const res = await fetch('/api/jobs')
-  if (!res.ok) return []
-  return res.json()
-}
-
-// A "group" is a switchable embedding: the served store root (path '') or a view
-// store nested under it (umap_views/<slug>), listed by the backend from the store.
 export type Group = { id: string; label: string; path: string; params?: RecordedParams | null }
-
-export async function fetchViews(): Promise<Group[]> {
-  const res = await request('/api/views', { cache: 'no-store' }, 'views')
-  return res.json()
-}
 
 export type GpuHealth = {
   status: 'ok' | 'error' | 'checking' | 'unconfigured'
@@ -60,27 +23,48 @@ export type GpuHealth = {
   checked_at?: string | null
 }
 
-// Cached backend probe: store credential + GPU visible in the backend container. refresh forces a re-probe.
+type LabelAssignment = { label: string; barcodes: string[] }
+
+async function request(url: string, init: RequestInit | undefined, what: string): Promise<Response> {
+  const res = await fetch(url, init)
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => null))?.detail
+    throw new Error(detail ?? `${what} failed: ${res.status}`)
+  }
+  return res
+}
+
+const postJson = (url: string, body: unknown, what: string) =>
+  request(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, what)
+
+export async function submitSelection(body: { barcodes: string[]; name: string; params: RunParams }): Promise<void> {
+  await postJson('/api/submit', body, 'submit')
+}
+
+export async function fetchJobs(): Promise<Job[]> {
+  const res = await fetch('/api/jobs')
+  return res.ok ? res.json() : []
+}
+
+export async function fetchViews(): Promise<Group[]> {
+  return (await request('/api/views', { cache: 'no-store' }, 'views')).json()
+}
+
 export async function fetchGpuHealth(refresh = false): Promise<GpuHealth | null> {
   const res = await fetch(`/api/gpu/health${refresh ? '?refresh=1' : ''}`)
-  if (!res.ok) return null
-  return res.json()
+  return res.ok ? res.json() : null
 }
 
 export async function deleteView(id: string): Promise<void> {
   await request(`/api/views/${encodeURIComponent(id)}`, { method: 'DELETE' }, 'delete view')
 }
 
-export type LabelAssignment = { label: string; barcodes: string[] }
-
-// Assignments are barcode-based so labels made inside a view land on the root store.
-// An existing column is edited in place; categories left with no cells are dropped.
-// `group` targets a view's own column (its leiden) instead of the root's.
+/** Barcode assignments, so labels made inside a view land on the root store; `group`
+ * targets a view's own column instead. */
 export async function saveLabels(
   name: string,
   assignments: LabelAssignment[],
   group?: string,
 ): Promise<{ name: string; categories: string[]; labeled: number }> {
-  const res = await postJson('/api/labels', { name, assignments, ...(group ? { group } : {}) }, 'label save')
-  return res.json()
+  return (await postJson('/api/labels', { name, assignments, ...(group ? { group } : {}) }, 'label save')).json()
 }

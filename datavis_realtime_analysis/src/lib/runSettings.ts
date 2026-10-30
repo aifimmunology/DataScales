@@ -1,12 +1,8 @@
-// Per-run GPU pipeline settings: what the settings drawer edits, what /api/submit
-// carries (`RunParams`, mirroring gpu/run_params.py), and how a view's recorded
-// parameters are summarised.
-
 export type Method = 'pca' | 'latent'
-type SentMethod = Method | 'auto' // auto = the backend picks the store's default route
+type SentMethod = Method | 'auto'
 
 export type RunSettings = {
-  method: Method | null // null = follow the store's default route
+  method: Method | null
   nNeighbors: number
   minDist: number
   resolution: number
@@ -42,8 +38,6 @@ export function effectiveMethod(s: RunSettings, info: EmbeddingInfo | null): Met
   return wanted === 'latent' && !info?.latent ? 'pca' : wanted
 }
 
-// Without embedding info (config fetch failed) the frontend can't resolve the route, so
-// the backend does — never silently fall back to PCA.
 export function toParams(s: RunSettings, info: EmbeddingInfo | null): RunParams {
   const method: SentMethod = info ? effectiveMethod(s, info) : s.method ?? 'auto'
   return {
@@ -68,7 +62,6 @@ export function saveSettings(s: RunSettings): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(s))
   } catch {
-    /* private window or blocked storage: settings just don't persist */
   }
 }
 

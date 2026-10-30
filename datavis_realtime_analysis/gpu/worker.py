@@ -1,7 +1,7 @@
-"""Warm pipeline worker, spawned by the backend on first submit. Does the heavy
-imports + CUDA init once, then runs one job per stdin JSON line
-({id, store, selection, out, label, params}), reporting `stage:` / `done:` / `error:` lines on
-stdout. Exits after WORKER_IDLE_S without a job so GPU memory frees when idle.
+"""Warm pipeline worker, spawned by the backend on first submit. Does the heavy imports +
+CUDA init once, then runs one job per stdin JSON line ({id, store, selection, out, label,
+params}), reporting `stage:` / `done:` / `error:` lines on stdout. Exits after
+WORKER_IDLE_S without a job so GPU memory frees when idle.
 """
 
 import gc
@@ -14,11 +14,10 @@ IDLE_S = float(os.environ.get("WORKER_IDLE_S", "900"))
 
 
 def main():
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     print("stage: warming up pipeline (imports + CUDA)", flush=True)
     import rerun_umap_on_selection as pipeline
-    pipeline.warm_up()
 
+    pipeline.warm_up()
     while True:
         ready, _, _ = select.select([sys.stdin], [], [], IDLE_S)
         if not ready:

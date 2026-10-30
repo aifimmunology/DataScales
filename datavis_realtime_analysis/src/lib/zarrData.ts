@@ -1,388 +1,101 @@
 import * as zarr from 'zarrita'
+import { cached } from './async'
+import type { LabelSetInfo } from './columns'
 import type { EmbeddingInfo } from './runSettings'
 
-// All zarr reads go through the backend's /api/data proxy (Vite in dev, nginx in Docker).
-export const DATA_BASE_URL = window.location.origin + '/api/data'
+const DATA_BASE_URL = window.location.origin + '/api/data'
 
-// Label saves rewrite store files in place: every read revalidates (a 304 when
-// unchanged), so a browser never answers from a stale cached copy.
 const REVALIDATE: RequestInit = { cache: 'no-cache' }
 const fetchStore = (url: string) => new zarr.FetchStore(url, { overrides: REVALIDATE })
+const inGroup = (group: string, path: string) => (group ? `${group}/${path}` : path)
 
 type AppConfig = { store?: string; embedding?: EmbeddingInfo }
 let cfgPromise: Promise<AppConfig> | null = null
+
 export function getConfig(): Promise<AppConfig> {
   cfgPromise ??= fetch(window.location.origin + '/api/config')
     .then(res => (res.ok ? res.json() : Promise.reject(new Error(`config ${res.status}`))))
     .catch(() => {
-      cfgPromise = null // transient failure (backend restarting): retry on next call
+      cfgPromise = null
       return {}
     })
   return cfgPromise
 }
 
-// Store recorded in selection exports/submissions.
-export async function getStoreId(): Promise<string> {
-  const cfg = await getConfig()
-  return cfg.store || DATA_BASE_URL
-}
-
-// A color-by label set is any categorical obs column; discovered per group.
-export type Level = string
-export type LabelSetInfo = { name: string; own: boolean; nCats: number } // own = app-created (extendable)
-
-/** Every obs column name in the group (column-order), categorical or not. */
-export async function loadObsColumns(group = ''): Promise<string[]> {
-  const meta = await probe(DATA_BASE_URL, group ? `${group}/obs` : 'obs')
-  return (meta?.attrs['column-order'] as string[]) ?? []
-}
-
-/** Every categorical obs column in the group, with app-ownership and category
- * count — metadata-only (counts come from categories/zarr.json shape). Consumers
- * filter: the Color-by dropdown applies its inclusion rule; the Labels panel
- * searches the full list for extending/forking. */
-export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
-  const base = DATA_BASE_URL
-  const prefix = group ? `${group}/` : ''
-  const obsMeta = await probe(base, `${prefix}obs`)
-  const cols = (obsMeta?.attrs['column-order'] as string[]) ?? []
-  const keep = await Promise.all(
-    cols.map(async col => {
-      const p = await probe(base, `${prefix}obs/${col}`)
-      if (p?.attrs['encoding-type'] !== 'categorical') return null
-      const res = await fetch(`${base}/${prefix}obs/${col}/categories/zarr.json`, REVALIDATE)
-      if (res.status === 404) return null
-      if (!res.ok) throw new Error(`obs/${col}/categories: ${res.status} ${res.statusText}`)
-      const meta = await res.json()
-      return {
-        name: col,
-        own: p.attrs['datavis-labelset'] === true,
-        nCats: (meta.shape?.[0] as number) ?? 0,
-      }
-    }),
-  )
-  return keep.filter((c): c is LabelSetInfo => c !== null)
-}
-
-// Each view's own clustering: the one column a view reads from itself. Every other
-// column in a view is read from the root via obs/root_row (the view's copies are frozen).
-export const VIEW_NATIVE = 'leiden'
-
-export const isViewNative = (group: string, name: string) => !!group && name === VIEW_NATIVE
-
-export const columnLabel = (group: string, name: string) =>
-  isViewNative(group, name) ? `${name} (current view only)` : name
-
-/** Columns as seen from a group: the root's, with a view's own VIEW_NATIVE in place of the root's. */
-export function groupColumns(group: string, ls: LabelSetInfo[], rootLs: LabelSetInfo[]): LabelSetInfo[] {
-  if (!group) return ls
-  const own = ls.find(s => s.name === VIEW_NATIVE)
-  const cols = rootLs.flatMap(s => (s.name !== VIEW_NATIVE ? [s] : own ? [own] : []))
-  return own && !rootLs.some(s => s.name === VIEW_NATIVE) ? [...cols, own] : cols
-}
-
-// Color-by dropdown rule: any categorical with fewer than 100 categories.
-const MAX_DROPDOWN_CATS = 100
-
-export function dropdownLabelSets(sets: LabelSetInfo[]): string[] {
-  return sets
-    .filter(s => s.nCats < MAX_DROPDOWN_CATS)
-    .map(s => s.name)
-}
-
-export type RGB = [number, number, number]
-
-// Categorical palette (tab20-ish, colorblind-leaning). Indexed by category code;
-// wraps if a level has more categories than colors.
-const PALETTE: RGB[] = [
-  [31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40],
-  [148, 103, 189], [140, 86, 75], [227, 119, 194], [127, 127, 127],
-  [188, 189, 34], [23, 190, 207], [174, 199, 232], [255, 187, 120],
-]
-
-export function colorForCode(code: number): RGB {
-  if (code < 0) return [130, 130, 130] // NaN / unassigned
-  return PALETTE[code % PALETTE.length]
-}
-
-// Cells with no category in the active label set: code -1 in AnnData categoricals.
-// The legend offers them as a selectable "unlabeled" row keyed by a sentinel name
-// that no real category can collide with.
-export const UNLABELED_CODE = -1
-export const UNLABELED_NAME = '\u0000unlabeled'
-export const UNLABELED_SWATCH: RGB = [0, 0, 0]
-
-export function hasUnlabeled(c: Categorical): boolean {
-  for (let i = 0; i < c.codes.length; i++) if (c.codes[i] < 0) return true
-  return false
-}
-
-// Expression ramp over EXPRESSING cells: viridis-style blue -> teal -> green ->
-// yellow. Multi-hue so adjacent expression levels stay distinguishable; starts at
-// blue (not viridis's near-black purple) to keep the low end distinct from EXPR_NONE.
-const RAMP: RGB[] = [
-  [59, 82, 139],
-  [33, 145, 140],
-  [94, 201, 98],
-  [253, 231, 37],
-]
-
-export function exprColor(t: number): RGB {
-  const x = Math.min(Math.max(t, 0), 1) * (RAMP.length - 1)
-  const i = Math.min(Math.floor(x), RAMP.length - 2)
-  const f = x - i
-  const a = RAMP[i]
-  const b = RAMP[i + 1]
-  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
-}
-
-// Zero/no expression: dark, recedes behind the ramp.
-export const EXPR_NONE: RGB = [46, 46, 58]
-
-// A "group" is either the served store root (path '') or a nested view store
-// (e.g. 'umap_views/bcell_selection'). Every array fetch is prefixed by it, so the
-// same obsm/X_umap + obs/* paths resolve inside whichever group is active.
-async function openArray(path: string, group: string, base: string) {
-  const rel = group ? `${group}/${path}` : path
-  const store = fetchStore(`${base}/${rel}`)
-  return zarr.open.v3(store, { kind: 'array' })
-}
-
-export type Point = { position: [number, number]; index: number }
-
-/** obsm/X_umap -> one Point per cell, for the given group. */
-export async function loadUmapCoords(group = ''): Promise<Point[]> {
-  const arr = await openArray('obsm/X_umap', group, DATA_BASE_URL)
-  const data = (await zarr.get(arr)).data as Float32Array | Float64Array
-  const n = arr.shape[0]
-  const points: Point[] = new Array(n)
-  for (let i = 0; i < n; i++) {
-    points[i] = { position: [data[i * 2], data[i * 2 + 1]], index: i }
-  }
-  return points
-}
-
-/** obs index column (named per its `_index` attr) -> one id per cell (obs_names).
- * Used for the selection export. */
-export async function loadBarcodes(group = ''): Promise<string[]> {
-  const rel = group ? `${group}/obs` : 'obs'
-  const obsGroup = await zarr.open.v3(fetchStore(`${DATA_BASE_URL}/${rel}`), { kind: 'group' })
-  const idxCol = (obsGroup.attrs['_index'] as string) ?? '_index'
-  const arr = await openArray(`obs/${idxCol}`, group, DATA_BASE_URL)
-  const data = (await zarr.get(arr)).data as ArrayLike<string>
-  return Array.from(data)
-}
-
-export type Categorical = { codes: Int8Array | Int16Array | Int32Array; categories: string[] }
-
-/** An AnnData categorical obs column: per-cell integer `codes` + `categories`. */
-export async function loadCategorical(col: Level, group = ''): Promise<Categorical> {
-  const base = DATA_BASE_URL
-  const codesArr = await openArray(`obs/${col}/codes`, group, base)
-  const codes = (await zarr.get(codesArr)).data as Int8Array | Int16Array | Int32Array
-  const catsArr = await openArray(`obs/${col}/categories`, group, base)
-  const categories = Array.from((await zarr.get(catsArr)).data as ArrayLike<string>)
-  return { codes, categories }
-}
-
-/** A ROOT categorical gathered into a view's row order via obs/root_row — how root
- * columns are read inside views: always the current root state, never the frozen
- * copy the pipeline baked into the view's own obs. */
-export async function gatherRootCategorical(col: Level, group: string): Promise<Categorical> {
-  return gatherCategorical(await loadCategorical(col, ''), group)
-}
-
-/** An already-loaded root categorical gathered into a view's row order. */
-export async function gatherCategorical(root: Categorical, group: string): Promise<Categorical> {
-  const rows = await viewRootRows(group)
-  const codes = new Int32Array(rows.length)
-  for (let i = 0; i < rows.length; i++) codes[i] = Number(root.codes[Number(rows[i])])
-  return { codes, categories: root.categories }
-}
-
-// Gene data always lives in the ROOT store: GPU views hold only obs + coords, so
-// their expression comes from the root gene source gathered via obs/root_row.
-let geneNamesP: Promise<string[]> | null = null
-
-/** Gene names from the root var index column (named per its `_index` attr) — only
- * when a gene-readable matrix exists; rejects otherwise so the picker stays hidden. */
-export function loadGeneNames(): Promise<string[]> {
-  geneNamesP ??= (async () => {
-    await geneSource()
-    const varGroup = await zarr.open.v3(fetchStore(`${DATA_BASE_URL}/var`), { kind: 'group' })
-    const idxCol = (varGroup.attrs['_index'] as string) ?? '_index'
-    const arr = await openArray(`var/${idxCol}`, '', DATA_BASE_URL)
-    return Array.from((await zarr.get(arr)).data as ArrayLike<string>)
-  })()
-  geneNamesP.catch(() => {
-    geneNamesP = null // transient failure: retry on next call
-  })
-  return geneNamesP
-}
-
-export type GeneExpression = { colors: Uint8Array; range: [number, number]; warning?: string }
-
-// A dense one-column read fetches every chunk intersecting the column; refuse
-// layouts where that means streaming a large share of X (row-oriented chunks).
-const MAX_COLUMN_READ_BYTES = 256 * 1024 * 1024
-
-type GeneSource =
-  | { kind: 'dense'; base: string; path: string }
-  | { kind: 'csc'; base: string; path: string; nObs: number }
-
-let geneSourceP: Promise<GeneSource> | null = null
-const cscIndptrs = new Map<string, Promise<number[]>>()
-const rootRowMaps = new Map<string, Promise<Int32Array>>() // per view: view row -> root row
-
-// Opened-array cache: zarr.open fetches the array's zarr.json, so without this
-// every gene click pays extra metadata round-trips through the proxy.
-type OpenedArray = Awaited<ReturnType<typeof openArray>>
-const openedArrays = new Map<string, Promise<OpenedArray>>()
-
-// Caches evict on rejection: a transient failure (backend restart, view still
-// uploading) must not poison the entry for the rest of the session.
-function openAt(url: string): Promise<OpenedArray> {
-  let arr = openedArrays.get(url)
-  if (!arr) {
-    arr = zarr.open.v3(fetchStore(url), { kind: 'array' })
-    arr.catch(() => openedArrays.delete(url))
-    openedArrays.set(url, arr)
-  }
-  return arr
-}
-
-// null means the node genuinely doesn't exist; transient failures (backend
-// booting -> 502, etc.) throw so callers retry instead of caching "absent".
-async function probe(base: string, path: string) {
-  const res = await fetch(`${base}/${path}/zarr.json`, REVALIDATE)
+/** A node's zarr.json, or null when it does not exist; other failures throw. */
+export async function probe(path: string) {
+  const res = await fetch(`${DATA_BASE_URL}/${path}/zarr.json`, REVALIDATE)
   if (res.status === 404) return null
   if (!res.ok) throw new Error(`${path}: ${res.status} ${res.statusText}`)
   const meta = await res.json()
-  return { node: meta.node_type as string, attrs: (meta.attributes ?? {}) as Record<string, unknown> }
-}
-
-// Gene reads resolve to the root layers/gexp first (the zarrsmith setup), then
-// root X; dense arrays and CSC groups are readable, CSR is not (a column read
-// would scan it all).
-async function resolveGeneSource(): Promise<GeneSource> {
-  for (const path of ['layers/gexp', 'X']) {
-    const p = await probe(DATA_BASE_URL, path)
-    if (!p) continue
-    if (p.node === 'array') return { kind: 'dense', base: DATA_BASE_URL, path }
-    if (p.attrs['encoding-type'] === 'csc_matrix') {
-      const [nObs] = p.attrs['shape'] as [number, number]
-      return { kind: 'csc', base: DATA_BASE_URL, path, nObs }
-    }
+  return {
+    node: meta.node_type as string,
+    shape: meta.shape as number[] | undefined,
+    attrs: (meta.attributes ?? {}) as Record<string, unknown>,
   }
-  throw new Error(
-    'no gene-readable matrix (need layers/gexp or a dense/CSC X) — run `annizarr add-expr` on the store',
-  )
 }
 
-function geneSource(): Promise<GeneSource> {
-  geneSourceP ??= resolveGeneSource()
-  geneSourceP.catch(() => {
-    geneSourceP = null
-  })
-  return geneSourceP
+const openArray = (path: string) => zarr.open.v3(fetchStore(`${DATA_BASE_URL}/${path}`), { kind: 'array' })
+type OpenedArray = Awaited<ReturnType<typeof openArray>>
+
+const openedArrays = new Map<string, Promise<OpenedArray>>()
+const rootRowMaps = new Map<string, Promise<Int32Array>>()
+
+export const openCached = (path: string) => cached(openedArrays, path, () => openArray(path))
+
+const readAll = async (path: string) => (await zarr.get(await openArray(path))).data
+
+/** obsm/X_umap as interleaved float32 x,y. */
+export async function loadUmapCoords(group = ''): Promise<Float32Array> {
+  const data = (await readAll(inGroup(group, 'obsm/X_umap'))) as Float32Array | Float64Array
+  return data instanceof Float32Array ? data : Float32Array.from(data)
 }
 
-// A view's obs/root_row maps its rows onto the root store (written by the GPU
-// pipeline), so root gene columns can be gathered into view order.
-function viewRootRows(group: string): Promise<Int32Array> {
-  let p = rootRowMaps.get(group)
-  if (!p) {
-    p = (async () => {
-      const arr = await openArray('obs/root_row', group, DATA_BASE_URL)
-      return (await zarr.get(arr)).data as Int32Array
-    })()
-    p.catch(() => rootRowMaps.delete(group))
-    rootRowMaps.set(group, p)
-  }
-  return p
+async function readIndex(group: string, node: 'obs' | 'var'): Promise<string[]> {
+  const meta = await probe(inGroup(group, node))
+  const col = (meta?.attrs['_index'] as string) ?? '_index'
+  return Array.from((await readAll(inGroup(group, `${node}/${col}`))) as ArrayLike<string>)
 }
 
-// CSC column = two tiny range reads: data/indices[indptr[j]:indptr[j+1]], scattered
-// into a dense per-cell vector. indptr is read once per source and cached.
-async function readCscColumn(src: { base: string; path: string; nObs: number }, geneIdx: number): Promise<Float32Array> {
-  const url = `${src.base}/${src.path}`
-  let indptr = cscIndptrs.get(url)
-  if (!indptr) {
-    indptr = openAt(`${url}/indptr`)
-      .then(arr => zarr.get(arr))
-      .then(r => Array.from(r.data as ArrayLike<number | bigint>, Number))
-    indptr.catch(() => cscIndptrs.delete(url))
-    cscIndptrs.set(url, indptr)
-  }
-  const ip = await indptr
-  const out = new Float32Array(src.nObs)
-  const [start, end] = [ip[geneIdx], ip[geneIdx + 1]]
-  if (start === end) return out
-  const sel = [zarr.slice(start, end)]
-  const [vals, rows] = await Promise.all([
-    openAt(`${url}/data`).then(a => zarr.get(a, sel)),
-    openAt(`${url}/indices`).then(a => zarr.get(a, sel)),
+export const loadBarcodes = (group = '') => readIndex(group, 'obs')
+export const loadVarNames = () => readIndex('', 'var')
+
+export type Categorical = { codes: Int8Array | Int16Array | Int32Array; categories: string[] }
+
+export async function loadCategorical(col: string, group = ''): Promise<Categorical> {
+  const [codes, cats] = await Promise.all([
+    readAll(inGroup(group, `obs/${col}/codes`)),
+    readAll(inGroup(group, `obs/${col}/categories`)),
   ])
-  const v = vals.data as ArrayLike<number>
-  const r = rows.data as ArrayLike<number | bigint>
-  for (let i = 0; i < v.length; i++) out[Number(r[i])] = Number(v[i])
-  return out
+  return { codes: codes as Categorical['codes'], categories: Array.from(cats as ArrayLike<string>) }
 }
 
-async function readDenseColumn(src: { base: string; path: string }, geneIdx: number): Promise<ArrayLike<number>> {
-  const arr = await openAt(`${src.base}/${src.path}`)
-  const readBytes = arr.shape[0] * arr.chunks[1] * 4
-  if (readBytes > MAX_COLUMN_READ_BYTES) {
-    throw new Error(
-      `store not laid out for gene queries: one gene read would fetch ~${Math.round(readBytes / 1e6)} MB`,
-    )
-  }
-  return (await zarr.get(arr, [null, geneIdx])).data as ArrayLike<number>
+/** A view's obs/root_row: view row -> root-store row. */
+export const viewRootRows = (group: string) =>
+  cached(rootRowMaps, group, async () => (await readAll(`${group}/obs/root_row`)) as Int32Array)
+
+export async function gatherCategorical(root: Categorical, group: string): Promise<Categorical> {
+  const rows = await viewRootRows(group)
+  const codes = new Int32Array(rows.length)
+  for (let i = 0; i < rows.length; i++) codes[i] = Number(root.codes[rows[i]])
+  return { codes, categories: root.categories }
 }
 
-/** One gene column (root layers/gexp, dense X, or CSC X) -> per-cell ramp colors
- * + value range. In a view, root values are gathered via obs/root_row, and the
- * ramp normalizes over the view's own cells. */
-export async function loadGeneExpression(geneIdx: number, group = ''): Promise<GeneExpression> {
-  const src = await geneSource()
-  const rootVals = src.kind === 'csc'
-    ? await readCscColumn(src, geneIdx)
-    : await readDenseColumn(src, geneIdx)
-  let vals: ArrayLike<number> = rootVals
-  if (group) {
-    const rows = await viewRootRows(group).catch(() => {
-      throw new Error('this view predates gene highlighting (no obs/root_row) — re-run the selection')
-    })
-    const gathered = new Float32Array(rows.length)
-    for (let i = 0; i < rows.length; i++) gathered[i] = Number(rootVals[Number(rows[i])])
-    vals = gathered
-  }
-  // ramp spans only the expressing cells (v > 0); zeros stay dark so the range
-  // isn't wasted on the non-expressing majority
-  const n = vals.length
-  let lo = Infinity
-  let hi = -Infinity
-  for (let i = 0; i < n; i++) {
-    const v = Number(vals[i]) // int64 stores yield BigInt — normalize before math
-    if (v <= 0) continue
-    if (v < lo) lo = v
-    if (v > hi) hi = v
-  }
-  const none = lo === Infinity // gene expressed nowhere
-  const span = hi - lo || 1
-  const colors = new Uint8Array(n * 3)
-  for (let i = 0; i < n; i++) {
-    const v = Number(vals[i])
-    const [r, g, b] = v > 0 ? exprColor((v - lo) / span) : EXPR_NONE
-    colors[i * 3] = r
-    colors[i * 3 + 1] = g
-    colors[i * 3 + 2] = b
-  }
-  const range: [number, number] = none ? [0, 0] : [lo, hi]
-  // integer dtype = raw counts (dtype comes from the cached open — no data scan)
-  const stored = await openAt(src.kind === 'csc' ? `${src.base}/${src.path}/data` : `${src.base}/${src.path}`)
-  const warning = String(stored.dtype).includes('int')
-    ? 'raw counts (integer dtype): colors follow skewed counts — use a normalized store/layer'
-    : undefined
-  return { colors, range, warning }
+export async function loadObsColumns(group = ''): Promise<string[]> {
+  const meta = await probe(inGroup(group, 'obs'))
+  return (meta?.attrs['column-order'] as string[]) ?? []
+}
+
+/** Every categorical obs column in the group, with app ownership and category count (metadata only). */
+export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
+  const cols = await loadObsColumns(group)
+  const found = await Promise.all(
+    cols.map(async name => {
+      const col = await probe(inGroup(group, `obs/${name}`))
+      if (col?.attrs['encoding-type'] !== 'categorical') return null
+      const cats = await probe(inGroup(group, `obs/${name}/categories`))
+      return cats ? { name, own: col.attrs['datavis-labelset'] === true, nCats: cats.shape?.[0] ?? 0 } : null
+    }),
+  )
+  return found.filter((c): c is LabelSetInfo => c !== null)
 }

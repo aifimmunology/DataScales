@@ -16,11 +16,11 @@ from . import storage
 from .config import SOURCE
 
 _lock = threading.Lock()
-_barcode_index: dict[str, dict[str, int]] = {}  # group -> barcode -> row
+_barcode_index: dict[str, dict[str, int]] = {}
 VIEW_NATIVE = "leiden"
 
 CODES_CHUNK = 375_000
-STAGING = ".datavis_staging"  # leading dot: never served or mirrored
+STAGING = ".datavis_staging"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,59}")
 
 
@@ -51,8 +51,6 @@ def _rows_for(obs, group: str, barcodes: list[str]):
 
 
 def _write_categorical(obs, rel: str, name: str, codes, cats: list[str]) -> None:
-    """Local stores get the new column built aside and renamed in, so readers and failed
-    saves never see a half-written column; a GCS store is rewritten in place."""
     import zarr
 
     attrs = {**(dict(obs[name].attrs) if name in obs else {}), "encoding-type": "categorical",

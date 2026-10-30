@@ -1,20 +1,20 @@
 import { useState } from 'react'
-import { panel, control, label as labelStyle, primaryBtn, rgb } from '../lib/styles'
-import { colorForCode, type LabelSetInfo } from '../lib/zarrData'
+import { button, buttonOff, column, control, dangerButton, label as labelStyle, primaryBtn, rgb } from '../lib/styles'
+import type { LabelSetInfo } from '../lib/columns'
 import { validLabelsetName } from '../lib/labeling'
+import { colorForCode } from '../lib/palette'
+import type { Saved } from '../hooks/useLabeling'
 import ComboBox from './ComboBox'
 
-type Active = { name: string; cats: string[]; counts: number[] }
-
 type Props = {
-  active: Active | null
-  columns: LabelSetInfo[] // every categorical obs column in this group
+  active: { name: string; cats: string[]; counts: number[] } | null
+  columns: LabelSetInfo[]
   labelFor: (name: string) => string
   selectionCount: number
   saving: boolean
-  saved: { name: string; labeled: number } | null // last completed save
+  saved: Saved | null
   dirty: boolean
-  selectedLabels: Set<number> // label rows currently cluster-selected
+  selectedLabels: Set<number>
   onLabelClick: (k: number) => void
   onStart: (name: string) => void
   onAssign: (label: string) => void
@@ -23,88 +23,55 @@ type Props = {
   onDismissSaved: () => void
 }
 
-// Rail section: pick any categorical obs column (or name a new one), relabel
-// selections (lasso or legend cluster clicks), then save it back in place.
-export default function LabelsPanel({
-  active,
-  columns,
-  labelFor,
-  selectionCount,
-  saving,
-  saved,
-  dirty,
-  selectedLabels,
-  onLabelClick,
-  onStart,
-  onAssign,
-  onSave,
-  onCancel,
-  onDismissSaved,
-}: Props) {
+export default function LabelsPanel(p: Props) {
   const [lab, setLab] = useState('')
 
-  if (!active) {
+  if (!p.active) {
     return (
-      <div style={panelStyle}>
+      <div style={column(6)}>
         <label style={labelStyle}>Labels</label>
-        {saved && (
-          <div style={savedStyle} onClick={onDismissSaved} title="dismiss">
-            ✓ '{saved.name}' saved — {saved.labeled.toLocaleString()} cells labeled
+        {p.saved && (
+          <div style={savedStyle} onClick={p.onDismissSaved} title="dismiss">
+            ✓ '{p.saved.name}' saved — {p.saved.labeled.toLocaleString()} cells labeled
           </div>
         )}
         <ComboBox
-          options={columns.map(c => ({ value: c.name, label: labelFor(c.name), hint: `(${c.nCats})` }))}
-          placeholder={`Edit one of ${columns.length} columns, or name a new set…`}
-          onPick={onStart}
-          createLabel={q => (columns.some(c => c.name === q) || !validLabelsetName(q) ? null : `＋ New empty labelset '${q}'`)}
-          onCreate={onStart}
+          options={p.columns.map(c => ({ value: c.name, label: p.labelFor(c.name), hint: `(${c.nCats})` }))}
+          placeholder={`Edit one of ${p.columns.length} columns, or name a new set…`}
+          onPick={p.onStart}
+          createLabel={q => (p.columns.some(c => c.name === q) || !validLabelsetName(q) ? null : `＋ New empty labelset '${q}'`)}
+          onCreate={p.onStart}
         />
       </div>
     )
   }
 
-  const canAssign = !!lab.trim() && selectionCount > 0 && !saving
+  const canAssign = !!lab.trim() && p.selectionCount > 0 && !p.saving
   return (
-    <div style={panelStyle}>
-      <label style={labelStyle}>Labeling: {labelFor(active.name)}</label>
-      {active.cats.map((c, k) => (
-        <div
-          key={c}
-          onClick={() => onLabelClick(k)}
-          title="click to select these cells"
-          style={{
-            display: 'flex',
-            gap: 6,
-            alignItems: 'center',
-            fontSize: 12,
-            cursor: 'pointer',
-            padding: '1px 4px',
-            borderRadius: 3,
-            background: selectedLabels.has(k) ? '#3a3411' : 'transparent',
-          }}
-        >
-          <span style={{ width: 10, height: 10, borderRadius: 2, background: rgb(colorForCode(k)), flexShrink: 0 }} />
-          <span style={{ color: selectedLabels.has(k) ? '#ffe94d' : '#ddd' }}>{c}</span>
-          <span style={{ color: '#888' }}>{active.counts[k]?.toLocaleString()}</span>
-        </div>
-      ))}
-      <input
-        value={lab}
-        placeholder="label for selection…"
-        onChange={e => setLab(e.target.value)}
-        style={inputStyle}
-      />
+    <div style={column(6)}>
+      <label style={labelStyle}>Labeling: {p.labelFor(p.active.name)}</label>
+      {p.active.cats.map((c, k) => {
+        const on = p.selectedLabels.has(k)
+        return (
+          <div key={c} onClick={() => p.onLabelClick(k)} title="click to select these cells" style={{ ...rowStyle, background: on ? '#3a3411' : 'transparent' }}>
+            <span style={{ ...swatchStyle, background: rgb(colorForCode(k)) }} />
+            <span style={{ color: on ? '#ffe94d' : '#ddd' }}>{c}</span>
+            <span style={{ color: '#888' }}>{p.active!.counts[k]?.toLocaleString()}</span>
+          </div>
+        )
+      })}
+      <input value={lab} placeholder="label for selection…" onChange={e => setLab(e.target.value)} style={{ ...control, cursor: 'text' }} />
       <button
         disabled={!canAssign}
         onClick={() => {
-          onAssign(lab.trim())
+          p.onAssign(lab.trim())
           setLab('')
         }}
-        style={canAssign ? primaryBtn : offStyle}
+        style={canAssign ? primaryBtn : buttonOff}
       >
-        Assign to {selectionCount.toLocaleString()} cells
+        Assign to {p.selectionCount.toLocaleString()} cells
       </button>
-      {saving ? (
+      {p.saving ? (
         <div>
           <div style={barTrackStyle}>
             <div style={barFillStyle} />
@@ -113,10 +80,10 @@ export default function LabelsPanel({
         </div>
       ) : (
         <div style={{ display: 'flex', gap: 6 }}>
-          <button disabled={!dirty} onClick={onSave} style={!dirty ? offStyle : canAssign ? btnStyle : primaryBtn}>
+          <button disabled={!p.dirty} onClick={p.onSave} style={!p.dirty ? buttonOff : canAssign ? button : primaryBtn}>
             💾 Save to store
           </button>
-          <button onClick={onCancel} style={{ ...btnStyle, color: '#f88', borderColor: '#622' }}>
+          <button onClick={p.onCancel} style={dangerButton}>
             Cancel
           </button>
         </div>
@@ -125,30 +92,9 @@ export default function LabelsPanel({
   )
 }
 
-const panelStyle: React.CSSProperties = {
-  ...panel,
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 6,
-  maxWidth: 220,
-}
-
-const inputStyle: React.CSSProperties = { ...control, cursor: 'text' }
-
-const btnStyle: React.CSSProperties = {
-  ...control,
-  padding: '6px 10px',
-  cursor: 'pointer',
-  textAlign: 'left',
-}
-
-const offStyle: React.CSSProperties = { ...btnStyle, opacity: 0.4, cursor: 'not-allowed' }
-
-const savedStyle: React.CSSProperties = {
-  fontSize: 12,
-  color: '#7f7',
-  cursor: 'pointer',
-}
+const rowStyle: React.CSSProperties = { display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer', padding: '1px 4px', borderRadius: 3 }
+const swatchStyle: React.CSSProperties = { width: 10, height: 10, borderRadius: 2, flexShrink: 0 }
+const savedStyle: React.CSSProperties = { fontSize: 12, color: '#7f7', cursor: 'pointer' }
 
 const barTrackStyle: React.CSSProperties = {
   position: 'relative',

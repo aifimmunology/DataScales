@@ -10,6 +10,7 @@ A browser app for labeling cells on a UMAP and re-clustering any selection on a 
 
 - **Labeling** — lasso cells, name a label, and *Save to store*. Labelsets are written onto the store's `obs` as anndata categorical columns (`-1` = unlabeled), so they are readable by scanpy/anndata immediately. Assignments travel as barcodes, so labels made inside a re-clustered view land on the root store.
 - **Re-clustering on the GPU** — lasso a selection and hit *Generate New UMAP*. The backend runs the RAPIDS single-cell pipeline on just those cells and writes the result to `umap_views/<name>` in the store. scRNA goes normalize → HVG → PCA → neighbors → UMAP from raw counts; a store whose neighbor graph came from a stored latent space (scATAC with a PeakVI embedding in `obsm`, recorded in `uns/neighbors/params/use_rep`) skips straight to neighbors → UMAP from that latent and never reads `X`. The route and the run parameters (neighbors, UMAP `min_dist`, leiden resolution, an optional Harmony batch key) are set per run in the settings drawer beside the Selection panel, pre-filled with the store's defaults and remembered by the browser; every view records the parameters that produced it. This is why the backend lives on a GPU: a sub-UMAP of tens of thousands to a few million cells comes back in seconds to minutes instead of hours, so you can drill into a population, re-embed it, label the sub-structure that appears, and repeat. A warm worker process keeps the CUDA context between jobs; selections ≤ 500k cells run eagerly on one GPU, larger ones stream through a per-run dask-cuda cluster.
+- **Rendering at scale** — the browser reads `obsm/X_umap` once and draws it with deck.gl in a fixed random order. Zoomed out it draws a uniform subsample (levels halving from the full store, ~600k points on screen), zoomed in it adds cells until every one is drawn; dot size follows the zoom so the plot keeps the same density of ink at every level. Lasso, legend selections and labels always act on every cell, drawn or not. The side drawers resize by dragging their right edge.
 - **Gene expression highlighting** — color the embedding by any gene, read from a log-normalized expression layer in the store (see [Data](#data)). The Genes panel only appears when the store has such a layer; an ATAC group without one simply has no gene panel.
 
 ---
@@ -82,9 +83,9 @@ If the checkout lives on the VM's local SSD, it is wiped on every stop/start —
 - Stop: `docker compose down`
 - Rebuild with `docker compose up -d --build` both services
 - Pipeline edits in `gpu/` take effect without a rebuild (the directory is bind-mounted); the worker respawns on the next job after 15 min idle, or restart the backend.
-- A red **GPU runs** badge in the app shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing. Running jobs can be cancelled from the runs panel or via `DELETE /api/jobs/<id>`; views are deletable from the view picker.
+- A red **GPU runs** badge in the app shows the failing step with fix commands (expired credential, bucket access, container can't see the GPU). Hit *Re-check* after fixing. Views are deletable from the view picker; a runaway job is stopped with `docker compose restart backend`.
 
-Set `APP_UID` / `APP_GID` in `.env` to your host `id -u` / `id -g` so the backend writes store files as you rather than root. `deploy/restage_store.sh` pulls `GCS_DATA` down to `LOCAL_DATA` after a VM stop/start wipes the local SSD. 
+Set `APP_UID` / `APP_GID` in `.env` to your host `id -u` / `id -g` so the backend writes store files as you rather than root. A VM stop/start wipes the local SSD: copy the store back to `LOCAL_DATA` before redeploying.
 
 ---
 
