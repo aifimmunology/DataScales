@@ -64,6 +64,11 @@ class Config:
     umap_min_dist: float = 0.45
     pca_float64: bool = False           # cast X to float64 before scale for stable std
     batch_key: str = ""         # obs column for harmony; "" disables the harmony step
+    hvg_batch_key: str = ""     # obs column for per-batch HVG selection; "" = pooled
+    harmony_max_iter: int = 30
+    harmony_theta: float = 2.0
+    harmony_alpha: float = 0.2
+    umap_n_components: int = 2
     random_seed: int = 5671
 
     # -- sampling / output --
@@ -504,7 +509,8 @@ def run_pipeline(cfg: Config) -> None:
         rsc.pp.log1p(adata)
 
     with step("hvg"):
-        rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=cfg.n_top_genes)
+        rsc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=cfg.n_top_genes,
+                                     batch_key=cfg.hvg_batch_key or None)
         hvg_mask = np.asarray(adata.var["highly_variable"])
         adata = adata[:, hvg_mask].copy()
         n_rows, n_cols = adata.shape
@@ -532,15 +538,18 @@ def run_pipeline(cfg: Config) -> None:
             # converges at atlas-scale batch counts
             rsc.pp.harmony_integrate(adata, key=cfg.batch_key, basis="X_pca",
                                      adjusted_basis="X_pca_harmony",
-                                     max_iter_harmony=30)
+                                     max_iter_harmony=cfg.harmony_max_iter,
+                                     theta=cfg.harmony_theta, alpha=cfg.harmony_alpha,
+                                     verbose=True)
 
+    rep = "X_pca_harmony" if cfg.batch_key else "X_pca"
     with step("neighbors"):
-        rsc.pp.neighbors(adata, n_neighbors=cfg.n_neighbors, n_pcs=cfg.n_comps,
+        rsc.pp.neighbors(adata, n_neighbors=cfg.n_neighbors, n_pcs=cfg.n_comps, use_rep=rep,
                          algorithm=cfg.neighbors_algorithm, random_state=cfg.random_seed)
 
     with step("umap"):
         rsc.tl.umap(adata, min_dist=cfg.umap_min_dist, init_pos="spectral",
-                    n_components=2, random_state=cfg.random_seed)
+                    n_components=cfg.umap_n_components, random_state=cfg.random_seed)
 
     with step("leiden"):
         rsc.tl.leiden(adata, resolution=cfg.leiden_resolution,
