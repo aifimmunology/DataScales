@@ -35,8 +35,10 @@ code/
     missing from the files, so it was added.
 - **`pixi.toml` is for use outside Code Ocean only** (`CONDA_OVERRIDE_CUDA=13 pixi install`). Code Ocean
   never reads it. **It has not been solved yet**: installing pixi from inside the capsule was blocked.
-- **annizarr 0.2.3 → 0.2.4** (2026-10-30). See §7. The environment page still has 0.2.3 until it's
-  updated and rebuilt; the code works on both.
+- **annizarr stays pinned at 0.2.3**, matching the environment page. The code also works on 0.2.4 (§7).
+- **Why exact pins:** this is an environment, not a library. The CUDA 13 RAPIDS wheels, torch and
+  `cuda-toolkit` have to match each other, and zarr/anndata/spatialdata change fast. annizarr 0.2.4 is an
+  example: it renamed `add_expr`. Without pins, a rebuild quietly installs whatever is newest that day.
 - **`MPLBACKEND=Agg` is set by the image.** Both notebooks start with `%matplotlib inline`.
   - *Why:* without it, JupyterLab shows no plots.
 

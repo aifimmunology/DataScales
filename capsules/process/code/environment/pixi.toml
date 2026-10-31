@@ -10,7 +10,7 @@ platforms = [{ name = "linux-64-cuda-13", platform = "linux-64", cuda = "13" }]
 python = "3.13.*"
 
 [pypi-dependencies]
-annizarr = "==0.2.4"
+annizarr = "==0.2.3"
 icechunk = "==2.3.0"
 boto3 = "==1.43.114"
 zarr = "==3.4.1"

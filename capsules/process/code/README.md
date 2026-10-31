@@ -34,7 +34,7 @@ The main packages:
 | Single-cell on CPU | scanpy 1.12.4, anndata 0.13.4 |
 | Deep learning | torch 2.14.1 (CUDA 13), scvi-tools 1.5.1 |
 | Spatial | squidpy 1.8.3, spatialdata 0.8.0, omnipath 1.0.12 |
-| Storage | zarr 3.4.1, icechunk 2.3.0, annizarr 0.2.4 |
+| Storage | zarr 3.4.1, icechunk 2.3.0, annizarr 0.2.3 |
 
 The full list is [`environment/requirements.txt`](environment/requirements.txt). It needs an NVIDIA
 GPU whose driver supports CUDA 13; the packages bring their own CUDA libraries.
