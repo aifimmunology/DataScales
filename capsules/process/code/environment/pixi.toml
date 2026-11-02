@@ -1,5 +1,6 @@
-# Same packages as requirements.txt, for use outside Code Ocean.
-# Code Ocean installs from the environment page; keep the three in step (see ../../README.md).
+# The same packages as requirements.txt, for use outside Code Ocean:
+#   CONDA_OVERRIDE_CUDA=13 pixi install --manifest-path pixi.toml
+# Code Ocean installs from the environment page instead; keep both files in step with it.
 [workspace]
 name = "datascales-process"
 channels = ["conda-forge"]
@@ -38,6 +39,7 @@ scvi-tools = "==1.5.1"
 matplotlib = "==3.11.2"
 scikit-misc = "==0.5.3"
 ipykernel = "==7.4.0"
+jupyter = "==1.1.1"
 squidpy = "==1.8.3"
 spatialdata = "==0.8.0"
 omnipath = "==1.0.12"
