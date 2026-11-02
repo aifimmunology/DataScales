@@ -123,6 +123,14 @@ Fixes from two independent reviews, each with a test:
     and the `nucleus_count` filter is skipped when that column is missing.
   - Integer counts are cast to float32 before the move to the GPU.
     - *Why:* `anndata_to_GPU` refused int32.
+  - **The `counts` layer is made after the QC filter**, not before the move to the GPU.
+    - *Why:* `adata[keep].copy()` and `filter_genes` copy every layer with `X`, so a second matrix doubled
+      the peak. A tester ran out of GPU memory there on the T4 (a 2.2 GB allocation failed, which works
+      out to about 550M non-zeros, ~4.4 GB per CSR copy). `filter_genes` reads only `X`, which is still
+      raw counts at that point.
+  - **RMM managed memory is on by default (`USE_MANAGED_MEMORY` in the imports cell).**
+    - *Why:* a fallback, so GPU memory spills to host RAM instead of failing with out_of_memory, at the
+      cost of speed when it spills. Set it to `False` to keep everything on the GPU.
   - **New optional §7 save (`SAVE = True`).** It writes the cell types, clusters, niches and embeddings
     into the table under their own names (`spatial_cell_type`, `spatial_leiden`, `spatial_niche`,
     `X_pca_spatial`, `X_umap_spatial`). It writes only those columns, refuses when the icechunk branch
