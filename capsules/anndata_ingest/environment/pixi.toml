@@ -11,7 +11,7 @@ gh = "==2.102.1"
 python-annoy = "==1.17.3"
 
 [pypi-dependencies]
-annizarr = "==0.2.3"
+annizarr = "==0.2.4"
 icechunk = "==2.3.0"
 boto3 = "==1.43.114"
 zarr = "==3.4.1"
