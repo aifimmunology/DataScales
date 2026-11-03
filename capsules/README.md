@@ -1,6 +1,7 @@
 # Capsules
 
-Sources for the three Code Ocean capsules (`ingest`, `qc`, `process`). The design is in [spec.md](spec.md).
+Sources for the Code Ocean capsules: `anndata_ingest` (formerly `ingest`), `qc`, `process`, and the planned
+`spatial_ingest`. The design, including the tested spatial findings, is in [spec.md](spec.md).
 
 ## Environments
 
@@ -45,6 +46,6 @@ for the interactive tutorial notebooks in `process/code/notebooks/`.
 ### Using the environments outside Code Ocean
 
 `pixi install --manifest-path <capsule>/environment/pixi.toml` (`process`: `code/environment/pixi.toml`) builds the capsule's environment anywhere pixi runs.
-`ingest` and `qc` solve for `linux-64` and `osx-arm64`. `process` is `linux-64` only and needs a CUDA 13 driver; to
+`anndata_ingest` and `qc` solve for `linux-64` and `osx-arm64`. `process` is `linux-64` only and needs a CUDA 13 driver; to
 solve it on a machine without a GPU, set `CONDA_OVERRIDE_CUDA=13`. Put pixi's cache somewhere large
 (`PIXI_CACHE_DIR`): the process environment is about 5 GB to download.

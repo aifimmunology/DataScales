@@ -7,6 +7,7 @@ import h5py
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse as sp
 import scrublet
 import zarr
 from anndata.io import read_elem
@@ -17,7 +18,7 @@ import contract
 import hise
 import main
 import store as stores
-from config import load_settings
+from config import ConfigError, load_settings
 from conftest import GENES, SAMPLES, write_hise_h5
 
 
@@ -180,11 +181,11 @@ def test_failure_while_appending_commits_nothing_on_icechunk(samples_dir, base_e
     real = stores.IcechunkStore.append
     calls = []
 
-    def fail_on_second(self, cells, cfg):
+    def fail_on_second(self, cells, cfg, **kwargs):
         calls.append(1)
         if len(calls) == 2:
             raise RuntimeError("network dropped")
-        real(self, cells, cfg)
+        real(self, cells, cfg, **kwargs)
 
     monkeypatch.setattr(stores.IcechunkStore, "append", fail_on_second)
     with pytest.raises(RuntimeError, match="network"):
@@ -195,7 +196,7 @@ def test_failure_while_appending_commits_nothing_on_icechunk(samples_dir, base_e
 def test_failed_bootstrap_append_keeps_the_seed_and_reruns_cleanly(samples_dir, base_env, tmp_path, monkeypatch):
     store = str(tmp_path / "store")
     files = files_of(samples_dir)
-    def fail(self, cells, cfg):
+    def fail(self, cells, cfg, **kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(stores.IcechunkStore, "append", fail)
@@ -211,24 +212,95 @@ def test_store_state_guards(samples_dir, base_env, store_path):
     with pytest.raises(main.IngestError, match="No store"):
         ingest(base_env, store_path, samples_dir)
     ingest(base_env, store_path, samples_dir, "--create", "true")
-    with pytest.raises(main.IngestError, match="already holds a store"):
-        ingest(base_env, store_path, samples_dir, "--create", "true")
+    again = ingest(base_env, store_path, samples_dir, "--create", "true")
+    assert again["appended_samples"] == [] and again["n_cells"] == sum(SAMPLES.values())
+
+
+def test_a_new_store_is_created_only_inside_the_create_roots(samples_dir, base_env, tmp_path):
+    env = {**base_env, "CREATE_ROOTS": str(tmp_path / "results")}
+    with pytest.raises(main.IngestError, match="created only inside"):
+        ingest(env, tmp_path / "elsewhere", samples_dir)
+    with pytest.raises(main.IngestError, match="created only inside"):
+        ingest(env, tmp_path / "results", samples_dir)
+    report = ingest(env, tmp_path / "results" / "store", samples_dir)
+    assert report["n_samples"] == len(SAMPLES) and report["kind"] == "icechunk"
+    assert ingest(env, tmp_path / "results" / "store", samples_dir)["appended_samples"] == []
+
+
+def add_results(root):
+    root.require_group("obsm").create_array("X_umap", shape=(160, 2), dtype="f4")
+    ad.io.write_elem(root.require_group("layers"), "lognorm", sp.random(160, len(GENES), format="csr", dtype=np.float32))
+    ad.io.write_elem(root.require_group("uns"), "process", {"integration": "none"})
+    if isinstance(root.store, zarr.storage.LocalStore):
+        zarr.consolidate_metadata(root.store)
+
+
+def test_appending_to_a_processed_store_drops_its_results(samples_dir, base_env, store_path, caplog):
+    files = files_of(samples_dir)
+    ingest(base_env, store_path, files[0], "--create", "true")
+    if store_path.endswith(".zarr"):
+        add_results(zarr.open_group(store_path, mode="r+"))
+    else:
+        repo = Repo(store_path)
+        add_results(repo.open_zarr("w"))
+        repo.commit("add results")
+    report = ingest(base_env, store_path, files[1])
+    dropped = ["obsm/X_umap", "layers/lognorm", "uns/process"]
+    assert report["dropped"] == dropped and "appending new cells drops them" in caplog.text
+    stored = ad.read_zarr(root_of(store_path))
+    assert stored.n_obs == report["n_cells"] > 160 and not stored.obsm and not stored.layers
+    assert "process" not in stored.uns
+    if not store_path.endswith(".zarr"):
+        assert Repo(store_path).log()[0].metadata["dropped"] == dropped
+
+
+def test_a_file_as_the_store_is_refused(samples_dir, base_env, tmp_path):
+    with pytest.raises(stores.StoreError, match="is a file"):
+        ingest(base_env, tmp_path / "store.h5ad", samples_dir, "--create", "true")
+
+
+def test_a_plain_zarr_without_the_suffix_is_appended_in_place(samples_dir, base_env, tmp_path):
+    files = files_of(samples_dir)
+    ingest(base_env, tmp_path / "store.zarr", files[0], "--create", "true")
+    (tmp_path / "store.zarr").rename(tmp_path / "renamed")
+    report = ingest(base_env, tmp_path / "renamed", files[1])
+    assert report["kind"] == "zarr" and report["n_cells"] == 340
+
+
+def test_the_none_preset_skips_celltypist(samples_dir, base_env, store_path):
+    env = {**base_env, "RUN_CELLTYPIST": "true"}
+    report = ingest(env, store_path, samples_dir, "--create", "true", "--celltypist-models", "None")
+    obs_columns = stores.obs_columns(root_of(store_path))
+    assert report["n_samples"] == len(SAMPLES) and not [c for c in obs_columns if c.endswith("_label")]
+
+
+def test_panel_values_in_any_shape_reach_the_run(samples_dir, base_env, tmp_path):
+    files = files_of(samples_dir)
+    store = str(tmp_path / "store")
+    samples = f'["{files[0]}",\n {samples_dir}/ ; {files[1]}]'
+    env = {**base_env, "RUN_CELLTYPIST": "true", "CREATE": "true"}
+    report = main.run(load_settings([f" {store}/ ", "", samples, "None"], env))
+    assert report["appended_samples"] == ["SP00001", "SP00002", "SP00003"]
+    report = main.run(load_settings([store, str(samples_dir / "*.h5"), "None"], env))
+    assert report["appended_samples"] == [] and report["store"] == store
 
 
 def test_input_guards(base_env, store_path, tmp_path):
     (tmp_path / "empty").mkdir()
-    with pytest.raises(main.IngestError, match="No .h5"):
+    with pytest.raises(ConfigError, match="holds no .h5"):
         ingest(base_env, store_path, tmp_path / "empty", "--create", "true")
+    with pytest.raises(ConfigError, match="not a .h5/.h5ad file"):
+        ingest(base_env, store_path, tmp_path / "notes.txt", "--create", "true")
     with pytest.raises(main.IngestError, match="not found"):
         ingest(base_env, store_path, tmp_path / "missing.h5", "--create", "true")
 
 
-def test_var_mismatch_is_refused(samples_dir, base_env, store_path, tmp_path):
+def test_var_mismatch_is_fitted_to_the_store_genes(samples_dir, base_env, store_path, tmp_path):
     ingest(base_env, store_path, files_of(samples_dir)[0], "--create", "true")
     other = write_hise_h5(tmp_path / "B092-P1_SP00009-01.h5", "SP00009", 50, seed=9, genes=GENES[:-1] + ["OTHER"])
-    with pytest.raises(contract.ContractError, match="var mismatch"):
-        ingest(base_env, store_path, other)
-    assert stores.n_obs(root_of(store_path)) == 160
+    report = ingest(base_env, store_path, other)
+    assert report["fitted"] == {"SP00009": "fitted to the store's genes: 1 zero-filled, 1 dropped"}
+    assert stores.n_obs(root_of(store_path)) == 210 and list(stores.var_names(root_of(store_path))) == GENES
 
 
 def test_origin_reads_the_mount_and_writes_the_origin(samples_dir, base_env, tmp_path):
@@ -238,8 +310,21 @@ def test_origin_reads_the_mount_and_writes_the_origin(samples_dir, base_env, tmp
     mount = str(tmp_path / "mount")
     shutil.copytree(origin, mount)
     report = ingest(base_env, mount, files[1], "--origin", origin)
-    assert report["store"] == origin and stores.n_obs(root_of(origin)) == 340
+    assert report["store"] == origin and stores.n_obs(root_of(origin)) == 340 == report["n_cells"]
     assert stores.n_obs(root_of(mount)) == 160
+    again = ingest(base_env, mount, f"{files[1]},{files[2]}", "--origin", origin)
+    assert again["appended_samples"] == ["SP00003"] and again["n_cells"] == sum(SAMPLES.values())
+    obs = read_elem(root_of(origin)["obs"])
+    assert obs["sample_id"].value_counts().to_dict() == SAMPLES and stores.n_obs(root_of(mount)) == 160
+
+
+def test_a_mistyped_origin_does_not_start_a_new_store(samples_dir, base_env, tmp_path):
+    files = files_of(samples_dir)
+    mount = str(tmp_path / "mount")
+    ingest(base_env, mount, files[0], "--create", "true")
+    with pytest.raises(main.IngestError, match="its origin .* doesn't"):
+        ingest(base_env, mount, files[1], "--origin", str(tmp_path / "tpyo"))
+    assert not (tmp_path / "tpyo").exists()
 
 
 def test_read_only_icechunk_without_origin_is_refused(samples_dir, base_env, tmp_path, monkeypatch):
@@ -274,7 +359,16 @@ def test_main_reports_user_errors_without_a_traceback(base_env, tmp_path, monkey
     for key, value in base_env.items():
         monkeypatch.setenv(key, value)
     code = main.main(["--store", str(tmp_path / "store"), "--samples", str(tmp_path)])
-    assert code == 1 and "No .h5" in caplog.text and "Traceback" not in caplog.text
+    assert code == 1 and "holds no .h5" in caplog.text and "Traceback" not in caplog.text
+
+
+def test_main_reads_positional_panel_values_from_the_command_line(samples_dir, base_env, tmp_path, monkeypatch):
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+    store = str(tmp_path / "store")
+    monkeypatch.setattr("sys.argv", ["main.py", store, "", str(samples_dir), "None"])
+    monkeypatch.setenv("CREATE", "true")
+    assert main.main() == 0 and stores.n_obs(root_of(store)) == sum(SAMPLES.values())
 
 
 def test_create_refuses_a_folder_that_holds_other_files(samples_dir, base_env, tmp_path):
@@ -287,9 +381,10 @@ def test_create_refuses_a_folder_that_holds_other_files(samples_dir, base_env, t
 
 
 def test_create_can_be_rerun_after_a_create_run_failed(samples_dir, base_env, store_path, tmp_path):
-    bad = write_hise_h5(tmp_path / "B092-P1_SP00009-01.h5", "SP00009", 30, seed=9, genes=GENES[::-1])
+    bad = tmp_path / "B092-P1_SP00009-01.h5"
+    bad.write_bytes(b"not an h5 file")
     files = files_of(samples_dir)
-    with pytest.raises(contract.ContractError):
+    with pytest.raises(OSError):
         ingest(base_env, store_path, f"{files[0]},{bad}", "--create", "true")
     report = ingest(base_env, store_path, files[0], "--create", "true")
     assert report["appended_samples"] == ["SP00001"] and report["n_cells"] == 160
@@ -301,6 +396,13 @@ def test_samples_without_cells_are_skipped(samples_dir, base_env, store_path, tm
     assert report["appended_samples"] == ["SP00001"] and report["n_samples"] == 1
     with pytest.raises(main.IngestError, match="none of the samples has cells"):
         ingest(base_env, store_path.replace("store", "other"), empty, "--create", "true")
+
+
+def test_an_empty_first_sample_does_not_set_a_new_stores_genes(samples_dir, base_env, store_path, tmp_path):
+    empty = write_hise_h5(tmp_path / "B092-P1_SP00008-01.h5", "SP00008", 0, seed=8, genes=GENES[::-1])
+    report = ingest(base_env, store_path, f"{empty},{files_of(samples_dir)[0]},{files_of(samples_dir)[1]}",
+                    "--create", "true")
+    assert report["fitted"] == {} and list(stores.var_names(root_of(store_path))) == GENES
 
 
 def test_a_sample_listed_twice_is_ingested_once(samples_dir, base_env, store_path, tmp_path):

@@ -1,12 +1,14 @@
 # Single-cell curation capsules — spec
 
-Three Code Ocean capsules that take HISE scRNA samples from raw files to a curated, processed store:
+Code Ocean capsules that take HISE scRNA samples from raw files to a curated, processed store, plus a
+spatial ingest that builds one SpatialData object from Xenium and Atera bundles (§3S):
 
 | # | Capsule | Hardware | Writes | Job |
 |---|---|---|---|---|
-| 1 | `ingest/` | CPU, sized to the largest **sample** | `main` | Per-sample QC metrics, CellTypist, Scrublet; append to the raw store. No whole-store analysis |
-| 2 | `qc/` | CPU; I/O-bound when applying | nothing by default; with `apply`, the `qc` branch or a new zarr | QC report for proposed thresholds, with a downsampled embedding. With `apply` and reviewed decisions, writes the passing cells as the curated object |
-| 3 | `process/` | **GPU, CUDA 13** (rapids-singlecell + Dask, scvi-tools) | a commit on the `qc` branch, or a new zarr | The shared RAPIDS environment, with guide notebooks (out-of-core, spatial) and a command-line run (`code/run`, no App Panel) of HVG, PCA, optional Harmony or scVI, neighbors, UMAP and leiden over the curated cells |
+| 1 | `anndata_ingest/` | CPU, sized to the largest **sample** | `main` | Per-sample QC metrics, CellTypist, Scrublet; append to the raw store. Takes .h5, .h5ad and SpatialData tables. No whole-store analysis |
+| 1S | `spatial_ingest/` (design tested, not built) | CPU, ~16 GB per Xenium sample | a local joint SpatialData `.zarr` | Append Xenium/Atera bundles: per-sample elements and table, plus one joint AnnData (§3S) |
+| 2 | `qc/` | CPU; I/O-bound when applying | nothing by default; with `apply`, a commit on `main` (icechunk) or a new zarr | QC report for proposed thresholds, with a downsampled embedding. With `apply` and reviewed decisions, writes the passing cells as the curated object |
+| 3 | `process/` | **GPU, CUDA 13** (rapids-singlecell + Dask, scvi-tools) | a new zarr, or a commit (icechunk) | First the shared RAPIDS environment with guide notebooks (out-of-core scRNA, spatial); optionally an App Panel / Reproducible Run pipeline: PCA (± harmony) or scVI, then neighbors, UMAP, leiden (§5) |
 
 ```
 samples ─► ingest ─► main (raw, all cells)
@@ -18,9 +20,9 @@ samples ─► ingest ─► main (raw, all cells)
                   qc (apply) ◄───────────────┘
                        │
                        ▼
-          qc branch (curated cells only; latest curation)
+        main, new commit (curated cells only; raw tagged and kept in history)
                        │
-                    process ─► + embeddings, clusters
+              process notebooks ─► + embeddings, clusters (new zarr, or a commit)
 ```
 
 Cell labeling and cluster-level doublet cleanup (standardized notebooks 06–08) come after `process`
@@ -28,8 +30,8 @@ and are a separate stage. Existing stores built by the old pipeline aren't migra
 rebuilt from samples with the new ingest.
 
 The capsules are meant to be shared and run by anyone on their own data: every location (data
-asset, local path, S3) comes in through the app panel, nothing is hard-coded, and there are no
-per-user permissions.
+asset, local path, S3) comes in through the app panel (ingest, qc) or a notebook's settings cell
+(process), nothing is hard-coded, and there are no per-user permissions.
 
 ### What QC reviews, at three levels
 | Level | What the report shows | What the reviewer can do |
@@ -66,7 +68,8 @@ The default thresholds (`min_genes 200`, `max_genes 5000`, `max_mito 10`) are **
 ```
 capsules/
 ├── spec.md                 this file
-├── ingest/                 ┐
+├── anndata_ingest/         ┐ (was ingest/)
+├── spatial_ingest/         │ (planned)
 ├── qc/                     │ each folder is one complete capsule root
 └── process/                ┘
     ├── code/               run (entrypoint), <package>/, tests/
@@ -94,15 +97,14 @@ capsules/
 
 - **Detecting the kind:** with `annizarr.Repo.exists(path)`.
 - **Supported locations:** local zarr, data-asset zarr, icechunk on S3, and icechunk on a data asset.
-- **Where results go** (`qc` with `apply`, and `process`):
+- **Where results go** (`qc` with `apply`, and the `process` notebooks):
 
-  | Input | `qc` with `apply` | `process` |
+  | Input | `qc` with `apply` | `process` notebooks |
   |---|---|---|
-  | icechunk | the curation branch (default `qc`) in the repo | a commit on that branch |
-  | plain zarr, writable (local or S3) | a new zarr (cells are removed, so the input can't be reused) | **in place**: the results are added to the input |
-  | plain zarr, read-only (e.g. a data asset) | a new zarr | a new zarr (§5.4) |
+  | icechunk | a new commit on `main` with only the curated cells (§4.10) | a commit on the branch read |
+  | plain zarr (writable or not) | a new zarr at the output path | a new full zarr in `/results` (§5) |
 
-  - **icechunk must be writable.** That means S3, a writable local repo, or a data-asset mount given its `origin`. Icechunk is never copied out to a zarr; a read-only repo without an `origin` is refused.
+  - **icechunk writes need write access:** S3, a writable local repo, or a data-asset mount given its `origin`.
   - **Plain zarr writability is probed,** not guessed: write and delete a small `.write_probe` key at the store root. Data-asset mounts fail the probe.
   - **A `qc` report run never needs write access.** Writability is checked only when `apply` is set.
 - **`.h5ad`:** out of scope. Convert it first with `annizarr convert in.h5ad out.zarr`.
@@ -133,55 +135,98 @@ Written per sample by the ingest:
 Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` (if integrated; `X_scVI` will come from the scVI step), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/process`.
 
 ### 2.3 Entrypoint and code style
-- **Entrypoint:**
+- **Entrypoint** (ingest and qc; `process` has notebooks only, §5):
   - `code/run` passes app-panel parameters positionally. An empty value falls back to an env var, then a default.
   - One `main.py`, with a `<Capsule>Error(RuntimeError)` for user-facing failures (logged as one line, exit code 1).
   - Every run writes `run.json` under `/results`: parameters, input fingerprint, versions, timestamps, peak memory.
 - **Modular within each capsule:** small modules with one job each.
   - `ingest`: `config`, `hise`, `annotate`, `contract`, `store`, `main`.
   - `qc`: `config`, `source`, `metrics`, `decisions`, `embed`, `report`, `write`, `main`.
-  - `process`: `config`, `cluster` (Dask-CUDA setup), `steps`, `store`, `main`.
+  - `process`: no package; two notebooks sharing one identical helper cell (open, save).
 - **No comments.** Names and short docstrings on public functions carry the meaning.
 - **Not overengineered:**
   - no plugin layers or abstract base classes;
   - no options nobody asked for;
   - branch on input kind only where icechunk and plain zarr actually differ.
-- **Tests sit beside the code** and run against small synthetic stores. `process` tests need a GPU and are skipped without one.
+- **Tests sit beside the code** and run against small synthetic stores. `process` runs its notebooks headless with `code/notebooks/test_notebooks.sh`, on the GPU capsule.
 
 ---
 
-## 3. `ingest` — append samples only (built)
+## 3. `anndata_ingest` — append samples only (built)
 
-The source is `capsules/ingest/`. Its `code/` is copied into the capsule checkout (`/root/capsule/code`, §1), so the capsule keeps working once this repo is gone. The README there describes it in full.
+The source is `capsules/anndata_ingest/` (renamed from `capsules/ingest/` on 2026-10-30; the Code Ocean capsule and its `code/ingest/` package keep the name `ingest`). Its `code/` is copied into the capsule checkout (`/root/capsule/code`, §1), so the capsule keeps working once this repo is gone. The README there describes it in full.
 
 ### 3.1 What it does
 - **Store:** an icechunk repo (one commit per run, plus a seed commit when a run creates the store), or a path ending in `.zarr` for a plain AnnData zarr appended in place.
-- **Per sample, one in memory at a time:** read (HISE / 10x / h5ad), QC metrics, CellTypist, Scrublet, project onto the contract, stage as a zarr. Samples with no cells are skipped with a warning.
+- **Per sample, one in memory at a time:** read (HISE / 10x / Xenium `cell_feature_matrix.h5` / h5ad / a SpatialData `.zarr`'s `tables/table`, read with zarr alone), QC metrics, CellTypist, Scrublet, project onto the contract, stage as a zarr. Samples with no cells are skipped with a warning. Only Gene Expression features are kept (Xenium control probes and codewords are dropped).
+- **Sample IDs:** parsed from the file name; a generic 10x name (`cell_feature_matrix.h5`, `filtered_feature_bc_matrix.h5`) takes its bundle folder's name (skipping `outs`, `extract`), a SpatialData `.zarr` its folder name.
+- **Gene panels:** every new sample's genes are compared with the store's (or the first sample's) from var alone, before any sample is read. A difference is a warning (n shared / only in store / only in sample, with examples), and the sample is fitted to the store's genes: missing genes zero-filled, extra genes dropped. annizarr 0.2.3 appends only identical var (names and order); growing the store's genes ("append new genes") is planned in annizarr.
+- **Storage warning on every run** for a store in `/scratch` (cleared) or `/results` (it can be saved as a data asset, but data assets are read-only, so later runs can't append), recommending S3.
 - **The store is touched only after every sample is staged,** so a failing sample leaves either kind unchanged.
   - On icechunk, a failed append discards the run.
   - A plain zarr can't roll back, which the README states.
 - **`main` holds only X (raw counts), obs and var.** There is no whole-store analysis, so memory depends on the largest sample.
 - **Scrublet:** NA calls when it fails or finds no threshold; scores are kept when it only finds no threshold.
-- **Create:** explicit.
-  - It refuses a path that already holds a store, and a non-empty folder that isn't one.
+- **Create:** automatic for a missing store at an `s3://` prefix (the write is the permission check) or inside `/results` or `/scratch`; any other local path only with `CREATE=true`.
+  - It refuses a non-empty folder that isn't a store.
   - An empty repo left by a failed create run can be reused.
+- **Appending drops results built for the old cells** (2026-11-02): `obsm`, `obsp`, `layers` and `uns/process`, with a warning, through annizarr `append(drop_derived=True)` (without the flag annizarr raises). The commit records them as `dropped`; on icechunk they stay in history. Earlier, such stores were refused.
 - **Read-only locations are refused before any work:** an icechunk repo without an `origin`, or an unwritable zarr.
 
 ### 3.2 App panel
-`samples`, `store`, `origin`, `celltypist models`, `create`. Every other setting is an environment variable named after its `Settings` field, in upper case.
+`store`, `origin`, `samples`, `Celltypist Model` (a dropdown: AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None), `Custom Celltypist model` (optional `.pkl` file(s) that replace the dropdown, e.g. a model trained for a spatial panel), passed positionally in that order; when Code Ocean drops an empty optional value, values are placed by shape. Defaults make a Reproducible Run ingest `/data/samples` into a new store at `/results/ingest_icechunk`. Every other setting is an environment variable named after its `Settings` field, in upper case.
 
 ### 3.3 Outputs
-- **The commit on `main`:** its metadata records `pipeline`, `annizarr` version, `appended_samples`, `n_cells` and `n_samples`.
+- **The commit on `main`:** the message lists one `- <sample>: <source path>` line per sample (with the fitting, if any); the metadata records `pipeline`, `annizarr` version, `appended_samples`, `sources` (sample → path), `fitted` (sample → how it was fitted), `n_cells` and `n_samples`.
 - **`/results`:**
   - `ingest_summary.csv`, per appended sample: cells, mean genes, mean mito %, doublets, whether Scrublet scored it, number of cell types, model;
   - `ingest_run.json`: store, kind, snapshot ids, appended samples, totals, annizarr version, peak memory, settings.
 
 ### 3.4 Verified
-- 63 tests: unit tests, plus end-to-end runs on both store kinds covering mixed inputs, CellTypist (a locally trained model) and Scrublet, failure and rerun semantics, read-only and create guards, and config parsing. They pass against annizarr 0.2.3; annizarr 0.2.1 fails the icechunk runs.
+- 85 tests (2026-10-30): unit tests, SpatialData-table inputs, gene-panel fitting and the custom `.pkl` field, plus plus end-to-end runs on both store kinds covering mixed inputs, every app-panel input shape and dropdown option, automatic creation, a mount that lags its origin, CellTypist (a locally trained model) and Scrublet, failure and rerun semantics, read-only and create guards, and config parsing. They pass against annizarr 0.2.3; annizarr 0.2.1 fails the icechunk runs.
 - The five real B092 samples (127,800 cells) on both kinds, with Scrublet. Stored counts, barcodes and HISE obs match each source file exactly, and the icechunk history is one commit per run.
 - The bundled AIFI L1/L2/L3 models on real samples: labels and probabilities identical to running CellTypist directly, as `06-label_h5s.py` does.
 - **CellTypist:** several models per store (default AIFI L1, L2, L3, bundled in `code/models` with a `SOURCE.json` of commit and checksums), columns `<model>_label` / `<model>_prob`. The model set is part of the schema.
+- **Xenium (2026-10-30):** two public bundles' `cell_feature_matrix.h5` (Breast 280 genes, Lung 289) through `./run`: named after their bundle folders, Lung fitted with a warning (67 shared, 213 zero-filled, 222 dropped), commit lines name both sources, and a rerun skips both. The PBMC CellTypist models are meaningless on such panels (AIFI L1 shares 94 of 1,109 genes; 75% of breast cells labelled "T cell"), so spatial stores use None or a custom `.pkl`.
 - **HISE layouts:** tenx-scrna-pipeline's observation names (`Batch`, `Pool`, `Chip`, `uuid`, …) are mapped onto the older HISE ones; labels already in a file are recomputed.
+
+---
+
+## 3S. `spatial_ingest` — Xenium and Atera into one SpatialData (design tested, not built)
+
+The source will be `capsules/spatial_ingest/`. Findings below were tested on 2026-10-29 with spatialdata 0.8.0, spatialdata-io 0.7.1 and zarr 3.4.2 on public 10x bundles; the test scripts lived in `/scratch/spatial_tests/` (not kept).
+
+### 3S.1 Decisions
+- **Output:** one joint SpatialData `.zarr`, **local only for now** (a path under `/results`, or a workstation path). Each run appends new bundles; samples already present are skipped by sample ID.
+- **Per sample:** its images, labels, cell/nucleus shapes and transcripts (points), and its own table, all prefixed by the sample ID and in its own coordinate system. The per-sample table keeps every gene of its panel and is the source of truth.
+- **Joint AnnData:** one table over all cells, appended with annizarr (no in-memory rewrite). Genes follow the same rule as `anndata_ingest`: the first sample's panel; later panels are fitted with a warning, until annizarr can append new genes. Gene key: Ensembl ID.
+- **CellTypist:** default None; an optional custom `.pkl` (same panel field as `anndata_ingest`).
+- **Crash safety (plain zarr):** each run writes its new samples into a temporary `.zarr` beside the store and renames their folders in; the joint table is appended last; refreshing the consolidated metadata is the commit step. At startup, leftovers are deleted, and a joint table that doesn't match the per-sample tables is rebuilt from them. Icechunk stores (`anndata_ingest`) already roll back, so they don't need this.
+- **Atera:** vendor the reader from spatialdata-io PR #426 (`10XGenomics/spatialdata-io@738204de`, `atera.py` + `_atera_common.py`, ~1.2k lines), pinned, until it is released.
+
+### 3S.2 Why not icechunk (yet)
+- Released spatialdata can't write to or read from icechunk: `write()`/`read_zarr()` take paths, and the store-backed writes in scverse/spatialdata PR #1107 are unmerged.
+- Points and shapes are Parquet files inside the `.zarr` folder. Icechunk holds only zarr keys and rejects them ("invalid zarr key format"). Packing each Parquet file into a uint8 zarr array works (prototyped) but needs our own read/write layer, loads whole files, and no other tool can open the result.
+- The earthmover `2026-scverse/icechunk-SpatialData` material is talk code on a patched spatialdata fork plus the non-public `zarr-files` package.
+
+### 3S.3 Tested findings
+| Area | Finding |
+|---|---|
+| Incremental append | 4 public Xenium bundles in 3 runs into one `.zarr` with `write_element`; stock `read_zarr` reads it back; bbox query and table↔shapes join work; a verifier catches corrupted transforms, obs and X. Rerun of a present sample: 1.5 s, all files byte-identical |
+| Gene key | All Xenium bundles and Atera carry Ensembl IDs (`gene_ids` / `feature_id`); accept `ENSG` and `ENST` (CD45RA/RO use `ENST`). Symbols collide (F3 human vs mouse) |
+| S3 | spatialdata 0.8.0 can't write or read S3: `UPath` is rejected, and a plain `"s3://…"` string silently creates a local `./s3:/` folder. Workaround tested: build locally, sync with root `zarr.json` last |
+| Crash | `write_element(overwrite=True)` refuses elements of its own store; delete-then-write loses the table on a crash and the store no longer opens. Staged write + `os.rename` + startup recovery tested OK. An element killed mid-write is invisible to consolidated metadata but blocks the rerun until deleted |
+| Scale (Xenium Prime 5K skin, 112k cells, 74M transcripts, 7.6 GB zip) | ~2–2.5 min and ~14 GB peak per sample append; 4.3 GB per sample on disk (images 2.9, transcripts 1.3); keep native Parquet row groups (2–3M rows). Opening the store: +0.85 s per sample (shapes load eagerly). Container memory cap is 61.7 GiB |
+| Joint table | In-memory rewrite: 1M cells 19 s / 7.5 GB, 5M 52 s / 27 GB, ~21M OOM. In-place append: ~3–4 s at any size, hence annizarr for the joint table |
+| Atera (tiny bundle) | PR #426 reader works on released spatialdata 0.8.0; 0.8.0 reads the joint Xenium+Atera `.zarr`. `morphology_3d_images=True` fails (chunks bug; workaround `chunks=(1,1,4096,4096)`). Full public Atera sets are ~50–65 GB |
+| Standard workflow | None published for incremental multi-sample SpatialData: `spatialdata.concatenate` is in-memory (and intersects genes by default), sopa keeps one `.zarr` per sample |
+
+### 3S.4 annizarr into the joint table (tested 2026-10-30)
+- `annizarr.append("<store>.zarr/tables/table", cells=<staged sample .zarr>)` appends in place: 7,275 cells onto a 19,828 × 5,753 int32 table in 1.4 s. `uns["spatialdata_attrs"]` is kept, and after `zarr.consolidate_metadata` stock `spatialdata.read_zarr` reads the store with the new cells.
+- The capsule must also add the new sample's region (e.g. `<sample>_cell_boundaries`) to `uns["spatialdata_attrs"]["region"]` and keep `region`/`instance_key` in obs, so the table still annotates every sample's cell shapes.
+
+### 3S.5 Still to test
+- A full-size Atera bundle (~50–65 GB).
 
 ---
 
@@ -194,8 +239,8 @@ and that haven't changed since.
 ### 4.1 The two modes
 | | Report (default) | Apply (`apply = true`) |
 |---|---|---|
-| Decisions | defaults → carried forward from the curation branch (§4.8) → the file, if given | **exactly the given file**, nothing merged |
-| Input access | read-only | read, plus write to the curation branch or output zarr |
+| Decisions | defaults → carried forward from `main`'s `uns/qc` (§4.8) → the file, if given | **exactly the given file**, nothing merged |
+| Input access | read-only | read, plus a commit on `main` or a new output zarr |
 | Report | yes | yes, the same report, so `/results` documents exactly what was written |
 | Writes | nothing | the passing cells (§4.10) |
 | Preconditions | none | §4.9, all checked **before** any report work |
@@ -211,9 +256,9 @@ If an ingest lands between steps 1 and 3, `main`'s snapshot changes, so the fing
 | # | Parameter | Default | Notes |
 |---|---|---|---|
 | 1 | input | — | icechunk repo (reads `main`) or plain zarr |
-| 2 | decisions | *(none)* | A `qc_decisions.json` (attached data asset). Report: none → defaults plus the curation branch's decisions (§4.8). Apply: required |
+| 2 | decisions | *(none)* | A `qc_decisions.json` (attached data asset). Report: none → defaults plus `main`'s carried-forward decisions (§4.8). Apply: required |
 | 3 | apply | `false` | `true` writes the curated object, after the checks in §4.9 |
-| 4 | branch / output | `qc` / `/results/<input stem>.qc.zarr` | icechunk: the curation branch, read for carried-forward decisions and written by `apply`. Plain zarr: the output zarr path (local or S3), used only by `apply` |
+| 4 | output | `/results/<input stem>.qc.zarr` | Plain zarr only: the output zarr path (local or S3), used only by `apply`. icechunk always commits to `main` |
 | 5 | origin | *(none)* | icechunk only: the writable location behind a read-only mount. Needed only for `apply` |
 | 6 | reviewer | *(none)* | Optional. Recorded in `uns/qc` and the commit metadata when given |
 | 7 | group columns | `batch_id,pool_id,chip_id` | A column that's absent or has a single value is skipped |
@@ -366,7 +411,8 @@ This is **detection, not correction**: no counts are changed. Correction (SoupX,
 - **Caveat:** labels are provisional and least reliable in low-quality cells. QC never changes labels.
 
 ### 4.8 Incremental runs (icechunk)
-- **The curation branch (parameter 4, default `qc`) is the starting point** of a report run, if it exists. Its `uns/qc/decisions` (JSON string) supplies the decisions, and reviewed samples keep their entries.
+**Revised 2026-11-02:** curation is a commit on `main` (§4.10), so `main` holds the curated cells of reviewed samples plus any raw samples ingested since. A report run reads `main`; samples listed in `uns/qc/decisions` are already curated and aren't filtered again, and only the others are reviewed.
+- **`main`'s `uns/qc/decisions`** (JSON string) supplies the decisions, and reviewed samples keep their entries.
 - **New samples on `main`** are flagged or accepted as described in §4.3.
 - **If a decisions file is passed:** it overrides key by key.
 - **The summary's first line says whether `qc` is current:** *"qc covers 3 of 5 samples on main (curated 2026-10-20 from 1CECHNKR); 2 new samples (1 flagged, pending: SP0010)."*
@@ -388,31 +434,19 @@ input, both of which are checked, so the apply run recomputes it and writes exac
 report shows as passing.
 
 ### 4.10 Apply: write the passing cells
-The copy is **out of core**, done by annizarr, so apply fits the same machine as the report whatever the store's size: memory is bounded by one band of storage chunks, never by the number of cells.
+**Revised 2026-11-02.** annizarr 0.2.4 shipped without `subset` and `Repo.garbage_collect`, so the capsule streams the subset itself; it swaps in `annizarr.subset` when that ships.
 
-Both input kinds go through one call, `annizarr.subset(store, output=…, keep=mask, branch=…, commit=False)` (new in annizarr 0.2.4, §9). `write` in the capsule only builds the mask, the `uns/qc` entry and the commit around it.
-- **Copied filtered, in bands of whole storage chunks:** X (and any layers), keeping passing rows via the mask over each band's `indptr` slice. They're streamed into pre-sized arrays with the source's chunking and compression, with an int64 `indptr`.
-- **Copied filtered row-wise:** `obs` (all columns) and any `obsm`.
-- **Copied unchanged:** `var`, `varm` and `uns`.
-- **Dropped:** `obsp`.
+- **Out of core:** X (and any layers) is read with `read_elem_lazy` in whole-chunk bands, passing rows are kept by the mask, and the dask CSR is written with `write_elem` (int64 `indptr`). Memory is bounded by one band, never by the number of cells.
+- **Copied filtered row-wise:** `obs` (all columns) and any `obsm`. **Unchanged:** `var`, `varm`, `uns`. **Dropped:** `obsp`.
 - **Added:** `uns/qc`: `decisions` (JSON string), `cell_qc_sha256`, `source` (snapshot or plain-zarr fingerprint), `samples`, `reviewer` (if given), per-sample before/after counts.
 
 Where it goes:
-- **icechunk:** one curation branch (default **`qc`**, or the name given), which always holds **only the latest curation** made under that name. Different names give independent curations, e.g. a strict and a lenient one.
-  - **Point `qc` at the reviewed snapshot:**
-    - create it on first use (`checkout(name, create=True)` while on `main`);
-    - otherwise reset it with `cherrypick(fingerprint)`.
-
-    Either way, `qc` becomes the fingerprinted `main` snapshot.
-  - **Write it:** `open_zarr("w", truncate=True)`, then `annizarr.subset` from the `main` snapshot, then one commit: `commit(msg, metadata={pipeline: "qc", created, source_snapshot, samples, decisions_sha256, reviewer, n_pass, n_cells})`. The message reads like `QC curation: 3 samples, 61,204 / 65,766 cells pass (source 1CECHNKR)`.
-  - **The previous curation** (and any `process` commits on it) is then no longer on any branch.
-  - **Reclaiming its storage:** icechunk's `garbage_collect(delete_object_older_than=…)` deletes objects that no branch or tag can reach.
-    - It runs after the commit, with a 24-hour margin, so that an ingest writing at the same time can't lose uncommitted chunks.
-    - `main` and its whole history stay reachable, so nothing raw is touched.
-    - Through `Repo.garbage_collect(older_than)`, new in annizarr 0.2.4 (§9).
-  - **`main` is untouched,** so ingest appends keep working.
+- **icechunk: a new commit on `main`** holding only the curated cells, written through the origin when the store is a read-only mount.
+  - **Tag first:** `raw-<snapshot>` on the reviewed `main` snapshot, so the raw cells are one checkout away. No garbage collection; raw history is kept.
+  - **One commit:** `commit(msg, metadata={pipeline: "qc", created, source_snapshot, samples, decisions_sha256, reviewer, n_pass, n_cells})`, message like `QC curation: 3 samples, 61,204 / 65,766 cells pass (source 1CECHNKR)`.
+  - **Later ingest runs append raw samples onto curated `main`;** the next report reviews only those (§4.8).
 - **plain zarr:** a new zarr at the output path. The input is never modified, writable or not.
-- **Cost:** the curated copy rereads and rewrites X, about 16 KB per cell (160 GB at 10M cells), mostly I/O; time grows with the store, memory doesn't. Only the latest curation is kept, once GC has run.
+- **Cost:** rereads and rewrites X, about 16 KB per cell (160 GB at 10M cells), mostly I/O; each curation adds a full copy to the history.
 
 ### 4.11 Outputs (`/results`)
 Every run:
@@ -441,119 +475,16 @@ Apply runs also write `apply_summary.csv` (per sample: before, after, removed by
 
 ---
 
-## 5. `process` — embeddings and clusters on GPU
+## 5. `process` — the RAPIDS environment and notebooks
 
-This follows `standardized_notebooks/scRNA/rapids-sc/10-Rapids_GPU_Analysis.ipynb`, plus an optional scVI path.
+**Reworked 2026-11-02** from a command-line pipeline into an environment capsule; the design is
+[`process/rework_spec.md`](process/rework_spec.md) and the change log [`process/spec.md`](process/spec.md).
 
-**What the capsule is for.** Mainly the RAPIDS GPU environment, to use here or copy elsewhere
-(`code/environment/`), plus guide notebooks. The pipeline below runs from a terminal with
-`code/run --input … [--flag value …]`; there is no App Panel. Every setting is a flag
-(`./run --help`) and also an environment variable named after it in upper case.
-
-### 5.1 Settings
-| Flag | Default | Notes |
-|---|---|---|
-| `--input` | — | Any location in §2.1: an icechunk repo, or a curated plain zarr. Either may be AnnData or SpatialData-shaped (§5.5) |
-| `--table` | `table` | SpatialData only: which `tables/<name>` to process |
-| `--branch` | `qc` | icechunk only: the curation branch to process |
-| `--origin` | *(none)* | icechunk only: the writable location behind a read-only mount |
-| `--integration` | `none` | `none` or `harmony`; `scvi` is next (§5.2 step 5) |
-| `--batch-keys` | *(none)* | Comma-separated obs columns (e.g. `chip_id`). Required unless integration is `none` |
-| `--output-mode` | `full` | Plain zarr (§5.4): `full`, or `results-only` (always a copy) |
-| `--output` | *(none)* | Plain zarr: copy to this path instead of writing in place |
-| `--leiden-resolution` | `1.1` | ≈ scanpy 1.0, per the notebook |
-
-The rest default to the notebook's values:
-
-| Setting | Value |
-|---|---|
-| Rows per Dask chunk | 24,000 (annizarr CSR stores chunk by nnz, so there is no row chunk to round to) |
-| HVG | 2,000, `seurat` flavor (the only one that works with Dask) |
-| Scale | `zero_center=False`, `max_value=10`, float64 for this step |
-| PCA | 50 components |
-| Neighbors | 20 neighbors, 30 PCs (or the full scVI latent); `ivfflat` (`n_probes=20`) on one GPU |
-| UMAP | `min_dist=0.45`, spectral init |
-| Leiden | 100 iterations |
-| scVI | `n_latent=30`, `n_layers=2`, `gene_likelihood="nb"`, `batch_size=1024`, scvi-tools' default epoch count with early stopping |
-| Seed | 4242 |
-
-### 5.2 Steps
-1. **Dask-CUDA cluster:**
-   - `LocalCUDACluster` over all visible GPUs;
-   - `rmm_managed_memory=True` and `enable_cudf_spill=True`, so GPU memory spills to host RAM;
-   - `dask.config.set({"distributed.scheduler.worker-ttl": None})`;
-   - RMM managed memory with the cupy allocator.
-2. **Open the curated cells read-only:**
-   - X: `anndata.experimental.read_elem_lazy(root["X"], (rows_per_chunk, n_vars))`, cast to float32;
-   - obs: only `sample_id` and the batch keys;
-   - var as is.
-3. **Normalize:** `rsc.get.anndata_to_GPU`, `rsc.pp.normalize_total`, `rsc.pp.log1p`.
-4. **HVG and PCA:** HVG, subset to the HVGs, rechunk across workers and persist; scale; PCA, persisted and computed.
-5. **Integration:**
-   - **`harmony`:** `rsc.pp.harmony_integrate(key=batch_keys)` on `X_pca` → `X_pca_harmony`.
-   - **`scvi`**, in a **separate Python subprocess**:
-     - PyTorch and RMM/cupy in one process compete for GPU memory: torch's caching allocator and RMM each hold their own reservations, and OOM is likely. A fresh process gets a clean CUDA context and frees everything on exit.
-     - **Before:** close the Dask-CUDA cluster (its workers exit and release their GPUs), free the client's cupy pool, then write the HVG raw counts (CSR, streamed in row bands) and the combined `_batch` label to a temporary zarr under `/scratch`. scVI trains on counts, not lognorm.
-     - **The subprocess** (`python -m process.scvi_train`, which never imports RMM):
-       - `scvi.model.SCVI.setup_anndata(adata, batch_key="_batch")`;
-       - train on the GPU;
-       - write `get_latent_representation()` to the temporary zarr;
-       - save the model to `/results/scvi_model/` for reuse (e.g. scANVI at the labeling stage).
-     - **After:** the main process reads `X_scVI` back.
-6. **Graph and clusters** (single GPU, no Dask needed): neighbors on `X_pca`, `X_pca_harmony` or `X_scVI`, then UMAP, then leiden. `rsc.pp.harmony_integrate` accepts the batch keys as a list directly.
-7. **lognorm layer:** the GPU normalization (`target_sum=1e4`, log1p) streamed block by block into `layers/lognorm`, with a `target_sum` attr. annizarr 0.2.4 dropped normalization (`add_expr` became the copy-only `add_layer`), so this is the only place lognorm is made. It's there for the labeling stage (markers, dotplots).
-8. **Write** (where: §5.4):
-   - `obsm/X_pca`, `obsm/X_pca_harmony` or `obsm/X_scVI`, `obsm/X_umap`;
-   - `obs/leiden` (categorical, added to `column-order`);
-   - `var/highly_variable`;
-   - `layers/lognorm`;
-   - `uns/process`: all parameters, the number of GPUs, package versions, the PCA variance ratio, and the source (branch and snapshot, or plain-zarr fingerprint);
-   - on icechunk, commit metadata `{pipeline: "process", curation_branch, source_snapshot, integration, batch_keys, n_cells, n_clusters}`.
-
-   The neighbor graph (`obsp`) isn't written in v1, because it's large and recomputable.
-9. **`/results`:**
-   - `cluster_summary.csv` (cells per cluster, by sample);
-   - `run.json` with per-step timings and peak GPU and host memory.
-
-### 5.3 Reruns (icechunk)
-Rerunning `process` on the same branch, for example with a different integration, adds another
-commit. The derived elements are replaced, and the previous result stays in the branch's history.
-
-### 5.4 Where results go
-- **icechunk:** one commit on the given branch, through `Repo(input, origin=origin)` and `open_zarr("w")`. `layers/lognorm` streams from the GPU normalization. A read-only repo without an `origin` is refused.
-- **Writable plain zarr:** in place, unless `--output` or `results-only` asks for a copy. The new elements replace earlier `process` results; nothing else is touched. Consolidated metadata is dropped before the first change and rewritten after the last, so a run that dies midway leaves a store that reads truthfully (without `uns/process`). A change to the input during the run (obs index, X) is caught by its fingerprint, and nothing is written.
-- **Read-only plain zarr:** a new zarr at `/results/<input stem>.processed.zarr`. A failed write deletes it; an output that appeared during the run is left alone.
-- **Remote plain zarr:** refused by `process` (no s3fs, and annizarr's in-place ops are local-only); use icechunk on S3.
-  - **`results-only`:**
-    - holds everything in the input except X, `layers` and `raw`, plus the results;
-    - has **no X**, which anndata reads back as `X=None`;
-    - is small apart from `lognorm`;
-    - `uns/process/source` records the input it pairs with.
-  - **`full` (default):** first a full streamed copy of the input with `annizarr.rechunk(input, output=…)`, then the results written onto it. It's a self-contained object, at the cost of a full copy of X.
-    - `rechunk` rewrites X with the configured chunking and stream-copies everything else.
-    - It's verified to carry X, obs, var, layers, obsm, varm, obsp and uns, from both a plain zarr and an icechunk branch.
-    - `convert` refuses a store as input.
-
----
-
-### 5.5 SpatialData
-A SpatialData store keeps its AnnData at `tables/<name>`; `process` finds it there when the root has no
-`X`, and writes only that group. Images, labels, points and shapes are never changed; only a read-only
-full copy copies them.
-
-- **Plain SpatialData `.zarr`:** in place, or (read-only) a full copy of the whole store with the results in
-  its table; `results-only` copies just the table without counts, as an AnnData zarr.
-- **icechunk repo laid out like a SpatialData store:** one commit whose diff touches only `/tables/<name>`
-  (tested). This is the way to edit a SpatialData table without rewriting the rest, with history.
-
-Limits as of spatialdata 0.8.0 (checked against earthmover's `2026-scverse/icechunk-SpatialData` notes):
-- `sdata.write()`/`sd.read_zarr()` don't take an icechunk store; that needs unmerged spatialdata PR #1107
-  plus patches. spatialdata's element writers do work on an icechunk session for images, labels, tables
-  and zarr-encoded shapes; points and GeoParquet shapes don't.
-- So build the repo with the element writers (or `write_elem` for the table), and read the table with
-  `anndata.io.read_elem(root["tables/<name>"])`. Anything needing the whole SpatialData object (napari,
-  `sd.read_zarr`) still wants a plain `.zarr`; keeping that next to an icechunk repo for the table also works.
-- annizarr's ops assume the AnnData at the repo root, so `process` writes the table's `lognorm` itself.
+- **What it is, first:** the pinned RAPIDS GPU environment (`code/environment/`, copyable to other capsules) and two notebooks: out-of-core scRNA (normalize, HVG, scale, PCA, optional harmony, neighbors, UMAP, leiden, following `10-Rapids_GPU_Analysis.ipynb`) and a spatial walkthrough.
+- **Optional pipeline (2026-11-03):** `code/run`, from the App Panel (named parameters, five categories) or a terminal. Method PCA (± harmony) or scVI (train), then neighbors, UMAP and leiden at one or more resolutions, optionally on an obs subset. One `Config` dataclass modelled on `dev_tools/rapids-benchmark/rapids_benchmark.py`: the panel sets the common fields, everything else (cluster preset, GPUs, scVI training knobs, …) is a flag or environment variable. A Reproducible Run with no input exits 0 with usage. Details and the GPU test plan: `process/spec.md` §12.
+- **Inputs:** an AnnData `.zarr` or a SpatialData `.zarr` (its `tables/<name>`) by default; icechunk through commented-out cells (branch, optional S3 origin).
+- **Saving (notebooks and pipeline):** zarr input → a new full object at `/results/<stem>.processed.zarr` (SpatialData: the whole store copied, results in its table); icechunk → one commit back to the branch. Results: `obsm/X_pca` (`X_pca_harmony`), `obsm/X_umap`, `obs/leiden`, `var/highly_variable`, `layers/lognorm` (with `target_sum`), `uns/process`.
+- **scVI:** in the pipeline (train a new model; `obsm/X_scVI`, model saved to `/results/scvi_model/`); HVGs are picked on the Dask-CUDA cluster, which is closed before training.
 
 ## 6. Environments
 
@@ -637,22 +568,18 @@ Limits as of spatialdata 0.8.0 (checked against earthmover's `2026-scverse/icech
 **`qc`, apply mode**
 - refuses on each condition in §4.9, before any report output is written;
 - a report run's `qc_decisions.json` passed straight to `apply` is accepted, and its `cell_qc.parquet` equals the apply run's;
-- `qc`'s parent is the fingerprinted snapshot, and its metadata is complete;
+- icechunk: a `raw-<snapshot>` tag points at the fingerprinted `main` snapshot, and the new `main` commit's parent is that snapshot, with complete metadata;
 - the output holds exactly the passing rows, with X, layers, obs and obsm equal to the input's rows, an int64 `indptr`, and no `obsp`;
-- `main` is untouched, and a later ingest append works, after which `apply` with the old file is refused;
-- a second curation after new samples resets `qc` onto the new snapshot, and GC removes the first curation's objects but nothing reachable from `main`;
-- plain zarr writes the same content to the output path, and never touches the input;
-- a custom branch name creates an independent curation, and `qc` is left alone.
+- a later ingest append onto curated `main` works, after which `apply` with the old file is refused, and the next report reviews only the new samples;
+- the raw cells are readable at the `raw-<snapshot>` tag;
+- plain zarr writes the same content to the output path, and never touches the input.
 
-**`process`** (GPU only)
-- on a small curated branch, writes every element in §5.2 in one commit;
-- `harmony` and `scvi` each write their own embedding, and `none` writes neither;
-- integration without batch keys is refused;
-- plain-zarr input: `results-only` has no X and reads back with `anndata.read_zarr`; `full` equals the input plus the results;
-- read-only icechunk without an origin is refused;
-- a writable plain zarr gets the results in place; a read-only one gets a new zarr;
-- `leiden` is in `column-order`, and the result is readable with `anndata.read_zarr`;
-- a rerun adds a commit and replaces the derived elements.
+**`process`** (`code/notebooks/test_notebooks.sh`, on the GPU capsule)
+- each notebook runs headless on tiny AnnData `.zarr`, SpatialData `.zarr`, ingest-style (no `layers`, no `sample_id`) and icechunk stores;
+- a zarr save writes a new full copy that reads back (`anndata.read_zarr`, `sd.read_zarr`), never touches the input, and never overwrites an earlier output;
+- an icechunk save makes one commit, also twice in a row through an `ORIGIN`, and refuses when the branch moved;
+- `lognorm` matches scanpy's normalize + log1p; the shared helper cell is identical in both notebooks;
+- the pipeline (`code/test_gpu.sh`): PCA, harmony, scVI, several resolutions, a subset, SpatialData, an ingest store, icechunk through an origin twice, and the no-input Reproducible Run; the full checklist is `process/spec.md` §12.6.
 
 ---
 
@@ -660,13 +587,16 @@ Limits as of spatialdata 0.8.0 (checked against earthmover's `2026-scverse/icech
 1. annizarr 0.2.3 on PyPI, with the `TypeIs` fix. **Done.**
 2. `ingest`: remove the whole-store analysis (§3) **(done)**, move its environment to the page (§6) **(copied into the checkout; rebuild pending)**, and rebuild a store from samples.
 3. `qc`, report mode: icechunk first, then plain zarr. Review the report on the rebuilt store.
-4. annizarr 0.2.4: `subset` (streaming row filter, both store kinds, int64 `indptr`, drops `obsp`) and `Repo.garbage_collect(older_than)`.
-5. `qc`, apply mode: icechunk first, then plain zarr.
-6. `process` on a GPU capsule, against the first `qc` branch. **Built without scVI and plots**, with SpatialData tables (38 tests, synthetic stores, annizarr 0.2.3 and 0.2.4); scVI next. Change log: `process/spec.md`.
+4. annizarr `subset` and `Repo.garbage_collect`: **not in 0.2.4**; qc apply streams its own subset meanwhile (§4.10).
+5. `qc`, apply mode: icechunk (a commit on `main`) first, then plain zarr.
+6. `process`: built as a pipeline on 2026-10-30, **reworked into an environment + notebooks capsule on 2026-11-02** (§5).
 7. Subtree-push each capsule to its own Code Ocean capsule.
+8. `anndata_ingest`: SpatialData-table inputs, gene-panel fitting, source paths in commits, custom `.pkl` **(done 2026-10-30)**; S3 creation without `CREATE`, dropping results on append **(done 2026-11-02)**.
+9. `spatial_ingest` (§3S): the annizarr joint-table test, then the capsule.
 
 ## 9. Open questions
 - **annizarr 0.2.4 shipped without `subset` and `Repo.garbage_collect`** (checked 2026-10-30). It renamed `add_expr` to `add_layer`, which now only copies a matrix in another layout (no normalization), split the matrix copy into `_writers/_copy.py`, and caps its CPU count by the cgroup quota. `process` works on it unchanged; qc apply still needs the two below, now for a later release.
 - **Planned for annizarr:** `subset(store, *, output, keep, branch, commit)` mirrors `rechunk`'s streaming copy with a row mask; `Repo.garbage_collect(older_than)` wraps icechunk's. Both keep the capsule free of store internals (no private `_writer_repo()`).
-- **First GPU run:** the environment builds and works on the T4. Still to test: the scVI subprocess handoff, once `process` code exists.
+- **First GPU run:** the environment builds and works on the T4. The reworked notebooks still need a headless run there (`code/notebooks/test_notebooks.sh`).
+- **Spatial `obsm["spatial"]`:** annizarr `append` drops `obsm`, so a joint table appended by `spatial_ingest` loses cell centers; keep them as obs columns, or have annizarr keep named `obsm` keys.
 - **Using RAPIDS in other capsules:** a capsule with its own environment could install `process/code/environment/requirements.txt` into a separate venv (`/opt/rapids`) from `postInstall`, with a Jupyter kernel. Untested whether Code Ocean exposes the GPU to a non-GPU base image.

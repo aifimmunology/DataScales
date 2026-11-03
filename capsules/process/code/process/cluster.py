@@ -1,97 +1,52 @@
-"""The Dask-CUDA cluster the pipeline runs on, and a sampler for peak host and GPU memory."""
+"""The Dask-CUDA cluster: one worker per visible GPU, over tcp, with the chosen RMM memory mode."""
 from __future__ import annotations
 
-import logging
-import threading
-from contextlib import contextmanager
-from typing import Iterator
-
-logger = logging.getLogger("process")
+from config import Config
 
 
-@contextmanager
-def gpu_cluster() -> Iterator:
-    """A LocalCUDACluster over every visible GPU, with managed memory spilling to host RAM."""
-    import cupy as cp
-    import dask
-    import rmm
-    from dask.distributed import Client
-    from dask_cuda import LocalCUDACluster
-    from rmm.allocators.cupy import rmm_cupy_allocator
+def set_zarr_config(concurrency: int, max_workers: int) -> None:
+    import zarr
 
-    dask.config.set({"distributed.scheduler.worker-ttl": None})
-    cluster = LocalCUDACluster(rmm_managed_memory=True, enable_cudf_spill=True,
-                               rmm_allocator_external_lib_list="cupy")
-    try:
-        with Client(cluster) as client:
-            rmm.reinitialize(managed_memory=True)
-            cp.cuda.set_allocator(rmm_cupy_allocator)
-            yield client
-    finally:
-        try:
-            cluster.close()
-        except Exception as exc:
-            logger.warning("Cluster shutdown: %s", exc)
+    zarr.config.set({"async.concurrency": concurrency, "threading.max_workers": max_workers})
 
 
-def n_workers(client) -> int:
-    return len(client.scheduler_info()["workers"])
+class GpuCluster:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.cluster = self.client = None
 
+    def start(self) -> None:
+        import cupy as cp
+        import dask
+        import rmm
+        from dask.distributed import Client
+        from dask_cuda import LocalCUDACluster
+        from rmm.allocators.cupy import rmm_cupy_allocator
 
-def sync() -> None:
-    import cupy as cp
+        cfg = self.cfg
+        dask.config.set({"distributed.scheduler.worker-ttl": None})
+        kw = dict(protocol="tcp", threads_per_worker=cfg.threads_per_worker, enable_cudf_spill=cfg.enable_cudf_spill,
+                  rmm_allocator_external_lib_list="cupy")
+        if cfg.rmm_mode == "managed":
+            kw["rmm_managed_memory"] = True
+        elif cfg.rmm_mode == "pool":
+            kw["rmm_pool_size"] = cfg.rmm_pool_size
+        self.cluster = LocalCUDACluster(**kw)
+        self.client = Client(self.cluster)
+        self.client.run(set_zarr_config, cfg.zarr_concurrency, cfg.zarr_max_workers)
+        rmm.reinitialize(managed_memory=cfg.rmm_mode == "managed")
+        cp.cuda.set_allocator(rmm_cupy_allocator)
 
-    cp.cuda.Stream.null.synchronize()
+    @property
+    def n_workers(self) -> int:
+        return len(self.client.scheduler_info()["workers"]) if self.client else 1
 
-
-class MemoryMonitor:
-    """Polls host RSS (this process and its workers) and GPU memory in a background thread.
-
-    GPU memory is device-wide, so another job on the same GPU counts toward the peak.
-    """
-
-    def __init__(self, interval: float = 0.25):
-        import psutil
-        import pynvml
-
-        pynvml.nvmlInit()
-        self._nvml = pynvml
-        self._gpus = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
-        self._proc = psutil.Process()
-        self._interval = interval
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self.peak_host = self.peak_gpu = 0
-
-    def _host(self) -> int:
-        total = self._proc.memory_info().rss
-        for child in self._proc.children(recursive=True):
+    def close(self) -> None:
+        """Frees every worker's GPU memory; later dask work runs in this process on its first GPU."""
+        for part in (self.client, self.cluster):
             try:
-                total += child.memory_info().rss
-            except Exception:
-                continue
-        return total
-
-    def _gpu(self) -> int:
-        return sum(self._nvml.nvmlDeviceGetMemoryInfo(h).used for h in self._gpus)
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            self.peak_host = max(self.peak_host, self._host())
-            self.peak_gpu = max(self.peak_gpu, self._gpu())
-            self._stop.wait(self._interval)
-
-    def __enter__(self) -> MemoryMonitor:
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        self._thread.join()
-        try:
-            self._nvml.nvmlShutdown()
-        except Exception:
-            pass
-
-    def summary(self) -> dict:
-        return {"peak_host_gb": round(self.peak_host / 1024**3, 2), "peak_gpu_gb": round(self.peak_gpu / 1024**3, 2)}
+                if part is not None:
+                    part.close()
+            except Exception as exc:
+                print(f"cluster shutdown: {exc}")
+        self.client = self.cluster = None

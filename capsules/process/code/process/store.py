@@ -1,280 +1,166 @@
-"""Where a run reads and writes its results.
+"""Opening the input and saving results, by the notebooks' rules.
 
-- icechunk: one commit on the curation branch.
-- writable plain zarr: in place.
-- read-only plain zarr, or one given --output: a new zarr, either a full copy or everything but the counts.
-
-A SpatialData store works the same way; only its table (`tables/<table>`) is read and written.
+`child` to `save_commit` are the notebooks' helper cell, word for word (tests/test_store.py checks it).
+- zarr input (AnnData, or a SpatialData store's tables/<table>): a new full copy built at `<out>.partial` and
+  renamed; an existing output is never overwritten, the next free `<stem>-<n>.zarr` is used.
+- icechunk input: one commit on the branch, through the origin when given; refused only if the branch moved.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import os
+import re
 import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import annizarr
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 import zarr
-from anndata.io import read_elem, write_elem
+from anndata.io import write_elem
 from annizarr import Repo
 
-from config import Settings
-from steps import Embedding
-
-_PROBE = ".write_probe"
-_TARGET_SUM_ATTR = "target_sum"
-DERIVED_OBSM = ("X_pca", "X_pca_harmony", "X_umap")
+PROCESS_OBSM = ("X_pca", "X_pca_harmony", "X_scVI", "X_umap")
+LEIDEN_COLUMN = re.compile(r"^leiden(_[0-9.eE+-]+)?$")
 
 
-class StoreError(RuntimeError):
-    """The input's location or state doesn't allow this run."""
+class InputError(RuntimeError):
+    pass
 
 
-class IcechunkTarget:
-    kind = "icechunk"
-
-    def __init__(self, settings: Settings):
-        self.path = settings.input
-        self.branch = settings.branch
-        self.repo = Repo(self.path, branch=self.branch, origin=settings.origin or None)
-        if self.repo.origin is None:
-            raise StoreError(f"{self.path} is read-only; give its writable origin (e.g. s3://bucket/prefix).")
-        self.repo.open_zarr("w")
-        self.snapshot = self.repo.log()[0].id
-        self.table = table_path(self.repo.open_zarr("r", snapshot_id=self.snapshot), settings.table, self.path)
+@dataclass
+class Source:
+    path: str
+    table: str
+    snapshot: str
+    root: zarr.Group
+    repo: Repo | None = None
 
     @property
-    def location(self) -> str:
-        return self.repo.origin or self.path
-
-    def source(self) -> dict:
-        return {"kind": self.kind, "location": self.location, "table": self.table, "branch": self.branch,
-                "snapshot": self.snapshot}
-
-    def read_root(self) -> zarr.Group:
-        return subgroup(self.repo.open_zarr("r", snapshot_id=self.snapshot), self.table)
-
-    def write(self, emb: Embedding, uns: dict, lognorm, settings: Settings) -> dict:
-        n_cells = len(emb.leiden)
-        tip = self.repo.log()[0].id
-        if tip != self.snapshot:
-            raise StoreError(f"Branch '{self.branch}' moved from {self.snapshot[:8]} to {tip[:8]} during the run; "
-                             "nothing was written. Rerun on the new tip.")
-        try:
-            group = subgroup(self.repo.open_zarr("w"), self.table)
-            write_lognorm(group, lognorm, settings.target_sum)
-            write_embedding(group, emb, uns)
-            snapshot = self.repo.commit(
-                f"Process: {settings.integration}, {emb.n_clusters} leiden clusters over {n_cells:,} cells "
-                f"(source {self.snapshot[:8]})",
-                metadata={
-                    "pipeline": "process",
-                    "curation_branch": self.branch,
-                    "source_snapshot": self.snapshot,
-                    "table": self.table,
-                    "integration": settings.integration,
-                    "batch_keys": settings.integration_keys,
-                    "n_cells": n_cells,
-                    "n_clusters": emb.n_clusters,
-                },
-            )
-        except BaseException:
-            self.repo.discard()
-            raise
-        return {"branch": self.branch, "snapshot": snapshot}
+    def group(self) -> zarr.Group:
+        return self.root[self.table] if self.table else self.root
 
 
-class ZarrTarget:
-    kind = "zarr"
-
-    def __init__(self, settings: Settings):
-        self.path = settings.input
-        self.table = table_path(zarr.open_group(self.path, mode="r"), settings.table, self.path)
-        copy = bool(settings.output) or settings.output_mode == "results-only"
-        self.in_place = not copy and writable(self.path)
-        self.dest = self.path if self.in_place else settings.output_path()
-        self.mode = "in-place" if self.in_place else settings.output_mode
-        if "://" in self.dest:
-            raise StoreError(f"Output {self.dest} must be a local path or a /results folder.")
-        if not self.in_place and exists(self.dest):
-            raise StoreError(f"Output {self.dest} already exists; remove it or set --output to a new path.")
-        self.fingerprint = fingerprint(self.read_root())
-
-    @property
-    def location(self) -> str:
-        return self.path
-
-    def source(self) -> dict:
-        return {"kind": self.kind, "location": self.path, "table": self.table, "fingerprint": self.fingerprint}
-
-    def read_root(self) -> zarr.Group:
-        return subgroup(zarr.open_group(self.path, mode="r"), self.table)
-
-    def write(self, emb: Embedding, uns: dict, lognorm, settings: Settings) -> dict:
-        if fingerprint(self.read_root()) != self.fingerprint:
-            raise StoreError(f"{self.path} changed during the run; nothing was written. Rerun on the new data.")
-        if self.in_place:
-            self._write_results(self.dest, self.table, emb, uns, lognorm, settings)
-            return {"output": self.dest, "mode": self.mode}
-        if exists(self.dest):
-            raise StoreError(f"Output {self.dest} appeared during the run; nothing was written.")
-        partial = f"{self.dest.rstrip('/')}.partial-{os.getpid()}"
-        try:
-            if self.mode == "results-only":
-                copy_without_counts(self.read_root(), partial)
-                table = ""
-            elif self.table:
-                copy_tree(self.path, partial)
-                table = self.table
-            else:
-                annizarr.rechunk(self.path, output=partial)
-                table = ""
-            self._write_results(partial, table, emb, uns, lognorm, settings)
-            os.rename(partial, self.dest)
-        except BaseException:
-            shutil.rmtree(partial, ignore_errors=True)
-            raise
-        return {"output": self.dest, "mode": self.mode}
-
-    def _write_results(self, path: str, table: str, emb: Embedding, uns: dict, lognorm, settings: Settings) -> None:
-        unconsolidate(path, table)
-        group = subgroup(zarr.open_group(path, mode="r+", use_consolidated=False), table)
-        if "uns" in group and "process" in group["uns"]:
-            del group["uns"]["process"]
-        write_lognorm(group, lognorm, settings.target_sum)
-        write_embedding(group, emb, uns)
-        zarr.consolidate_metadata(path)
-
-
-def open_target(settings: Settings) -> IcechunkTarget | ZarrTarget:
-    """An icechunk repo if annizarr finds one at the input, otherwise a plain zarr."""
-    if Repo.exists(settings.input):
-        return IcechunkTarget(settings)
-    if settings.origin:
-        raise StoreError("origin applies to icechunk repos only; a plain zarr is written in place or copied.")
-    if "://" in settings.input:
-        raise StoreError("A remote plain zarr isn't supported; put it in an icechunk repo, or attach it as a data asset.")
-    if not exists(settings.input):
-        raise StoreError(f"No icechunk repo or zarr store at {settings.input}.")
-    return ZarrTarget(settings)
-
-
-def table_path(root: zarr.Group, table: str, where: str) -> str:
-    """Where the AnnData is: the root of an AnnData store, or `tables/<table>` of a SpatialData store."""
-    if "X" in root:
-        return ""
-    if "tables" in root and table in root["tables"]:
-        return f"tables/{table}"
-    raise StoreError(f"{where} has no X and no tables/{table}; it isn't an AnnData or SpatialData store.")
-
-
-def subgroup(root: zarr.Group, path: str) -> zarr.Group:
-    return root[path] if path else root
-
-
-def exists(path: str) -> bool:
+def open_source(path: str, table: str, branch: str, origin: str) -> Source:
     try:
-        zarr.open_group(path, mode="r")
-    except (zarr.errors.GroupNotFoundError, FileNotFoundError):
-        return Path(path).exists()
-    return True
+        if Repo.exists(path):
+            repo = Repo(path, branch=branch, origin=origin or None)
+            view = Repo(origin, branch=branch) if origin else repo
+            snapshot = view.log()[0].id
+            root = view.open_zarr("r", snapshot_id=snapshot)
+        else:
+            repo, root, snapshot = None, zarr.open_group(path, mode="r"), "zarr"
+    except Exception as exc:
+        raise InputError(f"can't open {path} as an AnnData or SpatialData .zarr or an icechunk repo "
+                         f"({type(exc).__name__}: {exc})") from None
+    if origin and not repo:
+        print(f"origin {origin} is for icechunk repos; {path} is a zarr, so it's ignored")
+    table_path = "" if "X" in root else f"tables/{table}"
+    if table_path and table_path not in root:
+        raise InputError(f"{path} has no X and no {table_path}; it isn't an AnnData or SpatialData store")
+    return Source(path, table_path, snapshot, root, repo)
 
 
-def writable(path: str) -> bool:
-    try:
-        root = zarr.open_group(path, mode="r+")
-        root.create_array(_PROBE, shape=(1,), dtype="u1", overwrite=True)
-        del root[_PROBE]
-    except Exception:
-        return False
-    return True
+def child(group, key):
+    if key not in group:
+        write_elem(group, key, {})
+    return group[key]
 
 
-def fingerprint(root: zarr.Group) -> str:
-    """SHA-256 over the X and obs attrs, X's nonzero count, and the obs index (streamed by chunk).
-
-    Leaves out `column-order`, which this pipeline rewrites.
-    """
-    h = hashlib.sha256()
-    for node in (root["obs"], root["X"]):
-        attrs = {k: v for k, v in node.attrs.items() if k != "column-order"}
-        h.update(json.dumps(attrs, sort_keys=True, default=str).encode())
-    h.update(str(int(root["X/indptr"][-1])).encode())
-    index = root["obs"][root["obs"].attrs["_index"]]
-    if isinstance(index, zarr.Group):
-        index = index["values"]
-    step = index.chunks[0]
-    for start in range(0, index.shape[0], step):
-        h.update("\x00".join(map(str, index[start:start + step])).encode())
-    return h.hexdigest()
-
-
-def copy_without_counts(src: zarr.Group, dest: str) -> None:
-    """A new AnnData zarr holding everything in `src` but X, layers and raw."""
-    out = zarr.open_group(dest, mode="w-", zarr_format=src.metadata.zarr_format, attributes=dict(src.attrs))
-    for key in src:
-        if key not in ("X", "layers", "raw"):
-            write_elem(out, key, read_elem(src[key]))
-
-
-def copy_tree(src: str, dest: str) -> None:
-    """A writable copy of a local store, whatever the source's permissions."""
-    shutil.copytree(src, dest, copy_function=shutil.copyfile)
-    for folder, _, _ in os.walk(dest):
-        os.chmod(folder, 0o755)
-
-
-def unconsolidate(path: str, table: str = "") -> None:
-    """Drops consolidated metadata from the root and every group down to `table`, so a write that dies
-    midway can't leave a listing of deleted elements. The write consolidates the root again at the end."""
-    folder = Path(path)
-    for part in ["", *Path(table).parts]:
-        folder = folder / part
-        (folder / ".zmetadata").unlink(missing_ok=True)
-        meta = folder / "zarr.json"
-        doc = json.loads(meta.read_text()) if meta.exists() else {}
-        if doc.pop("consolidated_metadata", None) is not None:
-            tmp = meta.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(doc, indent=2))
-            os.replace(tmp, meta)
-
-
-def write_lognorm(root: zarr.Group, lognorm, target_sum: float) -> None:
-    """Streams the pipeline's GPU log-normalized matrix to `layers/lognorm`, one block at a time."""
-    host = lognorm.map_blocks(lambda b: b.get(), dtype=lognorm.dtype,
-                              meta=sp.csr_matrix((0, 0), dtype=lognorm.dtype))
-    ensure_dict(root, "layers")
-    write_elem(root["layers"], "lognorm", host)
-    root["layers"]["lognorm"].attrs[_TARGET_SUM_ATTR] = float(target_sum)
-
-
-def ensure_dict(root: zarr.Group, name: str) -> None:
-    if name not in root:
-        write_elem(root, name, {})
-
-
-def _replace(group: zarr.Group, key: str, value) -> None:
+def put(group, key, value):
     if key in group:
         del group[key]
     write_elem(group, key, value)
 
 
-def write_embedding(root: zarr.Group, emb: Embedding, uns: dict[str, Any]) -> None:
-    """Replaces every earlier `process` result with this run's; `uns/process` goes last, marking a complete write."""
-    for name in ("obsm", "uns"):
-        ensure_dict(root, name)
-    for key, value in emb.obsm.items():
-        _replace(root["obsm"], key, np.ascontiguousarray(value))
-    _replace(root["obs"], "leiden", emb.leiden)
-    _replace(root["var"], "highly_variable", np.asarray(emb.highly_variable, dtype=bool))
-    for frame, column in (("obs", "leiden"), ("var", "highly_variable")):
-        order = [c for c in root[frame].attrs.get("column-order", []) if c != column]
-        root[frame].attrs["column-order"] = [*order, column]
-    for key in set(DERIVED_OBSM) - set(emb.obsm):
-        if key in root["obsm"]:
-            del root["obsm"][key]
-    _replace(root["uns"], "process", uns)
+def put_column(frame, name, values):
+    put(frame, name, values)
+    frame.attrs["column-order"] = [*(c for c in frame.attrs["column-order"] if c != name), name]
+
+
+def free_path(stem, suffix=""):
+    out, n = f"{stem}{suffix}", 0
+    while Path(out).exists() or Path(f"{out}.partial").exists():
+        n += 1
+        out = f"{stem}-{n}{suffix}"
+    return out
+
+
+def new_output(store, output, results):
+    out = output or f"{results}/{Path(store.rstrip('/')).name.removesuffix('.zarr')}.processed"
+    return free_path(out.rstrip("/").removesuffix(".zarr"), ".zarr")
+
+
+def save_copy(store, table, write_results, output, results):
+    out = new_output(store, output, results)
+    partial = f"{out}.partial"
+    Path(partial).parent.mkdir(parents=True, exist_ok=True)
+    if table:
+        shutil.copytree(store, partial, copy_function=shutil.copyfile)
+        for folder, _, _ in os.walk(partial):
+            os.chmod(folder, 0o755)  # a read-only data asset's folders would be copied read-only
+    else:
+        annizarr.rechunk(store, output=partial)
+    copy = zarr.open_group(partial, mode="r+", use_consolidated=False)
+    write_results(copy[table] if table else copy)
+    zarr.consolidate_metadata(partial)
+    os.rename(partial, out)
+    return out
+
+
+def save_commit(repo, branch, snapshot, table, write_results, message, metadata=None):
+    store = repo.open_zarr("w")
+    if repo.log()[0].id != snapshot:
+        repo.discard()
+        raise RuntimeError(f"Branch {branch} moved since the store was opened; nothing was written. Reopen it and rerun.")
+    try:
+        write_results(store[table] if table else store)
+        return repo.commit(message, metadata={"source_snapshot": snapshot, "table": table, **(metadata or {})})
+    except BaseException:
+        repo.discard()
+        raise
+
+
+def drop_column(frame, name):
+    del frame[name]
+    frame.attrs["column-order"] = [c for c in frame.attrs["column-order"] if c != name]
+
+
+@dataclass
+class Results:
+    lognorm: object
+    target_sum: float
+    highly_variable: np.ndarray
+    obsm: dict[str, np.ndarray]
+    obs: dict[str, pd.Categorical]
+    uns: dict = field(default_factory=dict)
+
+    def write(self, group) -> None:
+        host = self.lognorm.map_blocks(lambda b: b.get(), dtype=self.lognorm.dtype,
+                                       meta=sp.csr_matrix((0, 0), dtype=self.lognorm.dtype))
+        put(child(group, "layers"), "lognorm", host)
+        group["layers/lognorm"].attrs["target_sum"] = self.target_sum
+        obsm = child(group, "obsm")
+        for key in PROCESS_OBSM:
+            if key in self.obsm:
+                put(obsm, key, np.ascontiguousarray(self.obsm[key], dtype=np.float32))
+            elif key in obsm:
+                del obsm[key]
+        obs = group["obs"]
+        for name in [c for c in obs.attrs["column-order"] if LEIDEN_COLUMN.match(c) and c not in self.obs]:
+            drop_column(obs, name)
+        for name, values in self.obs.items():
+            put_column(obs, name, values)
+        put_column(group["var"], "highly_variable", self.highly_variable)
+        put(child(group, "uns"), "process", {**self.uns, "created": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+
+
+def save(src: Source, results: Results, message: str, branch: str, output: str, results_dir: str, metadata: dict) -> str:
+    if src.repo:
+        if output:
+            print(f"output {output} is for zarr inputs; an icechunk input gets a commit on {branch}")
+        snapshot = save_commit(src.repo, branch, src.snapshot, src.table, results.write, message, metadata)
+        return f"committed {snapshot} on {branch}"
+    return f"saved to {save_copy(src.path, src.table, results.write, output, results_dir)}"

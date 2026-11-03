@@ -1,0 +1,81 @@
+{
+	"version": 1,
+	"categories": [
+		{
+			"id": "hNshNesucRS8w1XA",
+			"name": "Central Storage",
+			"description": "information on the storage that the sample(s) will be added to.",
+			"icon": "📂"
+		},
+		{
+			"id": "sxamMh7IcKwbGyOs",
+			"name": "Sample Information",
+			"description": "Information such as the data asset location or path to the sample being added to the store",
+			"icon": "📂"
+		},
+		{
+			"id": "JQPe5zIaMaeicuwR",
+			"name": "Run params",
+			"description": "ingest parameters, such as what celltypist model to run, and storage addition configuration",
+			"icon": "📂"
+		}
+	],
+	"parameters": [
+		{
+			"id": "4I12NzX5Uo8yP6oM",
+			"category": "hNshNesucRS8w1XA",
+			"name": "Storage Location",
+			"description": "Icechunk repo (data asset, local path or s3://bucket/prefix) or .zarr folder the samples are added to. If it does not exist, it is created at an s3:// prefix you can write to, or inside /results or /scratch.",
+			"help_text": "A store you will keep adding to belongs on S3. /data is read-only; a store in /results can be saved as a data asset but is then read-only too, and /scratch is cleared when the run ends.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "/results/ingest_icechunk",
+			"required": true
+		},
+		{
+			"id": "CwzYftWPQ5bWqno2",
+			"category": "hNshNesucRS8w1XA",
+			"name": "Origin of s3(optional)",
+			"description": "If the storage is a read-only data asset linked to an S3 bucket, the bucket location to write to. EX: s3://bucket/prefix",
+			"help_text": "This is optional, Only needed when writing to an external data asset that has a linked s3 bucket",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^(s3://.+)?$"
+		},
+		{
+			"id": "aqK0Q6vLFi4lB9bh",
+			"category": "sxamMh7IcKwbGyOs",
+			"name": "List of paths to samples",
+			"description": "Samples to add to the storage: .h5/.h5ad files, SpatialData .zarr folders (their table is added), folders holding them, or globs, separated by commas. EX: /data/samples, /data/other/sample1.h5ad",
+			"help_text": "Paths must be inside data assets attached to this capsule. Folders are not searched recursively. Samples already in the store are skipped.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "/data/samples"
+		},
+		{
+			"id": "d7VFKtzWt1oafeYk",
+			"category": "JQPe5zIaMaeicuwR",
+			"name": "Celltypist Model",
+			"description": "Which CellTypist models label the cells. An existing store accepts only the option it was created with.",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "AIFI L1, L2, L3 celltypes",
+			"extra_data": [
+				"AIFI L1, L2, L3 celltypes",
+				"Only AIFI L1 celltypes",
+				"CellTypist Immune_All High and Low labels",
+				"None"
+			]
+		},
+		{
+			"id": "Pk7xQm2RcTn4LwVb",
+			"category": "JQPe5zIaMaeicuwR",
+			"name": "Custom Celltypist model (.pkl, optional)",
+			"description": "A CellTypist model file to use instead of the dropdown, e.g. one trained for a spatial gene panel. Several can be separated by commas. EX: /data/models/my_model.pkl",
+			"help_text": "Leave empty to use the dropdown. The model's name (the file name without .pkl) names the label columns, so keep using the same file for one store.",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^(.+\\.pkl\\s*(,\\s*.+\\.pkl\\s*)*)?$"
+		}
+	]
+}

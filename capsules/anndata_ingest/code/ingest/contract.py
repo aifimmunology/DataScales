@@ -44,16 +44,23 @@ def requested_schema(run_scrublet: bool, models: list[str]) -> Schema:
     return schema
 
 
-def check_schema(store_columns: list[str], schema: Schema) -> None:
+def store_models(store_columns: list[str]) -> list[str]:
+    """The CellTypist models a store was built with, from its `<model>_label` columns."""
+    return [c.removesuffix("_label") for c in store_columns if c.endswith("_label")]
+
+
+def check_schema(store_columns: list[str], schema: Schema, run_scrublet: bool = True) -> None:
     """Appends need identical obs columns; a store's schema is fixed when it is created."""
     if store_columns == list(schema):
         return
     missing = sorted(set(store_columns) - set(schema))
     extra = sorted(set(schema) - set(store_columns))
+    scrublet = "with" if "scrublet_score" in store_columns else "without"
     raise ContractError(
         "This run's obs schema differs from the store's, so its cells cannot be appended. "
-        f"Store-only columns: {missing}; run-only columns: {extra}. Match the store's Scrublet setting "
-        "and CellTypist models, or start a new store."
+        f"Store-only columns: {missing}; run-only columns: {extra}. The store was built {scrublet} Scrublet "
+        f"and with CellTypist models {store_models(store_columns) or 'none'}; choose the same Celltypist "
+        "option, or start a new store."
     )
 
 
@@ -98,6 +105,47 @@ def _check_var(var_names: np.ndarray, expected: np.ndarray | None) -> None:
     else:
         found = f"{len(var_names)} genes, the store {len(expected)}, {len(set(var_names) ^ set(expected))} not shared"
     raise ContractError(f"var mismatch: the sample has {found}; gene names and order must match the store's.")
+
+
+def panel_diff(store_genes, sample_genes, n_examples: int = 5) -> dict | None:
+    """How a sample's genes differ from the store's, or None when names and order match."""
+    store_genes, sample_genes = list(store_genes), list(sample_genes)
+    if store_genes == sample_genes:
+        return None
+    in_sample, in_store = set(sample_genes), set(store_genes)
+    only_store = [g for g in store_genes if g not in in_sample]
+    only_sample = [g for g in sample_genes if g not in in_store]
+    return {"n_shared": len(in_store & in_sample), "n_only_in_store": len(only_store),
+            "n_only_in_sample": len(only_sample), "only_in_store": only_store[:n_examples],
+            "only_in_sample": only_sample[:n_examples]}
+
+
+def describe_diff(sid: str, diff: dict) -> str:
+    if not diff["n_only_in_store"] and not diff["n_only_in_sample"]:
+        return f"{sid}: the same {diff['n_shared']} genes in a different order"
+    return (f"{sid}: {diff['n_shared']} shared, {diff['n_only_in_store']} only in the store "
+            f"(e.g. {', '.join(diff['only_in_store']) or '-'}), {diff['n_only_in_sample']} only in the sample "
+            f"(e.g. {', '.join(diff['only_in_sample']) or '-'})")
+
+
+def fit_note(diff: dict) -> str:
+    if not diff["n_only_in_store"] and not diff["n_only_in_sample"]:
+        return "genes reordered to the store's"
+    return (f"fitted to the store's genes: {diff['n_only_in_store']} zero-filled, "
+            f"{diff['n_only_in_sample']} dropped")
+
+
+def conform_var(adata: ad.AnnData, store_genes) -> ad.AnnData:
+    """The sample's counts on the store's genes: store genes the sample lacks are zero-filled and its
+    genes the store lacks are dropped. Annotation must run before this, on the sample's own genes."""
+    store_genes = pd.Index(np.asarray(store_genes, dtype=object))
+    src = pd.Index(ad.utils.make_index_unique(adata.var_names.copy())).get_indexer(store_genes)
+    present = src >= 0
+    x = adata.X.tocsc() if sp.issparse(adata.X) else sp.csc_matrix(adata.X)
+    pick = sp.csr_matrix((np.ones(present.sum()), (src[present], np.flatnonzero(present))),
+                         shape=(adata.n_vars, len(store_genes)))
+    out = ad.AnnData(sp.csr_matrix(x @ pick).astype(x.dtype), obs=adata.obs.copy(), var=pd.DataFrame(index=store_genes))
+    return out
 
 
 def project(adata: ad.AnnData, schema: Schema, expected_var_names: np.ndarray | None = None) -> ad.AnnData:

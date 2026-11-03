@@ -16,6 +16,7 @@ from anndata.io import read_elem
 from annizarr import AppConfig, Repo, append, convert
 
 _PROBE = "_write_probe"
+RESULT_UNS = ("process",)
 
 
 class StoreError(RuntimeError):
@@ -29,6 +30,7 @@ class IcechunkStore:
         self.path = path
         self.origin = origin if origin and origin != path else None
         self.repo: Repo | None = None
+        self.state: Repo | None = None
 
     @property
     def location(self) -> str:
@@ -43,10 +45,13 @@ class IcechunkStore:
         self.repo = Repo.create(self.location) if fresh else Repo(self.path, origin=self.origin)
         if self.repo.origin is None:
             raise StoreError(f"{self.path} is read-only; give its writable origin (e.g. s3://bucket/prefix).")
+        # A data-asset mount can lag its origin by several commits, so the store's state (which
+        # samples it holds, its schema and genes) is read from the origin.
+        self.state = Repo(self.repo.origin) if self.repo.origin != self.path else self.repo
 
     def root(self) -> zarr.Group | None:
         try:
-            return self.repo.open_zarr("r")
+            return self.state.open_zarr("r")
         except zarr.errors.GroupNotFoundError:
             return None
 
@@ -57,8 +62,8 @@ class IcechunkStore:
     def bootstrap(self, adata: ad.AnnData, cfg: AppConfig, message: str) -> str:
         return convert(adata, output=self.repo, cfg=cfg, message=message).snapshot_id
 
-    def append(self, cells: str, cfg: AppConfig) -> None:
-        append(self.repo, cells=cells, cfg=cfg, commit=False)
+    def append(self, cells: str, cfg: AppConfig, drop_derived: bool = False) -> None:
+        append(self.repo, cells=cells, cfg=cfg, commit=False, drop_derived=drop_derived)
 
     def commit(self, message: str, metadata: dict[str, Any]) -> str:
         return self.repo.commit(message, metadata=metadata)
@@ -93,13 +98,13 @@ class ZarrStore:
             return None
 
     def working_root(self) -> zarr.Group:
-        return self.root()
+        return zarr.open_group(self.path, mode="r+")
 
     def bootstrap(self, adata: ad.AnnData, cfg: AppConfig, message: str) -> None:
         convert(adata, output=self.path, cfg=cfg)
 
-    def append(self, cells: str, cfg: AppConfig) -> None:
-        append(self.path, cells=cells, cfg=cfg)
+    def append(self, cells: str, cfg: AppConfig, drop_derived: bool = False) -> None:
+        append(self.path, cells=cells, cfg=cfg, drop_derived=drop_derived)
 
     def commit(self, message: str, metadata: dict[str, Any]) -> None:
         return None
@@ -109,10 +114,14 @@ class ZarrStore:
 
 
 def open_store(path: str, origin: str = "") -> IcechunkStore | ZarrStore:
-    """`.zarr` paths are plain AnnData zarr stores; anything else is an icechunk repo."""
+    """`.zarr` paths and local folders holding a plain zarr group are AnnData zarr stores; anything
+    else is an icechunk repo."""
     if not path:
         raise StoreError("No store given; set the store path (a data asset, local path, or s3:// URL).")
-    if path.rstrip("/").endswith(".zarr"):
+    if Path(path).suffix.lower() in (".h5", ".h5ad", ".h5mu", ".loom"):
+        raise StoreError(f"{path} is a file; the store is an icechunk repo or a .zarr folder, which a file "
+                         "can't be appended to. Give a new path inside /results to start a store.")
+    if path.rstrip("/").endswith(".zarr") or _is_plain_zarr(path):
         if origin:
             raise StoreError("origin applies to icechunk stores only; a plain zarr is written where it is.")
         return ZarrStore(path)
@@ -131,6 +140,27 @@ def _probe_writable(path: str) -> None:
 def _is_nonempty_dir(path: str) -> bool:
     p = Path(path)
     return "://" not in path and p.is_dir() and any(p.iterdir())
+
+
+def _is_plain_zarr(path: str) -> bool:
+    p = Path(path)
+    return "://" not in path and p.is_dir() and not (p / "repo").exists() and (
+        (p / "zarr.json").is_file() or (p / ".zgroup").is_file())
+
+
+def derived_elements(root: zarr.Group | None) -> list[str]:
+    """Elements built for the current cells (embeddings, graphs, layers, process results); appending
+    invalidates them."""
+    if root is None:
+        return []
+    found = [f"{group}/{key}" for group in ("obsm", "obsp", "layers") if group in root for key in root[group]]
+    return found + [f"uns/{key}" for key in RESULT_UNS if "uns" in root and key in root["uns"]]
+
+
+def drop_result_uns(root: zarr.Group) -> None:
+    for key in RESULT_UNS:
+        if "uns" in root and key in root["uns"]:
+            del root["uns"][key]
 
 
 def has_data(root: zarr.Group | None) -> bool:
