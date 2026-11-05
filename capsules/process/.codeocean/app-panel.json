@@ -1,0 +1,184 @@
+{
+	"version": 1,
+	"named_parameters": true,
+	"categories": [
+		{
+			"id": "fjkkmNN0idHqHVRS",
+			"name": "Input data",
+			"description": "Optional: this capsule is mainly an environment with notebooks. The store to process and, optionally, the cells to use."
+		},
+		{
+			"id": "GhlCWmuPGluuDV1v",
+			"name": "Embedding",
+			"description": "How cells are embedded before the neighbor graph: PCA (with harmony when a batch key is given) or a newly trained scVI model."
+		},
+		{
+			"id": "D4npHhbetnHEohzx",
+			"name": "Neighbors & UMAP",
+			"description": "The neighbor graph and the 2-D UMAP built from the embedding."
+		},
+		{
+			"id": "cfFi1YmLsqcKgvnB",
+			"name": "Clustering",
+			"description": "Leiden clustering on the neighbor graph, at one or more resolutions."
+		},
+		{
+			"id": "W3oWEbP7Z7LZFkUZ",
+			"name": "Output",
+			"description": "Where a zarr input's processed copy goes. An icechunk input gets a commit instead."
+		}
+	],
+	"parameters": [
+		{
+			"id": "c10i3GgTzgSHgMw7",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "Input store",
+			"param_name": "input",
+			"description": "An AnnData .zarr, a SpatialData .zarr, or an icechunk repo in an attached data asset. EX: /data/my_asset/sample.zarr. Leave empty and a run only prints how to use the capsule.",
+			"help_text": "X must hold raw counts as a sparse (CSR) matrix. The input is never changed: a zarr gets a new processed copy, an icechunk repo gets one commit.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "PilPv4d0dnl7GBdw",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "SpatialData table",
+			"param_name": "table",
+			"description": "SpatialData only: the table to process, tables/<name>. Ignored for an AnnData store.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "table"
+		},
+		{
+			"id": "qY4L4oOTVuK36CTF",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "Icechunk branch",
+			"param_name": "branch",
+			"description": "Icechunk only: the branch that is read and that the results are committed on.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "main"
+		},
+		{
+			"id": "LwAYpEe1RPI2g5hV",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "Icechunk origin (optional)",
+			"param_name": "origin",
+			"description": "Icechunk only: the writable S3 location behind a read-only data asset, to commit the results there. EX: s3://bucket/prefix",
+			"help_text": "The data is then read through the origin too, so the results are computed on the snapshot they're committed onto.",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^(s3://.+)?$"
+		},
+		{
+			"id": "UILt0zRd8uxxIKsN",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "Subset column (optional)",
+			"param_name": "subset_column",
+			"description": "An obs column to select cells by. Leave empty to use every cell. EX: sample_id",
+			"help_text": "Cells outside the subset get empty values in the results.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "0J9Wv9FhrHriawSW",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "Subset values",
+			"param_name": "subset_values",
+			"description": "Values of the subset column to keep, separated by commas. EX: SP0001, SP0002",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "wIw2p6krRlO0vAC4",
+			"category": "GhlCWmuPGluuDV1v",
+			"name": "Method",
+			"param_name": "method",
+			"description": "PCA: normalize, highly variable genes, scale, PCA, plus harmony when a batch key is given. scVI (train): trains a new scVI model on the raw counts of the highly variable genes; the model is saved to /results/scvi_model.",
+			"help_text": "scVI's training settings (latent size, layers, epochs, batch size, ...) are SCVI_* environment variables or flags; see code/README.md.",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "PCA",
+			"extra_data": [
+				"PCA",
+				"scVI (train)"
+			]
+		},
+		{
+			"id": "cRmaAmG9C8lWxNcY",
+			"category": "GhlCWmuPGluuDV1v",
+			"name": "Batch key (optional)",
+			"param_name": "batch_key",
+			"description": "An obs column with the batch of each cell. PCA: harmony corrects for it. scVI: the model's batch. Several, separated by commas: harmony uses all; scVI uses the first as batch and the rest as covariates. EX: chip_id",
+			"help_text": "Empty strings count as missing; cells with a missing batch make harmony and scVI fail.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "FoBeRKzm3XyZ3y4N",
+			"category": "GhlCWmuPGluuDV1v",
+			"name": "Highly variable genes",
+			"param_name": "n_top_genes",
+			"description": "How many highly variable genes the embedding uses.",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "2000",
+			"minimum": 50
+		},
+		{
+			"id": "fMTIyPBkhJ1eGT59",
+			"category": "GhlCWmuPGluuDV1v",
+			"name": "PCA components",
+			"param_name": "n_comps",
+			"description": "PCA only: the number of components computed (neighbors use the first 30, or all if fewer).",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "50",
+			"minimum": 2
+		},
+		{
+			"id": "Z04UFhsHkzFEGdZs",
+			"category": "D4npHhbetnHEohzx",
+			"name": "Neighbors",
+			"param_name": "n_neighbors",
+			"description": "Nearest neighbors per cell in the graph.",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "20",
+			"minimum": 2
+		},
+		{
+			"id": "O5WG2KJep1CstB14",
+			"category": "D4npHhbetnHEohzx",
+			"name": "UMAP min_dist",
+			"param_name": "umap_min_dist",
+			"description": "How tightly UMAP packs cells; smaller is tighter.",
+			"type": "text",
+			"value_type": "number",
+			"default_value": "0.45",
+			"minimum": 0,
+			"maximum": 1
+		},
+		{
+			"id": "IdU98hbVdIDKXl4Q",
+			"category": "cfFi1YmLsqcKgvnB",
+			"name": "Leiden resolutions",
+			"param_name": "leiden_resolutions",
+			"description": "One or more resolutions, separated by commas; higher gives more clusters. One gives obs/leiden; several give obs/leiden_<resolution> each, from one neighbor graph. Empty means 1.1. EX: 0.5, 1.0, 2.0",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "1.1",
+			"pattern": "^\\s*([0-9]*\\.?[0-9]+(\\s*,\\s*[0-9]*\\.?[0-9]+)*\\s*,?\\s*)?$"
+		},
+		{
+			"id": "0hMt27jwwKveffpB",
+			"category": "W3oWEbP7Z7LZFkUZ",
+			"name": "Output path (optional)",
+			"param_name": "output",
+			"description": "Zarr input only: where the processed copy goes. Leave empty for /results/<input name>.processed.zarr. An existing output is never overwritten: <name>-1.zarr, -2, ... is used.",
+			"help_text": "An icechunk input ignores this and gets a commit on its branch.",
+			"type": "text",
+			"value_type": "string"
+		}
+	]
+}

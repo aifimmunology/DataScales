@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Code Ocean entrypoint. The app panel passes named parameters (see README.md); an empty value keeps the
+# environment variable or default:
+#   --input            icechunk repo (reads main) or plain AnnData .zarr
+#   --decisions        qc_decisions.json from a report run (required with --mode apply)
+#   --mode             report (default) or apply
+#   --target           icechunk: curation branch (default qc); plain zarr: output zarr path
+#   --origin           writable s3:// prefix behind a read-only icechunk data asset
+#   --reviewer         recorded in uns/qc and the commit metadata
+#   --group_columns    comma-separated obs columns (default batch_id,pool_id,chip_id)
+#   --label_column     <model>_label column (default pbmc_clean_AIFI_L1_2024_label)
+#   --celltype_qc      yes to turn on the per-cell-type section and cell_types overrides
+#   --compute_metrics  yes to compute absent or NA QC metrics from X
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/qc_check"
+exec python -u main.py "$@"
