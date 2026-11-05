@@ -46,7 +46,7 @@ def run(env, store, samples, **extra):
 def test_a_spatialdata_table_is_read_without_its_control_features(tmp_path):
     path = write_spatialdata(tmp_path / "Breast_A.zarr", 40, seed=1)
     adata = hise.read_sample(path)
-    assert hise.is_spatialdata(path) and list(adata.var_names) == GENES == list(hise.gene_names(path))
+    assert hise.zarr_kind(path) == "spatialdata" and list(adata.var_names) == GENES == list(hise.gene_names(path))
     assert hise.sample_id(path) == "Breast_A"
 
 
@@ -71,10 +71,18 @@ def test_spatialdata_folders_are_listed_and_ingested_with_their_sources(base_env
     assert run(base_env, store, folder)["appended_samples"] == []
 
 
-def test_a_zarr_that_is_not_spatialdata_is_refused(base_env, tmp_path):
+def test_a_zarr_that_is_not_anndata_or_spatialdata_is_refused(base_env, tmp_path):
     zarr.open_group(tmp_path / "plain.zarr", mode="w")
-    with pytest.raises(main.IngestError, match="must be a SpatialData object"):
+    with pytest.raises(main.IngestError, match="must be an AnnData, or a SpatialData"):
         run(base_env, tmp_path / "store", tmp_path / "plain.zarr")
+
+
+def test_mudata_is_refused_by_name(base_env, tmp_path):
+    root = zarr.open_group(tmp_path / "sample_mudata", mode="w")
+    root.attrs["encoding-type"] = "MuData"
+    root.create_group("mod")
+    with pytest.raises(main.IngestError, match="is MuData"):
+        run(base_env, tmp_path / "store", tmp_path / "sample_mudata")
 
 
 def test_a_different_gene_panel_warns_and_is_fitted_to_the_store_genes(base_env, tmp_path, caplog):

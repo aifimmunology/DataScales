@@ -71,6 +71,9 @@ def test_multi_sample_bootstrap_is_a_seed_plus_one_commit(samples_dir, base_env,
     log = Repo(store).log()
     assert len(log) == 3 and log[1].id == report["bootstrap_snapshot"] and log[0].id == report["snapshot"]
     assert log[0].metadata["n_cells"] == 540 and log[0].metadata["n_samples"] == 3
+    seed = log[1].metadata
+    assert seed["pipeline"] == "ingest" and seed["appended_samples"] == ["SP00001"] and seed["n_cells"] == 160
+    assert set(seed["sources"]) == {"SP00001"} and "SP00001" in log[1].message
 
 
 def test_stored_counts_and_obs_match_the_source(samples_dir, base_env, store_path):
@@ -231,6 +234,9 @@ def add_results(root):
     root.require_group("obsm").create_array("X_umap", shape=(160, 2), dtype="f4")
     ad.io.write_elem(root.require_group("layers"), "lognorm", sp.random(160, len(GENES), format="csr", dtype=np.float32))
     ad.io.write_elem(root.require_group("uns"), "process", {"integration": "none"})
+    old = ad.AnnData(sp.csr_matrix((160, len(GENES)), dtype=np.float32), var=pd.DataFrame(index=GENES))
+    old.raw = old
+    ad.io.write_elem(root, "raw", old.raw)
     if isinstance(root.store, zarr.storage.LocalStore):
         zarr.consolidate_metadata(root.store)
 
@@ -245,11 +251,11 @@ def test_appending_to_a_processed_store_drops_its_results(samples_dir, base_env,
         add_results(repo.open_zarr("w"))
         repo.commit("add results")
     report = ingest(base_env, store_path, files[1])
-    dropped = ["obsm/X_umap", "layers/lognorm", "uns/process"]
+    dropped = ["obsm/X_umap", "layers/lognorm", "raw", "uns/process"]
     assert report["dropped"] == dropped and "appending new cells drops them" in caplog.text
     stored = ad.read_zarr(root_of(store_path))
     assert stored.n_obs == report["n_cells"] > 160 and not stored.obsm and not stored.layers
-    assert "process" not in stored.uns
+    assert "process" not in stored.uns and stored.raw is None
     if not store_path.endswith(".zarr"):
         assert Repo(store_path).log()[0].metadata["dropped"] == dropped
 

@@ -12,6 +12,7 @@ import resource
 import shutil
 import sys
 from dataclasses import asdict, dataclass
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from annizarr.errors import AnzError
 import annotate
 import contract
 import hise
+import objects
 import store as stores
 from config import ConfigError, Settings, load_settings
 
@@ -46,6 +48,7 @@ class Staged:
     summary: dict
     source: str = ""
     fitted: str = ""
+    samples: tuple[str, ...] = ()
 
     @property
     def line(self) -> str:
@@ -66,9 +69,18 @@ def input_files(settings: Settings) -> list[Path]:
     missing = [str(f) for f in files if not f.exists()]
     if missing:
         raise IngestError(f"Input files not found: {missing}")
-    not_spatial = [str(f) for f in files if f.is_dir() and not hise.is_spatialdata(f)]
-    if not_spatial:
-        raise IngestError(f"{not_spatial}: a .zarr sample must be a SpatialData object with a {hise.SPATIAL_TABLE}.")
+    mudata = [str(f) for f in files if f.suffix.lower() == ".h5mu" or hise.zarr_kind(f) == "mudata"]
+    if mudata:
+        raise IngestError(f"{mudata} is MuData, which this capsule doesn't take; write the modality you want "
+                          "as an AnnData and ingest that, e.g. anndata.io.read_elem(zarr.open_group(path)['mod/rna'])"
+                          ".write_h5ad('rna.h5ad').")
+    other = [str(f) for f in files if f.is_dir() and hise.zarr_kind(f) not in ("anndata", "spatialdata")]
+    if other:
+        raise IngestError(f"{other}: a .zarr input must be an AnnData, or a SpatialData with a {hise.SPATIAL_TABLE}.")
+    if settings.existing:
+        raw = [str(f) for f in files if f.suffix.lower() == ".h5"]
+        if raw:
+            raise IngestError(f"{raw} are raw .h5 samples; choose the input type 'Raw samples' for them.")
     return files
 
 
@@ -117,6 +129,46 @@ def open_store(settings: Settings) -> stores.IcechunkStore | stores.ZarrStore:
     return store
 
 
+def object_ids(path: Path, column: str) -> tuple[str | None, list[str]]:
+    """The obs column naming an existing AnnData's samples (`column`, else `sample_id`, else none) and
+    its sample IDs; without either column the file name is the one sample."""
+    for name in dict.fromkeys((column, "sample_id")):
+        ids = hise.object_sample_ids(path, name)
+        if ids is None:
+            if name == column != "sample_id":
+                logger.warning("%s has no %r column", path.name, column)
+            continue
+        if None in ids:
+            raise IngestError(f"{path.name}: some cells have no {name}; fill it in before ingesting.")
+        return name, ids
+    return None, [hise.sample_id(path)]
+
+
+def select_new_objects(files: list[Path], present: set[str],
+                       column: str) -> list[tuple[str, Path, str | None, list[str]]]:
+    """Existing AnnData objects whose samples are new; one that is partly in the store, or overlaps an
+    earlier input, is refused rather than duplicated."""
+    chosen, seen, labels = [], set(present), set()
+    for path in files:
+        if hise.object_n_obs(path) == 0:
+            logger.warning("%s has no cells; skipped", path.name)
+            continue
+        name, ids = object_ids(path, column)
+        overlap = sorted(set(ids) & seen)
+        if set(ids) <= present:
+            logger.info("%s: its samples are already in the store; skipping", path.name)
+            continue
+        if overlap:
+            raise IngestError(f"{path.name} holds samples that are already in the store or in an earlier input "
+                              f"({', '.join(overlap[:5])}{', …' if len(overlap) > 5 else ''}); its cells would be "
+                              "duplicated. Remove those samples from it, or leave it out.")
+        seen.update(ids)
+        label = next(f"{path.stem}{n or ''}" for n in range(len(files) + 1) if f"{path.stem}{n or ''}" not in labels)
+        labels.add(label)
+        chosen.append((label, path, name, ids))
+    return chosen
+
+
 def select_new_samples(files: list[Path], present: set[str]) -> list[tuple[str, Path]]:
     chosen: dict[str, Path] = {}
     for path in files:
@@ -150,8 +202,19 @@ def check_panels(new: list[tuple[str, Path]], expected_var: np.ndarray | None) -
                        "; ".join(contract.describe_diff(sid, d) for sid, d in diffs.items()))
 
 
-def prepare_sample(adata: ad.AnnData, sid: str, settings: Settings, schema: contract.Schema,
-                   expected_var: np.ndarray | None, fit: bool) -> ad.AnnData:
+def check_raw_schema(store_columns: list[str], schema: contract.Schema, run_scrublet: bool) -> None:
+    """A store built from raw samples keeps its exact schema; one seeded from an existing AnnData keeps
+    its own columns, and raw samples fill only those."""
+    if set(contract.requested_schema(False, [])) <= set(store_columns):
+        contract.check_schema(store_columns, schema, run_scrublet)
+        return
+    missing = [c for c in schema if c not in store_columns]
+    if missing:
+        logger.warning("The store was built from existing AnnData, so these raw-sample columns aren't kept: %s",
+                       ", ".join(missing))
+
+
+def annotate_sample(adata: ad.AnnData, sid: str, settings: Settings) -> ad.AnnData:
     adata.obs_names = [f"{sid}:{bc}" for bc in adata.obs_names]
     adata.obs["sample_id"] = sid
     annotate.qc_metrics(adata)
@@ -160,17 +223,14 @@ def prepare_sample(adata: ad.AnnData, sid: str, settings: Settings, schema: cont
         annotate.run_celltypist(adata, models)
     if settings.run_scrublet:
         annotate.run_scrublet(adata, random_state=settings.random_seed)
-    if fit:
-        adata = contract.conform_var(adata, expected_var)
-    return contract.project(adata, schema, expected_var)
+    return adata
 
 
 def summarize(obs: pd.DataFrame) -> dict:
-    row = {
-        "n_cells": len(obs),
-        "mean_genes": obs["n_genes_by_counts"].mean(),
-        "mean_pct_mt": obs["pct_counts_mt"].mean(),
-    }
+    row = {"n_cells": len(obs), "n_samples": obs["sample_id"].nunique()}
+    if "n_genes_by_counts" in obs:
+        row["mean_genes"] = obs["n_genes_by_counts"].mean()
+        row["mean_pct_mt"] = obs["pct_counts_mt"].mean()
     if "predicted_doublets" in obs:
         row["n_doublets"] = obs["predicted_doublets"].sum(min_count=1)
         row["scrublet_scored"] = bool(obs["scrublet_score"].notna().any())
@@ -179,8 +239,45 @@ def summarize(obs: pd.DataFrame) -> dict:
     return row
 
 
-def stage_samples(new: list[tuple[str, Path]], settings: Settings, schema: contract.Schema,
-                  expected_var: np.ndarray | None, cfg: AppConfig, staging: Path) -> list[Staged]:
+@dataclass
+class Target:
+    """What staged cells must match: the store's genes, X dtype, whether X holds counts, and obs kinds.
+    A new store takes them from its first staged sample."""
+    var: np.ndarray | None = None
+    x_dtype: np.dtype | None = None
+    counts: bool = False
+    obs: dict[str, str] | None = None
+
+    @classmethod
+    def of(cls, root) -> "Target":
+        if not stores.has_data(root):
+            return cls()
+        return cls(stores.var_names(root), stores.x_dtype(root), stores.x_holds_counts(root), stores.obs_kinds(root))
+
+    def fit_genes(self, adata: ad.AnnData) -> tuple[ad.AnnData, str]:
+        """The sample on the store's genes, and a note on how they were fitted."""
+        diff = None if self.var is None else contract.panel_diff(self.var, adata.var_names)
+        return (contract.conform_var(adata, self.var), contract.fit_note(diff)) if diff else (adata, "")
+
+    def fit_cells(self, adata: ad.AnnData, name: str) -> ad.AnnData:
+        """The sample's X and obs in the store's dtype and kinds; the first sample of a new store sets them."""
+        adata.X = contract.fit_x(adata.X, self.x_dtype, self.counts, name)
+        if self.obs is not None:
+            adata.obs, failed = contract.match_obs(adata.obs, self.obs)
+            if failed:
+                logger.warning("%s: obs columns left empty, since their values don't fit the store's types: %s",
+                               name, ", ".join(failed))
+        if self.var is None:
+            self.learn(np.asarray(adata.var_names, dtype=object), adata.X.dtype, contract.holds_counts(adata.X),
+                       contract.frame_kinds(adata.obs))
+        return adata
+
+    def learn(self, var: np.ndarray, x_dtype: np.dtype, counts: bool, obs: dict[str, str]) -> None:
+        self.var, self.x_dtype, self.counts, self.obs = var, x_dtype, counts, obs
+
+
+def stage_samples(new: list[tuple[str, Path]], settings: Settings, schema: contract.Schema, target: Target,
+                  cfg: AppConfig, staging: Path) -> list[Staged]:
     staged = []
     for sid, path in new:
         adata = hise.read_sample(path)
@@ -188,74 +285,89 @@ def stage_samples(new: list[tuple[str, Path]], settings: Settings, schema: contr
         if adata.n_obs == 0:
             logger.warning("%s has no cells; skipped", sid)
             continue
-        diff = None if expected_var is None else contract.panel_diff(expected_var, adata.var_names)
-        adata = prepare_sample(adata, sid, settings, schema, expected_var, fit=diff is not None)
-        if expected_var is None:
-            expected_var = np.asarray(adata.var_names, dtype=object)
-        out = staging / f"{sid}.zarr"
+        adata, note = target.fit_genes(annotate_sample(adata, sid, settings))
+        adata = target.fit_cells(contract.project(adata, schema, target.var), sid)
+        out = staging / f"{len(staged):04d}.zarr"
         annizarr.convert(adata, output=str(out), cfg=cfg)
-        note = contract.fit_note(diff) if diff else ""
-        staged.append(Staged(sid, out, summarize(adata.obs), str(path), note))
+        staged.append(Staged(sid, out, summarize(adata.obs), str(path), note, (sid,)))
         del adata
+    return staged
+
+
+def stage_objects(new: list[tuple[str, Path, str | None, list[str]]], target: Target, cfg: AppConfig,
+                  staging: Path) -> list[Staged]:
+    """Existing AnnData objects, streamed by annizarr. The first object of a new store keeps everything;
+    later ones keep X, the store's obs columns and var, since an append can't extend embeddings or layers."""
+    staged = []
+    for label, path, column, ids in new:
+        out = staging / f"{len(staged):04d}.zarr"
+        obs, note, left_out = objects.stage_object(path, out, column, ids[0], target, keep_all=target.var is None,
+                                                   cfg=cfg, name=label)
+        logger.info("%s: %d cells, samples %s", label, len(obs), ids)
+        if left_out:
+            logger.warning("%s: not added, since the store has no place for them: %s", label, ", ".join(left_out))
+        staged.append(Staged(label, out, summarize(obs), str(path), note, tuple(ids)))
     return staged
 
 
 def appended(staged: list[Staged], dropped: list[str]) -> dict:
     return {
-        "appended_samples": [s.sample_id for s in staged],
+        "appended_samples": [sid for s in staged for sid in s.samples],
         "sources": {s.sample_id: s.source for s in staged},
         "fitted": {s.sample_id: s.fitted for s in staged if s.fitted},
         "dropped": dropped if staged else [],
     }
 
 
-def commit(store, staged: list[Staged], dropped: list[str]) -> str | None:
-    root = store.working_root()
-    samples = [s.sample_id for s in staged]
-    n_cells = stores.n_obs(root)
+def record(staged: list[Staged], dropped: list[str], n_cells: int, n_samples: int) -> tuple[str, dict]:
+    """A commit's message and metadata: the samples it adds, where each came from, and the totals after it."""
+    added = appended(staged, dropped)
     lines = "\n".join(s.line for s in staged) + (f"\nDropped (built for the old cells): {', '.join(dropped)}"
                                                     if dropped else "")
-    return store.commit(
-        f"Ingest: appended {samples}; {n_cells:,} cells\n{lines}",
-        metadata={
-            "pipeline": "ingest",
-            "annizarr": annizarr.__version__,
-            **appended(staged, dropped),
-            "n_cells": n_cells,
-            "n_samples": len(stores.sample_ids(root)),
-        },
-    )
+    message = f"Ingest: appended {added['appended_samples']}; {n_cells:,} cells\n{lines}"
+    return message, {"pipeline": "ingest", "annizarr": annizarr.__version__, **added,
+                     "n_cells": n_cells, "n_samples": n_samples}
+
+
+def commit(store, staged: list[Staged], dropped: list[str]) -> str | None:
+    root = store.working_root()
+    return store.commit(*record(staged, dropped, stores.n_obs(root), len(stores.sample_ids(root))))
 
 
 def write(store, staged: list[Staged], seeding: bool, cfg: AppConfig,
-          dropped: list[str]) -> tuple[str | None, str | None]:
+          dropped: list[str]) -> tuple[str | None, str | None, list[str]]:
     """Seeds a new store with the first sample if needed, appends the rest, and commits them once.
 
     Returns the seed and run snapshot ids (the same id when the seed is the only write; None on a
-    plain zarr)."""
+    plain zarr), and the elements the appends dropped."""
     seed = None
     if seeding:
         first = staged[0]
-        message = f"Bootstrap: {first.sample_id}, {first.summary['n_cells']:,} cells\n{first.line}"
-        seed = store.bootstrap(ad.read_zarr(first.path), cfg, message)
+        seed = store.bootstrap(first.path, cfg, *record([first], [], int(first.summary["n_cells"]),
+                                                        int(first.summary["n_samples"])))
     rest = staged[1:] if seeding else staged
-    if dropped:
-        stores.drop_result_uns(store.working_root())
+    if not rest:
+        return seed, seed, dropped
+    root = store.working_root()
+    if seeding:
+        dropped = stores.derived_elements(root)
+        if dropped:
+            logger.warning("%s's %s can't extend to the other samples of this run; dropped.",
+                           staged[0].sample_id, ", ".join(dropped))
+    stores.drop_unappendable(root)
     for item in rest:
-        store.append(str(item.path), cfg, drop_derived=bool(dropped))
-    return seed, commit(store, staged, dropped) if rest else seed
+        store.append(str(item.path), cfg)
+    return seed, commit(store, staged, dropped), dropped
 
 
-def ingest(store, new: list[tuple[str, Path]], settings: Settings, schema: contract.Schema,
-           expected_var: np.ndarray | None, seeding: bool,
-           dropped: list[str]) -> tuple[list[Staged], str | None, str | None]:
+def ingest(store, stager, settings: Settings, seeding: bool,
+           dropped: list[str]) -> tuple[list[Staged], str | None, str | None, list[str]]:
     cfg = annizarr_config(settings)
     staging = Path(settings.staging_dir)
     staging.mkdir(parents=True, exist_ok=True)
     try:
-        staged = stage_samples(new, settings, schema, expected_var, cfg, staging)
-        seed, snapshot = write(store, staged, seeding, cfg, dropped) if staged else (None, None)
-        return staged, seed, snapshot
+        staged = stager(cfg, staging)
+        return (staged, *write(store, staged, seeding, cfg, dropped)) if staged else ([], None, None, dropped)
     except BaseException:
         store.discard()
         raise
@@ -290,26 +402,28 @@ def write_results(settings: Settings, store, staged: list[Staged], seed: str | N
 
 def run(settings: Settings) -> dict:
     files = input_files(settings)
-    models = model_files(settings)
+    models = [] if settings.existing else model_files(settings)
     store = open_store(settings)
     logger.info("Store %s (%s)", store.location, store.kind)
     root = store.root()
     seeding = not stores.has_data(root)
     present = set() if seeding else stores.sample_ids(root)
-    new = select_new_samples(files, present)
-    logger.info("%d samples in store, %d new: %s", len(present), len(new), [sid for sid, _ in new])
+    new = select_new_objects(files, present, settings.sample_column) if settings.existing else select_new_samples(files, present)
+    logger.info("%d samples in store, %d new input(s): %s", len(present), len(new), [n[0] for n in new])
 
     schema = contract.requested_schema(settings.run_scrublet, [m.stem for m in models])
-    if not seeding:
-        contract.check_schema(stores.obs_columns(root), schema, settings.run_scrublet)
-    expected_var = None if seeding else stores.var_names(root)
-    check_panels(new, expected_var)
+    if not seeding and not settings.existing:
+        check_raw_schema(stores.obs_columns(root), schema, settings.run_scrublet)
+    target = Target.of(root)
+    check_panels([n[:2] for n in new], target.var)
     dropped = stores.derived_elements(root) if new and not seeding else []
     if dropped:
         logger.warning("%s holds elements built for its current cells (%s); appending new cells drops them. "
                        "Re-run the analysis afterwards.", store.location, ", ".join(dropped))
-    staged, seed, snapshot = (ingest(store, new, settings, schema, expected_var, seeding, dropped)
-                              if new else ([], None, None))
+    stager = (partial(stage_objects, new, target) if settings.existing
+              else partial(stage_samples, new, settings, schema, target))
+    staged, seed, snapshot, dropped = (ingest(store, stager, settings, seeding, dropped) if new
+                                       else ([], None, None, dropped))
     if seeding and not staged:
         raise IngestError("The store is empty and none of the samples has cells to ingest.")
     if not staged:

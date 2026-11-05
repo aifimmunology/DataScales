@@ -13,7 +13,7 @@ import pandas as pd
 import zarr
 import zarr.errors
 from anndata.io import read_elem
-from annizarr import AppConfig, Repo, append, convert
+from annizarr import AppConfig, Repo, append, rechunk
 
 _PROBE = "_write_probe"
 RESULT_UNS = ("process",)
@@ -23,13 +23,23 @@ class StoreError(RuntimeError):
     """The store's location or state doesn't allow this run."""
 
 
+class _Repo(Repo):
+    """A Repo whose next commit, made inside an annizarr op, carries the run's message and metadata."""
+    next_commit: tuple[str, dict[str, Any]] | None = None
+
+    def commit(self, message: str, *, metadata: dict[str, Any] | None = None, allow_empty: bool = False) -> str:
+        if self.next_commit:
+            (message, metadata), self.next_commit = self.next_commit, None
+        return super().commit(message, metadata=metadata, allow_empty=allow_empty)
+
+
 class IcechunkStore:
     kind = "icechunk"
 
     def __init__(self, path: str, origin: str = ""):
         self.path = path
         self.origin = origin if origin and origin != path else None
-        self.repo: Repo | None = None
+        self.repo: _Repo | None = None
         self.state: Repo | None = None
 
     @property
@@ -42,7 +52,7 @@ class IcechunkStore:
     def open(self, create: bool) -> None:
         """Opens the repo; with `create`, makes it first unless an (empty) repo is already there."""
         fresh = create and not self.exists()
-        self.repo = Repo.create(self.location) if fresh else Repo(self.path, origin=self.origin)
+        self.repo = _Repo.create(self.location) if fresh else _Repo(self.path, origin=self.origin)
         if self.repo.origin is None:
             raise StoreError(f"{self.path} is read-only; give its writable origin (e.g. s3://bucket/prefix).")
         # A data-asset mount can lag its origin by several commits, so the store's state (which
@@ -59,11 +69,18 @@ class IcechunkStore:
         """The root as this run sees it, staged appends included."""
         return self.repo.open_zarr("w")
 
-    def bootstrap(self, adata: ad.AnnData, cfg: AppConfig, message: str) -> str:
-        return convert(adata, output=self.repo, cfg=cfg, message=message).snapshot_id
+    def bootstrap(self, staged: Path, cfg: AppConfig, message: str, metadata: dict[str, Any]) -> str:
+        self.repo.next_commit = (message, metadata)
+        try:
+            return rechunk(str(staged), output=self.repo, cfg=cfg).snapshot_id
+        finally:
+            self.repo.next_commit = None
 
-    def append(self, cells: str, cfg: AppConfig, drop_derived: bool = False) -> None:
-        append(self.repo, cells=cells, cfg=cfg, commit=False, drop_derived=drop_derived)
+    def append(self, cells: str, cfg: AppConfig) -> None:
+        """Derived elements are dropped (the run has warned and records them). The plan reads the open
+        writable session, so the origin rather than a mount that may lag it."""
+        self.working_root()
+        append(self.repo, cells=cells, cfg=cfg, commit=False, drop_derived=True)
 
     def commit(self, message: str, metadata: dict[str, Any]) -> str:
         return self.repo.commit(message, metadata=metadata)
@@ -100,11 +117,11 @@ class ZarrStore:
     def working_root(self) -> zarr.Group:
         return zarr.open_group(self.path, mode="r+")
 
-    def bootstrap(self, adata: ad.AnnData, cfg: AppConfig, message: str) -> None:
-        convert(adata, output=self.path, cfg=cfg)
+    def bootstrap(self, staged: Path, cfg: AppConfig, message: str, metadata: dict[str, Any]) -> None:
+        rechunk(str(staged), output=self.path, cfg=cfg)
 
-    def append(self, cells: str, cfg: AppConfig, drop_derived: bool = False) -> None:
-        append(self.path, cells=cells, cfg=cfg, drop_derived=drop_derived)
+    def append(self, cells: str, cfg: AppConfig) -> None:
+        append(self.path, cells=cells, cfg=cfg, drop_derived=True)
 
     def commit(self, message: str, metadata: dict[str, Any]) -> None:
         return None
@@ -149,18 +166,49 @@ def _is_plain_zarr(path: str) -> bool:
 
 
 def derived_elements(root: zarr.Group | None) -> list[str]:
-    """Elements built for the current cells (embeddings, graphs, layers, process results); appending
+    """Elements built for the current cells (embeddings, graphs, layers, raw, process results); appending
     invalidates them."""
     if root is None:
         return []
     found = [f"{group}/{key}" for group in ("obsm", "obsp", "layers") if group in root for key in root[group]]
+    found += ["raw"] if "raw" in root else []
     return found + [f"uns/{key}" for key in RESULT_UNS if "uns" in root and key in root["uns"]]
 
 
-def drop_result_uns(root: zarr.Group) -> None:
+def drop_unappendable(root: zarr.Group) -> None:
+    """Deletes what annizarr's append neither extends nor drops itself: raw and the process results."""
+    if "raw" in root:
+        del root["raw"]
     for key in RESULT_UNS:
         if "uns" in root and key in root["uns"]:
             del root["uns"][key]
+
+
+def _x_values(root: zarr.Group) -> zarr.Array:
+    x = root["X"]
+    return x["data"] if isinstance(x, zarr.Group) else x
+
+
+def x_dtype(root: zarr.Group) -> np.dtype:
+    return np.dtype(_x_values(root).dtype)
+
+
+def x_holds_counts(root: zarr.Group, n: int = 200_000) -> bool:
+    """Whether X looks like counts: its first `n` stored values are non-negative whole numbers."""
+    data = _x_values(root)
+    values = np.asarray(data[:n] if data.ndim == 1 else data[:100])
+    return bool(np.all(values >= 0) and np.all(np.mod(values, 1) == 0))
+
+
+_ENCODED = {"categorical": "category", "nullable-integer": "Int64", "nullable-boolean": "boolean",
+            "string-array": "str", "nullable-string-array": "str"}
+
+
+def obs_kinds(root: zarr.Group) -> dict[str, str]:
+    """Each obs column's kind (category, Int64, boolean, str, or a numpy dtype), from metadata alone."""
+    obs = root["obs"]
+    return {c: _ENCODED.get(obs[c].attrs.get("encoding-type"), str(getattr(obs[c], "dtype", "str")))
+            for c in obs.attrs["column-order"]}
 
 
 def has_data(root: zarr.Group | None) -> bool:

@@ -10,13 +10,13 @@
 		{
 			"id": "sxamMh7IcKwbGyOs",
 			"name": "Sample Information",
-			"description": "Information such as the data asset location or path to the sample being added to the store",
+			"description": "What is being added to the store: raw samples, or existing AnnData / SpatialData tables.",
 			"icon": "📂"
 		},
 		{
 			"id": "JQPe5zIaMaeicuwR",
 			"name": "Run params",
-			"description": "ingest parameters, such as what celltypist model to run, and storage addition configuration",
+			"description": "Raw samples only: CellTypist labels added to each sample. Ignored for existing AnnData / SpatialData tables, which go in as they are.",
 			"icon": "📂"
 		}
 	],
@@ -43,11 +43,25 @@
 			"pattern": "^(s3://.+)?$"
 		},
 		{
+			"id": "Ty3nRk8wQp2LmZa6",
+			"category": "sxamMh7IcKwbGyOs",
+			"name": "Input type",
+			"description": "Raw samples get QC metrics, CellTypist labels and Scrublet scores. Existing AnnData / SpatialData tables go in as they are (nothing recomputed; a new store from one object keeps its layers and embeddings, later objects add cells, counts and the store's obs columns), identified by their sample_id column, or the file name without one.",
+			"help_text": "Both kinds can go into the same store. A different column can name the samples with the SAMPLE_COLUMN environment variable.",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "Raw samples (QC, CellTypist, Scrublet)",
+			"extra_data": [
+				"Raw samples (QC, CellTypist, Scrublet)",
+				"Existing AnnData or SpatialData table (as is)"
+			]
+		},
+		{
 			"id": "aqK0Q6vLFi4lB9bh",
 			"category": "sxamMh7IcKwbGyOs",
 			"name": "List of paths to samples",
-			"description": "Samples to add to the storage: .h5/.h5ad files, SpatialData .zarr folders (their table is added), folders holding them, or globs, separated by commas. EX: /data/samples, /data/other/sample1.h5ad",
-			"help_text": "Paths must be inside data assets attached to this capsule. Folders are not searched recursively. Samples already in the store are skipped.",
+			"description": "Raw samples (.h5/.h5ad files, SpatialData .zarr folders) or existing AnnData (.h5ad, AnnData .zarr, SpatialData .zarr tables), folders holding them, or globs, separated by commas. EX: /data/samples, /data/atlas.h5ad",
+			"help_text": "Paths must be inside data assets attached to this capsule. Folders are not searched recursively. Samples already in the store are skipped. MuData isn't supported; ingest a modality as AnnData.",
 			"type": "text",
 			"value_type": "string",
 			"default_value": "/data/samples"
@@ -56,7 +70,7 @@
 			"id": "d7VFKtzWt1oafeYk",
 			"category": "JQPe5zIaMaeicuwR",
 			"name": "Celltypist Model",
-			"description": "Which CellTypist models label the cells. An existing store accepts only the option it was created with.",
+			"description": "Which CellTypist models label the cells. A store built from raw samples accepts only the option it was created with; one seeded from an existing AnnData keeps its own columns and warns about the rest.",
 			"type": "list",
 			"value_type": "string",
 			"default_value": "AIFI L1, L2, L3 celltypes",

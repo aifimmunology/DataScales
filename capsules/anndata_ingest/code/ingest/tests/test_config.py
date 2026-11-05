@@ -49,19 +49,23 @@ def test_the_default_models_are_the_bundled_aifi_models():
 
 
 def test_panel_values_are_positional_and_survive_a_dropped_origin():
-    full = panel_values(["/results/s", "s3://b/p", "/data/samples", "None"])
-    assert full == {"store": "/results/s", "origin": "s3://b/p", "samples": "/data/samples", "celltypist_models": "None"}
+    raw = "Raw samples (QC, CellTypist, Scrublet)"
+    full = panel_values(["/results/s", "s3://b/p", raw, "/data/samples", "None", ""])
+    assert full == {"store": "/results/s", "origin": "s3://b/p", "input_type": raw, "samples": "/data/samples",
+                    "celltypist_models": "None", "celltypist_pkl": ""}
     assert panel_values(["/results/s", "/data/samples", "Only AIFI L1 celltypes"]) == {
         "store": "/results/s", "samples": "/data/samples", "celltypist_models": "Only AIFI L1 celltypes"}
     assert panel_values(["/results/s", "s3://b/p", "/data/x.h5"]) == {
         "store": "/results/s", "origin": "s3://b/p", "samples": "/data/x.h5"}
-    s = load_settings(["/results/s", "", "/data/samples", "AIFI L1, L2, L3 celltypes"], {})
+    s = load_settings(["/results/s", "", raw, "/data/samples", "AIFI L1, L2, L3 celltypes"], {})
     assert s.store == "/results/s" and s.origin == "" and s.model_names() == Settings().model_names()
     assert panel_values(["/results/s", "/data/samples", "None", "/data/m/a.pkl"])["celltypist_pkl"] == "/data/m/a.pkl"
-    assert panel_values(["/results/s", "", "/data/samples", "None", ""]) == {
-        "store": "/results/s", "origin": "", "samples": "/data/samples", "celltypist_models": "None", "celltypist_pkl": ""}
-    with pytest.raises(ConfigError, match="at most 5"):
-        panel_values(["a", "b", "c", "d", "e", "f"])
+    existing = load_settings(["s3://b/p", "", "Existing AnnData or SpatialData table (as is)", "/data/x.h5ad"], {})
+    assert existing.existing and existing.samples == "/data/x.h5ad" and existing.origin == ""
+    with pytest.raises(ConfigError, match="at most 6"):
+        panel_values(["a", "b", "c", "d", "e", "f", "g"])
+    with pytest.raises(ConfigError, match="Input type"):
+        Settings(input_type="processed")
 
 
 def test_a_custom_pkl_replaces_the_dropdown(tmp_path, monkeypatch):

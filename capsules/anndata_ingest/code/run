@@ -4,11 +4,12 @@
 #   1  storage location   icechunk repo (data asset, local path, s3://bucket/prefix) or a .zarr path;
 #                         created when missing at an s3:// prefix, or inside /results or /scratch
 #   2  origin of s3       writable s3://bucket/prefix behind a read-only icechunk data asset (optional)
-#   3  samples            .h5/.h5ad files, SpatialData .zarr folders (their table), folders of them, or
-#                         globs; comma, semicolon or newline separated
-#   4  celltypist model   a dropdown option (AIFI L1, L2, L3 | AIFI L1 | Immune_All High and Low | None),
-#                         or model names in code/models / .pkl paths, comma-separated
-#   5  custom .pkl        CellTypist .pkl file(s) used instead of the dropdown (optional)
+#   3  input type         Raw samples (QC, CellTypist, Scrublet) | Existing AnnData or SpatialData table (as is)
+#   4  samples            .h5/.h5ad files, AnnData/SpatialData .zarr folders, folders of them, or globs;
+#                         comma, semicolon or newline separated
+#   5  celltypist model   a dropdown option (AIFI L1, L2, L3 | AIFI L1 | Immune_All High and Low | None),
+#                         or model names in code/models / .pkl paths, comma-separated (raw samples only)
+#   6  custom .pkl        CellTypist .pkl file(s) used instead of the dropdown (optional, raw samples only)
 # Run with no values (a Reproducible Run) it ingests /data/samples into a new store at /results/ingest_icechunk.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/ingest"

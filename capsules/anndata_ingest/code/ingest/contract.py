@@ -135,17 +135,73 @@ def fit_note(diff: dict) -> str:
             f"{diff['n_only_in_sample']} dropped")
 
 
+def gene_picker(sample_genes, store_genes) -> sp.csr_matrix:
+    """A 0/1 matrix that maps a sample's genes onto the store's: X @ picker gives the store's genes,
+    zero for those the sample lacks. Duplicate sample genes map by their first occurrence."""
+    src = pd.Index(ad.utils.make_index_unique(pd.Index(np.asarray(sample_genes, dtype=object)))).get_indexer(
+        pd.Index(np.asarray(store_genes, dtype=object)))
+    present = src >= 0
+    return sp.csr_matrix((np.ones(present.sum(), dtype=np.float32), (src[present], np.flatnonzero(present))),
+                         shape=(len(sample_genes), len(store_genes)))
+
+
 def conform_var(adata: ad.AnnData, store_genes) -> ad.AnnData:
     """The sample's counts on the store's genes: store genes the sample lacks are zero-filled and its
     genes the store lacks are dropped. Annotation must run before this, on the sample's own genes."""
-    store_genes = pd.Index(np.asarray(store_genes, dtype=object))
-    src = pd.Index(ad.utils.make_index_unique(adata.var_names.copy())).get_indexer(store_genes)
-    present = src >= 0
-    x = adata.X.tocsc() if sp.issparse(adata.X) else sp.csc_matrix(adata.X)
-    pick = sp.csr_matrix((np.ones(present.sum()), (src[present], np.flatnonzero(present))),
-                         shape=(adata.n_vars, len(store_genes)))
-    out = ad.AnnData(sp.csr_matrix(x @ pick).astype(x.dtype), obs=adata.obs.copy(), var=pd.DataFrame(index=store_genes))
-    return out
+    x = adata.X if sp.issparse(adata.X) else sp.csr_matrix(adata.X)
+    fitted = sp.csr_matrix(x @ gene_picker(adata.var_names, store_genes)).astype(x.dtype)
+    return ad.AnnData(fitted, obs=adata.obs.copy(), var=pd.DataFrame(index=pd.Index(np.asarray(store_genes, dtype=object))))
+
+
+def holds_counts(matrix) -> bool:
+    values = matrix.data if sp.issparse(matrix) else np.asarray(matrix)
+    return bool(np.all(values >= 0) and np.all(np.mod(values, 1) == 0))
+
+
+def fit_x(matrix, dtype: np.dtype | None, counts: bool, name: str):
+    """X in the store's dtype. A store of counts takes only counts; values must fit the dtype."""
+    if counts and not holds_counts(matrix):
+        raise ContractError(f"{name}: X holds non-count values, but the store's X holds counts; ingest raw "
+                            "counts, or start a new store for normalized data.")
+    if dtype is None or matrix.dtype == dtype:
+        return matrix
+    values = matrix.data if sp.issparse(matrix) else np.asarray(matrix)
+    if np.issubdtype(dtype, np.integer) and values.size and values.max() > np.iinfo(dtype).max:
+        raise ContractError(f"{name}: X values up to {values.max():g} don't fit the store's {dtype}.")
+    return matrix.astype(dtype)
+
+
+def frame_kinds(obs: pd.DataFrame) -> dict[str, str]:
+    kinds = {}
+    for c, dtype in obs.dtypes.items():
+        if isinstance(dtype, pd.CategoricalDtype):
+            kinds[c] = "category"
+        elif str(dtype) in ("Int64", "boolean"):
+            kinds[c] = str(dtype)
+        elif dtype == object or pd.api.types.is_string_dtype(dtype):
+            kinds[c] = "str"
+        else:
+            kinds[c] = str(dtype)
+    return kinds
+
+
+def match_obs(obs: pd.DataFrame, kinds: dict[str, str]) -> tuple[pd.DataFrame, list[str]]:
+    """obs with the store's columns converted to the store's kinds; a column that can't convert is left
+    empty (returned by name), since an append needs matching types."""
+    obs, failed = obs.copy(), []
+    for c in [c for c in obs.columns if c in kinds]:
+        kind = kinds[c]
+        try:
+            if kind == "category":
+                obs[c] = obs[c].astype(str).where(obs[c].notna()).astype("category")
+            elif kind == "str":
+                obs[c] = obs[c].astype(str).where(obs[c].notna(), "")
+            else:
+                obs[c] = obs[c].astype(kind)
+        except (TypeError, ValueError):
+            obs = obs.drop(columns=c)
+            failed.append(c)
+    return obs, failed
 
 
 def project(adata: ad.AnnData, schema: Schema, expected_var_names: np.ndarray | None = None) -> ad.AnnData:

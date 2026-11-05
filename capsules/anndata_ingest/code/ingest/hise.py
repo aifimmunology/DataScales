@@ -1,11 +1,13 @@
 """Sample sources: HISE H5 files (10x matrix plus a per-cell `observations` group) as an annizarr
-input source, and the table of a SpatialData `.zarr`, read directly with zarr.
+input source, AnnData `.h5ad`/`.zarr`, and the table of a SpatialData `.zarr`, read directly with zarr.
 
 Both HISE observation layouts are read onto the older HISE column names: tenx-scrna-pipeline's
 (`Batch`, `Pool`, `Chip`, `uuid`, ...) is renamed through `_ALIASES`. Only Gene Expression
 features are kept, so Xenium control probes and codewords never reach the store."""
 from __future__ import annotations
 
+import contextlib
+import functools
 import re
 from pathlib import Path
 
@@ -73,16 +75,64 @@ def load(path: Path | str, cfg: AppConfig) -> Source:
 register_source(KIND, load, sniffer=sniff)
 
 
-def is_spatialdata(path: Path | str) -> bool:
-    """A SpatialData `.zarr`: a zarr group with `spatialdata_attrs` and a `tables/table` AnnData."""
+def zarr_kind(path: Path | str) -> str | None:
+    """What a zarr folder holds: "spatialdata", "anndata", "mudata", "zarr" (anything else), or None."""
+    return _zarr_kind(str(path))
+
+
+@functools.lru_cache(maxsize=None)
+def _zarr_kind(path: str) -> str | None:
     path = Path(path)
     if not path.is_dir():
-        return False
+        return None
     try:
         root = zarr.open_group(path, mode="r")
     except Exception:
-        return False
-    return "spatialdata_attrs" in root.attrs and SPATIAL_TABLE in root
+        return None
+    if "spatialdata_attrs" in root.attrs and SPATIAL_TABLE in root:
+        return "spatialdata"
+    if root.attrs.get("encoding-type") == "MuData" or "mod" in root:
+        return "mudata"
+    if "X" in root and "obs" in root:
+        return "anndata"
+    return "zarr"
+
+
+def read_object(path: Path | str) -> ad.AnnData:
+    """An existing AnnData (`.h5ad`, AnnData `.zarr`, or a SpatialData table) as it is, in memory."""
+    path = Path(path)
+    kind = zarr_kind(path)
+    if kind == "spatialdata":
+        return ad.io.read_elem(zarr.open_group(path, mode="r")[SPATIAL_TABLE])
+    return ad.read_zarr(path) if kind == "anndata" else ad.read_h5ad(path)
+
+
+@contextlib.contextmanager
+def object_obs(path: Path | str):
+    """The obs group of an existing AnnData (`.h5ad`, AnnData `.zarr`, or a SpatialData table)."""
+    path = Path(path)
+    kind = zarr_kind(path)
+    group = zarr.open_group(path, mode="r") if kind else h5py.File(path, "r")
+    try:
+        yield group[f"{SPATIAL_TABLE}/obs" if kind == "spatialdata" else "obs"]
+    finally:
+        if not kind:
+            group.close()
+
+
+def object_n_obs(path: Path | str) -> int:
+    with object_obs(path) as obs:
+        return len(read_elem(obs[obs.attrs["_index"]]))
+
+
+def object_sample_ids(path: Path | str, column: str) -> list[str | None] | None:
+    """The distinct values of obs `column` in an existing AnnData (None for a missing value), read from
+    obs alone, or None without that column."""
+    with object_obs(path) as obs:
+        if column not in obs:
+            return None
+        return sorted({None if pd.isna(v) else str(v) for v in pd.unique(read_elem(obs[column]))},
+                      key=lambda v: (v is None, v))
 
 
 def gene_mask(var: pd.DataFrame) -> np.ndarray:
@@ -93,7 +143,7 @@ def gene_mask(var: pd.DataFrame) -> np.ndarray:
     return np.ones(len(var), dtype=bool)
 
 
-def _genes_only(adata: ad.AnnData) -> ad.AnnData:
+def genes_only(adata: ad.AnnData) -> ad.AnnData:
     keep = gene_mask(adata.var)
     return adata if keep.all() else adata[:, keep].copy()
 
@@ -104,11 +154,11 @@ def read_sample(path: Path | str) -> ad.AnnData:
 
     Loaded eagerly: annizarr's lazy default leaves a 10x source's X on a separate reader and an
     h5ad's X backed by a file that close() shuts, and every step after this needs X in memory."""
-    if is_spatialdata(path):
-        return _genes_only(ad.io.read_elem(zarr.open_group(path, mode="r")[SPATIAL_TABLE]))
+    if zarr_kind(path) in ("spatialdata", "anndata"):
+        return genes_only(read_object(path))
     source = open_source(path, AppConfig(io=IOConfig(lazy=False)))
     try:
-        return _genes_only(source.adata)
+        return genes_only(source.adata)
     finally:
         source.close()
 
@@ -124,8 +174,9 @@ def gene_names(path: Path | str) -> np.ndarray:
 
 
 def _gene_names(path: Path) -> np.ndarray:
-    if is_spatialdata(path):
-        var = read_elem(zarr.open_group(path, mode="r")[f"{SPATIAL_TABLE}/var"])
+    kind = zarr_kind(path)
+    if kind in ("spatialdata", "anndata"):
+        var = read_elem(zarr.open_group(path, mode="r")[f"{SPATIAL_TABLE}/var" if kind == "spatialdata" else "var"])
     elif path.suffix.lower() == ".h5ad":
         with h5py.File(path, "r") as f:
             var = read_elem(f["var"])

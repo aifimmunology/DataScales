@@ -1,11 +1,16 @@
-# ingest
+# anndata ingest
 
-A Code Ocean capsule that grows one single-cell store, sample by sample.
+A Code Ocean capsule that grows one single-cell AnnData store, run by run. It takes two kinds of input,
+picked with **Input type** on the App Panel:
 
-Each run reads new samples (HISE `.h5`, plain 10x or Xenium `.h5`, raw-count `.h5ad`, or the table
-of a SpatialData `.zarr`), annotates
-each one on its own (QC metrics, CellTypist labels, Scrublet doublet scores), and appends its
-cells to an [AnnData](https://anndata.readthedocs.io) store. The store is either an
+- **Raw samples** (HISE `.h5`, plain 10x or Xenium `.h5`, raw-count `.h5ad`, or the table of a
+  SpatialData `.zarr`): each sample is annotated on its own (QC metrics, CellTypist labels, Scrublet
+  doublet scores) and its cells are appended.
+- **Existing AnnData or SpatialData tables** (`.h5ad`, AnnData `.zarr`, SpatialData `.zarr`): added as
+  they are, with nothing recomputed. A new store seeded from a lone object keeps its obs, layers and
+  embeddings; later objects add their cells, counts and the obs columns the store already has.
+
+Both kinds can go into one [AnnData](https://anndata.readthedocs.io) store. The store is either an
 [Icechunk](https://icechunk.io) repository, where every run lands as one commit, or a plain
 AnnData `.zarr`. Nothing is filtered and nothing is computed across the whole store. QC
 thresholds, embeddings and clusters come later, from the `qc` and `process`
@@ -18,9 +23,10 @@ workstation session the checkout may be at `/scratch/DataScales`.
 
 ## Quick start
 
-You need: samples as `.h5` (HISE, 10x or Xenium `cell_feature_matrix.h5`), raw-count `.h5ad`
-files, or SpatialData `.zarr` folders, attached to this capsule as a data asset so they appear
-under `/data`.
+You need, attached to this capsule as a data asset so it appears under `/data`, either raw samples
+(`.h5` from HISE, 10x or Xenium `cell_feature_matrix.h5`, raw-count `.h5ad`, SpatialData `.zarr`) or
+existing AnnData objects (`.h5ad`, AnnData `.zarr`, SpatialData `.zarr`). MuData isn't supported:
+write the modality you want as an AnnData first.
 
 1. Open the **App Panel** and fill in the fields:
 
@@ -28,9 +34,10 @@ under `/data`.
    |---|---|---|
    | **Storage Location** | where the store is, or should be created | `/results/my_store` |
    | **Origin of s3** (optional) | only for a store on a data asset linked to S3: that bucket prefix | `s3://my-bucket/my_store` |
+   | **Input type** | Raw samples, or Existing AnnData or SpatialData table (as is) | Raw samples (default) |
    | **List of paths to samples** | files and/or folders, separated by commas | `/data/samples, /data/more/x.h5ad` |
-   | **Celltypist Model** | which cell-type labels to add | AIFI L1, L2, L3 (default) |
-| **Custom Celltypist model** (optional) | a `.pkl` used instead of the dropdown | `/data/models/xenium_panel.pkl` |
+   | **Celltypist Model** (raw samples only) | which cell-type labels to add | AIFI L1, L2, L3 (default) |
+   | **Custom Celltypist model** (optional, raw samples only) | a `.pkl` used instead of the dropdown | `/data/models/xenium_panel.pkl` |
 
 2. Click **Run**. Each 25k-cell sample takes about 1.5 minutes.
 3. Look in `/results`:
@@ -51,10 +58,34 @@ store at `/results/ingest_icechunk`.
 | start a shared store on S3 | `s3://<bucket>/<prefix>` (new; needs write access) | empty |
 | add samples to a shared store on S3 | `/data/<linked data asset>` | the S3 prefix that asset is linked to |
 | test without keeping anything | `/scratch/<name>` (cleared after the run) | empty |
+| put an existing AnnData (e.g. an atlas `.h5ad`) on S3 as icechunk | `s3://<bucket>/<prefix>` (new) | empty, and **Input type** = Existing |
 
 - **Running again is safe.** Samples already in the store are skipped, so you can rerun with the
   same folder after adding files to it.
-- **Keep the same Celltypist choice** for every run into one store; a different choice is refused.
+- **Keep the same Celltypist choice** for every run of raw samples into one store built from raw
+  samples; a different choice is refused. A store seeded from an existing AnnData keeps only its own
+  columns, so there a different choice only warns about the columns left out.
+- **Existing AnnData:**
+  - It is identified by its `sample_id` column (or the obs column set in `SAMPLE_COLUMN`, copied
+    into `sample_id`), or by its file name when it has none. A rerun skips an object whose samples
+    are all in the store; one that is partly in it is refused, so cells are never duplicated.
+  - The first object of a new store is kept whole when it's the only input, except `raw`, which no
+    append can extend, so it's never kept. Later objects add their cells, counts, and the obs columns
+    the store already has; their other columns, embeddings and layers are left out, and the store's
+    own embeddings and layers are dropped (they were built for the old cells). The log names
+    everything left out. An object without cells is skipped with a warning.
+  - Cell names get their sample as a prefix (`<sample_id>:<barcode>`), as raw samples do, so the same
+    barcode in two samples stays two cells.
+  - Values are converted to the store's types: X to its dtype (counts must fit it), obs columns to
+    the store's column types. A column whose values can't convert is left empty, with a warning.
+    Normalized values can't join a store of counts.
+  - Each object is streamed by annizarr (`convert` for `.h5ad`, `rechunk` for zarr) into a staging
+    zarr; a zarr v2 AnnData, which `rechunk` can't copy, is rewritten as v3 instead, X in row blocks.
+    Only obs and var are edited in memory, and X is rewritten in row blocks only when its genes or
+    dtype must change. Memory still grows with the object: for 300,000 cells with a 0.48 GB X, the
+    staging steps peaked at 0.69 GB, seeding a new store at 0.91 GB, and annizarr's `append` at
+    1.59 GB, so plan for about 3× the size of X.
+  - Raw samples added to a store seeded from an existing AnnData keep only the columns the store has.
 - **Spatial samples:** pick **None** for the Celltypist model, or give a custom `.pkl` trained for
   your gene panel. The bundled models are PBMC whole-transcriptome models and give meaningless
   labels on a 300–5,000-gene panel.
@@ -77,7 +108,13 @@ back. The log's `ERROR` line says what to change:
 | `obs schema differs from the store's` | pick the Celltypist option the store was created with (the message names it) |
 | `holds no .h5/.h5ad samples` / `not a .h5/.h5ad file` / `not found` | check the sample paths; folders are not searched into subfolders |
 | `var mismatch` | the sample's genes couldn't be fitted to the store's; report it, this shouldn't happen |
-| `a .zarr sample must be a SpatialData object` | a `.zarr` in the sample list isn't SpatialData (no `tables/table`) |
+| `a .zarr input must be an AnnData, or a SpatialData` | a `.zarr` in the list is neither (no `X`/`obs`, no `tables/table`) |
+| `is MuData, which this capsule doesn't take` | write the modality you want as an AnnData (the message shows how) and ingest that |
+| `are raw .h5 samples; choose the input type 'Raw samples'` | `.h5` files are always raw; switch **Input type** |
+| `holds samples that are already in the store` | an existing AnnData overlaps the store; remove those samples from it, or leave it out |
+| `X holds non-count values` | normalized data can't join a store of counts; ingest raw counts, or start a new store |
+| `some cells have no sample_id` | fill in the sample column of that AnnData (or set `SAMPLE_COLUMN` to a complete one) |
+| `don't fit the store's uint32` | counts larger than the store's X dtype allows; check the data |
 
 A **gene panel that differs** from the store's doesn't stop the run. The log warns with how it
 differs (for example `67 shared, 213 only in the store, 222 only in the sample`), and the sample
@@ -157,29 +194,30 @@ SHA-256, and a test checks them.
 
 ### Code Ocean app
 
-`code/run` is the entrypoint. It takes five positional app-panel parameters, in panel order; an
+`code/run` is the entrypoint. It takes six positional app-panel parameters, in panel order; an
 empty value keeps the environment variable or default:
 
 | # | category | parameter | meaning | default |
 |---|---|---|---|---|
 | 1 | Central Storage | Storage Location | an icechunk repo (data asset, local path, `s3://bucket/prefix`) or a plain zarr folder; created when missing (see below) | `/results/ingest_icechunk` |
 | 2 | Central Storage | Origin of s3 (optional) | the writable `s3://` prefix behind a read-only icechunk data asset | none |
-| 3 | Sample Information | List of paths to samples | `.h5`/`.h5ad` files, SpatialData `.zarr` folders, folders of them, or globs | `/data/samples` |
-| 4 | Run params | Celltypist Model | AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None | AIFI L1, L2, L3 |
-| 5 | Run params | Custom Celltypist model (optional) | `.pkl` file(s), comma-separated, used instead of the dropdown | none |
+| 3 | Sample Information | Input type | Raw samples (QC, CellTypist, Scrublet) · Existing AnnData or SpatialData table (as is) | Raw samples |
+| 4 | Sample Information | List of paths to samples | `.h5`/`.h5ad` files, AnnData/SpatialData `.zarr` folders, folders of them, or globs | `/data/samples` |
+| 5 | Run params | Celltypist Model (raw samples only) | AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None | AIFI L1, L2, L3 |
+| 6 | Run params | Custom Celltypist model (optional, raw samples only) | `.pkl` file(s), comma-separated, used instead of the dropdown | none |
 
 A **Reproducible Run** therefore ingests every sample in `/data/samples` into a new icechunk store
 at `/results/ingest_icechunk`.
 
 **Samples** are separated by commas, semicolons or newlines; quotes, brackets, spaces and trailing
 slashes are ignored, so `/data/samples/, /data/x.h5ad` and `["/data/samples", "/data/x.h5ad"]` mean
-the same. A folder contributes its `.h5`/`.h5ad` files and SpatialData `.zarr` folders (any case,
-hidden files skipped, not recursive), and a glob such as `/data/samples/*SP024*.h5` its matches. A relative path that doesn't
+the same. A folder contributes its `.h5`/`.h5ad` files and zarr folders (any case, hidden files
+skipped, not recursive); a zarr folder (with or without the `.zarr` suffix) is one input itself, and a glob such as `/data/samples/*SP024*.h5` its matches. A relative path that doesn't
 exist is looked up under `/data`. Repeats are read once, and an empty folder, an unmatched glob, a
 file of another type or a missing file stops the run before anything is written.
 
 If Code Ocean leaves out an empty optional value, the values after the store are placed by their
-shape: a dropdown option is the model choice, an `s3://` URL the origin, `.pkl` paths the custom
+shape: an input-type or model dropdown option, an `s3://` URL the origin, `.pkl` paths the custom
 model, anything else the samples.
 
 ### Where the store lives
@@ -200,7 +238,7 @@ model, anything else the samples.
   - Creation refuses a folder that holds other files. A local folder holding a plain zarr group
     is appended as a plain zarr even without the `.zarr` suffix; a `.h5`/`.h5ad` file is refused.
 - **Appending drops results built for the old cells:** embeddings, graphs and layers (`obsm`,
-  `obsp`, `layers`) and `uns/process`, with a warning, recorded in the commit metadata as
+  `obsp`, `layers`), `raw` and `uns/process`, with a warning, recorded in the commit metadata as
   `dropped`. On icechunk they stay in the store's history; on a plain zarr they're gone.
 
 ### Other settings
@@ -218,7 +256,7 @@ Every setting is an environment variable named after its field in `config.Settin
 cd code/ingest
 python main.py /scratch/atlas "" /data/samples "Only AIFI L1 celltypes" ""     # panel order: icechunk
 python main.py --samples /data/samples --store /scratch/atlas.zarr               # or flags: plain zarr
-python -m pytest tests                                                         # ~1.5 min, synthetic data
+python -m pytest tests                                                         # ~2.5 min, synthetic data
 ```
 
 ## The stored object
@@ -241,11 +279,12 @@ code/run              Code Ocean entrypoint: passes the app-panel values on to m
 code/ingest/
 ├── main.py           the run: pick new samples, stage them, write them, report
 ├── config.py         Settings from environment variables and app-panel values; sample-list parsing
-├── hise.py           sample sources: HISE .h5 (both layouts), SpatialData tables; gene names; sample IDs
+├── objects.py        existing AnnData: streamed into staging with annizarr, then fitted to the store
+├── hise.py           inputs: HISE .h5 (both layouts), AnnData .h5ad/.zarr, SpatialData tables; gene names; sample IDs
 ├── annotate.py       QC metrics, CellTypist (several models), Scrublet
 ├── contract.py       the obs schema, the projection, the schema and gene checks, gene-panel fitting
 ├── store.py          icechunk and plain-zarr stores behind one interface
-└── tests/            unit tests and end-to-end runs on synthetic samples (incl. SpatialData), both store kinds
+└── tests/            unit tests and end-to-end runs (raw and existing inputs, SpatialData), both store kinds
 code/models/          the bundled CellTypist models and their SOURCE.json
 code/Icechunk_annizarr_notebook.ipynb   explore a store: history, cells per sample, loading cells, old versions
 ```

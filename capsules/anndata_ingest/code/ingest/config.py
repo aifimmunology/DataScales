@@ -9,10 +9,15 @@ import sys
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
-SAMPLE_SUFFIXES = (".h5", ".h5ad")
-SPATIAL_SUFFIX = ".zarr"  # a SpatialData folder; its table is the sample
-SAMPLE_KINDS = ".h5/.h5ad samples or SpatialData .zarr folders"
-PANEL = ("store", "origin", "samples", "celltypist_models", "celltypist_pkl")
+SAMPLE_SUFFIXES = (".h5", ".h5ad", ".h5mu")
+SAMPLE_KINDS = ".h5/.h5ad files or AnnData/SpatialData .zarr folders"
+PANEL = ("store", "origin", "input_type", "samples", "celltypist_models", "celltypist_pkl")
+INPUT_TYPES = {
+    "Raw samples (QC, CellTypist, Scrublet)": "raw",
+    "Existing AnnData or SpatialData table (as is)": "existing",
+    "raw": "raw",
+    "existing": "existing",
+}
 BUNDLED_MODELS = Path(__file__).resolve().parents[1] / "models"
 DATA_DIR = Path("/data")
 AIFI_L1 = "pbmc_clean_AIFI_L1_2024"
@@ -45,6 +50,7 @@ def _key(text: str) -> str:
 
 
 _PRESETS = {_key(label): models for label, models in CELLTYPIST_PRESETS.items()}
+_INPUT_KEYS = {_key(label) for label in INPUT_TYPES}
 
 
 def split_list(raw: str) -> list[str]:
@@ -64,12 +70,15 @@ def _in_data(path: Path) -> Path:
     return path
 
 
+def _is_zarr(path: Path) -> bool:
+    return path.is_dir() and (path.suffix.lower() == ".zarr" or (path / "zarr.json").is_file()
+                              or (path / ".zgroup").is_file())
+
+
 def _is_sample(path: Path) -> bool:
     if path.name.startswith("."):
         return False
-    if path.is_dir():
-        return path.suffix.lower() == SPATIAL_SUFFIX
-    return path.is_file() and path.suffix.lower() in SAMPLE_SUFFIXES
+    return _is_zarr(path) or (path.is_file() and path.suffix.lower() in SAMPLE_SUFFIXES)
 
 
 def _expand(entry: str) -> list[Path]:
@@ -80,7 +89,7 @@ def _expand(entry: str) -> list[Path]:
             raise ConfigError(f"No {SAMPLE_KINDS} match {entry!r}.")
         return found
     path = _in_data(Path(entry))
-    if path.is_dir() and path.suffix.lower() == SPATIAL_SUFFIX:
+    if _is_zarr(path):
         return [path]
     if path.is_dir():
         found = sorted(p for p in path.iterdir() if _is_sample(p))
@@ -88,7 +97,7 @@ def _expand(entry: str) -> list[Path]:
             raise ConfigError(f"The folder {path} holds no {SAMPLE_KINDS} (other subfolders aren't searched).")
         return found
     if path.suffix.lower() not in SAMPLE_SUFFIXES:
-        raise ConfigError(f"{entry!r} is not a .h5/.h5ad file, a SpatialData .zarr, or a folder of them.")
+        raise ConfigError(f"{entry!r} is not a .h5/.h5ad file, an AnnData/SpatialData .zarr, or a folder of them.")
     return [path]
 
 
@@ -97,6 +106,8 @@ class Settings:
     samples: str = "/data/samples"
     store: str = "/results/ingest_icechunk"
     origin: str = ""
+    input_type: str = "raw"
+    sample_column: str = "sample_id"
     create: bool = False
     create_roots: str = "/results,/scratch"
     celltypist_models: str = AIFI_MODELS
@@ -113,6 +124,14 @@ class Settings:
     def __post_init__(self):
         object.__setattr__(self, "store", clean_path(self.store))
         object.__setattr__(self, "origin", clean_path(self.origin))
+        kinds = {_key(label): kind for label, kind in INPUT_TYPES.items()}
+        if _key(self.input_type) not in kinds:
+            raise ConfigError(f"Input type {self.input_type!r} is not one of {list(INPUT_TYPES)[:2]}.")
+        object.__setattr__(self, "input_type", kinds[_key(self.input_type)])
+
+    @property
+    def existing(self) -> bool:
+        return self.input_type == "existing"
 
     def sample_files(self) -> list[Path]:
         """Every listed file, folder (its .h5/.h5ad files) or glob, in order and without repeats."""
@@ -164,7 +183,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def panel_values(values: list[str]) -> dict[str, str]:
-    """The app panel's positional values (store, origin, samples, Celltypist model, custom .pkl) as settings.
+    """The app panel's positional values (store, origin, input type, samples, Celltypist model, custom
+    .pkl) as settings.
 
     Code Ocean may leave out an empty optional value, which shifts the rest, so after the store
     each value is placed by what it looks like: a dropdown label, an s3:// origin, a .pkl, or samples."""
@@ -177,7 +197,9 @@ def panel_values(values: list[str]) -> dict[str, str]:
         text = value.strip(_STRIP)
         if not text:
             continue
-        if _key(text) in _PRESETS:
+        if _key(text) in _INPUT_KEYS:
+            out["input_type"] = value
+        elif _key(text) in _PRESETS:
             out["celltypist_models"] = value
         elif re.match(r"^[a-z0-9]+://", text) and "origin" not in out:
             out["origin"] = value
