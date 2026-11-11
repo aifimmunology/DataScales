@@ -6,7 +6,7 @@ spatial ingest that builds one SpatialData object from Xenium and Atera bundles 
 | # | Capsule | Hardware | Writes | Job |
 |---|---|---|---|---|
 | 1 | `anndata_ingest/` | CPU, sized to the largest **sample** | `main` | Two input types: raw samples (.h5, .h5ad, SpatialData tables) get per-sample QC metrics, CellTypist, Scrublet; existing AnnData / SpatialData tables go in as they are. Both append to one AnnData store. No whole-store analysis |
-| 1S | `spatial_ingest/` (specified, not built) | CPU, ~16 GB per Xenium sample | one joint SpatialData `.zarr` on a local path, or synced to an `s3://` prefix (never icechunk) | Append Xenium/Atera bundles (folders or `.zip`) and existing SpatialData: per-sample elements and table, plus one symbol-indexed joint single-cell table (§3S) |
+| 1S | `spatial_ingest/` (built 2026-11-11) | CPU, ~16 GB per Xenium sample | one joint SpatialData `.zarr` on a local path, or synced to an `s3://` prefix (never icechunk) | Append Xenium/Atera bundles (folders or `.zip`) and existing SpatialData (single- or multi-sample, split per sample): per-sample elements and table, plus one symbol-indexed joint single-cell table (§3S) |
 | 2 | `qc/` | CPU; I/O-bound when applying | nothing by default; with `apply`, a commit on `main` (icechunk) or a new zarr | QC report for proposed thresholds, with a downsampled embedding. With `apply` and reviewed decisions, writes the passing cells as the curated object |
 | 3 | `process/` | **GPU, CUDA 13** (rapids-singlecell + Dask, scvi-tools) | a new zarr, or a commit (icechunk) | First the shared RAPIDS environment with guide notebooks (out-of-core scRNA, spatial); optionally an App Panel / Reproducible Run pipeline: PCA (± harmony) or scVI, then neighbors, UMAP, leiden (§5) |
 
@@ -69,7 +69,7 @@ The default thresholds (`min_genes 200`, `max_genes 5000`, `max_mito 10`) are **
 capsules/
 ├── spec.md                 this file
 ├── anndata_ingest/         ┐ (was ingest/)
-├── spatial_ingest/         │ (planned)
+├── spatial_ingest/         │
 ├── qc/                     │ each folder is one complete capsule root
 └── process/                ┘
     ├── code/               run (entrypoint), <package>/, tests/
@@ -198,9 +198,48 @@ The source is `capsules/anndata_ingest/` (renamed from `capsules/ingest/` on 202
 
 ---
 
-## 3S. `spatial_ingest` — Xenium and Atera into one SpatialData (design final, not built)
+## 3S. `spatial_ingest` — Xenium and Atera into one SpatialData (built 2026-11-11)
 
 The source will be `capsules/spatial_ingest/`, laid out like `anndata_ingest` (`code/run`, one package, tests beside it, §2.3). Findings below were tested from 2026-10-29 to 2026-11-05 with spatialdata 0.8.0, spatialdata-io 0.7.1 and zarr 3.4.2 on public 10x bundles. The prototype and test scripts are in `/scratch` (§3S.12): not saved to the repo, and gone when that machine's `/scratch` is cleared. Everything a build needs is in this section.
+
+### 3S.0 As built (2026-11-11)
+The capsule is in `capsules/spatial_ingest/`; its `code/README.md` documents it in full. It follows this section, with these changes:
+- **Multi-sample SpatialData inputs (user, 2026-11-10)** replace the v1 refusal in §3S.7. An input `.zarr` may hold several samples; each becomes its own sample, and every input merges into the one store:
+  - **Grouping:** regions are grouped by the table's `sample_id` (or `SAMPLE_COLUMN`) when present. Otherwise:
+    - regions linked by a shared coordinate system are one sample;
+    - separate systems are separate samples, named `<object>_<tag>` (`cell_labels-a` in `pair.zarr` → `pair_a`);
+    - a sample annotated by several tables keeps one (`table` first);
+    - samples sharing one system need the column.
+  - **Elements:** a sample gets the elements in coordinate systems only it uses, else those whose name carries its tag. Others are left out with a warning.
+  - **Tables:** tables that annotate nothing (this capsule's joint table) are left out, so a store from this capsule can be merged into another. Only a sample's rows are loaded (`anndata.experimental.read_lazy`).
+  - **Naming:** tags already in element or coordinate-system names are stripped before prefixing (`global-a` → `<sid>`), so names never double up.
+- **Atera** is read with `transcripts=True`. The vendored commit defaults to `False`, and §3S.1 wants transcripts.
+- **Joint table `indptr`:** annizarr writes int32 and widens to int64 itself when the nonzeros outgrow int32, on write and on append. The capsule doesn't force int64.
+- **Joint table attrs:** it carries `spatialdata-encoding-type: ngff:regions_table` and `version: 0.2` (with no region), without which `spatialdata.read_zarr` refuses it. The first sample's rows are written to staging and renamed into place, then later samples are appended in place.
+- **`uns/spatial_ingest`** also holds the species, the obs schema and the samples in table order; the repair rebuilds the joint table in that order.
+- **Repair** compares the joint table with the per-sample tables from their obs index alone. anndata 0.13 with pandas 3 writes string indexes as `nullable-string-array` groups.
+- **Verification runs before the S3 sync,** so a broken store is never pushed.
+- **annizarr 0.2.4,** like the other capsules' `requirements.txt`.
+- **After the code review and black-box validation (2026-11-11):**
+  - **Stores:** only stores this capsule created are grown; it marks them with `spatial_ingest` in the root attributes, because its repair deletes unlisted element folders. Another tool's SpatialData is refused as the target and goes in as an input instead. A new store is created only when its first sample is ready, so a refused run leaves nothing.
+  - **Sample IDs:** tag-derived IDs are `<object>_<tag>`. A skipped present sample from another path is warned about. Each per-sample table keeps `uns/spatial_ingest` (CellTypist model, source, fingerprint), and the same cells under a new ID are refused.
+  - **CellTypist:** the joint schema takes its model from that record, never from obs columns; the `.pkl` is loaded before any sample is read.
+  - **Failures:** a failing sample triggers repair, verification and, on S3, a sync of the samples finished before it.
+  - **Repair** always ends with a consolidate.
+  - **Atera:** `morphology_3d` is read only when the bundle has it.
+  - **S3 sync** trusts files unchanged since the download (same size and mtime) without hashing them.
+  - **Names:** a sample of several regions whose cell IDs repeat gets joint names `<sid>:<region>:<cell_id>`. Element-name collisions are checked across kinds.
+- **Second review pass:**
+  - joint rows are built before a sample is written, so the joint table can't reject a committed sample;
+  - S3 stores are judged from their root `zarr.json` before any download, folder-marker keys are skipped, and the working copy goes in `SCRATCH_DIR/store/`;
+  - the fingerprint hashes the exact CSR counts.
+- **Tested:** 53 tests, about 3 min.
+- **Tested** (45 tests at first build):
+  - synthetic single- and multi-sample objects;
+  - SIGKILL at three points (an element write, the joint staging, the per-sample table rename), each repaired by the next run;
+  - an S3 round trip under moto, with the root `zarr.json` uploaded last and a no-op rerun uploading nothing;
+  - the real tiny bundles (Xenium Breast/Ovary/Mouse Ileum, Atera) and their read-back;
+  - the joint table into `anndata_ingest`'s existing mode.
 
 ### 3S.1 Decisions (user, 2026-11-05)
 - **Store:** always a plain SpatialData `.zarr`, never icechunk (§3S.2). The Storage Location is a local path (written or grown in place) or an `s3://` prefix (copied to `/scratch`, grown there, synced back; §3S.6).
@@ -274,7 +313,7 @@ Fields, passed positionally in this order (as `anndata_ingest` §3.2; when Code 
   - **`morphology_3d` fix:** the reader passes the same `image_models_kwargs` to 2D and 3D images, and the 3D parse fails (chunks of the wrong length, then scale factor 2 along `z`). The 3D call gets its own kwargs `{"chunks": (1, 1, 4096, 4096), "scale_factors": [{"z": 1, "y": 2, "x": 2}] * 2}` (verified on the tiny bundle: 3-level pyramid, `z` kept at 5).
   - X comes back as a dask array (int32); it is computed and converted to CSR.
 - **Bundle `.zip`:** extracted to `/scratch/spatial_ingest/extract/<sid>/` first (10x zips hold the bundle files at the root; a single top-level folder inside is descended into), then read like a folder, and deleted after the sample is written.
-- **Existing SpatialData:** `sd.read_zarr(path)` (lazy). It must hold exactly one table annotating one region; several tables, several regions, or a table whose `sample_id` has more than one value is refused in v1: "<path> holds several samples; write one SpatialData per sample". A store written by this capsule is refused the same way.
+- **Existing SpatialData:** `sd.read_zarr(path)` (lazy). It must hold exactly one table annotating one region; several tables, several regions, or a table whose `sample_id` has more than one value is refused in v1: "<path> holds several samples; write one SpatialData per sample". A store written by this capsule is refused the same way. **Superseded (2026-11-10):** multi-sample inputs are split per sample (§3S.0).
 - **Sample IDs:** the bundle folder's name, or the `.zip` stem without a trailing `_outs` (10x download names: `Xenium_V1_human_Breast_2fov_outs.zip` → `Xenium_V1_human_Breast_2fov`); generic folders (`outs`, `extract`) are skipped up to the first meaningful parent (`anndata_ingest`'s rule); an existing SpatialData's folder name without `.zarr`. An ID must match `[A-Za-z0-9_.-]+` (SpatialData element names); anything else, or two inputs with the same ID in one run, is refused before any work.
 
 ### 3S.8 Layout inside the store
@@ -707,7 +746,7 @@ Apply runs also write `apply_summary.csv` (per sample: before, after, removed by
 6. `process`: built as a pipeline on 2026-10-30, **reworked into an environment + notebooks capsule on 2026-11-02** (§5).
 7. Subtree-push each capsule to its own Code Ocean capsule.
 8. `anndata_ingest`: SpatialData-table inputs, gene-panel fitting, source paths in commits, custom `.pkl` **(done 2026-10-30)**; S3 creation without `CREATE`, dropping results on append **(done 2026-11-02)**.
-9. `spatial_ingest` (§3S): the annizarr joint-table test, then the capsule.
+9. `spatial_ingest` (§3S): **built 2026-11-11** (§3S.0).
 
 ## 9. Open questions
 - **annizarr 0.2.4 shipped without `subset` and `Repo.garbage_collect`** (checked 2026-10-30). It renamed `add_expr` to `add_layer`, which now only copies a matrix in another layout (no normalization), split the matrix copy into `_writers/_copy.py`, and caps its CPU count by the cgroup quota. `process` works on it unchanged; qc apply still needs the two below, now for a later release.

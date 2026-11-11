@@ -1,6 +1,6 @@
 # Capsules
 
-Sources for the Code Ocean capsules: `anndata_ingest` (formerly `ingest`), `qc`, `process`, and the planned
+Sources for the Code Ocean capsules: `anndata_ingest` (formerly `ingest`), `qc`, `process` and
 `spatial_ingest`. The design, including the tested spatial findings, is in [spec.md](spec.md).
 
 ## Environments

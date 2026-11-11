@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Code Ocean entrypoint. App-panel values arrive positionally, in panel order; an empty value keeps the
+# environment variable or default (see spatial_ingest/.env.example).
+#   1  storage location   a local path or s3://bucket/prefix to a SpatialData .zarr; created when missing at
+#                         an s3:// prefix or inside /results or /scratch
+#   2  input type         Xenium bundle (folder or .zip) | Atera bundle (folder or .zip) | Existing SpatialData (.zarr)
+#   3  samples            bundle folders, bundle .zip files, SpatialData .zarr folders (single- or multi-sample),
+#                         folders holding them, or globs; comma, semicolon or newline separated
+#   4  custom .pkl        a CellTypist model whose labels are added to every new sample (optional)
+# Run with no values (a Reproducible Run) it adds the Xenium bundles in /data/samples to a new store at
+# /results/spatialdata.zarr.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/spatial_ingest"
+exec python -u main.py "$@"
