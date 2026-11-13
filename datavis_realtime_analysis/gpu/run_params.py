@@ -1,6 +1,3 @@
-"""Per-run pipeline parameters, shared by the backend (validation, defaults for the UI)
-and the GPU pipeline (execution). Recorded on every view the pipeline writes."""
-
 from dataclasses import asdict, dataclass, fields
 
 METHODS = ("auto", "pca", "latent")

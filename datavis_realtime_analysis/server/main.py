@@ -1,11 +1,6 @@
-"""Route assembly. Sections live in their own modules:
-config (env), storage (zarr proxy), views (umap_views listing), gpu (jobs), labels.
-"""
+from fastapi import FastAPI, HTTPException, Request
 
-from fastapi import FastAPI, Request
-
-from . import embedding, gpu, labels, storage, views
-from .config import MIRROR, SOURCE
+from . import embedding, gpu, labels, store, validate, views
 
 app = FastAPI(redoc_url=None)
 
@@ -24,13 +19,28 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"store": SOURCE.uri if SOURCE else "", "mirror": MIRROR.uri if MIRROR else None,
-            "embedding": embedding.describe()}
+    out = {"store": store.STORE.uri if store.STORE else "", "mirror": store.MIRROR.uri if store.MIRROR else None}
+    try:
+        out["embedding"] = embedding.describe()
+    except Exception as e:
+        out["error"] = f"store unreadable: {e}"
+    return out
+
+
+@app.get("/api/validate")
+def validate_store(deep: bool = False):
+    if store.STORE is None:
+        return {"ok": False, "errors": ["no store configured"], "warnings": [], "info": {}, "capabilities": {}}
+    return validate.inspect_store(store.STORE.uri, deep)
 
 
 @app.api_route("/api/data/{path:path}", methods=["GET", "HEAD"])
 def data(path: str, request: Request):
-    return storage.serve(path, request)
+    if store.STORE is None:
+        raise HTTPException(503, "no store configured: set LOCAL_DATA and/or GCS_DATA")
+    if not path or path.startswith("/") or ".." in path.split("/"):
+        raise HTTPException(404, "Not found")
+    return store.STORE.serve(path, request)
 
 
 @app.post("/api/submit")

@@ -46,7 +46,7 @@ export default function Umap() {
   const gpu = useGpuHealth()
   const run = useRunSettings()
   const sel = useSelection(n, group, level, cat.data)
-  const labeling = useLabeling(group, emb.data?.barcodes ?? [], setNotice, name => {
+  const labeling = useLabeling(group, n, setNotice, name => {
     setStoreVersion(v => v + 1)
     if (name) setLevel(name)
   })
@@ -81,9 +81,8 @@ export default function Umap() {
 
   const submit = async (name: string) => {
     if (!sel.selection || !emb.data) return
-    const barcodes = emb.data.barcodes
     try {
-      await submitSelection({ barcodes: sel.selection.indices.map(i => barcodes[i]), name, params: toParams(run.settings, run.embedding) })
+      await submitSelection({ group, n, indices: sel.selection.indices, name, params: toParams(run.settings, run.embedding) })
       setSubmitCount(c => c + 1)
       setSelecting(false)
       sel.dropLasso()

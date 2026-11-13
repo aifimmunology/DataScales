@@ -9,12 +9,13 @@ const REVALIDATE: RequestInit = { cache: 'no-cache' }
 const fetchStore = (url: string) => new zarr.FetchStore(url, { overrides: REVALIDATE })
 const inGroup = (group: string, path: string) => (group ? `${group}/${path}` : path)
 
-type AppConfig = { store?: string; embedding?: EmbeddingInfo }
+type AppConfig = { store?: string; embedding?: EmbeddingInfo; error?: string }
 let cfgPromise: Promise<AppConfig> | null = null
 
 export function getConfig(): Promise<AppConfig> {
   cfgPromise ??= fetch(window.location.origin + '/api/config')
     .then(res => (res.ok ? res.json() : Promise.reject(new Error(`config ${res.status}`))))
+    .then((c: AppConfig) => (c.error ? Promise.reject(new Error(c.error)) : c))
     .catch(() => {
       cfgPromise = null
       return {}
@@ -45,7 +46,6 @@ export const openCached = (path: string) => cached(openedArrays, path, () => ope
 
 const readAll = async (path: string) => (await zarr.get(await openArray(path))).data
 
-/** obsm/X_umap as interleaved float32 x,y. */
 export async function loadUmapCoords(group = ''): Promise<Float32Array> {
   const data = (await readAll(inGroup(group, 'obsm/X_umap'))) as Float32Array | Float64Array
   return data instanceof Float32Array ? data : Float32Array.from(data)
@@ -70,7 +70,6 @@ export async function loadCategorical(col: string, group = ''): Promise<Categori
   return { codes: codes as Categorical['codes'], categories: Array.from(cats as ArrayLike<string>) }
 }
 
-/** A view's obs/root_row: view row -> root-store row. */
 export const viewRootRows = (group: string) =>
   cached(rootRowMaps, group, async () => (await readAll(`${group}/obs/root_row`)) as Int32Array)
 
@@ -86,7 +85,6 @@ export async function loadObsColumns(group = ''): Promise<string[]> {
   return (meta?.attrs['column-order'] as string[]) ?? []
 }
 
-/** Every categorical obs column in the group, with app ownership and category count (metadata only). */
 export async function loadLabelSets(group = ''): Promise<LabelSetInfo[]> {
   const cols = await loadObsColumns(group)
   const found = await Promise.all(

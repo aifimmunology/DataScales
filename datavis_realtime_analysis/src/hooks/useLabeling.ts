@@ -1,15 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { saveLabels } from '../lib/api'
 import { errorText } from '../lib/async'
-import { isViewNative } from '../lib/columns'
 import { applyLabel, dropEmpty, loadWorkingLabels, MAX_LABEL_LEN, type LabelCodes } from '../lib/labeling'
 
 type Pending = { label: string; indices: number[] }
 export type Saved = { name: string; labeled: number }
 
-/** Editing one categorical column in place: load it, assign labels to selections, save.
- * `onStored(name)` fires after every save attempt (null on failure: a mirror error still saved locally). */
-export function useLabeling(group: string, barcodes: string[], notify: (msg: string) => void, onStored: (name: string | null) => void) {
+export function useLabeling(group: string, n: number, notify: (msg: string) => void, onStored: (name: string | null) => void) {
   const [working, setWorking] = useState<(LabelCodes & { name: string }) | null>(null)
   const [pending, setPending] = useState<Pending[]>([])
   const [saving, setSaving] = useState(false)
@@ -31,7 +28,7 @@ export function useLabeling(group: string, barcodes: string[], notify: (msg: str
     const g = group
     setSaved(null)
     try {
-      const l = await loadWorkingLabels(name, g, barcodes.length)
+      const l = await loadWorkingLabels(name, g, n)
       if (t !== token.current || groupRef.current !== g) return
       setWorking({ name, ...l })
       setPending([])
@@ -52,8 +49,7 @@ export function useLabeling(group: string, barcodes: string[], notify: (msg: str
     const g = group
     setSaving(true)
     try {
-      const assignments = pending.map(p => ({ label: p.label, barcodes: p.indices.map(i => barcodes[i] ?? '') }))
-      const res = await saveLabels(working.name, assignments, isViewNative(g, working.name) ? g : undefined)
+      const res = await saveLabels(working.name, pending, g, n)
       setSaved({ name: res.name, labeled: res.labeled })
       if (groupRef.current === g) {
         reset()
