@@ -11,7 +11,8 @@ PANEL = Path(__file__).resolve().parents[3] / ".codeocean" / "app-panel.json"
 
 def test_defaults_follow_the_notebook():
     c = load_config([], env={})
-    assert (c.input, c.method, c.branch, c.table, c.output) == ("", "pca", "main", "table", "")
+    assert (c.input, c.method, c.branch, c.table, c.results_copy, c.external) == ("", "pca", "main", "table", "", "")
+    assert (c.results_format, c.external_format) == ("auto", "auto")
     assert (c.n_top_genes, c.n_comps, c.n_pcs, c.n_neighbors, c.umap_min_dist) == (2000, 50, 30, 20, 0.45)
     assert (c.target_sum, c.scale_max_value, c.leiden_keys) == (1e4, 10.0, {"leiden": 1.1})
     assert (c.rmm_mode, c.gpus) == ("managed", "") and c.model_dir == "/results/scvi_model"
@@ -31,11 +32,11 @@ def test_every_field_is_a_flag_with_underscores_or_dashes():
 
 def test_empty_panel_fields_mean_the_default():
     env = {"N_COMPS": "40"}
-    for argv in (["--subset_column", "--n_comps", "--method", "scVI (train)", "--output"],
-                 ["--subset_column", "", "--n_comps", "", "--method", "scVI (train)", "--output", ""],
+    for argv in (["--subset_column", "--n_comps", "--method", "scVI (train)", "--results_copy", "--branch"],
+                 ["--subset_column", "", "--n_comps", "", "--method", "scVI (train)", "--results_copy", "", "--branch", ""],
                  ["--method", "scVI (train)"]):
         c = load_config(argv, env=env)
-        assert (c.subset_column, c.n_comps, c.method, c.output) == ("", 40, "scvi", ""), argv
+        assert (c.subset_column, c.n_comps, c.method, c.results_copy, c.branch) == ("", 40, "scvi", "", "main"), argv
 
 
 @pytest.mark.parametrize("raw, method", [("PCA", "pca"), ("scVI (train)", "scvi"), ("scvi", "scvi"), (" pca ", "pca")])
@@ -75,11 +76,10 @@ def test_subset_and_batch_lists():
 
 def test_relative_paths_resolve_from_where_run_started(tmp_path):
     env = {"PROCESS_CWD": str(tmp_path / "sub")}
-    c = load_config(["--input", "../data/x.zarr", "--output", "out", "--results_dir", "res", "--origin", "s3://b/p"],
-                    env=env)
+    c = load_config(["--input", "../data/x.zarr", "--external", "out", "--results_dir", "res"], env=env)
     expected = (tmp_path.resolve() / p for p in ("data/x.zarr", "sub/out", "sub/res"))
-    assert (c.input, c.output, c.results_dir) == tuple(map(str, expected))
-    assert c.origin == "s3://b/p" and load_config(["--input", "/abs.zarr"], env=env).input == "/abs.zarr"
+    assert (c.input, c.external, c.results_dir) == tuple(map(str, expected))
+    assert load_config(["--external", "s3://b/p"], env=env).external == "s3://b/p" and load_config(["--input", "/abs.zarr"], env=env).input == "/abs.zarr"
 
 
 def test_changed_lists_only_overrides():
@@ -92,8 +92,9 @@ def test_panel_matches_config():
     categories = {c["id"] for c in panel["categories"]}
     names = [p["param_name"] for p in panel["parameters"]]
     assert len(names) == len(set(names)) and len({p["id"] for p in panel["parameters"]}) == len(names)
-    expected = {"input", "table", "branch", "origin", "subset_column", "subset_values", "method", "batch_key",
-                "n_top_genes", "n_comps", "n_neighbors", "umap_min_dist", "leiden_resolutions", "output"}
+    expected = {"input", "table", "branch", "subset_column", "subset_values", "results_copy", "results_format", "external",
+                "external_format", "method", "batch_key", "n_top_genes", "n_comps", "n_neighbors", "umap_min_dist",
+                "leiden_resolutions", "color_keys"}
     assert set(names) == expected
     for p in panel["parameters"]:
         assert p["category"] in categories
@@ -104,5 +105,9 @@ def test_panel_matches_config():
         for option in p.get("extra_data", []):
             _cast(p["param_name"], option)
     assert all("optional" in c["description"].lower() for c in panel["categories"][:1])
+    assert [c["name"].split(":")[0] for c in panel["categories"][:3]] == ["Input data", "Output", "Output"]
+    assert "optional" in panel["categories"][2]["name"].lower()
+    optional = {p["param_name"] for p in panel["parameters"] if "(optional)" in p["name"]}
+    assert {"table", "branch", "subset_column", "results_copy", "external"} <= optional
     assert re.fullmatch(next(p["pattern"] for p in panel["parameters"] if p["param_name"] == "leiden_resolutions"),
                         "0.5, 1.0,2")

@@ -8,7 +8,8 @@ from pathlib import Path
 
 METHODS = {"pca": "pca", "scvi": "scvi", "scvi (train)": "scvi"}
 RMM_MODES = ("managed", "pool", "none")
-PATHS = ("input", "origin", "output", "results_dir", "scvi_model_dir")
+PATHS = ("input", "external", "results_dir", "scvi_model_dir")
+FORMATS = ("auto", "zarr", "icechunk")
 _BOOLS = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
 
 
@@ -21,8 +22,7 @@ class Config:
     # App Panel: input data
     input: str = ""                    # AnnData .zarr, SpatialData .zarr, or icechunk repo; "" prints usage and exits
     table: str = "table"               # SpatialData: tables/<table>
-    branch: str = "main"               # icechunk branch the results are committed on
-    origin: str = ""                   # icechunk: writable location behind a read-only data asset
+    branch: str = "main"               # icechunk: the branch read and the results are committed on
     subset_column: str = ""            # obs column; "" runs on every cell
     subset_values: str = ""            # comma-separated values of subset_column to keep
     # App Panel: embedding
@@ -30,14 +30,20 @@ class Config:
     batch_key: str = ""                # pca: harmony on these obs columns; scvi: batch (first) and covariates (rest)
     n_top_genes: int = 2000
     n_comps: int = 50
-    # App Panel: neighbors, UMAP, clustering, output
+    # App Panel: neighbors, UMAP & clustering
     n_neighbors: int = 20
     umap_min_dist: float = 0.45
     leiden_resolutions: str = "1.1"    # comma-separated; one gives obs/leiden, several give obs/leiden_<res>
-    output: str = ""                   # zarr input: the new copy; "" is <results_dir>/<stem>.processed.zarr
+    # App Panel: UMAP plots
+    color_keys: str = "batch_id,chip_id,pbmc_clean_AIFI_L1_2024_label,leiden"  # obs columns; leiden = the clusters
+    # App Panel: output (outputs.py), the copy in results_dir or an external location, never both
+    results_copy: str = ""             # name in results_dir (absolute: that path); "" is <stem>.processed
+    results_format: str = "auto"       # auto (the input's) | zarr | icechunk
+    external: str = ""                 # s3:// or a path; icechunk input: its own repo, zarr input: new or existing zarr
+    external_format: str = "auto"      # auto (what's there, zarr if new) | zarr | icechunk; must match what's there
 
     results_dir: str = "/results"
-    sample_key: str = "sample_id"      # plotted and counted per cluster when the store has it
+    sample_key: str = "sample_id"      # counted per cluster when the store has it
     chunk_rows: int = 24_000
     target_sum: float = 1e4
     hvg_flavor: str = "seurat"
@@ -85,6 +91,10 @@ class Config:
         return split(self.subset_values) if self.subset_column else []
 
     @property
+    def color_columns(self) -> list[str]:
+        return split(self.color_keys)
+
+    @property
     def resolutions(self) -> list[float]:
         return [float(r) for r in split(self.leiden_resolutions)]
 
@@ -114,6 +124,15 @@ class Config:
             raise ConfigError(f"leiden_resolutions must be numbers separated by commas, got {self.leiden_resolutions!r}") from None
         if not resolutions or min(resolutions) <= 0:
             raise ConfigError("leiden_resolutions needs at least one positive number")
+        for name in ("results_format", "external_format"):
+            if getattr(self, name) not in FORMATS:
+                raise ConfigError(f"{name} must be one of {', '.join(FORMATS)}, got {getattr(self, name)!r}")
+        if self.external and (self.results_copy or self.results_format != "auto"):
+            raise ConfigError("results_copy and results_format are for the copy in results_dir; with an external "
+                              "location, leave them empty (use external_format)")
+        for name in ("results_copy", "results_dir"):
+            if "://" in getattr(self, name):
+                raise ConfigError(f"{name} is a local path; for s3:// use external")
         if self.subset_column and not self.subset:
             raise ConfigError(f"subset_column {self.subset_column!r} needs subset_values")
         return self
@@ -131,6 +150,8 @@ def _cast(name: str, raw: str):
     try:
         if name == "method":
             return METHODS[raw.lower()]
+        if name.endswith("_format"):
+            return raw.lower()
         return _BOOLS[raw.lower()] if kind is bool else kind(raw)
     except (KeyError, ValueError):
         expected = " or ".join(sorted(set(METHODS.values()))) if name == "method" else kind.__name__

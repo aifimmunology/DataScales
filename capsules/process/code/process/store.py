@@ -4,6 +4,7 @@
 - zarr input (AnnData, or a SpatialData store's tables/<table>): a new full copy built at `<out>.partial` and
   renamed; an existing output is never overwritten, the next free `<stem>-<n>.zarr` is used.
 - icechunk input: one commit on the branch, through the origin when given; refused only if the branch moved.
+outputs.py decides which of these a run uses, and where.
 """
 from __future__ import annotations
 
@@ -155,12 +156,3 @@ class Results:
             put_column(obs, name, values)
         put_column(group["var"], "highly_variable", self.highly_variable)
         put(child(group, "uns"), "process", {**self.uns, "created": datetime.now(timezone.utc).isoformat(timespec="seconds")})
-
-
-def save(src: Source, results: Results, message: str, branch: str, output: str, results_dir: str, metadata: dict) -> str:
-    if src.repo:
-        if output:
-            print(f"output {output} is for zarr inputs; an icechunk input gets a commit on {branch}")
-        snapshot = save_commit(src.repo, branch, src.snapshot, src.table, results.write, message, metadata)
-        return f"committed {snapshot} on {branch}"
-    return f"saved to {save_copy(src.path, src.table, results.write, output, results_dir)}"

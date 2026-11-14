@@ -5,7 +5,18 @@
 		{
 			"id": "fjkkmNN0idHqHVRS",
 			"name": "Input data",
-			"description": "Optional: this capsule is mainly an environment with notebooks. The store to process and, optionally, the cells to use."
+			"description": "Optional: this capsule is mainly an environment with notebooks!! This page is for running it as a batch job for a full annotation/umap workflow.",
+			"icon": "\ud83d\udcc2"
+		},
+		{
+			"id": "W3oWEbP7Z7LZFkUZ",
+			"name": "Output: copy in /results (default)",
+			"description": "Used when no external location is set below. Leave these as they are if you write to an external location."
+		},
+		{
+			"id": "eXtErNaLoUtPuT01",
+			"name": "Output: external location (optional)",
+			"description": "Write the results somewhere outside the capsule instead of the copy in /results: an icechunk input's own S3 repo (one commit), or a new or existing zarr."
 		},
 		{
 			"id": "GhlCWmuPGluuDV1v",
@@ -14,18 +25,13 @@
 		},
 		{
 			"id": "D4npHhbetnHEohzx",
-			"name": "Neighbors & UMAP",
-			"description": "The neighbor graph and the 2-D UMAP built from the embedding."
+			"name": "Neighbors, UMAP & clustering",
+			"description": "The neighbor graph built from the embedding, the 2-D UMAP, and Leiden clustering at one or more resolutions."
 		},
 		{
-			"id": "cfFi1YmLsqcKgvnB",
-			"name": "Clustering",
-			"description": "Leiden clustering on the neighbor graph, at one or more resolutions."
-		},
-		{
-			"id": "W3oWEbP7Z7LZFkUZ",
-			"name": "Output",
-			"description": "Where a zarr input's processed copy goes. An icechunk input gets a commit instead."
+			"id": "uMaPpLoTsCaTeGrY",
+			"name": "UMAP plots",
+			"description": "Which UMAPs to save in /results as umap.png, one panel per name."
 		}
 	],
 	"parameters": [
@@ -35,14 +41,14 @@
 			"name": "Input store",
 			"param_name": "input",
 			"description": "An AnnData .zarr, a SpatialData .zarr, or an icechunk repo in an attached data asset. EX: /data/my_asset/sample.zarr. Leave empty and a run only prints how to use the capsule.",
-			"help_text": "X must hold raw counts as a sparse (CSR) matrix. The input is never changed: a zarr gets a new processed copy, an icechunk repo gets one commit.",
+			"help_text": "X must hold raw counts as a sparse (CSR) matrix. The input is never changed; where the results go is set under Output.",
 			"type": "text",
 			"value_type": "string"
 		},
 		{
 			"id": "PilPv4d0dnl7GBdw",
 			"category": "fjkkmNN0idHqHVRS",
-			"name": "SpatialData table",
+			"name": "SpatialData table (optional)",
 			"param_name": "table",
 			"description": "SpatialData only: the table to process, tables/<name>. Ignored for an AnnData store.",
 			"type": "text",
@@ -52,23 +58,11 @@
 		{
 			"id": "qY4L4oOTVuK36CTF",
 			"category": "fjkkmNN0idHqHVRS",
-			"name": "Icechunk branch",
+			"name": "Icechunk branch (optional)",
 			"param_name": "branch",
-			"description": "Icechunk only: the branch that is read and that the results are committed on.",
+			"description": "Icechunk only: the branch that is read and that the results are committed on, in the input repo, the copy in /results or the external repo. Empty means main.",
 			"type": "text",
-			"value_type": "string",
-			"default_value": "main"
-		},
-		{
-			"id": "LwAYpEe1RPI2g5hV",
-			"category": "fjkkmNN0idHqHVRS",
-			"name": "Icechunk origin (optional)",
-			"param_name": "origin",
-			"description": "Icechunk only: the writable S3 location behind a read-only data asset, to commit the results there. EX: s3://bucket/prefix",
-			"help_text": "The data is then read through the origin too, so the results are computed on the snapshot they're committed onto.",
-			"type": "text",
-			"value_type": "string",
-			"pattern": "^(s3://.+)?$"
+			"value_type": "string"
 		},
 		{
 			"id": "UILt0zRd8uxxIKsN",
@@ -88,6 +82,56 @@
 			"description": "Values of the subset column to keep, separated by commas. EX: SP0001, SP0002",
 			"type": "text",
 			"value_type": "string"
+		},
+		{
+			"id": "0hMt27jwwKveffpB",
+			"category": "W3oWEbP7Z7LZFkUZ",
+			"name": "Copy name (optional)",
+			"param_name": "results_copy",
+			"description": "The copy's name in /results. Empty means <input name>.processed (.zarr for a zarr copy). An existing name is never overwritten: <name>-1, -2, ... is used.",
+			"help_text": "An absolute path puts the copy there instead.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "rEsUlTsFoRmAt001",
+			"category": "W3oWEbP7Z7LZFkUZ",
+			"name": "Copy format",
+			"param_name": "results_format",
+			"description": "auto: the input's own format (an icechunk copy keeps the repo's history). zarr or icechunk to convert; a SpatialData zarr can't become icechunk.",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "auto",
+			"extra_data": [
+				"auto",
+				"zarr",
+				"icechunk"
+			]
+		},
+		{
+			"id": "LwAYpEe1RPI2g5hV",
+			"category": "eXtErNaLoUtPuT01",
+			"name": "External location (optional)",
+			"param_name": "external",
+			"description": "Where the results go instead of /results. EX: s3://bucket/prefix",
+			"help_text": "Icechunk input: its own writable S3 repo behind the data asset; the data is read from there and the results are one commit on the branch. Anything else there is refused as a likely typo. Zarr input: a new location gets a new store; an existing zarr with the same cells and genes gets the results written into it.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "eXtErNaLfOrMaT01",
+			"category": "eXtErNaLoUtPuT01",
+			"name": "External format",
+			"param_name": "external_format",
+			"description": "auto: whatever is already at the location, or zarr for a new one. zarr or icechunk: what to create, and for an existing location, what it must already be (a mismatch is an error).",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "auto",
+			"extra_data": [
+				"auto",
+				"zarr",
+				"icechunk"
+			]
 		},
 		{
 			"id": "wIw2p6krRlO0vAC4",
@@ -161,7 +205,7 @@
 		},
 		{
 			"id": "IdU98hbVdIDKXl4Q",
-			"category": "cfFi1YmLsqcKgvnB",
+			"category": "D4npHhbetnHEohzx",
 			"name": "Leiden resolutions",
 			"param_name": "leiden_resolutions",
 			"description": "One or more resolutions, separated by commas; higher gives more clusters. One gives obs/leiden; several give obs/leiden_<resolution> each, from one neighbor graph. Empty means 1.1. EX: 0.5, 1.0, 2.0",
@@ -171,14 +215,15 @@
 			"pattern": "^\\s*([0-9]*\\.?[0-9]+(\\s*,\\s*[0-9]*\\.?[0-9]+)*\\s*,?\\s*)?$"
 		},
 		{
-			"id": "0hMt27jwwKveffpB",
-			"category": "W3oWEbP7Z7LZFkUZ",
-			"name": "Output path (optional)",
-			"param_name": "output",
-			"description": "Zarr input only: where the processed copy goes. Leave empty for /results/<input name>.processed.zarr. An existing output is never overwritten: <name>-1.zarr, -2, ... is used.",
-			"help_text": "An icechunk input ignores this and gets a commit on its branch.",
+			"id": "uMaPcOlOrKeYsPaRm",
+			"category": "uMaPpLoTsCaTeGrY",
+			"name": "UMAP colors",
+			"param_name": "color_keys",
+			"description": "obs columns to color the UMAP by, separated by commas. leiden stands for the cluster column(s). Names the store doesn't have are skipped. Empty means the default. EX: batch_id, chip_id, pbmc_clean_AIFI_L1_2024_label, leiden",
 			"type": "text",
-			"value_type": "string"
+			"value_type": "string",
+			"default_value": "batch_id,chip_id,pbmc_clean_AIFI_L1_2024_label,leiden",
+			"pattern": "^[A-Za-z0-9_.\\- ,]*$"
 		}
 	]
 }

@@ -36,7 +36,7 @@ The main packages:
 | Single-cell on CPU | scanpy 1.12.4, anndata 0.13.4 |
 | Deep learning | torch 2.14.1 (CUDA 13), scvi-tools 1.5.1 |
 | Spatial | squidpy 1.8.3, spatialdata 0.8.0, omnipath 1.0.12 |
-| Storage | zarr 3.4.1, icechunk 2.3.0, annizarr 0.2.3 |
+| Storage | zarr 3.4.1, icechunk 2.3.0, annizarr 0.2.4 |
 
 The full list is [`environment/requirements.txt`](environment/requirements.txt). It needs an NVIDIA
 GPU whose driver supports CUDA 13; the packages bring their own CUDA libraries.
@@ -148,18 +148,21 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 | Category | Field | `--name` | Default | What it does |
 |---|---|---|---|---|
 | Input data | Input store | `input` | empty: print usage | An AnnData `.zarr`, a SpatialData `.zarr`, or an icechunk repo; raw counts in a CSR `X` |
-| | SpatialData table | `table` | `table` | SpatialData: which `tables/<name>` |
-| | Icechunk branch | `branch` | `main` | Read from, and the results committed on |
-| | Icechunk origin | `origin` | — | `s3://…` behind a read-only data asset; read and committed through it |
-| | Subset column / values | `subset_column`, `subset_values` | — | Use only cells whose column is one of the values (`SP1, SP2`) |
+| | SpatialData table (optional) | `table` | `table` | SpatialData: which `tables/<name>` |
+| | Icechunk branch (optional) | `branch` | `main` | Read from, and the results committed on (input repo, its copy, or the external repo) |
+| | Subset column / values (optional) | `subset_column`, `subset_values` | — | Use only cells whose column is one of the values (`SP1, SP2`) |
+| Output: copy in /results (default) | Copy name (optional) | `results_copy` | `<name>.processed` | Name in `/results` (an absolute path goes there instead). Leave empty with an external location |
+| | Copy format | `results_format` | `auto` | `auto` (the input's format), `zarr` or `icechunk` |
+| Output: external location (optional) | External location | `external` | — | `s3://…` or a path; see Outputs below |
+| | External format | `external_format` | `auto` | `auto` (what's there, or zarr if new), `zarr` or `icechunk`; must match an existing store |
 | Embedding | Method | `method` | `PCA` | `PCA` or `scVI (train)`, see below |
 | | Batch key | `batch_key` | — | PCA: harmony on it; scVI: the batch (more keys, comma-separated: harmony uses all, scVI uses the rest as covariates). Every cell needs a value |
 | | Highly variable genes | `n_top_genes` | 2000 | |
 | | PCA components | `n_comps` | 50 | Neighbors use the first `n_pcs` (30) |
-| Neighbors & UMAP | Neighbors | `n_neighbors` | 20 | |
+| Neighbors, UMAP & clustering | Neighbors | `n_neighbors` | 20 | |
 | | UMAP min_dist | `umap_min_dist` | 0.45 | |
-| Clustering | Leiden resolutions | `leiden_resolutions` | 1.1 | Comma-separated; one neighbor graph for all; empty means 1.1 |
-| Output | Output path | `output` | `/results/<name>.processed.zarr` | Zarr input only |
+| | Leiden resolutions | `leiden_resolutions` | 1.1 | Comma-separated; one neighbor graph for all; empty means 1.1 |
+| UMAP plots | UMAP colors | `color_keys` | batch_id, chip_id, AIFI L1 label, leiden | Comma-separated obs columns, one panel each in `umap.png`; `leiden` is the clusters; names the store lacks are skipped |
 
 ### Methods
 
@@ -175,13 +178,27 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 
 ### Outputs
 
-The same rules as the notebooks' save section:
+One destination per run (`process/outputs.py`), never both:
 
-- **Zarr input:** a new full copy at `output` (default `/results/<name>.processed.zarr`), built at
-  `.partial` and renamed; an existing output is never overwritten (`-1`, `-2`, …). A SpatialData store is
-  copied whole and the results go in its table.
-- **Icechunk input:** one commit on `branch` (through `origin` if given); nothing is written if the branch
-  moved during the run.
+- **Copy in `/results`** (no external location): `results_copy`, default `<name>.processed`; never overwritten
+  (`-1`, `-2`, …), built at `.partial` and renamed. `results_format`:
+  - `auto`: a zarr input gets a full zarr copy (a SpatialData store whole, the results in its table); an
+    icechunk input gets a copy of the repo, every branch and snapshot, with one commit on `branch`.
+  - `zarr` from icechunk: the snapshot exported as zarr. `icechunk` from an AnnData zarr: a new repo with one
+    commit on `branch`. A SpatialData zarr can't become icechunk (shapes and points are parquet).
+- **External location** (`external`, `s3://…` or a path), used exactly as given:
+  - **Icechunk input:** it must be the input's own repo, usually the writable S3 location behind the read-only
+    data asset, holding the input's snapshot on `branch`. The data is read from there and one commit is made
+    on `branch`; nothing is written if the branch moved during the run. Nothing there, a zarr, or another
+    repo is an error (a likely typo).
+  - **Zarr input, nothing there:** a new store, zarr unless `external_format` is `icechunk`.
+  - **Zarr input, an existing zarr:** the results are written into it in place. It must have the input's layout
+    (AnnData, or SpatialData with the table), cells and genes. This isn't atomic: a run that dies midway leaves
+    partial results, which a rerun replaces.
+  - An existing icechunk repo with a zarr input, or anything that isn't zarr or icechunk, is an error.
+  - On S3 there is no atomic rename, so a store being written carries a `.process-writing` marker until done;
+    a new store left with it is refused (delete it, or pick another location).
+- The destination is checked before any GPU work and again just before writing.
 - **Checked before any GPU work**, each a one-line error (exit 1): an input that can't be opened, a SpatialData
   store without the table, a batch key or subset column the store doesn't have, a subset with no cells, and
   cells with no batch value (missing, or `""` as ingest writes it). Pick another key, or a subset without them.
@@ -191,7 +208,7 @@ Written: the embedding (`X_pca`, `X_pca_harmony` or `X_scVI`), `obsm/X_umap`, `o
 `target_sum` attr) and `uns/process` (method, basis, resolutions, subset, every setting, the input and its
 snapshot). With a subset, cells outside it get empty values. Earlier `X_pca`/`X_pca_harmony`/`X_scVI`/`X_umap`
 and `leiden*` results in the store are replaced or removed, so all of them come from one run. Beside it, in
-`/results`: `umap.png`, `cluster_summary.csv` (`cluster_summary_<key>.csv` per resolution) and
+`/results`: `umap.png` (one panel per `color_keys` name the store has; `leiden` is the clusters), `cluster_summary.csv` (`cluster_summary_<key>.csv` per resolution) and
 `process_report.txt` (wall time and peak host/GPU memory per step).
 
 ### Every other setting
@@ -208,7 +225,7 @@ talk over tcp; UCX would need `distributed-ucxx-cu13`, which the environment doe
 | Group | Settings (default) |
 |---|---|
 | Cluster | `gpus` (all visible), `rmm_mode` (`managed`: GPU memory spills to host RAM; `pool`: `rmm_pool_size` (0.8) of each GPU; `none`), `threads_per_worker` (1), `enable_cudf_spill` (true), `zarr_concurrency` (12), `zarr_max_workers` (12), `sample_interval_s` (0.1: how often peak memory is sampled for the report) |
-| Data | `chunk_rows` (24000), `target_sum` (1e4), `sample_key` (`sample_id`), `results_dir` (`/results`), `plots` (true) |
+| Data | `chunk_rows` (24000), `target_sum` (1e4), `sample_key` (`sample_id`), `color_keys` (`batch_id,chip_id,pbmc_clean_AIFI_L1_2024_label,leiden`; also a panel field), `results_dir` (`/results`), `plots` (true) |
 | Steps | `hvg_flavor` (`seurat`), `hvg_batch_key`, `scale_max_value` (10), `n_pcs` (30), `neighbors_algorithm` (`ivfflat`; `mg_ivfflat` for several GPUs), `umap_n_components` (2), `leiden_iterations` (100), `harmony_max_iter` (30), `harmony_theta` (2), `harmony_alpha` (0.2), `random_seed` (0) |
 | scVI | `scvi_n_latent` (30), `scvi_n_layers` (2), `scvi_n_hidden` (128), `scvi_dropout_rate` (0.1), `scvi_gene_likelihood` (`nb`), `scvi_max_epochs` (0: scvi-tools picks from the cell count), `scvi_batch_size` (128), `scvi_lr` (1e-3), `scvi_train_size` (0.9), `scvi_early_stopping` (false), `scvi_early_stopping_patience` (45), `scvi_accelerator` (`auto`), `scvi_model_dir` (`<results_dir>/scvi_model`) |
 
@@ -224,7 +241,9 @@ their defaults in `process/config.py`, or add an `export SCVI_MAX_EPOCHS=50`-sty
 ./run --input /data/pbmc/pbmc.zarr --subset_column sample_id --subset_values SP1,SP2
 SCVI_N_LATENT=20 SCVI_MAX_EPOCHS=50 ./run --input /data/pbmc/pbmc.zarr --method scvi --batch_key sample_id
 ./run --input /data/tissue/tissue.zarr --table table      # SpatialData: the results go in the copy's table
-./run --input /data/repo --origin s3://bucket/repo --branch main   # icechunk: one commit on the origin
+./run --input /data/repo --external s3://bucket/repo --branch main  # icechunk: one commit on its S3 repo
+./run --input /data/repo                                  # icechunk: a copy with the commit in /results
+./run --input /data/pbmc/pbmc.zarr --external s3://bucket/pbmc.zarr  # zarr: new, or written into in place
 GPUS=0,1 NEIGHBORS_ALGORITHM=mg_ivfflat ./run --input ... # two GPUs
 ```
 
@@ -242,4 +261,4 @@ origin), runs each notebook headless with `jupyter nbconvert --execute` and savi
 object or commit holds the results and reads back. It needs a GPU and internet (OmniPath). `WORK=<dir>`
 keeps the stores and executed notebooks. The pipeline tests check the settings and the save rules, then run
 `./run` end to end (PCA, harmony, scVI, several resolutions, a subset, an ingest-style store, SpatialData,
-icechunk through an origin, no input); without a GPU, only the parts that need none run.
+icechunk through its external repo and as a copy, output errors, no input); without a GPU, only the parts that need none run.

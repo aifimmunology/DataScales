@@ -328,6 +328,7 @@ scVI trains **in the main process, after the Dask-CUDA cluster is shut down**, n
   batch values; here the run would fail later in harmony or scVI anyway, after the expensive steps. A bad
   setting value exits 2 with its name.
 - `output` is ignored, with a message, for icechunk input; `origin` is ignored for a zarr input.
+  *(superseded 2026-11-13: `origin` and `output` are gone, see §13)*
 
 ### 12.5 Tested
 - **CPU, 2026-11-03:** 49 pytest tests in `code/process/tests` (48 pass, the GPU-only one skips), with stand-ins
@@ -384,3 +385,55 @@ is; a Reproducible Run must be started on a GPU machine class. From `/root/capsu
   the input path is resolved before it's recorded.
 - The notebook helper cell and `store.py` share seven functions word for word, with a test.
 - Simpler code: `main.run` split into `load`/`embed`/`write`; `report` memory is two functions; no `Source.branch`.
+
+## 13. Output rework and App Panel layout (2026-11-13)
+A Reproducible Run on an internal icechunk data asset with no origin failed at `write`: the commit went to the
+read-only `/data` mount. The user then asked for the panel and the outputs to be reworked before publishing.
+The plan was reviewed by a separate agent against the code and annizarr before building, and the code again
+after; both reviews' findings are fixed and tested.
+
+### 13.1 App Panel
+- Order: Input data → Output: copy in /results (default) → Output: external location (optional) → Embedding →
+  Neighbors, UMAP & clustering (the two categories merged) → UMAP plots.
+- SpatialData table, Icechunk branch, subset and copy name are marked (optional). The branch has no panel
+  default (empty means `main`).
+- **One `branch`** for reading and committing, in the input repo, its copy or the external repo. *Why:* the
+  user's call; a separate external branch only added a case where the tip isn't the snapshot that was read.
+- The panel can't show fields conditionally, so "only when not writing externally" is in the descriptions and
+  is a settings error (exit 2) when both are filled in.
+- UMAP colors (`color_keys`): obs columns to colour `umap.png` by, `leiden` for the clusters; names the store
+  lacks are skipped.
+
+### 13.2 Output rules (`code/process/outputs.py`)
+`origin` and `output` are replaced by `results_copy`, `results_format`, `external`, `external_format`
+(formats `auto` | `zarr` | `icechunk`). No aliases: the capsule wasn't published yet. One destination per run:
+- **Copy in `/results`** (no external): `auto` is the input's format. An icechunk input gets the repo copied,
+  every branch and snapshot, with one commit on `branch` (this fixes the failed run). icechunk → zarr exports
+  the snapshot; an AnnData zarr → icechunk is a new repo. Never overwritten (`-1`, `-2`, …), built at
+  `.partial` and renamed.
+- **External, icechunk input:** must be the input's own repo (holds the input's tip on `branch`). It's read
+  from there and gets one commit. Nothing there, a zarr, or another repo is an error. *Why:* the user — a new or
+  other location most likely means a mistyped S3 path.
+- **External, zarr input:** nothing there → a new store (zarr unless `external_format` is `icechunk`); an
+  existing zarr → the results written into it in place (user's call), when its layout, cells (obs index) and
+  genes (var index) match the input. Not atomic: a run that dies leaves partial results, which a rerun replaces.
+- A format picked explicitly must match what's already at the location.
+- **Refused:** a SpatialData zarr as icechunk (user's call: `copy_group` only copies zarr nodes, so its parquet
+  shapes and points would be lost); the input itself as the external location; an existing icechunk repo for a
+  zarr input; an input branch whose tip is icechunk's first commit `1CECHNKREP0F1RSTCMT0` (every repo has it, so
+  it proves nothing); a leftover `<location>.partial`; a read-only local location; `s3://` in `results_copy`.
+- **S3:** no atomic rename, so a store being written carries `.process-writing` (`new`, or `results` in place)
+  until done. `new` is refused next time (delete it); `results` is rewritten. Listings are re-read
+  (`invalidate_cache`), since s3fs would answer from the listing made hours earlier at plan time.
+- Checked in `load()` before any GPU work (the destination decides how the input is read, so it's planned
+  before `open_source`), and again right before writing. A write failure is one line saying what was left.
+
+### 13.3 Tested (2026-11-13, T4 GPU capsule)
+- 72 pytest tests pass on the GPU, with no skips, including `test_outputs.py` (every rule and every writer:
+  local, and remote zarr through fsspec `memory://`) and end to end through `code/run`: icechunk via its external
+  repo twice, icechunk copied into `/results`, and the output errors stopping before the cluster.
+- **Not tested:** real S3. moto isn't in the environment, so icechunk on S3 isn't covered and zarr on S3 only
+  through `memory://`. Before publishing, run once each: an icechunk data asset with its S3 location as
+  `external`, and a zarr input to a new `s3://` location. Also check the panel renders as intended in Code Ocean.
+- §12.6's `-k icechunk_origin_twice` is now `-k icechunk_external_twice`; also `-k icechunk_copy_in_results`
+  and `-k output_errors`.

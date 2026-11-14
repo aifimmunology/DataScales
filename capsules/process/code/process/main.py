@@ -2,7 +2,7 @@
 
 load -> h2d -> normalize/log1p -> HVG -> PCA path: rechunk/persist -> scale -> PCA -> harmony (with a batch key)
                                       -> scVI path: gather the HVG counts -> close the cluster -> train scVI
--> neighbors -> UMAP -> leiden (one per resolution) -> save (new zarr copy, or an icechunk commit)
+-> neighbors -> UMAP -> leiden (one per resolution) -> save (outputs.py: a copy in /results, or an external location)
 
 dask-cuda spawns its workers, and spawn re-imports __main__ in each: keep module level free of work.
 """
@@ -28,14 +28,16 @@ repo in an attached data asset (e.g. /data/<asset>/<name>.zarr), pick a method (
 and press Run. From a terminal: code/run --input /data/<asset>/<name>.zarr [--flag value ...]; code/run --help
 lists every setting, and each one can also be set as an upper-case environment variable.
 
-A zarr input gets a new copy with the results in /results/<name>.processed.zarr; an icechunk input gets
-one commit on its branch. See code/README.md, "Optional: run from the App Panel or as a Reproducible Run".
+The results go in a new copy in /results (<name>.processed.zarr, or an icechunk repo for an icechunk input),
+or to an external location: an icechunk input's own S3 repo (one commit), or a new or existing zarr.
+See code/README.md, "Optional: run from the App Panel or as a Reproducible Run".
 """
 
 
 @dataclass
 class Loaded:
     src: object
+    dest: object
     obs: object
     var: object
     counts: object
@@ -50,14 +52,17 @@ def load(cfg: Config) -> Loaded:
 
     import steps
     from cluster import set_zarr_config
+    import outputs
     from store import open_source
 
     set_zarr_config(cfg.zarr_concurrency, cfg.zarr_max_workers)
-    src = open_source(cfg.input, cfg.table, cfg.branch, cfg.origin)
+    dest = outputs.plan(cfg)
+    src = open_source(cfg.input, cfg.table, cfg.branch, dest.location if dest.mode == "commit" else "")
+    outputs.check(dest, src)
     group = src.group
     n_cells, n_genes = group["X"].attrs["shape"]
     keys = cfg.batch_keys + ([cfg.hvg_batch_key] if cfg.hvg_batch_key else [])
-    obs = steps.read_obs(group, [cfg.sample_key], keys + ([cfg.subset_column] if cfg.subset_column else []))
+    obs = steps.read_obs(group, [cfg.sample_key, *cfg.color_columns], keys + ([cfg.subset_column] if cfg.subset_column else []))
     rows = steps.subset_rows(obs, cfg.subset_column, cfg.subset) if cfg.subset_column else None
     if rows is not None:
         obs = obs.iloc[rows].copy()
@@ -66,8 +71,8 @@ def load(cfg: Config) -> Loaded:
     steps.check_batch(obs, keys)
     counts = steps.lazy_counts(group, cfg.chunk_rows)
     print(f"{len(obs):,} of {n_cells:,} cells x {n_genes:,} genes from {src.path}"
-          + (f" ({src.table})" if src.table else "") + (f", snapshot {src.snapshot[:12]}" if src.repo else ""))
-    return Loaded(src, obs, read_elem(group["var"]), counts, steps.slice_rows(counts, rows), rows, n_cells)
+          + (f" ({src.table})" if src.table else "") + (f", snapshot {src.snapshot[:12]}" if src.repo else "") + f"; results: {dest.describe()}")
+    return Loaded(src, dest, obs, read_elem(group["var"]), counts, steps.slice_rows(counts, rows), rows, n_cells)
 
 
 def embed(cfg: Config, data: Loaded, gpu, report) -> tuple:
@@ -115,7 +120,8 @@ def write(cfg: Config, data: Loaded, graph, basis: str, lognorm, hv, uns: dict) 
     import numpy as np
 
     import steps
-    from store import PROCESS_OBSM, Results, save
+    import outputs
+    from store import PROCESS_OBSM, Results
 
     leiden = cfg.leiden_keys
     clusters = ", ".join(f"{k}: {graph.obs[k].nunique()} clusters" for k in leiden)
@@ -129,26 +135,28 @@ def write(cfg: Config, data: Loaded, graph, basis: str, lognorm, hv, uns: dict) 
              "subset": {"column": cfg.subset_column, "values": np.array(cfg.subset, dtype=str)},
              "settings": asdict(cfg)},
     )
-    written = save(data.src, results, f"Process: {cfg.method} ({basis}), {clusters} over {graph.n_obs:,} cells",
-                   cfg.branch, cfg.output, cfg.results_dir,
-                   {"method": cfg.method, "basis": basis, "leiden": dict(leiden), "n_cells": graph.n_obs})
+    written = outputs.save(data.dest, data.src, results.write,
+                           f"Process: {cfg.method} ({basis}), {clusters} over {graph.n_obs:,} cells", cfg.branch,
+                           {"method": cfg.method, "basis": basis, "leiden": dict(leiden), "n_cells": graph.n_obs})
     print(f"{clusters}; {written}")
     return written
 
 
 def plots(graph, cfg: Config) -> None:
-    """umap.png and cluster_summary[_<leiden key>].csv in results_dir, as the notebook writes them."""
+    """umap.png, one panel per colour key the store has ("leiden" is every cluster column), and cluster_summary csvs."""
     import pandas as pd
     import scanpy as sc
 
     results = Path(cfg.results_dir)
     results.mkdir(parents=True, exist_ok=True)
-    samples = [cfg.sample_key] if cfg.sample_key in graph.obs else []
-    fig = sc.pl.umap(graph, color=[*cfg.leiden_keys, *samples], ncols=2, return_fig=True, show=False)
-    fig.savefig(results / "umap.png", dpi=150, bbox_inches="tight")
+    keys = [k for name in cfg.color_columns for k in (cfg.leiden_keys if name == "leiden" else [name]) if k in graph.obs]
+    if keys:
+        fig = sc.pl.umap(graph, color=list(dict.fromkeys(keys)), ncols=2, return_fig=True, show=False)
+        fig.savefig(results / "umap.png", dpi=150, bbox_inches="tight")
+    sample = cfg.sample_key in graph.obs
     for key in cfg.leiden_keys:
         labels = graph.obs[key]
-        summary = pd.crosstab(labels, graph.obs[cfg.sample_key]) if samples else pd.DataFrame(index=labels.cat.categories)
+        summary = pd.crosstab(labels, graph.obs[cfg.sample_key]) if sample else pd.DataFrame(index=labels.cat.categories)
         summary.insert(0, "n_cells", labels.value_counts())
         summary.to_csv(results / ("cluster_summary.csv" if key == "leiden" else f"cluster_summary_{key}.csv"))
 

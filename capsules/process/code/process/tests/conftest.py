@@ -56,6 +56,7 @@ def synthetic(seed: int = 0) -> ad.AnnData:
         "sample_id": pd.Categorical([f"SP{s}" for s in sample]),
         "chip_id": pd.Categorical([f"C{c}" for c in chip]),
         "cell_type": pd.Categorical([f"T{t}" for t in cell_type]),
+        "pbmc_clean_AIFI_L1_2024_label": pd.Categorical([f"L{t % 3}" for t in cell_type]),
     }, index=[f"cell{i}" for i in range(N_CELLS)])
     return ad.AnnData(X=counts, obs=obs, var=pd.DataFrame(index=[f"GENE{i}" for i in range(N_GENES)]))
 
