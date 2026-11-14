@@ -1,8 +1,3 @@
-"""GPU jobs: in-memory queue and history, dispatched to a warm pipeline process
-(gpu/worker.py) that keeps imports + CUDA context between jobs. Stage updates stream
-over the worker's stdout; the store only sees the finished view (mirrored when configured).
-"""
-
 import json
 import queue
 import re
@@ -17,8 +12,9 @@ from pathlib import Path
 from fastapi import HTTPException
 from run_params import RunParams
 
-from . import storage
-from .config import MAX_JOBS, MIRROR, SOURCE, Location
+from . import selection, store
+from .config import MAX_JOBS, Location
+from .store.gcs import bucket
 
 WORKER_SCRIPT = Path(__file__).resolve().parents[1] / "gpu" / "worker.py"
 PROBE_TTL_S = 60
@@ -71,43 +67,47 @@ def _follow(proc: subprocess.Popen, job: dict) -> None:
             raise RuntimeError(line[len("error: "):])
 
 
-def _run_gpu_job(job: dict, barcodes: list[str]) -> None:
+def _run_gpu_job(job: dict, rows: list[int]) -> None:
     sel = Path(f"/tmp/datavis_job_{job['id']}.json")
-    sel.write_text(json.dumps({"barcodes": barcodes}))
+    sel.write_text(json.dumps({"rows": rows}))
     view = f"umap_views/{job['slug']}"
+    uri = store.STORE.uri
     try:
-        _follow(_send({"id": job["id"], "store": SOURCE.uri, "selection": str(sel), "label": job["name"],
-                       "out": f"{SOURCE.uri}/{view}", "params": job["params"]}), job)
+        _follow(_send({"id": job["id"], "store": uri, "selection": str(sel), "label": job["name"],
+                       "out": f"{uri}/{view}", "params": job["params"]}), job)
+        if store.MIRROR:
+            job["stage"] = "mirroring view to GCS"
+            try:
+                store.MIRROR.copy(view)
+            except store.MirrorError as e:
+                raise RuntimeError(f"view written but not mirrored: {e}")
     except BaseException:
         _discard(view)
         raise
     finally:
         sel.unlink(missing_ok=True)
-    if MIRROR:
-        job["stage"] = "mirroring view to GCS"
-        try:
-            storage.mirror(view)
-        except storage.MirrorError as e:
-            raise RuntimeError(f"view written but not mirrored: {e}")
 
 
 def _discard(view: str) -> None:
-    try:
-        storage.delete_prefix(view)
-    except Exception as e:
-        print(f"[jobs] could not remove partial {view}: {e}", file=sys.stderr, flush=True)
+    """Local first (what the picker lists), then the mirror; each is tried even if the other fails."""
+    targets = [store.STORE] + ([store.MIRROR] if store.MIRROR else [])
+    for t in targets:
+        try:
+            t.delete_prefix(view)
+        except Exception as e:
+            print(f"[jobs] could not remove partial {view} from {t.uri}: {e}", file=sys.stderr, flush=True)
 
 
 def _worker() -> None:
     while True:
-        job_id, barcodes = JOB_QUEUE.get()
+        job_id, rows = JOB_QUEUE.get()
         job = JOBS.get(job_id)
         if job is None:
             continue
         job["status"] = "running"
         t0 = time.monotonic()
         try:
-            _run_gpu_job(job, barcodes)
+            _run_gpu_job(job, rows)
             job["view"] = f"umap_views/{job['slug']}"
             job["stage"] = job["status"] = "done"
         except Exception as e:
@@ -126,24 +126,34 @@ def _ensure_worker() -> None:
 
 
 def _config_problem() -> str | None:
-    return None if SOURCE else "no store configured: set LOCAL_DATA and/or GCS_DATA"
+    return None if store.STORE else "no store configured: set LOCAL_DATA and/or GCS_DATA"
+
+
+def _check_run(params: RunParams, n_cells: int, root) -> None:
+    if params.n_neighbors >= n_cells:
+        raise HTTPException(400, f"n_neighbors ({params.n_neighbors}) must be smaller than the selection ({n_cells} cells)")
+    if params.batch_key:
+        obs = root["obs"]
+        if params.batch_key not in obs.attrs.get("column-order", []) or \
+                obs[params.batch_key].attrs.get("encoding-type") != "categorical":
+            raise HTTPException(400, f"batch_key '{params.batch_key}' is not a categorical obs column of this store")
 
 
 def submit(payload: dict) -> dict:
-    """Queue a re-embedding of the cells named by payload["barcodes"]."""
     problem = _config_problem()
     if problem:
         raise HTTPException(400, problem)
-    barcodes = [str(b) for b in payload.get("barcodes") or []]
-    if not barcodes:
-        raise HTTPException(400, "empty selection")
     try:
-        params = RunParams.from_dict(payload.get("params")).to_dict()
+        params = RunParams.from_dict(payload.get("params"))
     except ValueError as e:
         raise HTTPException(400, str(e))
+    root = selection.open_root()
+    rows = selection.resolve_rows(payload, root).tolist()
+    _check_run(params, len(rows), root)
+    params = params.to_dict()
     job_id = uuid.uuid4().hex[:8]
     name = str(payload.get("name") or f"view {job_id}").strip()[:60]
-    print(f"[submit] job {job_id} '{name}': {len(barcodes)} cells", file=sys.stderr, flush=True)
+    print(f"[submit] job {job_id} '{name}': {len(rows)} cells", file=sys.stderr, flush=True)
     while len(JOBS) >= MAX_JOBS:
         victim = next((k for k, j in JOBS.items() if j["status"] in FINISHED), None)
         if victim is None:
@@ -151,12 +161,12 @@ def submit(payload: dict) -> dict:
         del JOBS[victim]
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_").lower() or "view"
     JOBS[job_id] = {
-        "id": job_id, "name": name, "slug": f"{slug}_{job_id}", "cells": len(barcodes), "params": params,
+        "id": job_id, "name": name, "slug": f"{slug}_{job_id}", "cells": len(rows), "params": params,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "status": "queued", "stage": "queued", "view": None,
     }
     _ensure_worker()
-    JOB_QUEUE.put((job_id, barcodes))
+    JOB_QUEUE.put((job_id, rows))
     return {"job_id": job_id, "status": "submitted"}
 
 
@@ -187,16 +197,16 @@ def _verdict(status: str, problem: str | None = None, summary: str = "",
 
 
 def _probe_local() -> dict | None:
-    if SOURCE.gcs or (Path(SOURCE.uri) / "zarr.json").is_file():
+    if store.STORE.is_gcs or (Path(store.STORE.uri) / "zarr.json").is_file():
         return None
-    return _verdict("error", "store", f"No zarr group at LOCAL_DATA={SOURCE.uri} (zarr.json missing).",
+    return _verdict("error", "store", f"No zarr group at LOCAL_DATA={store.STORE.uri} (zarr.json missing).",
                     "", ["check the /data volume mount in docker-compose.yml",
                          "the scratch disk is wiped on stop/start: copy the store back to LOCAL_DATA"])
 
 
 def _probe_bucket(loc: Location, what: str) -> dict | None:
     try:
-        storage.bucket(loc).get_blob(loc.key("zarr.json"))
+        bucket(loc).get_blob(loc.key("zarr.json"))
         return None
     except Exception as e:
         s, low = str(e), str(e).lower()
@@ -222,15 +232,15 @@ def _probe_nvidia() -> tuple[dict | None, int]:
 def _probe() -> dict:
     gpu_problem, n = _probe_nvidia()
     checks = [_probe_local()]
-    if SOURCE.gcs:
-        checks.append(_probe_bucket(SOURCE, "store"))
-    if MIRROR:
-        checks.append(_probe_bucket(MIRROR, "mirror"))
+    if store.STORE.is_gcs:
+        checks.append(_probe_bucket(store.STORE.loc, "store"))
+    if store.MIRROR:
+        checks.append(_probe_bucket(store.MIRROR.loc, "mirror"))
     checks.append(gpu_problem)
     failed = next((c for c in checks if c), None)
     if failed:
         return failed
-    access = ("bucket store" if SOURCE.gcs else "local store") + (" + GCS mirror" if MIRROR else "")
+    access = ("bucket store" if store.STORE.is_gcs else "local store") + (" + GCS mirror" if store.MIRROR else "")
     return _verdict("ok", None, f"{access} + {n} GPU{'s' if n != 1 else ''} visible")
 
 
@@ -254,7 +264,6 @@ def _invalidate_probe() -> None:
 
 
 def health(refresh: bool = False) -> dict:
-    """Cached store/credential/GPU probe; a stale or forced check runs in the background."""
     problem = _config_problem()
     if problem:
         return {"status": "unconfigured", "summary": problem, "checking": False}

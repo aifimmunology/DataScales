@@ -114,6 +114,22 @@ The store is read with plain `zarr`/`anndata`; nothing app-specific is required 
 
 ---
 
+## Adding a dataset
+
+Check a store before pointing the app at it (local path or `gs://` prefix; `--deep` also reads the barcode index to prove it is unique):
+
+```bash
+cd server && pixi run python -m server.validate /data/new_store.zarr --deep
+```
+
+It reports errors (the app cannot serve the store), warnings (a feature is missing, e.g. no latent space or sparse `X` means *Generate New UMAP* is unavailable), the capabilities the store supports, and the worst-case request size against the proxy limit. A running backend serves the same report at `/api/validate`, and `/api/config` reports `error` instead of failing when the store is unreadable.
+
+Selections travel as row indices (`{group, n, indices}`, about 9 bytes per cell), not barcodes; `n` is the group's cell count so a stale browser tab is refused (409) instead of labelling the wrong cells. The request body limit lives in two places that must agree: `client_max_body_size` in `nginx.conf` and `MAX_BODY_BYTES` in `server/config.py`.
+
+Storage goes through one interface (`server/store/`): `LocalStore`, `GcsStore`, and a `Mirror` that copies local writes to a bucket. Labels, views and jobs call only that interface, so a new store type means one new class and a run of `tests/test_store_contract.py`.
+
+---
+
 ## Local dev
 
 The backend runs CPU-only locally (the RAPIDS pipeline is linux-64 only and lives in the GPU image), so labeling, viewing, and gene highlighting work on a laptop; *Generate New UMAP* does not.
@@ -150,5 +166,14 @@ To run the servers separately:
 bun run dev:frontend
 LOCAL_DATA=./data/my-store.zarr bun run dev:api
 ```
+
+### Tests
+
+```bash
+cd server
+pixi run -e dev test    # backend: both store backends, labels, views, jobs, validator (dev env adds pytest)
+cd .. && bun test       # frontend pure logic
+```
+
 
 To test the full container build locally (no GPU needed for the frontend image): `docker compose build frontend`.

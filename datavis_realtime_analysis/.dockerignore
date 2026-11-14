@@ -1,0 +1,8 @@
+# the build context was 6.6 GB with these: pixi envs and node_modules are rebuilt in the image
+**/.pixi
+node_modules
+dist
+.git
+**/__pycache__
+**/.pytest_cache
+.env

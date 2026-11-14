@@ -23,7 +23,10 @@ export type GpuHealth = {
   checked_at?: string | null
 }
 
-type LabelAssignment = { label: string; barcodes: string[] }
+/** `n` is the group's cell count: the backend refuses a selection made against a stale copy. */
+export type Selection = { group: string; n: number; indices: number[] }
+
+type LabelAssignment = { label: string; indices: number[] }
 
 async function request(url: string, init: RequestInit | undefined, what: string): Promise<Response> {
   const res = await fetch(url, init)
@@ -37,7 +40,7 @@ async function request(url: string, init: RequestInit | undefined, what: string)
 const postJson = (url: string, body: unknown, what: string) =>
   request(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, what)
 
-export async function submitSelection(body: { barcodes: string[]; name: string; params: RunParams }): Promise<void> {
+export async function submitSelection(body: Selection & { name: string; params: RunParams }): Promise<void> {
   await postJson('/api/submit', body, 'submit')
 }
 
@@ -59,12 +62,11 @@ export async function deleteView(id: string): Promise<void> {
   await request(`/api/views/${encodeURIComponent(id)}`, { method: 'DELETE' }, 'delete view')
 }
 
-/** Barcode assignments, so labels made inside a view land on the root store; `group`
- * targets a view's own column instead. */
 export async function saveLabels(
   name: string,
   assignments: LabelAssignment[],
-  group?: string,
+  group: string,
+  n: number,
 ): Promise<{ name: string; categories: string[]; labeled: number }> {
-  return (await postJson('/api/labels', { name, assignments, ...(group ? { group } : {}) }, 'label save')).json()
+  return (await postJson('/api/labels', { name, group, n, assignments }, 'label save')).json()
 }

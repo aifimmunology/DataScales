@@ -42,3 +42,4 @@ if GCS and not GCS.gcs:
 SOURCE = LOCAL or GCS
 MIRROR = GCS if LOCAL and GCS else None
 MAX_JOBS = 50
+MAX_BODY_BYTES = 256 << 20  # keep equal to client_max_body_size in nginx.conf

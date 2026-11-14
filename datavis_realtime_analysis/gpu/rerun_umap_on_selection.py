@@ -1,16 +1,5 @@
-"""Re-embed cells selected in the datavis app with the RAPIDS single-cell pipeline.
-
-gpu/worker.py calls warm_up() once, then run() per job. The result is a small "view"
-store — obsm/X_umap + obs for the selected cells, no X — read by the viewer by row position.
-
-Two routes into neighbors → UMAP → leiden, chosen by RunParams.method (see resolve_rep):
-  * a stored latent space (recorded in uns/neighbors/params/use_rep) is embedded directly;
-  * otherwise X (raw counts) goes through normalize → HVG → scale → PCA first, eagerly on
-    one GPU up to RERUN_EAGER_MAX cells, through a per-run dask-cuda cluster beyond.
-
-dask-cuda spawns its workers, and spawn re-imports __main__ in every child: module level
-must stay trivial, with all cluster/pipeline code inside functions.
-"""
+"""dask-cuda spawns its workers, and spawn re-imports __main__ in every child: module level must
+stay trivial, with all cluster/pipeline code inside functions."""
 
 import os
 from contextlib import contextmanager, nullcontext
@@ -40,7 +29,6 @@ def _set_zarr_config(concurrency: int, max_workers: int) -> None:
 
 
 def warm_up() -> None:
-    """Heavy imports + RMM/cupy allocator, once per process."""
     global _gpu_ready
     import anndata, pandas, zarr  # noqa: F401
     import cupy as cp
@@ -96,17 +84,16 @@ def _read_obs(root):
     return obs
 
 
-def _selected_rows(obs, barcodes):
+def _selected_rows(obs, rows):
     import numpy as np
 
-    rows = obs.index.get_indexer(barcodes)
-    if (rows < 0).any():
-        raise ValueError(f"{int((rows < 0).sum())} selected barcodes are not in this store")
-    return np.unique(rows)
+    rows = np.unique(np.asarray(rows, dtype=np.int64))
+    if rows.size == 0 or rows[0] < 0 or rows[-1] >= len(obs):
+        raise ValueError(f"selected rows fall outside the store's {len(obs)} cells")
+    return rows
 
 
 def resolve_rep(root, method: str = "auto"):
-    """The obsm key to embed from, or None for normalize → PCA on X."""
     if method == "pca":
         return None
     rep = latent_rep(root)
@@ -217,7 +204,6 @@ def _write_view(adata, out, label, params: RunParams):
 
 
 def run(store: str, selection_file: str, out: str, label: str | None = None, params: dict | None = None) -> str:
-    """Embed the barcodes in selection_file ({"barcodes": [...]}) from `store` into the view at `out`."""
     import json
 
     import zarr
@@ -225,16 +211,16 @@ def run(store: str, selection_file: str, out: str, label: str | None = None, par
     warm_up()
     _set_zarr_config(ZARR_CONCURRENCY, ZARR_MAX_WORKERS)
     with open(selection_file) as f:
-        barcodes = json.load(f)["barcodes"]
+        selected = json.load(f)["rows"]
     root = zarr.open(store, mode="r")
     p = RunParams.from_dict(params)
     rep = resolve_rep(root, p.method)
-    eager = rep is not None or len(barcodes) <= EAGER_MAX
+    eager = rep is not None or len(selected) <= EAGER_MAX
 
     with nullcontext() if eager else _cuda_cluster():
         print("stage: loading selected cells", flush=True)
         obs = _read_obs(root)
-        adata = _load_cells(root, obs, _selected_rows(obs, barcodes), rep, eager)
+        adata = _load_cells(root, obs, _selected_rows(obs, selected), rep, eager)
         adata = _embed(adata, rep, eager, p)
         print("stage: writing view store", flush=True)
         _write_view(adata, out, label, p)

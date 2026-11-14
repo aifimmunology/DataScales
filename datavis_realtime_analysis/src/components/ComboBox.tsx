@@ -1,7 +1,6 @@
 import { useState } from 'react'
+import { pickOnEnter, type ComboOption } from '../lib/pickOnEnter'
 import { control } from '../lib/styles'
-
-type ComboOption = { value: string; label?: string; hint?: string }
 
 type Props = {
   options: ComboOption[]
@@ -13,8 +12,6 @@ type Props = {
   onCreate?: (query: string) => void
 }
 
-/** Searchable dropdown: focusing lists the options (up to `limit`), typing filters them;
- * `createLabel` offers an extra row for a typed name that is not an option. */
 export default function ComboBox({ options, value = '', placeholder, limit = Infinity, onPick, createLabel, onCreate }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -45,7 +42,7 @@ export default function ComboBox({ options, value = '', placeholder, limit = Inf
         onKeyDown={e => {
           if (e.key === 'Escape') (e.target as HTMLInputElement).blur()
           if (e.key !== 'Enter') return
-          const hit = matches.find(o => o.value === q) ?? (matches.length === 1 ? matches[0] : null)
+          const hit = pickOnEnter(matches, q, create !== null)
           if (hit) choose(() => onPick(hit.value))
           else if (create) choose(() => onCreate!(q))
         }}
