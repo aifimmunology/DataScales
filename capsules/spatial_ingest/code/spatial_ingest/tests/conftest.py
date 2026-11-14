@@ -1,4 +1,3 @@
-import logging
 import os
 import sys
 import warnings
@@ -13,8 +12,9 @@ import scipy.sparse as sp
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-for name in ("ome_zarr", "spatialdata", "numcodecs"):
-    logging.getLogger(name).setLevel(logging.WARNING)
+import logs  # noqa: E402
+
+logs.setup()   # the run's logging: library noise silenced, as in main.main
 
 BUNDLES = Path(os.environ.get("SPATIAL_TEST_DATA", "/scratch/spatial_dev/data"))
 HUMAN = [f"GENE{i}" for i in range(40)] + ["MT-CO1", "MT-ND1"]
@@ -143,8 +143,9 @@ def run_capsule(env):
 @pytest.fixture(scope="session")
 def tiny_model(tmp_path_factory) -> Path:
     """A CellTypist model with two labels, trained on synthetic counts over HUMAN genes."""
-    import celltypist
+    import annotate
 
+    celltypist, _ = annotate._celltypist()
     x = sp.vstack([counts(60, len(HUMAN), seed) for seed in range(2)]).astype(np.float32)
     x = sp.csr_matrix(np.log1p(x.multiply(1e4 / np.maximum(x.sum(axis=1), 1)).toarray()))
     train = ad.AnnData(x, var=pd.DataFrame(index=HUMAN))

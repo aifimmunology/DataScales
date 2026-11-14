@@ -17,7 +17,10 @@ def strip_tags(name: str, tags: tuple[str, ...]) -> str:
 
 
 def element_name(name: str, sid: str, tags: tuple[str, ...] = ()) -> str:
-    """`<sid>_<name>`; a name already carrying the sample's ID or tag keeps only one prefix."""
+    """`<sid>_<name>`; a name already carrying the sample's ID or tag keeps only one prefix, and a name
+    that IS the sample's ID or tag (a Visium region named after its section) becomes `<sid>`."""
+    if name in (sid, *tags):
+        return sid
     return f"{sid}_{strip_tags(name, (sid, *tags))}"
 
 
