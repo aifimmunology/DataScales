@@ -1,0 +1,12 @@
+{
+  "repo": "https://github.com/aifimmunology/tenx-scrna-pipeline",
+  "path": "models",
+  "commit": "ce24e2de895a1e50c9b2366d92c9af9f6abf4807",
+  "sha256": {
+    "Immune_All_High.pkl": "a715fec36c2c421f7c4e31cf4cb4bea883eedab7fd7b20a4b76f091c22660448",
+    "Immune_All_Low.pkl": "290874d35dac039d4c9218c343fde4aac1077709b72a331ce7266f6828c36502",
+    "pbmc_clean_AIFI_L1_2024.pkl": "c63ec36ec90e195706dbab0e5596082d3bc06d980fcb212781c60c5ddb63d973",
+    "pbmc_clean_AIFI_L2_2024.pkl": "1f5d49bb85bf1fdff4936a6b250a4a24362ec5b58472a73d891f77f706e0eb10",
+    "pbmc_clean_AIFI_L3_2024.pkl": "df18d419fc3b73468b5d0e3fd940871c3930f207bddab91f1fba69e3905ff5cc"
+  }
+}

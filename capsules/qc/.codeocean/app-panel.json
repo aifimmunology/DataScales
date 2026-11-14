@@ -1,0 +1,144 @@
+{
+	"version": 1,
+	"named_parameters": true,
+	"general": {
+		"title": "Single-cell QC review",
+		"instructions": "Checks cell quality in a single-cell store. Start with just the input store: you get a report and a qc_decisions.json in /results. Tweak that file if needed, attach it, run again to preview, then switch mode to apply to save the passing cells. Your input is never changed."
+	},
+	"categories": [
+		{
+			"id": "data",
+			"name": "1. Data (start here)",
+			"description": "What to check",
+			"help_text": "First time? Just fill in the input store and hit run.",
+			"icon": "🏁"
+		},
+		{
+			"id": "apply",
+			"name": "2. Save the passing cells",
+			"description": "Once you're happy with the report",
+			"help_text": "Set mode to **apply** and pick the `qc_decisions.json` from your last report run. It won't run if you edited that file since, if new samples came in, or if any sample is still pending.",
+			"icon": "✅"
+		},
+		{
+			"id": "advanced",
+			"name": "3. Advanced",
+			"description": "Usually leave these alone",
+			"help_text": "The defaults match stores made by the ingest capsule.",
+			"icon": "⚙️"
+		}
+	],
+	"parameters": [
+		{
+			"id": "DwdoiG0D0Gimehwi",
+			"category": "data",
+			"name": "Input store",
+			"param_name": "input",
+			"description": "icechunk repo or .zarr to check",
+			"help_text": "e.g. `/data/atlas` (icechunk, local or `s3://bucket/prefix`) or `/data/atlas.zarr`. A SpatialData `.zarr` works too: its cell table gets checked. Only read, never changed.",
+			"type": "text",
+			"value_type": "string",
+			"required": true
+		},
+		{
+			"id": "qcDecisionsFile1",
+			"category": "data",
+			"name": "Decisions file",
+			"param_name": "decisions",
+			"description": "qc_decisions.json from a previous run (optional)",
+			"help_text": "Leave empty the first time. Later, edit the `qc_decisions.json` a run gave you, attach it, and pick it here.",
+			"type": "file"
+		},
+		{
+			"id": "qcModeParameter1",
+			"category": "apply",
+			"name": "Mode",
+			"param_name": "mode",
+			"description": "report = just look, apply = save the passing cells",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "report",
+			"extra_data": [
+				"report",
+				"apply"
+			]
+		},
+		{
+			"id": "qcTargetParam001",
+			"category": "apply",
+			"name": "Save to",
+			"param_name": "target",
+			"description": "branch name (icechunk) or new .zarr path",
+			"help_text": "Empty = branch `qc` for icechunk, or `/results/<input>.qc.zarr` for a .zarr input. Apply always writes a copy, never the input.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "qcOriginParam001",
+			"category": "apply",
+			"name": "Writable origin",
+			"param_name": "origin",
+			"description": "s3:// path behind a read-only icechunk data asset",
+			"help_text": "Only needed to apply to an icechunk store attached as a data asset.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "qcReviewerParam1",
+			"category": "apply",
+			"name": "Reviewer",
+			"param_name": "reviewer",
+			"description": "your name, saved with the curation (optional)",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "qcGroupColumns01",
+			"category": "advanced",
+			"name": "Group columns",
+			"param_name": "group_columns",
+			"description": "batch/chip columns to compare",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "batch_id,pool_id,chip_id"
+		},
+		{
+			"id": "qcLabelColumn001",
+			"category": "advanced",
+			"name": "Label column",
+			"param_name": "label_column",
+			"description": "cell-type label column",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "pbmc_clean_AIFI_L1_2024_label"
+		},
+		{
+			"id": "qcCelltypeQc0001",
+			"category": "advanced",
+			"name": "Per-cell-type QC",
+			"param_name": "celltype_qc",
+			"description": "extra tables and plots per cell type",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "no",
+			"extra_data": [
+				"no",
+				"yes"
+			]
+		},
+		{
+			"id": "qcComputeMetric1",
+			"category": "advanced",
+			"name": "Compute missing metrics",
+			"param_name": "compute_metrics",
+			"description": "for stores without QC columns (slow: reads all counts)",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "no",
+			"extra_data": [
+				"no",
+				"yes"
+			]
+		}
+	]
+}

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Optional pipeline (App Panel / Reproducible Run); with no input it prints how to use the capsule and exits 0.
+set -euo pipefail
+export PROCESS_CWD="${PROCESS_CWD:-$PWD}"
+cd "$(dirname "${BASH_SOURCE[0]}")/process"
+exec python -u main.py "$@"

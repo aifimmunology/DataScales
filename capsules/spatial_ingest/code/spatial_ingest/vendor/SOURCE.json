@@ -1,0 +1,26 @@
+{
+  "repository": "https://github.com/10XGenomics/spatialdata-io",
+  "commit": "738204de8eca677d49c6031f447cacdfde8f58d0",
+  "pull_request": "https://github.com/scverse/spatialdata-io/pull/426",
+  "changes": [
+    "imports of AteraKeys and _atera_common rewritten to this package",
+    "atera(): the morphology_3d image gets MORPHOLOGY_3D_KWARGS instead of the 2D image_models_kwargs"
+  ],
+  "files": {
+    "atera.py": {
+      "upstream_path": "src/spatialdata_io/readers/atera.py",
+      "upstream_sha256": "89306dfacea18ca785ec89943da25f275750c11c833565a978a1c7f023ae7349",
+      "vendored_sha256": "0d9fc9f30c6a403e54912317b639e8bcc32845cb6f8ec3fb5b55d51e9359164c"
+    },
+    "_atera_common.py": {
+      "upstream_path": "src/spatialdata_io/readers/_atera_common.py",
+      "upstream_sha256": "50169d5953dcd19e7f006ceaf8840d088e15040eef84e225734a1d26c406dc39",
+      "vendored_sha256": "7c4341b0a67027fbb398c25a8a6d4f06971e4600318fb916f8d5dca684be561c"
+    },
+    "_constants.py": {
+      "upstream_path": "src/spatialdata_io/_constants/_constants.py",
+      "upstream_sha256": "e55245ef4c7b3e71f793ca1372860c935216e944a51ad45cb4fce79cd3585b8e",
+      "vendored_sha256": "e55245ef4c7b3e71f793ca1372860c935216e944a51ad45cb4fce79cd3585b8e"
+    }
+  }
+}

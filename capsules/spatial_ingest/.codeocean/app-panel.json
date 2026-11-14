@@ -1,0 +1,56 @@
+{
+	"version": 1,
+	"categories": [
+		{
+			"id": "wSeSzj9xFi8wEAAx",
+			"name": "Central Storage",
+			"description": "The SpatialData .zarr the samples are added to.",
+			"icon": "📂"
+		},
+		{
+			"id": "97KZifbm0oTS8NTd",
+			"name": "Sample Information",
+			"description": "What is added: Xenium or Atera bundles and existing SpatialData objects, in any mix; each sample's kind is detected from its files.",
+			"icon": "📂"
+		},
+		{
+			"id": "MUfvt6jYICmRxDn2",
+			"name": "Run params",
+			"description": "Optional CellTypist labels for every new sample.",
+			"icon": "📂"
+		}
+	],
+	"parameters": [
+		{
+			"id": "pHFQ1SsCPMDrPuyW",
+			"category": "wSeSzj9xFi8wEAAx",
+			"name": "Storage Location",
+			"description": "A SpatialData .zarr (local path or s3://bucket/prefix) the samples are added to. If it doesn't exist, it is created at an s3:// prefix you can write to, or at a .zarr path inside /results or /scratch (e.g. /results/spatialdata.zarr).",
+			"help_text": "A store you will keep adding to belongs on S3 (it is copied to /scratch, grown there and synced back). /results is a one-off build: saved as a data asset it is read-only. /scratch is cleared when the run ends. /data is read-only. One run per store at a time.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "/results/spatialdata.zarr",
+			"required": true
+		},
+		{
+			"id": "LHPzBqMentr1EzwJ",
+			"category": "97KZifbm0oTS8NTd",
+			"name": "List of paths to samples",
+			"description": "Xenium or Atera bundles (folders, .zip, .tar.gz), SpatialData .zarr folders or .zarr.zip, folders holding any of them, or globs; separated by commas, semicolons or new lines. EX: /data/xenium_runs, /data/extra/sample_outs.zip",
+			"help_text": "Your data assets appear under /data/<mount name>. Folders and archives are searched for samples, and Xenium, Atera and SpatialData samples can be mixed; anything that isn't a sample is left out with one warning. Every sample is checked before anything is written: a sample missing its count matrix or cell positions, or samples of different species (one store holds one species), stop the run. Sample IDs come from the folder or archive name (without _outs), or a SpatialData's sample_id column. Samples already in the store are skipped.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "/data/samples"
+		},
+		{
+			"id": "wJuj2jYRPaEJQRcu",
+			"category": "MUfvt6jYICmRxDn2",
+			"name": "Custom CellTypist model (.pkl, optional)",
+			"description": "A CellTypist model trained for your gene panel, with the same species and gene symbols as your samples; its labels are added to every new sample. Empty = no labels. EX: /data/models/my_panel_model.pkl",
+			"help_text": "The run stops before writing anything when the model shares too few genes with a sample's panel. The file name (without .pkl) names the label columns, and a store keeps the model it was built with, so use the same file for every run into one store.",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^(.+\\.[pP][kK][lL]\\s*)?$"
+		}
+	]
+}
