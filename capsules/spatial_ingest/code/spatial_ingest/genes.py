@@ -1,5 +1,5 @@
-"""Gene panels: every table is indexed by gene symbol with Gene Expression features only (spec §3S.4),
-and later samples are fitted to the joint table's genes."""
+"""Gene panels: every table is indexed by gene symbol with Gene Expression features only (spec §3S.4);
+panel comparisons and count checks. (The joint table takes the union of panels: see joint.py.)"""
 from __future__ import annotations
 
 import re

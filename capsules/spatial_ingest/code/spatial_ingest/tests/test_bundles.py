@@ -26,9 +26,8 @@ def built(tmp_path_factory):
            "WRITE_CPUS": "2", "N_JOBS": "2"}
     store = tmp / "store.zarr"
     xenium = f"{bundle('Xenium_V1_Human_Ovary_tiny', zipped=True)}, {bundle('Xenium_V1_human_Breast_2fov')}"
-    first = main.run(config.load_settings([str(store), "Xenium bundle (folder or .zip)", xenium], env))
-    second = main.run(config.load_settings([str(store), "Atera bundle (folder or .zip)",
-                                            str(bundle("tiny_atera_dataset", zipped=True))], env))
+    first = main.run(config.load_settings([str(store), xenium], env))
+    second = main.run(config.load_settings([str(store), str(bundle("tiny_atera_dataset", zipped=True))], env))
     return store, env, first, second
 
 
@@ -45,6 +44,9 @@ def test_xenium_and_atera_bundles_into_one_store(built):
     assert back["tables"]["Xenium_V1_human_Breast_2fov_table"] == [7275, 280]
     assert back["tables"]["tiny_atera_dataset_table"] == [13, 53]
     assert back["tables"]["table"][0] == 632 + 7275 + 13
+    panels = [set(read_elem(zarr.open_group(store / "tables" / f"{sid}_table" / "var", mode="r")).index) for sid in sids]
+    assert back["tables"]["table"][1] == len(set().union(*panels))
+    assert second["kinds"] == {"tiny_atera_dataset": "atera"} and first["kinds"]["Xenium_V1_human_Breast_2fov"] == "xenium"
     assert not (Path(built[1]["SCRATCH_DIR"]) / "extract" / "tiny_atera_dataset").exists()
 
 
@@ -52,7 +54,7 @@ def test_every_table_is_symbol_indexed_gene_expression(built):
     store = built[0]
     for name in ("Xenium_V1_human_Breast_2fov_table", "tiny_atera_dataset_table", "table"):
         var = read_elem(zarr.open_group(store / "tables" / name / "var", mode="r"))
-        assert list(var.columns) == ["gene_ids", "feature_types"] and (var["feature_types"] == "Gene Expression").all()
+        assert list(var.columns)[:2] == ["gene_ids", "feature_types"] and (var["feature_types"] == "Gene Expression").all()
         assert not var.index.str.startswith("ENSG").any() and var.index.is_unique
     atera = read_elem(zarr.open_group(store / "tables" / "tiny_atera_dataset_table" / "var", mode="r"))
     assert "ATOX1" in atera.index and atera.loc["ATOX1", "gene_ids"] == "ENSG00000177556"
@@ -63,11 +65,10 @@ def test_rerun_is_byte_identical_and_mouse_is_refused(built):
 
     store, env, _, _ = built
     before = snapshot(store)
-    again = main.run(config.load_settings([str(store), "xenium", str(bundle("Xenium_V1_human_Breast_2fov"))], env))
+    again = main.run(config.load_settings([str(store), str(bundle("Xenium_V1_human_Breast_2fov"))], env))
     assert again["appended_samples"] == [] and snapshot(store) == before
-    with pytest.raises(main.IngestError, match="mouse panel"):
-        main.run(config.load_settings([str(store), "xenium", str(bundle("Xenium_Prime_Mouse_Ileum_tiny", zipped=True))],
-                                      env))
+    with pytest.raises(main.IngestError, match=r"Xenium_Prime_Mouse_Ileum_tiny \(mouse\); the store holds human genes"):
+        main.run(config.load_settings([str(store), str(bundle("Xenium_Prime_Mouse_Ileum_tiny", zipped=True))], env))
     assert snapshot(store) == before
 
 

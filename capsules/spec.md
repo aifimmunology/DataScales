@@ -240,6 +240,13 @@ The capsule is in `capsules/spatial_ingest/`; its `code/README.md` documents it 
   - an S3 round trip under moto, with the root `zarr.json` uploaded last and a no-op rerun uploading nothing;
   - the real tiny bundles (Xenium Breast/Ovary/Mouse Ileum, Atera) and their read-back;
   - the joint table into `anndata_ingest`'s existing mode.
+- **Robustness rework (user decisions 2026-11-13, after 260 test cases on 83 public datasets):**
+  - **No Input type:** the panel is Storage Location, List of paths to samples, Custom CellTypist `.pkl`. Each sample's kind (Xenium, Atera, SpatialData) is detected from its files; kinds mix in one run. Older 4-value calls and `INPUT_TYPE` are accepted, the input type ignored (INFO). `~` expanded, `.pkl` any case.
+  - **Discovery** (`discover.py`): archives (`.zip`, `.tar(.gz)`, `.tgz`) listed, not extracted; every bundle root at any depth is a sample; per-file prefixes (10x downloads, GEO `GSM…_`, `MB263-`) grouped one sample per prefix; GEO per-file `.gz` decompressed to scratch on demand (`stage.py`); old SpatialData layouts and `.zarr.zip`; junk ignored silently; anything else left out with one warning.
+  - **Precheck** (`precheck.py`) before any write: every bundle's inventory (essential: count matrix; cells table with IDs + x/y matching the matrix), every SpatialData split, species, duplicate IDs, CellTypist overlap (refuse below max(10, 5% of the model's genes), warn below 50%). Any problem stops the run with one message listing every sample's problem; optional parts missing are one warning line per sample.
+  - **Joint table = union** of genes and obs columns (supersedes §3S.1 "first sample's genes"): new genes extend var at the end; `var["n_samples_measured"]` and `uns/spatial_ingest/measured_genes/<sid>` tell measured zeros from filled ones; differing panels get one strong warning in the precheck.
+  - **Out-of-core:** count matrices streamed to CSR zarr on scratch and processed in row chunks (QC, labels, fingerprint, joint append). Resource class: 64 GB ("large").
+  - **Logging** (`logs.py`): library noise silenced at its source; a clean run logs no WARNING line. celltypist is imported inside `warnings.catch_warnings()` (it disables UserWarning/FutureWarning/RuntimeWarning globally on import).
 
 ### 3S.1 Decisions (user, 2026-11-05)
 - **Store:** always a plain SpatialData `.zarr`, never icechunk (§3S.2). The Storage Location is a local path (written or grown in place) or an `s3://` prefix (copied to `/scratch`, grown there, synced back; §3S.6).

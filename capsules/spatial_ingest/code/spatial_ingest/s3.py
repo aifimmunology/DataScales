@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 PART_SIZE = 8 * 1024 * 1024
 ROOT_META = "zarr.json"
+POOL_MIN = 32
 
 
 class S3Error(RuntimeError):
@@ -26,9 +27,18 @@ def split(url: str) -> tuple[str, str]:
 
 
 def client():
-    import boto3
+    """An S3 client whose connection pool fits the parallel transfers (S3_WORKERS, each using up to two
+    connections), so urllib3 never drops connections with "Connection pool is full" warnings."""
+    import os
 
-    return boto3.client("s3")
+    import boto3
+    from botocore.config import Config
+
+    try:
+        workers = int(os.environ.get("S3_WORKERS", "16"))
+    except ValueError:
+        workers = 16
+    return boto3.client("s3", config=Config(max_pool_connections=max(POOL_MIN, 2 * workers)))
 
 
 def transfer_config():

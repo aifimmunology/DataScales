@@ -1,22 +1,27 @@
-"""One sample, read and made ready for the store: elements renamed into the sample's coordinate system,
-and its own table, symbol-indexed, with QC metrics and optional CellTypist labels (spec §3S.4, §3S.8)."""
+"""One sample made ready for the store (spec §3S.4, §3S.8): its elements renamed into the sample's own
+coordinate system, and its per-sample table written as a complete AnnData zarr group on scratch, a row
+band at a time — X (CSR raw counts, symbol-indexed Gene Expression var), obs (source columns + `sample_id`
++ QC metrics + optional CellTypist labels), `uns/spatial_ingest` (model, source, fingerprint, genes in
+panel) and the spatialdata table attributes annotating the renamed regions. The count matrix is never
+held whole: QC, labels and the fingerprint are computed band by band."""
 from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+import shutil
 from pathlib import Path
 
-import anndata as ad
-import dask.array as da
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import zarr
+from anndata.io import read_elem, write_elem
 
 import annotate
 import existing
-import genes
 import layout
+import matrix
+from contracts import Loaded, Prepared, Sample
 
 logger = logging.getLogger(__name__)
 
@@ -24,70 +29,13 @@ BUNDLE_REGION = "cell_boundaries"
 BUNDLE_REGION_KEY = "region"
 BUNDLE_INSTANCE_KEY = "cell_id"
 RECORD = "spatial_ingest"
+TABLE_ATTRS = {"spatialdata-encoding-type": "ngff:regions_table", "version": "0.2"}
+LABEL_ROWS = 10_000            # cells per CellTypist call (it densifies the model's genes)
+FINGERPRINT_CHUNK = 1 << 24
 
 
 class SampleError(ValueError):
     """A sample that can't be added as it is."""
-
-
-@dataclass
-class Loaded:
-    """A sample as read: elements by kind and name, its table, and how the table annotates them."""
-    elements: dict[str, dict[str, object]]
-    table: ad.AnnData
-    regions: list[str]
-    region_key: str | None
-    instance_key: str | None
-    tags: tuple[str, ...] = ()
-
-
-def read_bundle(kind: str, folder: Path, n_jobs: int) -> Loaded:
-    """A Xenium or Atera bundle; its table is re-pointed at `cell_boundaries` by `cell_id`, which both
-    readers use as the shapes' index."""
-    if kind == "xenium":
-        from spatialdata_io import xenium
-
-        sdata = xenium(folder, n_jobs=n_jobs)
-    else:
-        from vendor.atera import atera
-
-        sdata = atera(folder, morphology_3d_images=(folder / "morphology_3d").is_dir(), transcripts=True)
-    if BUNDLE_REGION not in sdata.shapes or "table" not in sdata.tables:
-        raise SampleError(f"{folder}: the reader found no {BUNDLE_REGION} or no cell table.")
-    elements = {k: dict(getattr(sdata, k)) for k in existing.ELEMENT_KINDS}
-    table = sdata.tables["table"]
-    table.obs[BUNDLE_REGION_KEY] = BUNDLE_REGION
-    return Loaded(elements, table, [BUNDLE_REGION], BUNDLE_REGION_KEY, BUNDLE_INSTANCE_KEY)
-
-
-def read_part(path: Path, part: existing.Part) -> Loaded:
-    """One sample of an existing SpatialData, read lazily: only its elements and its table rows."""
-    import spatialdata as sd
-
-    sdata = sd.read_zarr(path, selection=existing.ELEMENT_KINDS)
-    elements: dict[str, dict[str, object]] = {k: {} for k in existing.ELEMENT_KINDS}
-    for kind, name in part.elements:
-        elements[kind][name] = getattr(sdata, kind)[name]
-    table = existing.read_table(path, part)
-    attrs = table.uns.pop("spatialdata_attrs", {}) if part.regions else {}
-    return Loaded(elements, table, list(part.regions), attrs.get("region_key"), attrs.get("instance_key"), part.tags)
-
-
-def counts(table: ad.AnnData, sid: str) -> sp.csr_matrix:
-    """The table's raw counts as CSR: X, or `layers["counts"]` when X isn't counts."""
-    for source in ("X", "counts"):
-        x = table.X if source == "X" else table.layers.get("counts")
-        if x is None:
-            continue
-        if isinstance(x, da.Array):
-            x = x.compute()
-        x = x.tocsr() if sp.issparse(x) else sp.csr_matrix(np.asarray(x))
-        if genes.holds_counts(x):
-            if source == "counts":
-                logger.info("%s: X isn't raw counts; using layers['counts']", sid)
-            return x
-    raise SampleError(f"{sid}: X holds non-count values and there is no layers['counts']; the joint table takes "
-                      "raw counts only.")
 
 
 def renamed(elements: dict[str, dict[str, object]], sid: str, tags: tuple[str, ...]) -> dict[str, dict[str, object]]:
@@ -108,53 +56,148 @@ def renamed(elements: dict[str, dict[str, object]], sid: str, tags: tuple[str, .
     return out
 
 
-def fingerprint(table: ad.AnnData) -> str:
-    """Identifies a sample's cells whatever its name: its exact counts (CSR) and cell IDs."""
-    ids = table.obs["cell_id"].astype(str) if "cell_id" in table.obs else pd.Series(table.obs_names)
-    x = sp.csr_matrix(table.X)
-    digest = hashlib.sha256(f"{table.n_obs}:{table.n_vars}".encode())
-    for part in (x.indptr.astype(np.int64), x.indices.astype(np.int64), x.data.astype(np.float64)):
-        digest.update(np.ascontiguousarray(part).tobytes())
-    digest.update("\n".join(ids).encode())
-    return digest.hexdigest()
+class Fingerprint:
+    """sha256 over "n_obs:n_vars", indptr (int64), indices (int64), data (float64) and the "\\n"-joined cell
+    IDs — the same value as the in-memory fingerprint of earlier versions, fed band by band (indices while
+    writing, data from the written array afterwards), so it doesn't depend on how the rows are chunked."""
+
+    def __init__(self, n_obs: int, n_vars: int, indptr: np.ndarray):
+        self.digest = hashlib.sha256(f"{n_obs}:{n_vars}".encode())
+        self.digest.update(np.ascontiguousarray(indptr, dtype=np.int64).tobytes())
+
+    def indices(self, band: sp.csr_matrix) -> None:
+        self.digest.update(np.ascontiguousarray(band.indices, dtype=np.int64).tobytes())
+
+    def finish(self, data, ids: pd.Series) -> str:
+        for a in range(0, data.shape[0], FINGERPRINT_CHUNK):
+            self.digest.update(np.ascontiguousarray(data[a:a + FINGERPRINT_CHUNK], dtype=np.float64).tobytes())
+        self.digest.update("\n".join(ids.astype(str)).encode())
+        return self.digest.hexdigest()
 
 
-def build_table(loaded: Loaded, sid: str, model: Path | None, source: str) -> ad.AnnData:
-    """The per-sample table: Gene Expression counts on symbols, the source's obs, obsm and obsp, plus
-    `sample_id`, QC metrics and CellTypist labels, annotating the renamed regions."""
-    from spatialdata.models import TableModel
+def cell_ids(obs: pd.DataFrame) -> pd.Series:
+    return obs["cell_id"].astype(str) if "cell_id" in obs else pd.Series(obs.index.astype(str), index=obs.index)
 
-    table = loaded.table
-    x = counts(table, sid)
-    keep, var = genes.symbol_var(table.var, sid)
-    dropped = [k for k in ("layers", "varm") if len(getattr(table, k))]
-    if dropped:
-        logger.info("%s: %s left out of the per-sample table (gene-indexed for the source's features)",
-                    sid, " and ".join(dropped))
-    uns = {k: v for k, v in table.uns.items() if k not in ("spatialdata_attrs", RECORD)}
-    out = ad.AnnData(x[:, keep], obs=table.obs.copy(), var=var, obsm=dict(table.obsm), obsp=dict(table.obsp), uns=uns)
-    out.uns[RECORD] = {"celltypist_model": model.stem if model else "", "source": source, "fingerprint": fingerprint(out)}
-    if out.obs.index.name in out.obs.columns:
-        out.obs.index.name = None
-    out.obs["sample_id"] = pd.Categorical([sid] * out.n_obs)
-    qc = annotate.qc_metrics(out)
-    out.obs = out.obs.drop(columns=[c for c in qc.columns if c in out.obs]).join(qc)
+
+def fingerprint_of(group_path: Path, obs: pd.DataFrame) -> str:
+    """The fingerprint of a CSR AnnData zarr (or its X) holding these cells, read band by band."""
+    n_obs, n_vars = matrix.shape(group_path)
+    fp = Fingerprint(n_obs, n_vars, matrix.read_indptr(group_path))
+    for _, band in matrix.iter_rows(group_path):
+        fp.indices(band)
+    return fp.finish(matrix.x_node(group_path)["data"], cell_ids(obs))
+
+
+def _source_obs(obs: pd.DataFrame, sid: str) -> pd.DataFrame:
+    obs = obs.copy()
+    if obs.index.name in obs.columns:          # a column named like the index: anndata refuses to write it
+        obs.index.name = None
+    obs.index = pd.Index(obs.index.astype(str))
+    obs["sample_id"] = pd.Categorical([sid] * len(obs))
+    return obs
+
+
+def _annotations(band: sp.csr_matrix, obs: pd.DataFrame, var: pd.DataFrame, model: Path | None) -> pd.DataFrame:
+    """QC metrics (and CellTypist labels) of one row band; every cell is independent."""
+    import anndata as ad
+
+    chunk = ad.AnnData(band, obs=pd.DataFrame(index=obs.index), var=pd.DataFrame(index=var.index))
+    parts = [annotate.qc_metrics(chunk)]
     if model is not None:
-        labels = annotate.celltypist_labels(out, model)
-        out.obs = out.obs.drop(columns=[c for c in labels.columns if c in out.obs]).join(labels)
-    if not loaded.regions:
-        return TableModel.parse(out)
+        labels = [annotate.celltypist_labels(chunk[a:a + LABEL_ROWS].copy(), model)
+                  for a in range(0, chunk.n_obs, LABEL_ROWS)]
+        parts.append(pd.concat(labels))
+    return pd.concat(parts, axis=1)
+
+
+def _categorical(frame: pd.DataFrame) -> pd.DataFrame:
+    for col in frame.columns:
+        if frame[col].dtype == object or isinstance(frame[col].dtype, pd.CategoricalDtype) \
+                or pd.api.types.is_string_dtype(frame[col]):
+            frame[col] = pd.Categorical(frame[col].astype(str))
+    return frame
+
+
+def _regions(loaded: Loaded, sid: str, obs: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     regions = {r: layout.element_name(r, sid, loaded.tags) for r in loaded.regions}
-    out.obs[loaded.region_key] = pd.Categorical(out.obs[loaded.region_key].astype(str).map(regions))
-    region = list(regions.values())
-    return TableModel.parse(out, region=region[0] if len(region) == 1 else region,
-                            region_key=loaded.region_key, instance_key=loaded.instance_key)
+    if loaded.region_key and regions:
+        if loaded.region_key in obs:
+            obs[loaded.region_key] = pd.Categorical(obs[loaded.region_key].astype(str).map(regions))
+        else:
+            obs[loaded.region_key] = pd.Categorical([next(iter(regions.values()))] * len(obs))
+        if obs[loaded.region_key].isna().any():
+            raise SampleError(f"{sid}: some cells annotate a region that isn't one of {list(regions)}.")
+    return obs, list(regions.values())
 
 
-def build(loaded: Loaded, sid: str, model: Path | None, source: str):
-    """The sample as a SpatialData holding only its renamed elements and its table `<sid>_table`."""
-    from spatialdata import SpatialData
+def _new_table_group(path: Path) -> zarr.Group:
+    shutil.rmtree(path, ignore_errors=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    group = zarr.open_group(str(path), mode="w", zarr_format=3)
+    group.attrs.update({"encoding-type": "anndata", "encoding-version": "0.1.0"})
+    return group
 
-    table = build_table(loaded, sid, model, source)
+
+def _check_counts(band: sp.csr_matrix, sid: str) -> None:
+    if band.nnz and (band.data.min() < 0 or np.any(np.mod(band.data, 1))):
+        raise SampleError(f"{sid}: the table holds non-count values (negative or fractional); the store takes "
+                          "raw counts only.")
+
+
+def prepare(loaded: Loaded, sample: Sample, model: Path | None, scratch: Path) -> Prepared:
+    """The sample ready to install (see the module docstring); the table goes to
+    `scratch/prepared/<sid>/<sid>_table`."""
+    sid = sample.sid
+    source = loaded.table
+    src = zarr.open_group(str(source.path), mode="r")
+    var = read_elem(src["var"])
+    obsm = dict(read_elem(src["obsm"])) if "obsm" in src else {}
+    obs = _source_obs(source.obs, sid)
+    n_obs, n_vars = matrix.shape(source.path)
+    if len(obs) != n_obs:
+        raise SampleError(f"{sid}: obs has {len(obs)} rows but the count table {n_obs}.")
+    renames = existing.safe_names(list(obs.columns))       # cell_ID beside cell_id, invalid characters
+    if renames:
+        logger.info("%s: obs columns renamed so spatialdata can read the table: %s", sid,
+                    ", ".join(f"{a} -> {b}" for a, b in renames.items()))
+        obs = obs.rename(columns=renames)
+        loaded.region_key = renames.get(loaded.region_key, loaded.region_key)
+        loaded.instance_key = renames.get(loaded.instance_key, loaded.instance_key)
+    obs, regions = _regions(loaded, sid, obs)
+
+    out = scratch / "prepared" / sid / layout.table_name(sid)
+    group = _new_table_group(out)
+    writer = matrix.CSRWriter(group, n_vars, matrix.x_node(source.path)["data"].dtype)
+    fp = Fingerprint(n_obs, n_vars, matrix.read_indptr(source.path))
+    annotations = []
+    for start, band in matrix.iter_rows(source.path):
+        _check_counts(band, sid)
+        writer.append(band)
+        fp.indices(band)
+        annotations.append(_annotations(band, obs.iloc[start:start + band.shape[0]], var, model))
+    writer.close()
+    fingerprint = fp.finish(group["X"]["data"], cell_ids(obs))
+
+    extra = _categorical(pd.concat(annotations)) if annotations else pd.DataFrame(index=obs.index)
+    extra.index = obs.index
+    obs = obs.drop(columns=[c for c in extra.columns if c in obs]).join(extra)
+    write_elem(group, "obs", obs)
+    write_elem(group, "var", var)
+    write_elem(group, "obsm", {k: np.asarray(v) for k, v in obsm.items()})
+    attrs = {"region": (regions[0] if len(regions) == 1 else regions) if regions else None,
+             "region_key": loaded.region_key if regions else None,
+             "instance_key": loaded.instance_key if regions else None}
+    uns = {RECORD: {"celltypist_model": model.stem if model else "", "source": str(sample.candidate.origin),
+                    "fingerprint": fingerprint, "genes_in_panel": int(n_vars)}}
+    if regions:
+        uns["spatialdata_attrs"] = dict(attrs)
+    write_elem(group, "uns", uns)
+    group.attrs.update({**TABLE_ATTRS, **attrs})
+
+    label = f"{model.stem}_label" if model else None
+    stats = {"n_cells": int(n_obs), "genes_in_panel": int(n_vars),
+             "mean_genes": float(obs["n_genes_by_counts"].mean()) if n_obs else 0.0,
+             "mean_total_counts": float(obs["total_counts"].mean()) if n_obs else 0.0,
+             "n_celltypist_labels": int(obs[label].nunique()) if label and label in obs else 0}
     elements = renamed(loaded.elements, sid, loaded.tags)
-    return SpatialData(**elements, tables={layout.table_name(sid): table})
+    return Prepared(sid, elements, out, obs, var, fingerprint, loaded.region_key, stats)
