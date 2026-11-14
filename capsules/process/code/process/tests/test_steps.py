@@ -70,3 +70,22 @@ def test_the_gpu_libraries_take_our_arguments():
     assert {"rng", "resolution", "key_added", "n_iterations"} <= params(rsc.tl.leiden)
     assert {"rng", "key", "basis", "adjusted_basis", "max_iter_harmony", "theta", "alpha"} <= params(rsc.pp.harmony_integrate)
     assert {"max_epochs", "batch_size", "train_size", "early_stopping", "plan_kwargs"} <= params(scvi.model.SCVI.train)
+
+
+def test_custom_names_never_replace_what_the_pipeline_did_not_write(stores, tmp_path):
+    from config import Config
+
+    group = zarr.open_group(stores["pbmc"], mode="r")
+    assert "sample_id" in group["obs"]
+    steps.check_names(group, Config())  # the defaults replace the notebooks' X_umap / leiden
+    steps.check_names(group, Config(leiden_key="clusters", umap_key="X_umap_b"))
+    with pytest.raises(InputError, match="obs already has sample_id, which this pipeline didn't write"):
+        steps.check_names(group, Config(leiden_key="sample_id", sample_key="other"))
+    import shutil
+
+    copy = tmp_path / "copy.zarr"
+    shutil.copytree(stores["pbmc"], copy)
+    zarr.open_group(copy, mode="r+", use_consolidated=False)["obsm"].create_array("X_mine", shape=(2, 2), dtype="f4")
+    group = zarr.open_group(copy, mode="r", use_consolidated=False)
+    with pytest.raises(InputError, match="obsm already has X_mine, which this pipeline didn't write"):
+        steps.check_names(group, Config(umap_key="X_mine"))

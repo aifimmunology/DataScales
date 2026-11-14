@@ -25,9 +25,9 @@ from pathlib import Path
 
 import fsspec
 import zarr
-from annizarr import AnzError, Repo
+from annizarr import Repo
 
-from store import InputError, Source, free_path, save_commit, save_copy
+from store import BranchMoved, InputError, Source, access_hint, free_path, is_access_error, save_commit, save_copy
 
 FORMATS = ("auto", "zarr", "icechunk")
 MARKER = ".process-writing"
@@ -56,14 +56,30 @@ def is_remote(location: str) -> bool:
 
 def detect(location: str) -> tuple[str, str]:
     """(kind, marker): kind is "missing", "zarr", "icechunk" or "other"; marker is the .process-writing content."""
+    try:
+        return _detect(location)
+    except OutputError:
+        raise
+    except Exception as exc:
+        if is_remote(location) and is_access_error(exc):
+            raise OutputError(access_hint(location, writing=True)) from None
+        raise
+
+
+def _detect(location: str) -> tuple[str, str]:
     fs, path = fsspec.core.url_to_fs(location)
     fs.invalidate_cache()  # s3fs answers exists() from listings cached hours ago, at plan time
-    marker = fs.cat_file(f"{path}/{MARKER}").decode().strip() if fs.exists(f"{path}/{MARKER}") else ""
+    try:
+        marker = fs.cat_file(f"{path}/{MARKER}").decode().strip()
+    except FileNotFoundError:
+        marker = ""
     try:
         if Repo.exists(location):
             return "icechunk", marker
     except Exception as exc:
         if is_remote(location):
+            if is_access_error(exc):
+                raise OutputError(access_hint(location, writing=True)) from None
             raise OutputError(f"can't check {location} ({type(exc).__name__}: {exc})") from None
     if not fs.exists(path) or not fs.ls(path, detail=False):
         return "missing", marker
@@ -72,10 +88,28 @@ def detect(location: str) -> tuple[str, str]:
     return ("zarr" if fs.exists(f"{path}/zarr.json") or fs.exists(f"{path}/.zgroup") else "other"), marker
 
 
+def probe_write(location: str) -> None:
+    """Remote locations only: put and delete one empty object, so missing write or delete permission stops the run
+    now, before the GPU work, instead of after it. The store's own marker needs both."""
+    if not is_remote(location):
+        return
+    fs, path = fsspec.core.url_to_fs(location)
+    probe = f"{path}/.process-write-check"
+    try:
+        fs.pipe_file(probe, b"")
+        fs.rm_file(probe)
+    except Exception as exc:
+        if is_access_error(exc):
+            raise OutputError(access_hint(location, writing=True)) from None
+        raise OutputError(f"can't write to {location} ({type(exc).__name__}: {exc})") from None
+
+
 def input_kind(path: str) -> str:
     try:
         return "icechunk" if Repo.exists(path) else "zarr"
-    except Exception:
+    except Exception as exc:
+        if is_remote(path) and is_access_error(exc):
+            raise InputError(access_hint(path, writing=False)) from None
         return "zarr"
 
 
@@ -99,7 +133,7 @@ def plan(cfg) -> Destination:
     kind, marker = detect(location)
     if marker == "new":
         raise OutputError(f"external location {location} was left half-written by an earlier run "
-                          f"({MARKER} is still there); delete it, or pick another location")
+                          f"(a file named {MARKER} is still there); delete that store, or pick another location")
     if kind == "other":
         raise OutputError(f"external location {location} holds something that isn't a zarr or an icechunk repo")
     if kind != "missing" and wanted != "auto" and wanted != kind:
@@ -110,6 +144,7 @@ def plan(cfg) -> Destination:
         parent = next(p for p in Path(location).absolute().parents if p.exists()) if kind == "missing" else Path(location)
         if not os.access(parent, os.W_OK):
             raise OutputError(f"external location {location} can't be written ({parent} is read-only)")
+    probe_write(location)
     if source_kind == "icechunk":
         if kind != "icechunk":
             found = "nothing there" if kind == "missing" else "a zarr there"
@@ -129,6 +164,8 @@ def _check_same_repo(input_path: str, location: str, branch: str) -> None:
     try:
         external = {s.id for s in Repo(location, branch=branch).log()}
     except Exception as exc:
+        if is_remote(location) and is_access_error(exc):
+            raise OutputError(access_hint(location, writing=True)) from None
         raise OutputError(f"can't use branch {branch} of the external repo {location} ({type(exc).__name__}: {exc})") from None
     try:
         tip = Repo(input_path, branch=branch).log()[0].id
@@ -137,8 +174,8 @@ def _check_same_repo(input_path: str, location: str, branch: str) -> None:
     if tip == FIRST_COMMIT:
         raise OutputError(f"the input's branch {branch} has no commits with data, so it can't be matched to {location}")
     if tip not in external:
-        raise OutputError(f"the external repo {location} doesn't hold the input's snapshot {tip[:12]} on {branch}: "
-                          f"it's another repo, check the location for a typo")
+        raise OutputError(f"the repo at {location} is not the one the input comes from (its latest version on {branch} "
+                          f"differs): check the location for a typo")
 
 
 def check(dest: Destination, src: Source) -> None:
@@ -179,8 +216,15 @@ def save(dest: Destination, src: Source, write_results, message: str, branch: st
     """Write the results; a failure is one line (OutputError), the destination left as the error says."""
     try:
         return _save(dest, src, write_results, message, branch, metadata)
-    except (RuntimeError, AnzError, OSError) as exc:
-        left = {"commit": "nothing was committed", "in_place": "its results may be partial; a rerun replaces them",
+    except (OutputError, BranchMoved):
+        raise
+    except Exception as exc:
+        if is_remote(dest.location) and is_access_error(exc):
+            raise OutputError(access_hint(dest.location, writing=True)) from None
+        if isinstance(exc, RuntimeError) and BranchMoved.TEXT in str(exc):
+            raise BranchMoved(f"branch {branch} got a new commit while this run was computing, so the results no longer "
+                              "match its data; nothing was saved. Rerun to start from the latest version.") from None
+        left = {"commit": "nothing was saved", "in_place": "its results may be partial; a rerun replaces them",
                 "new": "it's marked half-written" if is_remote(dest.location) else "nothing was left there",
                 "copy": "nothing was left there"}[dest.mode]
         raise OutputError(f"writing to {dest.location} failed, {left} ({type(exc).__name__}: {exc})") from None
@@ -190,7 +234,7 @@ def _save(dest: Destination, src: Source, write_results, message: str, branch: s
     """Write the results; the destination is checked again first, since a run can take hours."""
     if dest.mode == "commit":
         snapshot = save_commit(src.repo, branch, src.snapshot, src.table, write_results, message, metadata)
-        return f"committed {snapshot} on {branch} at {dest.location}"
+        return f"saved as a new version ({snapshot}) on branch {branch} at {dest.location}"
     if dest.mode in ("new", "in_place"):
         kind, marker = detect(dest.location)
         if kind != ("missing" if dest.mode == "new" else "zarr") or marker == "new":
@@ -215,7 +259,7 @@ def _save(dest: Destination, src: Source, write_results, message: str, branch: s
     else:
         out = dest.location
     snapshot = _with_marker(out, "new", lambda: build(out)) if is_remote(out) else _local(out, build)
-    return f"saved to {out}" if dest.kind == "zarr" else f"committed {snapshot} on {branch} of a new repo at {out}"
+    return f"saved to {out}" if dest.kind == "zarr" else f"saved as a new version ({snapshot}) on branch {branch} of a new repo at {out}"
 
 
 def _local(out: str, build):

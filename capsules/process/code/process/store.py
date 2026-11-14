@@ -23,12 +23,54 @@ import zarr
 from anndata.io import write_elem
 from annizarr import Repo
 
-PROCESS_OBSM = ("X_pca", "X_pca_harmony", "X_scVI", "X_umap")
-LEIDEN_COLUMN = re.compile(r"^leiden(_[0-9.eE+-]+)?$")
+from config import EMBEDDING_KEYS, LEIDEN_DEFAULT
+
+EMBEDDINGS = EMBEDDING_KEYS  # obsm keys a run replaces or removes, besides its UMAP
+ACCESS_WORDS = ("403", "forbidden", "access denied", "accessdenied", "credentials", "not authorized", "unauthorized")
+
+
+def leiden_pattern(base: str = LEIDEN_DEFAULT) -> re.Pattern:
+    """The columns a run with leiden_key `base` owns: <base> and <base>_<resolution>."""
+    return re.compile(rf"^{re.escape(base)}(_[0-9.eE+-]+)?$")
+
+
+LEIDEN_COLUMN = leiden_pattern()
 
 
 class InputError(RuntimeError):
     pass
+
+
+class BranchMoved(InputError):
+    """Someone committed on the icechunk branch while the run was computing, so the results no longer match it.
+
+    save_commit is the notebooks' helper word for word and raises a plain RuntimeError; outputs.save turns it into this.
+    """
+
+    TEXT = "moved since the store was opened"
+
+
+def is_access_error(exc: BaseException) -> bool:
+    """A 403 / missing credentials from S3 (s3fs, botocore and icechunk word it differently)."""
+    seen, todo = set(), [exc]
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        code = str(getattr(e, "response", {}).get("Error", {}).get("Code", "")) if isinstance(getattr(e, "response", None), dict) else ""
+        if (isinstance(e, PermissionError) or code in ("403", "AccessDenied", "InvalidAccessKeyId")
+                or any(w in f"{type(e).__name__} {e}".lower() for w in ACCESS_WORDS)):
+            return True
+        todo += [e.__cause__, e.__context__]
+    return False
+
+
+def access_hint(location: str, writing: bool) -> str:
+    """One line for a refused S3 access, saying what to attach."""
+    need = "write" if writing else "read"
+    return (f"no {need} access to {location}: attach an AWS secret with {need} permission for it "
+            "to the capsule (Environment > Secrets > AWS), then run again")
 
 
 @dataclass
@@ -54,6 +96,8 @@ def open_source(path: str, table: str, branch: str, origin: str) -> Source:
         else:
             repo, root, snapshot = None, zarr.open_group(path, mode="r"), "zarr"
     except Exception as exc:
+        if "://" in path and is_access_error(exc):
+            raise InputError(access_hint(path, writing=False)) from None
         raise InputError(f"can't open {path} as an AnnData or SpatialData .zarr or an icechunk repo "
                          f"({type(exc).__name__}: {exc})") from None
     if origin and not repo:
@@ -137,6 +181,7 @@ class Results:
     obsm: dict[str, np.ndarray]
     obs: dict[str, pd.Categorical]
     uns: dict = field(default_factory=dict)
+    leiden_key: str = LEIDEN_DEFAULT  # obs columns named <leiden_key>[_<res>] from an earlier run are dropped
 
     def write(self, group) -> None:
         host = self.lognorm.map_blocks(lambda b: b.get(), dtype=self.lognorm.dtype,
@@ -144,13 +189,13 @@ class Results:
         put(child(group, "layers"), "lognorm", host)
         group["layers/lognorm"].attrs["target_sum"] = self.target_sum
         obsm = child(group, "obsm")
-        for key in PROCESS_OBSM:
+        for key in dict.fromkeys((*EMBEDDINGS, *self.obsm)):
             if key in self.obsm:
                 put(obsm, key, np.ascontiguousarray(self.obsm[key], dtype=np.float32))
             elif key in obsm:
                 del obsm[key]
-        obs = group["obs"]
-        for name in [c for c in obs.attrs["column-order"] if LEIDEN_COLUMN.match(c) and c not in self.obs]:
+        obs, owned = group["obs"], leiden_pattern(self.leiden_key)
+        for name in [c for c in obs.attrs["column-order"] if owned.match(c) and c not in self.obs]:
             drop_column(obs, name)
         for name, values in self.obs.items():
             put_column(obs, name, values)

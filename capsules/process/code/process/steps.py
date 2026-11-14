@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from anndata.io import read_elem
 
-from config import Config
+from config import LEIDEN_DEFAULT, UMAP_DEFAULT, Config
 from store import InputError
 
 
@@ -24,6 +24,19 @@ def read_obs(group, columns: list[str], required: list[str]) -> pd.DataFrame:
         raise InputError(f"obs has no column {', '.join(missing)}; it has {', '.join(obs.attrs['column-order'])}")
     keep = [c for c in dict.fromkeys(columns + required) if c in obs]
     return pd.DataFrame({c: read_elem(obs[c]) for c in keep}, index=read_elem(obs[obs.attrs["_index"]]))
+
+
+def check_names(group, cfg: Config) -> None:
+    """A custom umap_key / leiden_key never replaces something this pipeline didn't write: the store's own earlier
+    run lists its names in uns/process. The defaults keep replacing the notebooks' X_umap and leiden."""
+    prior = read_elem(group["uns/process"]) if "uns/process" in group else {}
+    mine_umap, mine_leiden = {prior.get("umap_key", UMAP_DEFAULT)}, set(dict(prior.get("leiden", {})))
+    if cfg.umap_key != UMAP_DEFAULT and "obsm" in group and cfg.umap_key in group["obsm"] and cfg.umap_key not in mine_umap:
+        raise InputError(f"obsm already has {cfg.umap_key}, which this pipeline didn't write; pick another umap_key")
+    if cfg.leiden_key != LEIDEN_DEFAULT:
+        taken = [c for c in cfg.leiden_keys if c in group["obs"] and c not in mine_leiden]
+        if taken:
+            raise InputError(f"obs already has {', '.join(taken)}, which this pipeline didn't write; pick another leiden_key")
 
 
 def check_batch(obs: pd.DataFrame, keys: list[str]) -> None:

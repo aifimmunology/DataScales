@@ -151,10 +151,10 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 | | SpatialData table (optional) | `table` | `table` | SpatialData: which `tables/<name>` |
 | | Icechunk branch (optional) | `branch` | `main` | Read from, and the results committed on (input repo, its copy, or the external repo) |
 | | Subset column / values (optional) | `subset_column`, `subset_values` | — | Use only cells whose column is one of the values (`SP1, SP2`) |
-| Output: copy in /results (default) | Copy name (optional) | `results_copy` | `<name>.processed` | Name in `/results` (an absolute path goes there instead). Leave empty with an external location |
-| | Copy format | `results_format` | `auto` | `auto` (the input's format), `zarr` or `icechunk` |
-| Output: external location (optional) | External location | `external` | — | `s3://…` or a path; see Outputs below |
-| | External format | `external_format` | `auto` | `auto` (what's there, or zarr if new), `zarr` or `icechunk`; must match an existing store |
+| Output: external location (optional) | External location | `external` | — | `s3://…` or a path; see Outputs below. Writing to S3 needs an AWS secret with write access attached to the capsule |
+| | External format | `external_format` | empty (`auto`) | `auto` (what's there, or zarr if new), `zarr` or `icechunk`; must match an existing store |
+| Output: copy in /results (optional) | Copy name (optional) | `results_copy` | `<name>.processed` | Used when External location is empty (leave both sections empty for the default copy). Name in `/results` (an absolute path goes there instead) |
+| | Copy format (optional) | `results_format` | empty (`auto`) | `auto` (the input's format), `zarr` or `icechunk` |
 | Embedding | Method | `method` | `PCA` | `PCA` or `scVI (train)`, see below |
 | | Batch key | `batch_key` | — | PCA: harmony on it; scVI: the batch (more keys, comma-separated: harmony uses all, scVI uses the rest as covariates). Every cell needs a value |
 | | Highly variable genes | `n_top_genes` | 2000 | |
@@ -162,6 +162,8 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 | Neighbors, UMAP & clustering | Neighbors | `n_neighbors` | 20 | |
 | | UMAP min_dist | `umap_min_dist` | 0.45 | |
 | | Leiden resolutions | `leiden_resolutions` | 1.1 | Comma-separated; one neighbor graph for all; empty means 1.1 |
+| | UMAP name (optional) | `umap_key` | `X_umap` | `obsm` key for the UMAP. A custom name is refused if the store already has it from another source. For scanpy plots with a custom `X_<name>`, use `basis="<name>"` |
+| | Leiden name (optional) | `leiden_key` | `leiden` | `obs` column for the clusters; with several resolutions `<name>_<resolution>`. Refused if the store already has such a column from another source. `leiden` in UMAP colors always means these columns |
 | UMAP plots | UMAP colors | `color_keys` | batch_id, chip_id, AIFI L1 label, leiden | Comma-separated obs columns, one panel each in `umap.png`; `leiden` is the clusters; names the store lacks are skipped |
 
 ### Methods
@@ -204,7 +206,7 @@ One destination per run (`process/outputs.py`), never both:
   cells with no batch value (missing, or `""` as ingest writes it). Pick another key, or a subset without them.
 
 Written: the embedding (`X_pca`, `X_pca_harmony` or `X_scVI`), `obsm/X_umap`, `obs/leiden` (or one
-`obs/leiden_<res>` per resolution when several are given), `var/highly_variable`, `layers/lognorm` (all cells,
+`obs/leiden_<res>` per resolution when several are given; the UMAP and Leiden names can be changed, see the table above), `var/highly_variable`, `layers/lognorm` (all cells,
 `target_sum` attr) and `uns/process` (method, basis, resolutions, subset, every setting, the input and its
 snapshot). With a subset, cells outside it get empty values. Earlier `X_pca`/`X_pca_harmony`/`X_scVI`/`X_umap`
 and `leiden*` results in the store are replaced or removed, so all of them come from one run. Beside it, in
@@ -262,3 +264,10 @@ object or commit holds the results and reads back. It needs a GPU and internet (
 keeps the stores and executed notebooks. The pipeline tests check the settings and the save rules, then run
 `./run` end to end (PCA, harmony, scVI, several resolutions, a subset, an ingest-style store, SpatialData,
 icechunk through its external repo and as a copy, output errors, no input); without a GPU, only the parts that need none run.
+
+## S3 access
+
+Writing to (or reading from) S3 needs an AWS secret attached to the capsule (Environment > Secrets > AWS) with
+the matching permission. A run checks write access to an external S3 location before any GPU work and stops with
+one line saying so. In the messages, an icechunk "version" (snapshot) is one saved state of the repo; saving the
+results adds a new version on the branch.

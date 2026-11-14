@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from config import Config, ConfigError, _cast, load_config
+from config import METHODS, Config, ConfigError, _cast, load_config
 
 PANEL = Path(__file__).resolve().parents[3] / ".codeocean" / "app-panel.json"
 
@@ -49,7 +49,7 @@ def test_method_accepts_the_panel_labels(raw, method):
     (["--n_comps", "many"], "not a valid int"),
     (["--leiden_resolutions", "0.5,high"], "numbers separated by commas"),
     (["--leiden_resolutions", "0"], "positive"),
-    (["--subset_column", "sample_id"], "needs subset_values"),
+    (["--subset_column", "sample_id"], "subset_values is empty"),
     (["--rmm_mode", "ucx"], "rmm_mode must be"),
     (["--plots", "maybe"], "not a valid bool"),
 ])
@@ -94,7 +94,7 @@ def test_panel_matches_config():
     assert len(names) == len(set(names)) and len({p["id"] for p in panel["parameters"]}) == len(names)
     expected = {"input", "table", "branch", "subset_column", "subset_values", "results_copy", "results_format", "external",
                 "external_format", "method", "batch_key", "n_top_genes", "n_comps", "n_neighbors", "umap_min_dist",
-                "leiden_resolutions", "color_keys"}
+                "leiden_resolutions", "umap_key", "leiden_key", "color_keys"}
     assert set(names) == expected
     for p in panel["parameters"]:
         assert p["category"] in categories
@@ -105,9 +105,44 @@ def test_panel_matches_config():
         for option in p.get("extra_data", []):
             _cast(p["param_name"], option)
     assert all("optional" in c["description"].lower() for c in panel["categories"][:1])
-    assert [c["name"].split(":")[0] for c in panel["categories"][:3]] == ["Input data", "Output", "Output"]
-    assert "optional" in panel["categories"][2]["name"].lower()
+    assert [c["name"] for c in panel["categories"][:3]] == [
+        "Input data", "Output: external location (optional)", "Output: copy in /results (optional)"]
+    by_name = {p["param_name"]: p for p in panel["parameters"]}
+    assert not by_name["results_format"].get("default_value") and not by_name["external_format"].get("default_value")
+    assert not by_name["results_copy"].get("default_value") and not by_name["external"].get("default_value")
+    assert [p["param_name"] for p in panel["parameters"]].index("external") < [p["param_name"] for p in panel["parameters"]].index("results_copy")
+    assert {"umap_key", "leiden_key"} <= {p["param_name"] for p in panel["parameters"] if p["category"] == "D4npHhbetnHEohzx"}
     optional = {p["param_name"] for p in panel["parameters"] if "(optional)" in p["name"]}
     assert {"table", "branch", "subset_column", "results_copy", "external"} <= optional
     assert re.fullmatch(next(p["pattern"] for p in panel["parameters"] if p["param_name"] == "leiden_resolutions"),
                         "0.5, 1.0,2")
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["--umap_key", "a/b"], "umap_key may only have letters"),
+    (["--leiden_key", "my clusters"], "leiden_key may only have letters"),
+    (["--umap_key", "X_pca"], "name of the PCA/scVI embedding"),
+    (["--leiden_key", "sample_id"], "would overwrite it"),
+    (["--leiden_key", "chip", "--batch_key", "chip"], "would overwrite it"),
+    (["--n_comps", "1"], "n_comps must be at least 2"),
+    (["--n_neighbors", "0"], "n_neighbors must be at least 2"),
+    (["--n_top_genes", "10"], "n_top_genes must be at least 50"),
+    (["--umap_min_dist", "5"], "between 0 and 1"),
+])
+def test_names_and_ranges_are_checked_before_any_gpu_work(argv, message):
+    with pytest.raises(ConfigError, match=message):
+        load_config(argv, env={})
+
+
+def test_custom_names():
+    c = Config(leiden_key="clusters", umap_key="X_umap_batch")
+    assert c.leiden_keys == {"clusters": 1.1}
+    assert Config(leiden_key="clusters", leiden_resolutions="0.5,1").leiden_keys == {"clusters_0.5": 0.5, "clusters_1.0": 1.0}
+    assert (Config().umap_key, Config().leiden_key) == ("X_umap", "leiden")
+    assert load_config(["--leiden_key", ""], env={}).leiden_key == "leiden"
+
+
+def test_every_method_has_an_embedder_and_an_output_key():
+    import main
+
+    assert set(METHODS.values()) == set(main.EMBEDDERS)

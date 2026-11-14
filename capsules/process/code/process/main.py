@@ -60,6 +60,7 @@ def load(cfg: Config) -> Loaded:
     src = open_source(cfg.input, cfg.table, cfg.branch, dest.location if dest.mode == "commit" else "")
     outputs.check(dest, src)
     group = src.group
+    steps.check_names(group, cfg)
     n_cells, n_genes = group["X"].attrs["shape"]
     keys = cfg.batch_keys + ([cfg.hvg_batch_key] if cfg.hvg_batch_key else [])
     obs = steps.read_obs(group, [cfg.sample_key, *cfg.color_columns], keys + ([cfg.subset_column] if cfg.subset_column else []))
@@ -75,8 +76,25 @@ def load(cfg: Config) -> Loaded:
     return Loaded(src, dest, obs, read_elem(group["var"]), counts, steps.slice_rows(counts, rows), rows, n_cells)
 
 
-def embed(cfg: Config, data: Loaded, gpu, report) -> tuple:
-    """normalize -> HVG -> PCA (+harmony) or scVI; returns the graph AnnData, its basis, lognorm, HVGs and uns."""
+def embed_pca(cfg: Config, data: Loaded, adata, hv, gpu, report) -> tuple:
+    """Scale -> PCA, then harmony when batch keys are given; returns the graph AnnData, its basis and uns."""
+    import anndata as ad
+
+    import steps
+
+    steps.persist_bands(adata, gpu.n_workers)
+    with report.step("scale_pca"):
+        X_pca, variance = steps.scale_pca(adata, cfg)
+    graph = ad.AnnData(obs=data.obs, obsm={"X_pca": X_pca})
+    if not cfg.batch_keys:
+        return graph, "X_pca", {"pca_variance_ratio": variance}
+    with report.step("harmony"):
+        steps.harmony(graph, cfg.batch_keys, cfg)
+    return graph, "X_pca_harmony", {"pca_variance_ratio": variance}
+
+
+def embed_scvi(cfg: Config, data: Loaded, adata, hv, gpu, report) -> tuple:
+    """Gather the HVG counts, close the Dask cluster so torch owns the GPU, train scVI."""
     import anndata as ad
     import numpy as np
     import scipy.sparse as sp
@@ -84,36 +102,32 @@ def embed(cfg: Config, data: Loaded, gpu, report) -> tuple:
     import steps
     from store import free_path
 
-    keys = cfg.batch_keys
+    with report.step("gather_counts"):
+        counts = sp.csr_matrix(data.x[:, hv].compute(), dtype=np.float32)
+    gpu.close()
+    model_dir = free_path(cfg.model_dir.rstrip("/"))
+    with report.step("scvi"):
+        latent = steps.train_scvi(counts, data.obs, data.var.index[hv], cfg.batch_keys, cfg, model_dir)
+    return ad.AnnData(obs=data.obs, obsm={"X_scVI": latent}), "X_scVI", {"scvi_model": model_dir}
+
+
+# method name (the values of config.METHODS) -> the function that makes the embedding. A new method is one
+# function here, its name in config.METHODS and its key in config.EMBEDDING_KEYS.
+EMBEDDERS = {"pca": embed_pca, "scvi": embed_scvi}
+
+
+def embed(cfg: Config, data: Loaded, gpu, report) -> tuple:
+    """normalize -> HVG -> the chosen embedder; returns the graph AnnData, its basis, lognorm, HVGs and uns."""
+    import steps
+
     with report.step("h2d_normalize"):
         adata = steps.lognormalized(data.x, data.obs, data.var, cfg.target_sum)
         lognorm = adata.X if data.rows is None else steps.lognormalized(data.counts, None, None, cfg.target_sum).X
     with report.step("hvg"):
         hv = steps.highly_variable(adata, cfg)
         adata = adata[:, hv].copy()
-        if cfg.method == "pca":
-            steps.persist_bands(adata, gpu.n_workers)
-
-    uns = {}
-    if cfg.method == "pca":
-        with report.step("scale_pca"):
-            X_pca, uns["pca_variance_ratio"] = steps.scale_pca(adata, cfg)
-        del adata
-        graph = ad.AnnData(obs=data.obs, obsm={"X_pca": X_pca})
-        if not keys:
-            return graph, "X_pca", lognorm, hv, uns
-        with report.step("harmony"):
-            steps.harmony(graph, keys, cfg)
-        return graph, "X_pca_harmony", lognorm, hv, uns
-
-    del adata
-    with report.step("gather_counts"):
-        counts = sp.csr_matrix(data.x[:, hv].compute(), dtype=np.float32)
-    gpu.close()
-    uns["scvi_model"] = model_dir = free_path(cfg.model_dir.rstrip("/"))
-    with report.step("scvi"):
-        latent = steps.train_scvi(counts, data.obs, data.var.index[hv], keys, cfg, model_dir)
-    return ad.AnnData(obs=data.obs, obsm={"X_scVI": latent}), "X_scVI", lognorm, hv, uns
+    graph, basis, uns = EMBEDDERS[cfg.method](cfg, data, adata, hv, gpu, report)
+    return graph, basis, lognorm, hv, uns
 
 
 def write(cfg: Config, data: Loaded, graph, basis: str, lognorm, hv, uns: dict) -> str:
@@ -121,16 +135,19 @@ def write(cfg: Config, data: Loaded, graph, basis: str, lognorm, hv, uns: dict) 
 
     import steps
     import outputs
-    from store import PROCESS_OBSM, Results
+    from config import UMAP_DEFAULT
+    from store import EMBEDDINGS, Results
 
     leiden = cfg.leiden_keys
     clusters = ", ".join(f"{k}: {graph.obs[k].nunique()} clusters" for k in leiden)
     results = Results(
         lognorm=lognorm, target_sum=cfg.target_sum, highly_variable=hv,
-        obsm={k: steps.full_rows(v, data.rows, data.n_cells) for k, v in graph.obsm.items() if k in PROCESS_OBSM},
+        obsm={cfg.umap_key if k == UMAP_DEFAULT else k: steps.full_rows(v, data.rows, data.n_cells)
+              for k, v in graph.obsm.items() if k in EMBEDDINGS + (UMAP_DEFAULT,)},
         obs={k: steps.full_column(graph.obs[k], data.rows, data.n_cells) for k in leiden},
+        leiden_key=cfg.leiden_key,
         uns={**uns, "input": cfg.input, "table": data.src.table, "snapshot": data.src.snapshot, "method": cfg.method,
-             "basis": basis, "batch_keys": np.array(cfg.batch_keys, dtype=str), "target_sum": cfg.target_sum,
+             "basis": basis, "umap_key": cfg.umap_key, "batch_keys": np.array(cfg.batch_keys, dtype=str), "target_sum": cfg.target_sum,
              "leiden": dict(leiden), "n_cells": graph.n_obs,
              "subset": {"column": cfg.subset_column, "values": np.array(cfg.subset, dtype=str)},
              "settings": asdict(cfg)},
@@ -158,7 +175,7 @@ def plots(graph, cfg: Config) -> None:
         labels = graph.obs[key]
         summary = pd.crosstab(labels, graph.obs[cfg.sample_key]) if sample else pd.DataFrame(index=labels.cat.categories)
         summary.insert(0, "n_cells", labels.value_counts())
-        summary.to_csv(results / ("cluster_summary.csv" if key == "leiden" else f"cluster_summary_{key}.csv"))
+        summary.to_csv(results / ("cluster_summary.csv" if len(cfg.leiden_keys) == 1 else f"cluster_summary_{key}.csv"))
 
 
 def run(cfg: Config) -> str:
@@ -167,6 +184,7 @@ def run(cfg: Config) -> str:
     from report import Report, header
 
     report, gpu = Report(cfg.sample_interval_s, tuple(cfg.gpu_ids)), GpuCluster(cfg)
+    n_gpus, written = 0, "NOT WRITTEN"
     with report.step("load"):
         data = load(cfg)
     try:
@@ -181,15 +199,19 @@ def run(cfg: Config) -> str:
             steps.umap(graph, cfg)
         with report.step("leiden"):
             steps.leiden(graph, cfg)
+        if cfg.plots:  # before the write, so a failed write still leaves them; a failed plot never blocks the write
+            try:
+                with report.step("plots"):
+                    plots(graph, cfg)
+            except Exception as exc:
+                print(f"warning: plots skipped ({type(exc).__name__}: {exc})")
         with report.step("write"):
             written = write(cfg, data, graph, basis, lognorm, hv, uns)
-        if cfg.plots:
-            with report.step("plots"):
-                plots(graph, cfg)
     finally:
         gpu.close()
+        if report.rows:
+            report.write(Path(cfg.results_dir) / "process_report.txt", header(cfg, n_gpus, written))
     print("\n" + report.table())
-    report.write(Path(cfg.results_dir) / "process_report.txt", header(cfg, n_gpus, written))
     return written
 
 

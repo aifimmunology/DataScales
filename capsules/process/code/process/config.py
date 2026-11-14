@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
@@ -10,6 +11,9 @@ METHODS = {"pca": "pca", "scvi": "scvi", "scvi (train)": "scvi"}
 RMM_MODES = ("managed", "pool", "none")
 PATHS = ("input", "external", "results_dir", "scvi_model_dir")
 FORMATS = ("auto", "zarr", "icechunk")
+EMBEDDING_KEYS = ("X_pca", "X_pca_harmony", "X_scVI")  # obsm keys the pipeline owns besides the UMAP
+UMAP_DEFAULT, LEIDEN_DEFAULT = "X_umap", "leiden"
+NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _BOOLS = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
 
 
@@ -33,7 +37,9 @@ class Config:
     # App Panel: neighbors, UMAP & clustering
     n_neighbors: int = 20
     umap_min_dist: float = 0.45
-    leiden_resolutions: str = "1.1"    # comma-separated; one gives obs/leiden, several give obs/leiden_<res>
+    leiden_resolutions: str = "1.1"    # comma-separated; one gives obs/<leiden_key>, several give obs/<leiden_key>_<res>
+    umap_key: str = UMAP_DEFAULT           # obsm name of the UMAP coordinates
+    leiden_key: str = LEIDEN_DEFAULT         # obs column name (prefix when there are several resolutions)
     # App Panel: UMAP plots
     color_keys: str = "batch_id,chip_id,pbmc_clean_AIFI_L1_2024_label,leiden"  # obs columns; leiden = the clusters
     # App Panel: output (outputs.py), the copy in results_dir or an external location, never both
@@ -101,7 +107,7 @@ class Config:
     @property
     def leiden_keys(self) -> dict[str, float]:
         res = self.resolutions
-        return {"leiden": res[0]} if len(res) == 1 else {f"leiden_{r}": r for r in res}
+        return {self.leiden_key: res[0]} if len(res) == 1 else {f"{self.leiden_key}_{r}": r for r in res}
 
     @property
     def gpu_ids(self) -> list[int]:
@@ -110,6 +116,17 @@ class Config:
     @property
     def model_dir(self) -> str:
         return self.scvi_model_dir or f"{self.results_dir.rstrip('/')}/scvi_model"
+
+    def _validate_names(self) -> None:
+        for name in ("umap_key", "leiden_key"):
+            if not NAME.match(getattr(self, name)):
+                raise ConfigError(f"{name} may only have letters, digits, _ . - (no spaces), got {getattr(self, name)!r}")
+        if self.umap_key in EMBEDDING_KEYS:
+            raise ConfigError(f"umap_key {self.umap_key!r} is already the name of the PCA/scVI embedding; choose another, e.g. X_umap")
+        taken = {self.sample_key, self.subset_column, self.hvg_batch_key, *self.batch_keys}
+        clash = taken & {self.leiden_key, *self.leiden_keys}
+        if clash:
+            raise ConfigError(f"leiden_key {sorted(clash)[0]!r} is also a batch, subset or sample column and would overwrite it; choose another")
 
     def changed(self) -> dict:
         base = Config()
@@ -124,6 +141,13 @@ class Config:
             raise ConfigError(f"leiden_resolutions must be numbers separated by commas, got {self.leiden_resolutions!r}") from None
         if not resolutions or min(resolutions) <= 0:
             raise ConfigError("leiden_resolutions needs at least one positive number")
+        for name, low, high in (("n_top_genes", 50, None), ("n_comps", 2, None), ("n_neighbors", 2, None),
+                                ("umap_min_dist", 0, 1)):
+            value = getattr(self, name)
+            if value < low or (high is not None and value > high):
+                limit = f"at least {low}" if high is None else f"between {low} and {high}"
+                raise ConfigError(f"{name} must be {limit}, got {value}")
+        self._validate_names()
         for name in ("results_format", "external_format"):
             if getattr(self, name) not in FORMATS:
                 raise ConfigError(f"{name} must be one of {', '.join(FORMATS)}, got {getattr(self, name)!r}")
@@ -134,7 +158,7 @@ class Config:
             if "://" in getattr(self, name):
                 raise ConfigError(f"{name} is a local path; for s3:// use external")
         if self.subset_column and not self.subset:
-            raise ConfigError(f"subset_column {self.subset_column!r} needs subset_values")
+            raise ConfigError(f"subset_column {self.subset_column!r} is set but subset_values is empty: add the values to keep, or clear the column")
         return self
 
 

@@ -437,3 +437,30 @@ after; both reviews' findings are fixed and tested.
   `external`, and a zarr input to a new `s3://` location. Also check the panel renders as intended in Code Ocean.
 - §12.6's `-k icechunk_origin_twice` is now `-k icechunk_external_twice`; also `-k icechunk_copy_in_results`
   and `-k output_errors`.
+
+## 14. Panel order, output names, S3 access errors (2026-11-14)
+- **Panel:** Output: external location comes first, then Output: copy in /results, both optional and empty
+  (the two format lists have no default; empty means `auto`). Both empty gives the default copy in /results.
+  Descriptions shortened to what's needed.
+- **`umap_key` / `leiden_key`** (Neighbors, UMAP & clustering): obsm name of the UMAP (default `X_umap`) and obs
+  column of the clusters (default `leiden`; several resolutions give `<name>_<res>`). A custom name is refused
+  (`steps.check_names`, before any GPU work) when the store already has it and `uns/process` doesn't list it as
+  this pipeline's own; the defaults keep replacing the notebooks' `X_umap` / `leiden`. A rerun drops only stale
+  columns of its own `leiden_key`. `leiden` in `color_keys` still means the cluster columns.
+- **S3 without a secret:** the 403 on the first `HeadObject` came from `outputs.detect`, outside any try, so it was
+  a traceback. Access errors now become one line telling the user to attach an AWS secret (`store.is_access_error`
+  / `access_hint`), for the input, the external location's checks, and the final write. A remote external
+  location also gets a put+delete probe in `plan()`, so missing write or delete permission stops before the GPU work.
+- **Why it wasn't caught:** §13.3 listed real S3 as untested; every test ran with full permissions (local paths,
+  `memory://`), and both earlier reviews checked the output rules and typo cases, not what happens when
+  credentials are missing or read-only. "Checked before any GPU work" covered readability and layout, never
+  writability. Tests now deny `pipe_file` / `cat_file` / `rm_file` on `memory://`.
+- `Config.validate` enforces the panel's minimums (n_top_genes 50, n_comps 2, n_neighbors 2, umap_min_dist 0..1).
+- Plots run before the write; a failed plot only warns, and `process_report.txt` is written even if the write fails.
+- **`BranchMoved`** (`store.py`): raised when the icechunk branch got another commit while the run was computing;
+  nothing is saved. `save_commit` stays the notebooks' word-for-word helper (a RuntimeError); `outputs.save`
+  converts it to one clear line.
+- **`EMBEDDERS`** (`main.py`): method name -> function (`embed_pca`, `embed_scvi`); `embed()` does the shared
+  normalize + HVG and looks the method up. A test checks every `config.METHODS` value has an embedder.
+- Open (from the modularity review, not done): one table for output keys, a shim for annizarr's private
+  `copy_group`.

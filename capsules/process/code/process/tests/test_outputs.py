@@ -9,6 +9,7 @@ from annizarr import Repo
 import outputs
 from config import Config, ConfigError, load_config
 from outputs import MARKER, OutputError
+import store
 from store import open_source
 from test_store import check, results
 
@@ -82,7 +83,7 @@ def test_icechunk_input_only_commits_onto_its_own_repo(stores, icechunk, tmp_pat
         with pytest.raises(OutputError, match=f"{message}: check .* for a typo"):
             outputs.plan(cfg(mount, tmp_path, external=str(location)))
     other = Repo.init(stores["ingest_no_sample"], tmp_path / "other_repo")
-    with pytest.raises(OutputError, match="doesn't hold the input's snapshot"):
+    with pytest.raises(OutputError, match="is not the one the input comes from"):
         outputs.plan(cfg(mount, tmp_path, external=other.path))
     with pytest.raises(OutputError, match="can't use branch dev"):
         outputs.plan(cfg(mount, tmp_path, external=str(origin), branch="dev"))
@@ -174,7 +175,7 @@ def test_conversions_in_the_copy(stores, icechunk, adata, tmp_path):
     check(zarr_at(written), adata)
     written, _ = run(cfg(stores["pbmc"], tmp_path, results_format="icechunk", branch="dev"), adata)
     out = written.split(" at ")[1]
-    assert out == f"{tmp_path}/res/pbmc.processed" and " on dev " in written
+    assert out == f"{tmp_path}/res/pbmc.processed" and " on branch dev " in written
     assert Repo(out, branch="dev").log()[0].metadata["source"] == str(stores["pbmc"])
     check(Repo(out, branch="dev").open_zarr("r"), adata)
 
@@ -185,7 +186,7 @@ def test_commit_through_the_external_repo_twice(icechunk, adata, tmp_path):
     n = len(Repo(origin).log())
     for _ in range(2):
         written, _ = run(cfg(mount, tmp_path, external=origin), adata)
-        assert written.startswith("committed") and written.endswith(f"on main at {origin}")
+        assert written.startswith("saved as a new version") and written.endswith(f"on branch main at {origin}")
     log = Repo(origin).log()
     assert len(log) == n + 2 and log[0].metadata["source_snapshot"] == log[1].id and log[0].metadata["method"] == "pca"
     check(Repo(origin).open_zarr("r"), adata)
@@ -201,7 +202,7 @@ def test_branch_moved_writes_nothing(icechunk, adata, tmp_path):
     other = Repo(origin, branch="main")
     other.open_zarr("w").attrs["touched"] = "yes"
     tip = other.commit("moved meanwhile")
-    with pytest.raises(RuntimeError, match="moved since the store was opened"):
+    with pytest.raises(store.BranchMoved, match="got a new commit while this run was computing"):
         outputs.save(dest, src, results(adata).write, "m", "main", {})
     assert Repo(origin).log()[0].id == tip
 
@@ -220,7 +221,7 @@ def test_new_external_zarr_local_and_remote(stores, adata, tmp_path):
 
 def test_new_external_icechunk_from_a_zarr(stores, adata, tmp_path):
     written, _ = run(cfg(stores["pbmc"], tmp_path, external=str(tmp_path / "repo"), external_format="icechunk"), adata)
-    assert written.startswith("committed") and written.endswith(f"of a new repo at {tmp_path}/repo")
+    assert written.startswith("saved as a new version") and written.endswith(f"of a new repo at {tmp_path}/repo")
     assert len(Repo(str(tmp_path / "repo")).log()) == 2
     check(Repo(str(tmp_path / "repo")).open_zarr("r"), adata)
 
@@ -317,7 +318,7 @@ def test_write_failures_are_one_line(icechunk, adata, tmp_path):
     other = Repo(origin, branch="main")
     other.open_zarr("w").attrs["touched"] = "yes"
     other.commit("moved")
-    with pytest.raises(OutputError, match="nothing was committed .*moved since the store was opened"):
+    with pytest.raises(store.BranchMoved, match="nothing was saved"):
         outputs.save(dest, src, results(adata).write, "m", "main", {})
 
 
@@ -325,3 +326,49 @@ def ad_read(group):
     import anndata as ad
 
     return ad.io.read_elem(group)
+
+
+# --- no access to S3: one line saying what to attach, before any GPU work -------------------------------------
+
+def denied(monkeypatch, *methods):
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    def refuse(self, *args, **kwargs):
+        raise PermissionError("An error occurred (403) when calling the HeadObject operation: Forbidden")
+
+    for method in methods:
+        monkeypatch.setattr(MemoryFileSystem, method, refuse)
+
+
+@pytest.mark.parametrize("method", ["pipe_file", "cat_file", "rm_file"])
+def test_remote_without_access_is_an_aws_secret_hint(stores, tmp_path, monkeypatch, method):
+    denied(monkeypatch, method)
+    with pytest.raises(OutputError, match="attach an AWS secret with write permission"):
+        outputs.plan(cfg(stores["pbmc"], tmp_path, external=memory("bucket/denied.zarr")))
+
+
+def test_write_probe_leaves_nothing_behind(stores, tmp_path):
+    remote = memory("bucket/probe.zarr")
+    outputs.plan(cfg(stores["pbmc"], tmp_path, external=remote))
+    assert not fsspec.filesystem("memory").exists("/bucket/probe.zarr/.process-write-check")
+
+
+def test_write_refused_after_the_run_is_the_same_hint(stores, adata, tmp_path, monkeypatch):
+    remote = memory("bucket/late-denied.zarr")
+    c = cfg(stores["pbmc"], tmp_path, external=remote)
+    dest = outputs.plan(c)
+    src = open_source(c.input, c.table, c.branch, "")
+    denied(monkeypatch, "pipe_file")
+    with pytest.raises(OutputError, match="attach an AWS secret with write permission"):
+        outputs.save(dest, src, results(adata).write, "m", c.branch, {})
+
+
+def test_unreadable_remote_input_is_the_read_hint(monkeypatch):
+    import annizarr
+
+    def refuse(path):
+        raise PermissionError("403 Forbidden")
+
+    monkeypatch.setattr(annizarr.Repo, "exists", staticmethod(refuse))
+    with pytest.raises(store.InputError, match="no read access to s3://b/in.zarr: attach an AWS secret with read"):
+        outputs.input_kind("s3://b/in.zarr")

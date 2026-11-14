@@ -52,6 +52,7 @@ def test_input_errors_stop_before_the_cluster(stores, tmp_path):
         ([stores["pbmc"], "--batch_key", "chip"], "error: obs has no column chip; it has sample_id, chip_id, cell_type, pbmc_clean_AIFI_L1_2024_label"),
         ([stores["ingest_no_sample"], "--batch_key", "batch"], 'cells have no batch (missing or "")'),
         ([stores["pbmc"], "--subset_column", "sample_id", "--subset_values", "SP9"], "no cells have sample_id in"),
+        ([stores["pbmc"], "--leiden_key", "cell_type"], "obs already has cell_type, which this pipeline didn't write"),
     ]
     for args, message in cases:
         done = run_pipeline("--input", *args, "--results_dir", tmp_path, check=False)
@@ -160,3 +161,15 @@ def test_output_errors_stop_before_the_cluster(stores, icechunk, tmp_path):
         assert "start_cluster" not in done.stdout and "Traceback" not in done.stderr
     done = run_pipeline("--input", stores["pbmc"], "--external", "s3://b/p", "--results_copy", "x", check=False)
     assert done.returncode == 2 and "leave them empty" in done.stderr
+
+
+@needs_pipeline
+def test_custom_umap_and_leiden_names(stores, tmp_path):
+    run_pipeline("--input", stores["pbmc"], "--umap_key", "X_umap_pbmc", "--leiden_key", "clusters",
+                 "--leiden_resolutions", "0.5,1.0", "--results_dir", tmp_path, *SMALL)
+    out = ad.io.read_elem(zarr.open_group(tmp_path / "pbmc.processed.zarr", mode="r"))
+    assert out.obsm["X_umap_pbmc"].shape == (N_CELLS, 2) and "X_umap" not in out.obsm
+    assert {"clusters_0.5", "clusters_1.0"} <= set(out.obs) and not any(c.startswith("leiden") for c in out.obs)
+    p = out.uns["process"]
+    assert p["umap_key"] == "X_umap_pbmc" and set(p["leiden"]) == {"clusters_0.5", "clusters_1.0"}
+    assert (tmp_path / "umap.png").exists() and (tmp_path / "cluster_summary_clusters_0.5.csv").exists()

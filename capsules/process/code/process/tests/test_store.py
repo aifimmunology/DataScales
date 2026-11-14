@@ -23,7 +23,7 @@ class Gpu(sp.csr_matrix):
         return sp.csr_matrix(self)
 
 
-def results(adata, leiden=("leiden",), obsm=("X_pca", "X_umap")) -> store.Results:
+def results(adata, leiden=("leiden",), obsm=("X_pca", "X_umap"), leiden_key="leiden") -> store.Results:
     x = da.from_array(adata.X.astype(np.float32), chunks=(1000, N_GENES), asarray=False)
     lognorm = x.map_blocks(lambda b: Gpu(b), dtype=np.float32, meta=Gpu((0, 0), dtype=np.float32))
     rng = np.random.default_rng(0)
@@ -31,13 +31,13 @@ def results(adata, leiden=("leiden",), obsm=("X_pca", "X_umap")) -> store.Result
         lognorm=lognorm, target_sum=1e4, highly_variable=np.arange(N_GENES) < 50,
         obsm={k: rng.normal(size=(N_CELLS, 2)) for k in obsm},
         obs={k: pd.Categorical(rng.integers(0, 3, N_CELLS).astype(str)) for k in leiden},
-        uns={"method": "pca", "leiden": {k: 1.0 for k in leiden}},
+        uns={"method": "pca", "leiden": {k: 1.0 for k in leiden}}, leiden_key=leiden_key,
     )
 
 
 def check(group, adata, leiden=("leiden",), obsm=("X_pca", "X_umap")):
     out = ad.io.read_elem(group)
-    assert set(obsm) == set(out.obsm) & set(store.PROCESS_OBSM)
+    assert set(obsm) == set(out.obsm) & {*store.EMBEDDINGS, "X_umap"}
     assert set(leiden) == {c for c in out.obs if store.LEIDEN_COLUMN.match(c)}
     assert out.var["highly_variable"].sum() == 50 and out.uns["process"]["method"] == "pca"
     assert group["layers/lognorm"].attrs["target_sum"] == 1e4
@@ -75,3 +75,35 @@ def test_helpers_match_the_notebooks():
         cell = next("".join(c["source"]) for c in json.loads(nb.read_text())["cells"]
                     if "def save_commit" in "".join(c["source"]))
         assert _functions(cell, names) == module, nb.name
+
+
+def test_custom_names_keep_the_default_results_and_replace_only_their_own(stores, adata, tmp_path):
+    import shutil
+
+    out = str(tmp_path / "x.zarr")
+    shutil.copytree(stores["pbmc"], out)
+    group = zarr.open_group(out, mode="r+", use_consolidated=False)
+    results(adata, ("leiden",)).write(group)
+    results(adata, ("clusters_0.5", "clusters_1.0"), ("X_pca", "X_umap_b"), "clusters").write(group)
+    done = ad.io.read_elem(group)
+    assert {"leiden", "clusters_0.5", "clusters_1.0"} <= set(done.obs) and {"X_umap", "X_umap_b"} <= set(done.obsm)
+    results(adata, ("clusters",), ("X_pca", "X_umap_b"), "clusters").write(group)
+    done = ad.io.read_elem(group)
+    assert {"leiden", "clusters"} <= set(done.obs) and not {"clusters_0.5", "clusters_1.0"} & set(done.obs)
+    assert "X_umap" in done.obsm
+
+
+def test_access_errors_are_recognized():
+    import botocore.exceptions as be
+
+    denied = be.ClientError({"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject")
+    wrapped = PermissionError("denied")
+    wrapped.__cause__ = denied
+    assert store.is_access_error(denied) and store.is_access_error(wrapped)
+    assert store.is_access_error(RuntimeError("Unable to locate credentials"))
+    assert not store.is_access_error(FileNotFoundError("nope"))
+    outer = RuntimeError("write failed")
+    middle = ValueError("icechunk error")
+    outer.__context__, middle.__cause__ = middle, denied
+    assert store.is_access_error(outer)
+    assert "AWS secret with write permission" in store.access_hint("s3://b/p", writing=True)

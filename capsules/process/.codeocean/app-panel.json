@@ -5,33 +5,34 @@
 		{
 			"id": "fjkkmNN0idHqHVRS",
 			"name": "Input data",
-			"description": "Optional: this capsule is mainly an environment with notebooks!! This page is for running it as a batch job for a full annotation/umap workflow.",
-			"icon": "\ud83d\udcc2"
-		},
-		{
-			"id": "W3oWEbP7Z7LZFkUZ",
-			"name": "Output: copy in /results (default)",
-			"description": "Used when no external location is set below. Leave these as they are if you write to an external location."
+			"description": "Optional: the capsule is mainly an environment with notebooks. Fill this in to run the annotation/UMAP pipeline as a batch job.",
+			"icon": "📂"
 		},
 		{
 			"id": "eXtErNaLoUtPuT01",
 			"name": "Output: external location (optional)",
-			"description": "Write the results somewhere outside the capsule instead of the copy in /results: an icechunk input's own S3 repo (one commit), or a new or existing zarr."
+			"description": "Write the results to S3 or another path instead of /results. S3 writes need an AWS secret with write access attached to the capsule.",
+			"icon": "📂"
+		},
+		{
+			"id": "W3oWEbP7Z7LZFkUZ",
+			"name": "Output: copy in /results (optional)",
+			"description": "Used when no external location is set. Leave both output sections empty for the default copy."
 		},
 		{
 			"id": "GhlCWmuPGluuDV1v",
 			"name": "Embedding",
-			"description": "How cells are embedded before the neighbor graph: PCA (with harmony when a batch key is given) or a newly trained scVI model."
+			"description": "PCA (with harmony given a batch key) or a new scVI model."
 		},
 		{
 			"id": "D4npHhbetnHEohzx",
 			"name": "Neighbors, UMAP & clustering",
-			"description": "The neighbor graph built from the embedding, the 2-D UMAP, and Leiden clustering at one or more resolutions."
+			"description": "Neighbor graph, UMAP and Leiden clustering."
 		},
 		{
 			"id": "uMaPpLoTsCaTeGrY",
 			"name": "UMAP plots",
-			"description": "Which UMAPs to save in /results as umap.png, one panel per name."
+			"description": "UMAPs saved to /results/umap.png, one panel per name."
 		}
 	],
 	"parameters": [
@@ -40,8 +41,8 @@
 			"category": "fjkkmNN0idHqHVRS",
 			"name": "Input store",
 			"param_name": "input",
-			"description": "An AnnData .zarr, a SpatialData .zarr, or an icechunk repo in an attached data asset. EX: /data/my_asset/sample.zarr. Leave empty and a run only prints how to use the capsule.",
-			"help_text": "X must hold raw counts as a sparse (CSR) matrix. The input is never changed; where the results go is set under Output.",
+			"description": "AnnData .zarr, SpatialData .zarr or icechunk repo, e.g. /data/my_asset/sample.zarr. Empty: only prints usage.",
+			"help_text": "X must be raw counts in CSR. The input is never changed.",
 			"type": "text",
 			"value_type": "string"
 		},
@@ -50,7 +51,7 @@
 			"category": "fjkkmNN0idHqHVRS",
 			"name": "SpatialData table (optional)",
 			"param_name": "table",
-			"description": "SpatialData only: the table to process, tables/<name>. Ignored for an AnnData store.",
+			"description": "SpatialData only: table to use, tables/<name>.",
 			"type": "text",
 			"value_type": "string",
 			"default_value": "table"
@@ -60,7 +61,7 @@
 			"category": "fjkkmNN0idHqHVRS",
 			"name": "Icechunk branch (optional)",
 			"param_name": "branch",
-			"description": "Icechunk only: the branch that is read and that the results are committed on, in the input repo, the copy in /results or the external repo. Empty means main.",
+			"description": "Icechunk only: branch to read and commit on. Empty: main.",
 			"type": "text",
 			"value_type": "string"
 		},
@@ -69,8 +70,8 @@
 			"category": "fjkkmNN0idHqHVRS",
 			"name": "Subset column (optional)",
 			"param_name": "subset_column",
-			"description": "An obs column to select cells by. Leave empty to use every cell. EX: sample_id",
-			"help_text": "Cells outside the subset get empty values in the results.",
+			"description": "obs column to select cells by, e.g. sample_id. Empty: all cells.",
+			"help_text": "Cells outside the subset get empty results.",
 			"type": "text",
 			"value_type": "string"
 		},
@@ -79,42 +80,17 @@
 			"category": "fjkkmNN0idHqHVRS",
 			"name": "Subset values",
 			"param_name": "subset_values",
-			"description": "Values of the subset column to keep, separated by commas. EX: SP0001, SP0002",
+			"description": "Values to keep, comma-separated, e.g. SP0001, SP0002.",
 			"type": "text",
 			"value_type": "string"
-		},
-		{
-			"id": "0hMt27jwwKveffpB",
-			"category": "W3oWEbP7Z7LZFkUZ",
-			"name": "Copy name (optional)",
-			"param_name": "results_copy",
-			"description": "The copy's name in /results. Empty means <input name>.processed (.zarr for a zarr copy). An existing name is never overwritten: <name>-1, -2, ... is used.",
-			"help_text": "An absolute path puts the copy there instead.",
-			"type": "text",
-			"value_type": "string"
-		},
-		{
-			"id": "rEsUlTsFoRmAt001",
-			"category": "W3oWEbP7Z7LZFkUZ",
-			"name": "Copy format",
-			"param_name": "results_format",
-			"description": "auto: the input's own format (an icechunk copy keeps the repo's history). zarr or icechunk to convert; a SpatialData zarr can't become icechunk.",
-			"type": "list",
-			"value_type": "string",
-			"default_value": "auto",
-			"extra_data": [
-				"auto",
-				"zarr",
-				"icechunk"
-			]
 		},
 		{
 			"id": "LwAYpEe1RPI2g5hV",
 			"category": "eXtErNaLoUtPuT01",
 			"name": "External location (optional)",
 			"param_name": "external",
-			"description": "Where the results go instead of /results. EX: s3://bucket/prefix",
-			"help_text": "Icechunk input: its own writable S3 repo behind the data asset; the data is read from there and the results are one commit on the branch. Anything else there is refused as a likely typo. Zarr input: a new location gets a new store; an existing zarr with the same cells and genes gets the results written into it.",
+			"description": "s3://bucket/prefix or a path. Needs an AWS secret with write access.",
+			"help_text": "Icechunk input: its own S3 repo; the results are one commit on the branch. Zarr input: a new store, or results written into an existing zarr with the same cells and genes.",
 			"type": "text",
 			"value_type": "string"
 		},
@@ -123,10 +99,33 @@
 			"category": "eXtErNaLoUtPuT01",
 			"name": "External format",
 			"param_name": "external_format",
-			"description": "auto: whatever is already at the location, or zarr for a new one. zarr or icechunk: what to create, and for an existing location, what it must already be (a mismatch is an error).",
+			"description": "Empty/auto: what is there, or zarr if new. Otherwise must match what is there.",
 			"type": "list",
 			"value_type": "string",
-			"default_value": "auto",
+			"extra_data": [
+				"auto",
+				"zarr",
+				"icechunk"
+			]
+		},
+		{
+			"id": "0hMt27jwwKveffpB",
+			"category": "W3oWEbP7Z7LZFkUZ",
+			"name": "Copy name (optional)",
+			"param_name": "results_copy",
+			"description": "Name in /results. Empty: <input name>.processed. Never overwrites: -1, -2, ... is added.",
+			"help_text": "An absolute path puts the copy there.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "rEsUlTsFoRmAt001",
+			"category": "W3oWEbP7Z7LZFkUZ",
+			"name": "Copy format (optional)",
+			"param_name": "results_format",
+			"description": "Empty/auto: the input's format. zarr or icechunk to convert (SpatialData can't be icechunk).",
+			"type": "list",
+			"value_type": "string",
 			"extra_data": [
 				"auto",
 				"zarr",
@@ -138,8 +137,8 @@
 			"category": "GhlCWmuPGluuDV1v",
 			"name": "Method",
 			"param_name": "method",
-			"description": "PCA: normalize, highly variable genes, scale, PCA, plus harmony when a batch key is given. scVI (train): trains a new scVI model on the raw counts of the highly variable genes; the model is saved to /results/scvi_model.",
-			"help_text": "scVI's training settings (latent size, layers, epochs, batch size, ...) are SCVI_* environment variables or flags; see code/README.md.",
+			"description": "PCA (harmony with a batch key), or train a new scVI model on the highly variable genes (saved to /results/scvi_model).",
+			"help_text": "scVI settings are SCVI_* environment variables or flags; see code/README.md.",
 			"type": "list",
 			"value_type": "string",
 			"default_value": "PCA",
@@ -153,8 +152,8 @@
 			"category": "GhlCWmuPGluuDV1v",
 			"name": "Batch key (optional)",
 			"param_name": "batch_key",
-			"description": "An obs column with the batch of each cell. PCA: harmony corrects for it. scVI: the model's batch. Several, separated by commas: harmony uses all; scVI uses the first as batch and the rest as covariates. EX: chip_id",
-			"help_text": "Empty strings count as missing; cells with a missing batch make harmony and scVI fail.",
+			"description": "obs column(s) with each cell's batch, comma-separated. PCA: harmony. scVI: first is batch, rest covariates. e.g. chip_id",
+			"help_text": "Cells with an empty batch make the run fail.",
 			"type": "text",
 			"value_type": "string"
 		},
@@ -163,7 +162,7 @@
 			"category": "GhlCWmuPGluuDV1v",
 			"name": "Highly variable genes",
 			"param_name": "n_top_genes",
-			"description": "How many highly variable genes the embedding uses.",
+			"description": "Highly variable genes used.",
 			"type": "text",
 			"value_type": "integer",
 			"default_value": "2000",
@@ -174,7 +173,7 @@
 			"category": "GhlCWmuPGluuDV1v",
 			"name": "PCA components",
 			"param_name": "n_comps",
-			"description": "PCA only: the number of components computed (neighbors use the first 30, or all if fewer).",
+			"description": "PCA only: components computed (neighbors use the first 30).",
 			"type": "text",
 			"value_type": "integer",
 			"default_value": "50",
@@ -185,7 +184,7 @@
 			"category": "D4npHhbetnHEohzx",
 			"name": "Neighbors",
 			"param_name": "n_neighbors",
-			"description": "Nearest neighbors per cell in the graph.",
+			"description": "Nearest neighbors per cell.",
 			"type": "text",
 			"value_type": "integer",
 			"default_value": "20",
@@ -196,7 +195,7 @@
 			"category": "D4npHhbetnHEohzx",
 			"name": "UMAP min_dist",
 			"param_name": "umap_min_dist",
-			"description": "How tightly UMAP packs cells; smaller is tighter.",
+			"description": "UMAP packing; smaller is tighter.",
 			"type": "text",
 			"value_type": "number",
 			"default_value": "0.45",
@@ -208,18 +207,38 @@
 			"category": "D4npHhbetnHEohzx",
 			"name": "Leiden resolutions",
 			"param_name": "leiden_resolutions",
-			"description": "One or more resolutions, separated by commas; higher gives more clusters. One gives obs/leiden; several give obs/leiden_<resolution> each, from one neighbor graph. Empty means 1.1. EX: 0.5, 1.0, 2.0",
+			"description": "Comma-separated; higher gives more clusters. Several give one column each. Empty: 1.1. e.g. 0.5, 1.0, 2.0",
 			"type": "text",
 			"value_type": "string",
 			"default_value": "1.1",
 			"pattern": "^\\s*([0-9]*\\.?[0-9]+(\\s*,\\s*[0-9]*\\.?[0-9]+)*\\s*,?\\s*)?$"
 		},
 		{
+			"category": "D4npHhbetnHEohzx",
+			"name": "UMAP name (optional)",
+			"param_name": "umap_key",
+			"description": "obsm key for the UMAP coordinates. Empty: X_umap.",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^[A-Za-z0-9_.\\-]*$",
+			"id": "AyqX3dqph0qvuGHP"
+		},
+		{
+			"category": "D4npHhbetnHEohzx",
+			"name": "Leiden name (optional)",
+			"param_name": "leiden_key",
+			"description": "obs column for the clusters. Empty: leiden. Several resolutions: <name>_<resolution>.",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^[A-Za-z0-9_.\\-]*$",
+			"id": "Y5uu9QbFOiTwLyt2"
+		},
+		{
 			"id": "uMaPcOlOrKeYsPaRm",
 			"category": "uMaPpLoTsCaTeGrY",
 			"name": "UMAP colors",
 			"param_name": "color_keys",
-			"description": "obs columns to color the UMAP by, separated by commas. leiden stands for the cluster column(s). Names the store doesn't have are skipped. Empty means the default. EX: batch_id, chip_id, pbmc_clean_AIFI_L1_2024_label, leiden",
+			"description": "obs columns to color by, comma-separated; leiden means the clusters. Missing names are skipped. Empty: the default.",
 			"type": "text",
 			"value_type": "string",
 			"default_value": "batch_id,chip_id,pbmc_clean_AIFI_L1_2024_label,leiden",
