@@ -464,3 +464,7 @@ after; both reviews' findings are fixed and tested.
   normalize + HVG and looks the method up. A test checks every `config.METHODS` value has an embedder.
 - Open (from the modularity review, not done): one table for output keys, a shim for annizarr's private
   `copy_group`.
+- **Tested (2026-11-14, T4):** 93 pytest tests pass, no skips (§13.3's 72 plus panel, names, access-error, registry
+  and branch-moved tests). **Before publishing, still to do by hand:** one real S3 run each with and without the
+  AWS secret (icechunk asset to its own S3 repo; zarr to a new `s3://`), and a look at the panel in Code Ocean
+  (empty format lists, external-first order).
