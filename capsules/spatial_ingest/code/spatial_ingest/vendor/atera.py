@@ -19,6 +19,7 @@ from spatialdata_io._docs import inject_docs
 from ._atera_common import (
     DEFAULT_TABLE_ROW_CHUNK_SIZE,
     DEFAULT_VAR_COLUMNS,
+    OPENED,
     _cell_row_positions_in_bbox,
     _get_labels,
     _get_morphology_images,
@@ -172,6 +173,7 @@ def atera(
 
     if needs_cells_zarr:
         cells_store = zarr.storage.ZipStore(path / AteraKeys.CELLS_FILE, read_only=True)
+        OPENED.append(cells_store)  # spatial_ingest: labels read lazily from it; closed by readers.close
         cells_group = zarr.open_group(cells_store, mode="r")
 
         cell_ids = table.obs[str(AteraKeys.CELL_ID)].to_numpy() if table is not None else None

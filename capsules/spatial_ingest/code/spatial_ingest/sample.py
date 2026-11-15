@@ -198,6 +198,7 @@ def prepare(loaded: Loaded, sample: Sample, model: Path | None, scratch: Path) -
     stats = {"n_cells": int(n_obs), "genes_in_panel": int(n_vars),
              "mean_genes": float(obs["n_genes_by_counts"].mean()) if n_obs else 0.0,
              "mean_total_counts": float(obs["total_counts"].mean()) if n_obs else 0.0,
-             "n_celltypist_labels": int(obs[label].nunique()) if label and label in obs else 0}
+             "n_celltypist_labels": int(obs[label].nunique()) if label and label in obs else 0,
+             "n_cells_without_position": int((~obs["has_position"].astype(bool)).sum()) if "has_position" in obs else 0}
     elements = renamed(loaded.elements, sid, loaded.tags)
     return Prepared(sid, elements, out, obs, var, fingerprint, loaded.region_key, stats)

@@ -257,3 +257,15 @@ def test_region_named_like_its_section_is_not_doubled(tmp_path):
     # the regions `cells-a`/`cells-b` are tagged `a`/`b`; an element named exactly by the tag becomes the sample ID
     assert layout.element_name("cells-a", "visium_a", parts["visium_a"].tags) == "visium_a_cells"
     assert layout.element_name("a", "visium_a", parts["visium_a"].tags) == "visium_a"
+
+
+def test_sample_column_values_become_valid_ids(tmp_path, caplog):
+    """Critic F2: "Patient 1" crashed at install; values are sanitised, collisions get the object's name."""
+    samples = {"a": {"n": 4, "seed": 0}, "b": {"n": 5, "seed": 1}, "c": {"n": 3, "seed": 2}}
+    path = F.write(tmp_path / "named.zarr", samples,
+                   extra_obs={"sample_id": ["Patient 1"] * 4 + ["Patient/2"] * 5 + ["patient_2"] * 3})
+    with caplog.at_level(logging.INFO, logger="existing"):
+        parts = existing.plan(path, "named", "sample_id")
+    assert sorted(p.sid for p in parts) == ["Patient_1", "named_Patient_2", "named_patient_2_1"]  # unique case-insensitively too
+    assert all(existing.INVALID_CHARS.search(p.sid) is None for p in parts)
+    assert "'Patient 1' -> Patient_1" in caplog.text

@@ -56,10 +56,10 @@ def test_cells_of_another_cell_set_are_an_essential_miss(tmp_path, scratch):
     inv = inventory.inspect(fb.candidate(folder), scratch)
     # cells.zarr.zip holds the matrix's cells: positions come from there, and the note says why
     assert inv.missing_essential == [] and inv.chosen["cells"] == "cells.zarr.zip"
-    assert any("only 0 of the matrix's 30 cells" in n for n in inv.notes)
+    assert any("none of the matrix's 30 cells are in it" in n for n in inv.notes)
     (folder / "cells.zarr.zip").unlink()
     inv = inventory.inspect(fb.candidate(folder), tmp_path / "scratch2")
-    assert inv.missing_essential and "only 0 of the matrix's 30 cells" in inv.missing_essential[0]
+    assert inv.missing_essential and "none of the matrix's 30 cells are in it" in inv.missing_essential[0]
 
 
 def test_transcripts_chosen_by_cell_ids_not_by_name(tmp_path, scratch):
@@ -111,3 +111,15 @@ def test_describe_is_one_line(tmp_path, scratch):
     _, cand = fb.geo_partial(tmp_path / "geo")
     line = inventory.describe(inventory.inspect(cand, scratch))
     assert "\n" not in line and line.startswith("not available:")
+
+
+def test_a_partly_placed_matrix_is_not_an_essential_miss(tmp_path, scratch):
+    """H5: only 'no cell placed' is essential; a low placed fraction keeps every cell (the reader warns)."""
+    import pandas as pd
+
+    folder = fb.xenium_full(tmp_path / "part", labels=False)
+    cells = pd.read_parquet(folder / "cells.parquet")
+    fb.write_parquet(cells.iloc[:5], folder / "cells.parquet")             # 5 of 30 placed (17 %)
+    inv = inventory.inspect(fb.candidate(folder), scratch)
+    assert inv.missing_essential == [] and inv.n_cells == 30
+    assert any("25 of 30 matrix cells have no row in cells.parquet" in n for n in inv.notes)

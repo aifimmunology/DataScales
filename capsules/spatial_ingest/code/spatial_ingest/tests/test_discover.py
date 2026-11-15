@@ -490,9 +490,16 @@ def test_prefixed_file_means_its_group_only(tmp_path):
 
 
 def test_a_lone_file_is_refused_clearly(tmp_path):
-    write(tmp_path / "somewhere" / "matrix.h5")
-    with pytest.raises(discover.InputError, match="single file"):
-        run(tmp_path, tmp_path / "somewhere" / "matrix.h5")
+    write(tmp_path / "somewhere" / "image.tif")
+    with pytest.raises(discover.InputError, match="single file that is not part of a bundle; give the folder"):
+        run(tmp_path, tmp_path / "somewhere" / "image.tif")
+    write(tmp_path / "flat" / "cell_feature_matrix.h5")
+    write(tmp_path / "flat" / "cells (2).parquet")
+    with pytest.raises(discover.InputError, match="single 10x bundle file without the rest of its bundle"):
+        run(tmp_path, tmp_path / "flat" / "cell_feature_matrix.h5")
+    write(tmp_path / "somewhere" / "filtered_feature_bc_matrix.h5")
+    with pytest.raises(discover.InputError, match="Chromium/Visium count matrix"):
+        run(tmp_path, tmp_path / "somewhere" / "filtered_feature_bc_matrix.h5")
 
 
 def test_missing_paths_globs_tilde_and_data_dir(tmp_path, monkeypatch):
@@ -565,3 +572,116 @@ def test_kinds_mix_freely_across_entries(tmp_path):
                 sd_v3(tmp_path / "S1.zarr"), macos_zip(tmp_path))
     assert [(c.sid, c.kind) for c in found.candidates] == [
         ("X1", "xenium"), ("A1", "atera"), ("S1", "spatialdata"), ("Xenium_V1_human_Breast_2fov", "xenium")]
+
+
+# ------------------------------------------------------------------------------------------ fix round 2 (critics)
+
+def test_nested_bundle_is_its_own_sample(tmp_path):
+    """critic_integrity F6: runTop/ with runTop/runInner/ (its own marker and data) used to be swallowed."""
+    top = xenium_bundle(tmp_path / "runTop")
+    inner = xenium_bundle(top / "runInner")
+    xenium_bundle(top / "matrix_cells_only", files=("cell_feature_matrix.h5", "cells.parquet"))
+    found = run(tmp_path, top)
+    cands = by_sid(found)
+    assert sorted(cands) == ["matrix_cells_only", "runInner", "runTop"]
+    assert not any(k.startswith(("runInner/", "matrix_cells_only/")) for k in cands["runTop"].files)
+    assert "cell_feature_matrix/matrix.mtx.gz" in cands["runTop"].files          # its own subfolders stay its own
+    assert cands["runInner"].origin == inner and any("kept as a sample of its own" in n for n in cands["runInner"].notes)
+    zipped = run(tmp_path, zip_folder(top, tmp_path / "runTop.zip"))               # the same inside a zip
+    assert sorted(by_sid(zipped)) == ["matrix_cells_only", "runInner", "runTop"]
+
+
+@pytest.mark.parametrize("name,text", [
+    ("GSM8889642_Xenium_Spleen1.rds", "Seurat object"),
+    ("Xenium-CJ23.56.004-BG-raw.h5ad", "anndata_ingest"),
+    ("Atera_breast_adata.h5ad", "AnnData .h5ad"),
+    ("sample.h5seurat", "Seurat .h5seurat"),
+    ("counts.loom", ".loom"),
+    ("GSM1_counts.csv.gz", "count table alone"),
+])
+def test_foreign_formats_say_what_they_are(tmp_path, name, text):
+    """critic_unseen M1 (GSE293759 .rds, figshare_33106505 / abc marmoset .h5ad): given as file, in a folder,
+    or beside a bundle, the reason names the format and where it goes instead."""
+    path = write(tmp_path / "in" / name)
+    for entry in (path, path.parent):
+        with pytest.raises(discover.InputError) as err:
+            run(tmp_path, entry)
+        assert text in str(err.value) and "give the folder" not in str(err.value)
+    xenium_bundle(tmp_path / "in" / "S1")
+    left = reasons(run(tmp_path, path.parent))
+    assert text in left[str(path)]
+
+
+def test_many_loose_files_still_name_foreign_ones(tmp_path):
+    xenium_bundle(tmp_path / "in" / "S1")
+    for i in range(12):
+        write(tmp_path / "in" / f"fig_{i}.png")
+    write(tmp_path / "in" / "atlas.h5ad")
+    left = reasons(run(tmp_path, tmp_path / "in"))
+    assert "anndata_ingest" in left[str(tmp_path / "in" / "atlas.h5ad")]
+    assert left[str(tmp_path / "in")].startswith("12 files")
+
+
+def test_anndata_zarr_points_to_anndata_ingest(tmp_path):
+    with pytest.raises(discover.InputError, match="anndata_ingest"):
+        run(tmp_path, anndata_zarr(tmp_path / "table.zarr"))
+
+
+def test_incomplete_bundle_in_an_archive_keeps_its_reason(tmp_path):
+    """critic_unseen M2: GSE326793 (MTX only) zipped said only 'holds no … bundle'."""
+    src = tmp_path / "GSE326793"
+    for name in ("barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz"):
+        write(src / f"GSM9640639_KPGCT1_{name}")
+    folder_reason = str(pytest.raises(discover.InputError, run, tmp_path, src).value)
+    assert "no cells table" in folder_reason and "no count matrix" not in folder_reason
+    for archive in (zip_folder(src, tmp_path / "GSE326793.zip"), tar_folder(src, tmp_path / "GSE326793.tar.gz")):
+        with pytest.raises(discover.InputError) as err:
+            run(tmp_path, archive)
+        message = str(err.value)
+        assert f"{archive}: holds no Xenium/Atera bundle and no SpatialData object: " in message
+        assert "GSE326793/GSM9640639_KPGCT1: 10x files (" in message and "but no cells table" in message
+    empty = tmp_path / "empty.zip"
+    with zipfile.ZipFile(empty, "w"):
+        pass
+    with pytest.raises(discover.InputError, match="no files in it"):
+        run(tmp_path, empty)
+
+
+def test_refusals_name_every_missing_essential_and_empty_files(tmp_path):
+    """critic_unseen L3 (GSE308148): 0-byte image, no matrix, no cells; experiment.xenium is optional."""
+    folder = tmp_path / "GSE308148"
+    prefix = "GSM9238736_2024_Xenium_Breast_tTMA1_"
+    for name in ("cell_boundaries.parquet.gz", "transcripts.parquet.gz", "gene_panel.json.gz"):
+        write(folder / f"{prefix}{name}")
+    write(folder / f"{prefix}morphology.ome.tif.gz", b"")
+    write(folder / "GSM1_notes.txt", b"")
+    with pytest.raises(discover.InputError) as err:
+        run(tmp_path, folder)
+    message = str(err.value)
+    assert "no count matrix" in message and "no cells table" in message
+    assert "empty (0-byte) file(s): morphology.ome.tif" in message
+    assert f"{folder / 'GSM1_notes.txt'}: an empty file (0 bytes)" in message
+    assert "experiment.xenium" not in message
+    write(tmp_path / "solo" / "x_cell_feature_matrix.h5")                          # matrix only
+    with pytest.raises(discover.InputError) as err:
+        run(tmp_path, tmp_path / "solo")
+    assert "no cells table" in str(err.value) and "experiment.xenium" not in str(err.value)
+
+
+def test_geo_archive_and_folder_take_the_gsm_id(tmp_path):
+    """critic_unseen L1 (GSE313808): GSM…_xenium_raw_data.tar.gz holding output-XETG…/ gave the instrument ID."""
+    run_dir = "output-XETG00281__0033528__EDT-057_SV1__20250207__180935"
+    src = xenium_bundle(tmp_path / "src" / run_dir)
+    archive = tar_folder(src, tmp_path / "GSM9375928_EDT_057_SV1_xenium_raw_data.tar.gz")
+    (cand,) = run(tmp_path, archive).candidates
+    assert cand.sid == "GSM9375928_EDT_057_SV1" and any(run_dir in n for n in cand.notes)
+    extracted = tmp_path / "x" / "GSM9375928_EDT_057_SV1_xenium_raw_data"
+    xenium_bundle(extracted / run_dir)
+    assert [c.sid for c in run(tmp_path, extracted).candidates] == ["GSM9375928_EDT_057_SV1"]
+    two = tmp_path / "GSM1_two_runs.zip"                                              # two runs: keep their own IDs
+    with zipfile.ZipFile(two, "w") as zf:
+        for r in ("output-XETG1__a", "output-XETG1__b"):
+            zf.writestr(f"{r}/experiment.xenium", "{}")
+            zf.writestr(f"{r}/cell_feature_matrix.h5", "x")
+    assert sorted(c.sid for c in run(tmp_path, two).candidates) == ["output-XETG1__a", "output-XETG1__b"]
+    assert [c.sid for c in run(tmp_path, tmp_path / "src" / run_dir).candidates] == [run_dir]   # no GSM: unchanged

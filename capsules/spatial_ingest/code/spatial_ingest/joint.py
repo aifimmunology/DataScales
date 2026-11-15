@@ -9,6 +9,11 @@ sample did not measure are zero in its rows: `uns/spatial_ingest/measured_genes/
 genes each sample measured and `var["n_samples_measured"]` counts them per gene, so filled zeros
 can be told from measured ones.
 
+Genes are matched by gene_id when both sides have one (else by symbol), so two loci sharing a symbol
+never merge (`MATR3-ENSG01` / `MATR3-ENSG02`). `check_rows` runs everything `add` would refuse before
+a sample is installed; `repair` rebuilds the table from the per-sample tables after a killed run and
+takes out of the store a sample it can't append (one WARNING) instead of failing every later run.
+
 Nothing reads a whole count matrix: tables are CSR AnnData zarr groups read in row chunks
 (`matrix.iter_rows`) and written chunk by chunk (`TableWriter`). Every change to the joint table is either
 a rename into place (the first sample) or leaves a state `sample_counts` reports as broken (a
@@ -47,6 +52,11 @@ ANNDATA_ATTRS = {"encoding-type": "anndata", "encoding-version": "0.1.0"}
 CSR_ATTRS = {"encoding-type": "csr_matrix", "encoding-version": "0.1.0"}
 OBS_CHUNK = 1 << 16                       # zarr chunk of obs arrays (rows): appends touch few files
 FLAT_CHUNK = 1 << 20                      # zarr chunk of X's data/indices (elements)
+INDPTR_CHUNK = 1 << 20                    # zarr chunk of X's indptr: fixed, so a grown indptr keeps old chunks' layout
+# Every array of the joint table keeps one chunk length for life (OBS_CHUNK for obs/var/record arrays,
+# FLAT_CHUNK / INDPTR_CHUNK for X). Growing an array then only appends to its last chunk, so a chunk
+# uploaded by a sync before the new metadata still reads correctly under the old metadata (the old,
+# shorter shape is a prefix of it): an S3 reader never sees a half-synced joint table (s3.sync order).
 STRINGLIKE = ("categorical", "string-array", "nullable-string-array")
 
 
@@ -120,7 +130,7 @@ class TableWriter:
         if len(counts) != self.n_obs:
             raise ValueError(f"{self.path}: {len(counts)} rows written, obs has {self.n_obs}")
         indptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
-        self.x.create_array("indptr", data=indptr, chunks=(max(1, len(indptr)),))
+        self.x.create_array("indptr", data=indptr, chunks=(INDPTR_CHUNK,))
         return self.path
 
 
@@ -170,12 +180,20 @@ def _group(path: Path, mode: str = "r") -> zarr.Group:
 
 
 def read_schema(store: Path) -> Schema | None:
-    """The joint table's schema, or None when the store has none. A table whose record is missing
-    (a rewrite killed midway) comes back with `intact=False` and no samples; `sample_counts`
-    reports it broken, so the repair rebuilds it."""
+    """The joint table's schema, or None when the store has none. Never raises: a table whose record
+    or var is missing or unreadable (a rewrite or an S3 sync killed midway) comes back with
+    `intact=False` and no samples; `sample_counts` reports it broken, so the repair rebuilds it."""
     path = table_path(store)
     if not (path / "zarr.json").exists():
         return None
+    try:
+        return _read_schema(path)
+    except Exception as exc:
+        logger.debug("joint table record unreadable: %s", exc)
+        return Schema([], [], "float32", {}, "", intact=False)
+
+
+def _read_schema(path: Path) -> Schema:
     group = _group(path)
     var = read_elem(group["var"]) if "var" in group else pd.DataFrame(index=pd.Index([], dtype=object))
     ids = list(var["gene_ids"].astype(str)) if "gene_ids" in var else [""] * len(var)
@@ -198,12 +216,24 @@ def _replace(parent: Path, name: str, value, staging: Path) -> None:
     old = staging / f".{parent.name}.{name}.old"
     for p in (tmp, old):
         shutil.rmtree(p, ignore_errors=True)
-    write_elem(zarr.open_group(tmp, mode="w", zarr_format=3), name, value)
+    _write(zarr.open_group(tmp, mode="w", zarr_format=3), name, value)
     if (parent / name).exists():
         os.rename(parent / name, old)
     os.rename(tmp / name, parent / name)
     shutil.rmtree(old, ignore_errors=True)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _write(group: zarr.Group, name: str, value) -> None:
+    """write_elem with every 1-d array in OBS_CHUNK-long chunks (see INDPTR_CHUNK); dicts recursively."""
+    if isinstance(value, dict):
+        write_elem(group, name, {})
+        for key, item in value.items():
+            _write(group[name], key, item)
+    elif isinstance(value, pd.DataFrame) or (isinstance(value, np.ndarray) and value.ndim == 1):
+        write_elem(group, name, value, dataset_kwargs={"chunks": (OBS_CHUNK,)})
+    else:
+        write_elem(group, name, value)
 
 
 def write_schema(path: Path, schema: Schema, staging: Path) -> None:
@@ -351,7 +381,7 @@ def rows_obs(obs: pd.DataFrame, sid: str, region_key: str | None) -> pd.DataFram
     return out
 
 
-def fit_obs(obs: pd.DataFrame, target: Path, sid: str) -> pd.DataFrame:
+def fit_obs(obs: pd.DataFrame, target: Path, sid: str, warn: bool = True) -> pd.DataFrame:
     """Joint rows' obs fitted to the joint table's columns: a shared column takes the store's
     encoding family and dtype; one that can't is left out of the joint table for this sample (one
     warning). A store string column of the oldest kind (no missing values) the sample lacks gets ""."""
@@ -368,7 +398,7 @@ def fit_obs(obs: pd.DataFrame, target: Path, sid: str) -> pd.DataFrame:
             dropped.append(c)
         else:
             out[c] = fitted
-    if dropped:
+    if dropped and warn:
         logger.warning("%s: obs columns %s are left out of the joint table: their values don't fit the type the joint "
                        "table already holds them in (the sample's own table keeps them).", sid, ", ".join(dropped))
     return out
@@ -377,10 +407,11 @@ def fit_obs(obs: pd.DataFrame, target: Path, sid: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------- adding a sample
 
 def _stage_rows(staged: Path, table_path: Path, obs: pd.DataFrame, union_genes: Sequence[str],
-                sample_genes: pd.Index, dtype: np.dtype, sid: str) -> None:
-    """The sample's joint rows as a CSR table on the union genes, written chunk by chunk."""
+                targets: Sequence[str], dtype: np.dtype, sid: str) -> None:
+    """The sample's joint rows as a CSR table on the union genes (its gene i goes to `targets[i]`),
+    written chunk by chunk."""
     var = pd.DataFrame(index=pd.Index(np.asarray(union_genes, dtype=object)))
-    columns = var.index.get_indexer(sample_genes).astype(np.int32)
+    columns = var.index.get_indexer(pd.Index(np.asarray(targets, dtype=object))).astype(np.int32)
     writer = TableWriter(staged, obs, var, dtype)
     for _, chunk in iter_rows(table_path):
         if not genes.holds_counts(chunk):
@@ -401,24 +432,35 @@ def _extend_var(target: Path, schema: Schema, staging: Path) -> None:
     x.attrs["shape"] = [int(x.attrs["shape"][0]), len(schema.genes)]
 
 
-def _widen_obs_chunks(target: Path, staging: Path) -> None:
-    """Rewrites joint obs arrays stored in chunks shorter than OBS_CHUNK (written while the table was
-    small, by an older version or by annizarr for a new column) with OBS_CHUNK-long chunks, each swapped
-    in by rename. Appends then touch a few chunks per column instead of one file per few rows (a
-    13-cell first sample made a 7K-cell append write ~9000 files, 97 s); the rewrite happens once."""
-    obs = _group(target / "obs")
-    small = [(name, node) for name, node in obs.members(max_depth=None)
-             if isinstance(node, zarr.Array) and node.ndim == 1 and node.chunks[0] < OBS_CHUNK
-             and (node.shards is None or node.shards[0] < OBS_CHUNK)]
-    for name, node in small:
-        tmp, old = staging / ".obs_column.new", staging / ".obs_column.old"
+def _fix_chunks(group_path: Path, chunk: int, staging: Path) -> None:
+    """Rewrites every 1-d array under `group_path` whose chunk length isn't `chunk` (written while the
+    table was small, by an older version, or by annizarr for a new column / a grown indptr) with
+    `chunk`-long chunks, each swapped in by rename. Appends then touch a few chunks per column
+    instead of one file per few rows (a 13-cell first sample made a 7K-cell append write ~9000
+    files, 97 s), and grown arrays stay readable under older metadata (see INDPTR_CHUNK)."""
+    group = zarr.open_array(group_path, mode="r") if (group_path / "zarr.json").is_file() and \
+        json.loads((group_path / "zarr.json").read_text()).get("node_type") == "array" else _group(group_path)
+    nodes = [group] if isinstance(group, zarr.Array) else [n for _, n in group.members(max_depth=None)]
+    for node in nodes:
+        if not isinstance(node, zarr.Array) or node.ndim != 1 or (node.shards or node.chunks)[0] == chunk:
+            continue
+        where = group_path / node.path[len(group.path):].lstrip("/") if not isinstance(group, zarr.Array) \
+            else group_path
+        tmp, old = staging / ".rechunk.new", staging / ".rechunk.old"
         for p in (tmp, old):
             shutil.rmtree(p, ignore_errors=True)
-        zarr.create_array(store=str(tmp), data=node[:], chunks=(OBS_CHUNK,), fill_value=node.fill_value,
+        zarr.create_array(store=str(tmp), data=node[:], chunks=(chunk,), fill_value=node.fill_value,
                           attributes=dict(node.attrs), zarr_format=3)
-        os.rename(target / "obs" / name, old)
-        os.rename(tmp, target / "obs" / name)
+        os.rename(where, old)
+        os.rename(tmp, where)
         shutil.rmtree(old, ignore_errors=True)
+
+
+def _commit(table: Path) -> None:
+    """Consolidates the joint table's own metadata into its `zarr.json`. Readers that open the table by
+    itself (anndata, spatialdata's table reader) then see it whole as of its last commit, so an S3 sync
+    that uploads this file after its arrays' files (s3.sync: deepest first) flips it in one step."""
+    zarr.consolidate_metadata(str(table))
 
 
 def config(cpus: int):
@@ -428,15 +470,47 @@ def config(cpus: int):
     return AppConfig(io=IOConfig(overwrite=True), chunks=ChunkConfig(cpus=cpus))
 
 
-def add(local: Path, sid: str, table_path: Path, staging: Path, cpus: int, celltypist_model: str = "") -> str:
-    """Adds the per-sample table at `table_path` (a CSR AnnData zarr group) as sample `sid`'s rows of
-    the joint table: seeds the table (staged, renamed into place), or extends var with the sample's
-    new genes and appends in place. Also the repair's way to rebuild the table (pass the stored
-    `tables/<sid>_table`). Returns a note on how the sample's genes relate to the joint genes."""
-    import annizarr
+def _targets(schema: Schema, sample_genes: pd.Index, gene_ids: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Where each of a sample's genes goes in the joint var, and the joint genes it adds (name, gene_id).
+    Genes match by gene_id when both sides have one (so `MATR3`/ENSG02 meets `MATR3-ENSG02`), else by
+    symbol; a symbol the joint table holds for another gene_id becomes `<symbol>-<gene_id>`."""
+    by_id = {i: g for g, i in zip(schema.genes, schema.gene_ids) if i}
+    ids = dict(zip(schema.genes, schema.gene_ids))
+    suffixed = {g.removesuffix(f"-{i}") for g, i in ids.items() if i and g.endswith(f"-{i}")}
+    out, fresh = [], []
+    for g, i in zip(sample_genes, gene_ids):
+        if i and i in by_id:
+            t = by_id[i]
+        elif i and ((g in ids and ids[g] and ids[g] != i) or g in suffixed):
+            t = f"{g}-{i}"
+        else:
+            t = g
+        if t not in ids:
+            fresh.append((t, i))
+            ids[t] = i
+            if i:
+                by_id[i] = t
+        out.append(t)
+    if len(set(out)) != len(out):
+        dup = pd.Index(out)[pd.Index(out).duplicated()][:5]
+        raise JointError(f"several of the sample's genes map to the same joint gene ({', '.join(map(str, dup))}); "
+                         "check its gene names and gene_ids.")
+    return out, fresh
 
-    local, table_path, staging = Path(local), Path(table_path), Path(staging)
-    staging.mkdir(parents=True, exist_ok=True)
+
+@dataclass
+class _Rows:
+    """A sample's joint rows as planned (nothing written): its schema after the add, obs, gene targets."""
+    schema: Schema
+    rows: pd.DataFrame
+    targets: list[str]
+    n_new: int
+    n_missing: int
+    seed: bool
+
+
+def _plan_rows(local: Path, sid: str, table_path: Path, celltypist_model: str, warn: bool = True) -> _Rows:
+    """Everything `add` decides before writing; raises JointError for anything it would refuse."""
     group = _group(table_path)
     var = read_elem(group["var"])
     obs = read_elem(group["obs"])
@@ -452,41 +526,134 @@ def add(local: Path, sid: str, table_path: Path, staging: Path, cpus: int, cellt
     if schema is not None and sid in schema.samples:
         raise JointError(f"{sid} is already in the joint table.")
     sample_genes = pd.Index(np.asarray(var.index, dtype=object))
-    gene_ids = var["gene_ids"].astype(str) if "gene_ids" in var else pd.Series("", index=var.index)
+    gene_ids = [str(i) if not pd.isna(i) else "" for i in var["gene_ids"]] if "gene_ids" in var else [""] * len(var)
     rows = rows_obs(obs, sid, group.attrs.get("region_key"))
     if schema is None:
-        schema = Schema(list(sample_genes), list(gene_ids), str(x_dtype), kinds(rows), sid, celltypist_model,
+        schema = Schema(list(sample_genes), gene_ids, str(x_dtype), kinds(rows), sid, celltypist_model,
                         genes.species(var) or "")
-        n_new = n_missing = 0
-    else:
-        known = set(schema.genes)
-        fresh = [g for g in sample_genes if g not in known]
-        n_new, n_missing = len(fresh), len(schema.genes) - (len(sample_genes) - len(fresh))
-        schema.genes += fresh
-        schema.gene_ids += [str(i) for i in gene_ids[fresh]]
-        rows = fit_obs(rows, target, sid)
+        return _Rows(schema, rows, list(sample_genes), 0, 0, True)
+    targets, fresh = _targets(schema, sample_genes, gene_ids)
+    n_missing = len(schema.genes) - (len(targets) - len(fresh))
+    schema.genes += [g for g, _ in fresh]
+    schema.gene_ids += [i for _, i in fresh]
+    rows = fit_obs(rows, target, sid, warn)
+    return _Rows(schema, rows, targets, len(fresh), n_missing, False)
+
+
+def _encodable(obs: pd.DataFrame, sid: str) -> None:
+    """Writes obs to memory the way the joint table stores it: a column anndata can't encode fails here."""
+    try:
+        write_elem(zarr.open_group(zarr.storage.MemoryStore(), mode="w", zarr_format=3), "obs", obs)
+    except Exception as exc:
+        raise JointError(f"{sid}: its obs can't be stored in the joint table ({type(exc).__name__}: {exc}).") from None
+
+
+def check_rows(local: Path, sid: str, table_path: Path) -> None:
+    """Raises JointError for anything `add` would refuse for this sample, without writing: shapes,
+    repeated gene names or cell IDs, genes mapping onto one joint gene, obs it can't encode, counts
+    that aren't counts or don't fit the joint table's dtype. Reads obs/var and streams X once (its
+    max only), so it runs before the sample is installed."""
+    local, table_path = Path(local), Path(table_path)
+    planned = _plan_rows(local, sid, table_path, "", warn=False)
+    _encodable(planned.rows, sid)
+    dtype = np.dtype(planned.schema.x_dtype)
+    for _, chunk in iter_rows(table_path):
+        if not genes.holds_counts(chunk):
+            raise JointError(f"{sid}: its table's X holds non-count values; the joint table takes raw counts only.")
+        try:
+            genes.as_dtype(chunk, dtype)
+        except genes.PanelError as exc:
+            raise JointError(f"{sid}: {exc}") from None
+
+
+def add(local: Path, sid: str, table_path: Path, staging: Path, cpus: int, celltypist_model: str = "") -> str:
+    """Adds the per-sample table at `table_path` (a CSR AnnData zarr group) as sample `sid`'s rows of
+    the joint table: seeds the table (staged, renamed into place), or extends var with the sample's
+    new genes and appends in place. Also the repair's way to rebuild the table (pass the stored
+    `tables/<sid>_table`). Returns a note on how the sample's genes relate to the joint genes."""
+    import annizarr
+
+    local, table_path, staging = Path(local), Path(table_path), Path(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    planned = _plan_rows(local, sid, table_path, celltypist_model)
+    schema, rows, target = planned.schema, planned.rows, local / "tables" / NAME
     staged = staging / f"{sid}.joint.zarr"
-    stores.retry_once(f"{sid}'s joint rows", lambda: _stage_rows(staged, table_path, rows, schema.genes, sample_genes,
-                                                                 np.dtype(schema.x_dtype), sid),
+    stores.retry_once(f"{sid}'s joint rows", lambda: _stage_rows(staged, table_path, rows, schema.genes,
+                                                                 planned.targets, np.dtype(schema.x_dtype), sid),
                       lambda: shutil.rmtree(staged, ignore_errors=True))
-    if not (target / "zarr.json").exists():
-        schema.samples, schema.measured = [sid], {sid: list(sample_genes)}
+    if planned.seed:
+        schema.samples, schema.measured = [sid], {sid: list(planned.targets)}
         _group(staged, "r+").attrs.update(TABLE_ATTRS)
         write_schema(staged, schema, staging)
+        _commit(staged)
         _group(local, "a").require_group("tables")
         os.rename(staged, target)
     else:
-        if n_new:
+        if planned.n_new:
             _extend_var(target, schema, staging)
-        _widen_obs_chunks(target, staging)
+        _fix_chunks(target / "obs", OBS_CHUNK, staging)
+        _commit(target)                                  # annizarr reads the store through this metadata
         annizarr.append(str(target), cells=str(staged), include_new_obs=True, cfg=config(cpus))
-        _widen_obs_chunks(target, staging)           # columns annizarr just added or rewrote whole
+        _fix_chunks(target / "obs", OBS_CHUNK, staging)       # columns annizarr just added or rewrote whole
+        _fix_chunks(target / "X" / "indptr", INDPTR_CHUNK, staging)   # annizarr rewrites it in one chunk
         schema.samples.append(sid)
-        schema.measured[sid] = list(sample_genes)
+        schema.measured[sid] = list(planned.targets)
         schema.obs = {**kinds(rows), **schema.obs}
         write_schema(target, schema, staging)
+        _commit(target)
     shutil.rmtree(staged, ignore_errors=True)
-    return _note(n_new, len(schema.genes), n_missing)
+    return _note(planned.n_new, len(schema.genes), planned.n_missing)
+
+
+def repair(local: Path, present: list[str], staging: Path, cpus: int, models: dict[str, str] | None = None) -> list[str]:
+    """Brings the joint table in line with the store's per-sample tables (`present`, in store order):
+    rebuilt from them when it is inconsistent or unreadable (a killed append or S3 sync), then every
+    present sample missing from it appended. A present sample that can't be appended is taken out
+    of the store (`stores.uninstall_sample`) with one WARNING naming it and why, so it never blocks
+    later runs; add it again once fixed. Returns what was done (one line each); the caller consolidates."""
+    from annizarr.errors import AnzError
+
+    local, staging = Path(local), Path(staging)
+    models = models or {}
+    actions: list[str] = []
+    order: list[str] = []
+    has_joint = (table_path(local) / "zarr.json").exists()
+    counts = sample_counts(local) if has_joint else pd.Series(dtype=np.int64)
+    sizes = {sid: stores.n_obs(_group(local / "tables" / f"{sid}_table")) for sid in present}
+    if counts is None or any(sizes.get(sid) != n for sid, n in counts.items()):
+        schema = read_schema(local)
+        recorded = schema.samples if schema is not None else []
+        order = [sid for sid in recorded if sid in sizes]
+        drop(local)
+        counts = pd.Series(dtype=np.int64)
+        actions.append("the joint table was inconsistent (a killed append or sync); rebuilt from the per-sample tables")
+    missing = [sid for sid in present if sid not in counts.index and sid not in order]
+    for sid in order + missing:
+        try:
+            add(local, sid, local / "tables" / f"{sid}_table", staging, cpus, models.get(sid, ""))
+        except (JointError, genes.PanelError, stores.StoreError, AnzError) as exc:
+            if sample_counts(local) is None and table_path(local).exists():
+                return actions + _quarantine_and_rebuild(local, sid, exc, present, staging, cpus, models)
+            stores.uninstall_sample(local, sid)
+            logger.warning("%s is taken out of the store: its rows can't go into the joint table (%s). Add it "
+                           "again once that is fixed.", sid, exc)
+            actions.append(f"took {sid} out of the store (its rows can't go into the joint table)")
+            continue
+        if sid in missing:
+            actions.append(f"appended present sample {sid}, missing from the joint table")
+    return actions
+
+
+def _quarantine_and_rebuild(local: Path, sid: str, exc: Exception, present: list[str], staging: Path, cpus: int,
+                            models: dict[str, str]) -> list[str]:
+    """A failed append left the joint table broken: take the sample out and rebuild from the rest."""
+    stores.uninstall_sample(local, sid)
+    logger.warning("%s is taken out of the store: its rows can't go into the joint table (%s). Add it again once "
+                   "that is fixed.", sid, exc)
+    drop(local)
+    rest = [s for s in present if s != sid]
+    return [f"took {sid} out of the store (its rows can't go into the joint table)"] + \
+        repair(local, rest, staging, cpus, models)
 
 
 def sample_counts(store: Path) -> pd.Series | None:

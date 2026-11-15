@@ -31,11 +31,12 @@ import tarfile
 import zipfile
 from zlib import error as zlib_error
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 import config
 from contracts import NAMES, Candidate, Discovery, LeftOut, Member
+from stage import is_zip
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,44 @@ GENERIC = {"outs", "out", "output", "outputs", "data", "extract", "extracted", "
            "unzipped", "tmp", "temp"}
 GENERIC_RE = re.compile(r"^(.*[_-])?spatialdata([_.-]zarr)?$", re.IGNORECASE)
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+INSTRUMENT = re.compile(r"^output-XETG\d+__", re.IGNORECASE)     # Xenium instrument run folder names
+GSM = re.compile(r"^GSM\d+")
+GEO_TAIL = re.compile(r"([_.\- ](xenium|raw|data|outs?|outputs?|bundle|files|results))+$", re.IGNORECASE)
 BROWSER_COPY = re.compile(r"^(?P<stem>.+?) \((?P<n>\d+)\)(?P<ext>(\.[A-Za-z0-9]+)+)$")   # "cells (2).parquet"
+
+
+TAKES = "spatial_ingest takes Xenium or Atera bundles or SpatialData .zarr"
+ANNDATA = f"{TAKES} (AnnData tables go to the anndata_ingest capsule)"
+FOREIGN = {   # file types users give that are not spatial bundles: what they are, and where they go instead
+    ".h5ad": f"an AnnData .h5ad table, not a spatial bundle: {ANNDATA}",
+    ".rds": f"an R .rds file (e.g. a Seurat object), not a spatial bundle: {TAKES}; convert it to AnnData "
+            "for the anndata_ingest capsule",
+    ".rdata": f"an R data file, not a spatial bundle: {TAKES}",
+    ".rda": f"an R data file, not a spatial bundle: {TAKES}",
+    ".h5seurat": f"a Seurat .h5seurat file, not a spatial bundle: {TAKES}; convert it to AnnData for the "
+                 "anndata_ingest capsule",
+    ".loom": f"a .loom table, not a spatial bundle: {ANNDATA}",
+    ".h5": f"an .h5 file that is not a Xenium cell_feature_matrix.h5 (a Chromium/Visium count matrix?): a count "
+           f"matrix alone can't be placed in space; {TAKES}",
+    ".mtx": f"a count matrix without the Xenium cells table beside it: {TAKES}",
+    ".csv": f"a table (.csv/.tsv), not part of a bundle; a count table alone can't be placed in space: {TAKES}",
+    ".tsv": f"a table (.csv/.tsv), not part of a bundle; a count table alone can't be placed in space: {TAKES}",
+}
+
+
+def foreign_reason(name: str) -> str | None:
+    """Why a loose file of a known non-bundle type isn't used (`.gz` looked through), else None."""
+    if split_name(name) is not None:            # a 10x bundle file (cells.csv.gz, cell_feature_matrix.h5, …)
+        return None
+    lower = name.lower()
+    lower = lower[:-3] if lower.endswith(".gz") else lower
+    return next((why for ext, why in FOREIGN.items() if lower.endswith(ext)), None)
+
+
+def loose_reason(node: Node) -> str:
+    if node.size == 0 and not node.is_dir:
+        return "an empty file (0 bytes): download it again"
+    return foreign_reason(node.name) or "not part of a bundle or SpatialData object"
 
 
 class InputError(ValueError):
@@ -147,6 +185,15 @@ def name_id(names: Iterable[str]) -> str:
         if name and name.lower() not in GENERIC and not GENERIC_RE.match(name):
             return name
     return "sample"
+
+
+def geo_id(found_sids: list[str], name: str) -> str | None:
+    """A GSM-named archive or folder holding exactly one sample named after its instrument run folder
+    (`GSM9375928_EDT_057_SV1_xenium_raw_data.tar.gz` -> `output-XETG00281__…`): the GSM name is the ID users
+    search by (`GSM9375928_EDT_057_SV1`)."""
+    if len(found_sids) != 1 or not INSTRUMENT.match(found_sids[0]) or not GSM.match(name):
+        return None
+    return GEO_TAIL.sub("", clean_name(name)) or None
 
 
 def sanitize(sid: str) -> tuple[str, str | None]:
@@ -245,7 +292,7 @@ class ArchiveIndex:
         self.path = path
         self.dirs: dict[str, dict[str, tuple[bool, int]]] = {"": {}}
         self.meta: dict[str, bytes] = {}
-        self.zip = zipfile.is_zipfile(path)
+        self.zip = is_zip(path)
         if self.zip:
             with zipfile.ZipFile(path) as zf:
                 infos = [(i.filename, i.is_dir(), i.file_size) for i in zf.infolist()]
@@ -358,7 +405,7 @@ def zarr_verdict(node: Node, kids: dict[str, Node]) -> str | None:
         if group is not None and group.is_dir and {"zarr.json", ".zgroup"} & {c.name for c in group.children()}:
             return "spatialdata"
     if attrs.get("encoding-type") == "anndata":
-        return "an AnnData .zarr (a table with no spatial elements), not a SpatialData object"
+        return f"an AnnData .zarr (a table with no spatial elements), not a SpatialData object: {ANNDATA}"
     if ".zarray" in kids or v3.get("node_type") == "array":
         return "a zarr array, not a SpatialData object"
     return "a zarr store without SpatialData elements (no images/labels/points/shapes/tables groups)"
@@ -459,23 +506,45 @@ class Found:
         self.left_out += other.left_out
 
 
-def _files_under(node: Node, rel: str = "", depth: int = 0) -> Iterator[tuple[str, Node]]:
+def looks_like_root(node: Node) -> bool:
+    """A folder that is a sample of its own (marker plus data, matrix plus cells, a prefix group that qualifies,
+    or a SpatialData store): inside another bundle's folder it is never absorbed as that bundle's files."""
+    kids = node.children()
+    if zarr_verdict(node, {k.name: k for k in kids}) == "spatialdata":
+        return True
+    files = [k for k in kids if not k.is_dir and not is_junk(k.name)]
+    groups, _ = group_files(files)
+    plain = groups.get("")
+    if plain is not None and _marker_kind(plain.keys):
+        return _has_data(plain.keys)
+    mex = {"cell_feature_matrix/matrix.mtx.gz"} if any(k.is_dir and k.name == "cell_feature_matrix" for k in kids) \
+        else set()
+    return qualifies((plain.keys if plain else set()) | mex) or any(p and qualifies(g.keys) for p, g in groups.items())
+
+
+def _files_under(node: Node, rel: str = "", depth: int = 0,
+                 nested: list[Node] | None = None) -> Iterator[tuple[str, Node]]:
+    """Files below a bundle folder; subfolders that are samples of their own go to `nested` instead."""
     for child in node.children():
         if is_junk(child.name):
             continue
         path = f"{rel}{child.name}"
         if child.is_dir:
-            if depth < MAX_DEPTH:
-                yield from _files_under(child, path + "/", depth + 1)
+            if nested is not None and looks_like_root(child):
+                nested.append(child)
+            elif depth < MAX_DEPTH:
+                yield from _files_under(child, path + "/", depth + 1, nested)
         else:
             yield path, child
 
 
-def bundle_files(node: Node, skip: set[str] = frozenset()) -> tuple[dict[str, Member], int]:
+def bundle_files(node: Node, skip: set[str] = frozenset(),
+                 nested: list[Node] | None = None) -> tuple[dict[str, Member], int]:
     """Every file of a bundle folder under its canonical key (top-level names in `skip` left out: they belong
-    to other samples), and how many need gunzipping."""
+    to other samples; folders that are bundles of their own are collected in `nested`), and how many need
+    gunzipping."""
     group = Group("")
-    for rel, child in _files_under(node):
+    for rel, child in _files_under(node, nested=nested):
         if rel in skip:
             continue
         folder, _, base = rel.rpartition("/")
@@ -521,6 +590,20 @@ class Search:
 
     # -- folders
     def scan(self, node: Node, depth: int = 0, recurse: bool = True, archives: bool = True) -> Found:
+        return self._geo_named(self._scan(node, depth, recurse, archives), node.name)
+
+    @staticmethod
+    def _geo_named(found: Found, name: str) -> Found:
+        """The instrument-folder ID of a GSM folder's or archive's only sample replaced by the GSM name."""
+        sid = geo_id([c.sid for c, _ in found.candidates], name)
+        if sid:
+            (cand, root), = found.candidates
+            sid, _ = sanitize(sid)
+            note = f"sample ID from the GEO name {name!r} (the instrument folder is {cand.sid})"
+            found.candidates = [(replace(cand, sid=sid, notes=cand.notes + (note,)), root)]
+        return found
+
+    def _scan(self, node: Node, depth: int = 0, recurse: bool = True, archives: bool = True) -> Found:
         found = Found()
         if depth > MAX_DEPTH:
             found.left_out.append(LeftOut(node.display, f"more than {MAX_DEPTH} folder levels below the input; "
@@ -554,7 +637,7 @@ class Search:
             # an unprefixed bundle without a marker: the whole folder (minus other prefixes' samples)
             others = [g for p, g in groups.items() if p and qualifies(g.keys)]
             taken = {n.name for g in others for n, _ in g.files.values()}
-            found.candidates.append(self._folder_bundle(node, taken))
+            found.extend(self._folder_bundle(node, taken, depth))
             for group in others:
                 found.candidates.append(self._group_bundle(node, group, []))
             return found
@@ -566,8 +649,7 @@ class Search:
         found = Found()
         own = _has_data(plain.keys) or any(d.name in DATA_DIRS for d in dirs)
         if own:
-            found.candidates.append(self._folder_bundle(node, set()))
-            return found
+            return self._folder_bundle(node, set(), depth)
         if recurse:
             nested = Found()
             for child in dirs:
@@ -587,15 +669,24 @@ class Search:
                                                     "boundaries or transcripts) and no bundle below it"))
         return found
 
-    def _folder_bundle(self, node: Node, taken: set[str]) -> tuple[Candidate, str]:
-        files, n_gz = bundle_files(node, taken)
+    def _folder_bundle(self, node: Node, taken: set[str], depth: int) -> Found:
+        """The folder as one bundle, plus any bundle nested in it as samples of their own."""
+        nested: list[Node] = []
+        files, n_gz = bundle_files(node, taken, nested)
         kind = _marker_kind(files) or infer_kind(files)
         notes = []
         if not _marker_kind(files):
             notes.append(f"no experiment file: kind inferred from the files ({NAMES[kind]})")
         if n_gz:
             notes.append(f"{n_gz} gzipped file(s) are decompressed when staged")
-        return self._candidate(node, kind, name_id(node.up_names()), files, notes)
+        found = Found([self._candidate(node, kind, name_id(node.up_names()), files, notes)])
+        for child in nested:
+            inner = self.scan(child, depth + 1)
+            for cand, root in inner.candidates:
+                note = f"found inside the folder of {found.candidates[0][0].sid}, kept as a sample of its own"
+                found.candidates.append((replace(cand, notes=cand.notes + (note,)), root))
+            found.left_out += inner.left_out
+        return found
 
     def _group_bundle(self, node: Node, group: Group, extra: list[tuple[str, Node]]) -> tuple[Candidate, str]:
         files: dict[str, tuple[Node, bool]] = dict(group.files)
@@ -675,7 +766,7 @@ class Search:
         if node.size == 0:
             found.left_out.append(LeftOut(node.display, "an empty file (0 bytes): download it again"))
             return found
-        if path.name.lower().endswith(".zip") and not zipfile.is_zipfile(path):
+        if path.name.lower().endswith(".zip") and not is_zip(path):
             found.left_out.append(LeftOut(node.display, "not a valid .zip file (damaged or incomplete download?)"))
             return found
         try:
@@ -687,17 +778,29 @@ class Search:
             return found
         inner = self.scan(ArchiveNode(index, ""), depth)
         if not inner.candidates:
-            # one line for the archive, not one per member; a lone zarr's verdict says the most
-            reasons = {lo.reason for lo in inner.left_out}
-            zarr = len(reasons) == 1 and "zarr" in next(iter(reasons))
-            found.left_out.append(LeftOut(node.display, next(iter(reasons)) if zarr else
-                                          "holds no Xenium/Atera bundle and no SpatialData object"))
+            # one line for the archive, carrying what was found inside and why it isn't a sample
+            found.left_out.append(LeftOut(node.display, archive_reason(path, inner.left_out)))
             return found
+        inner = self._geo_named(inner, archive_stem(path.name))
         roots = [c for c, _ in inner.candidates]
         if len(roots) > 1:
             logger.info("%s holds %d samples: %s", node.display, len(roots), ", ".join(c.sid for c in roots))
         found.extend(inner)
         return found
+
+
+def archive_reason(path: Path, inner: list[LeftOut]) -> str:
+    """One reason for an archive without samples: the first inner reasons, with their paths inside it."""
+    if not inner:
+        return "holds no Xenium/Atera bundle and no SpatialData object (no files in it)"
+    head = f"{path}!"
+    parts = []
+    for lo in inner[:3]:
+        where = lo.path[len(head):] if lo.path.startswith(head) else ""
+        where = where.removesuffix("*").rstrip(SEPARATORS + "/")
+        parts.append(f"{where}: {lo.reason}" if where else lo.reason)
+    more = f"; … and {len(inner) - 3} more" if len(inner) > 3 else ""
+    return "holds no Xenium/Atera bundle and no SpatialData object: " + "; ".join(parts) + more
 
 
 def _sidecars(found: Found, loose: list[Node]) -> list[tuple[str, set[str], str]]:
@@ -740,21 +843,37 @@ def _summarise(node: Node, loose: list[Node], groups: dict[str, Group], samples:
         if not mine:
             continue
         names -= set(mine)
-        keys = ", ".join(sorted(group.keys))
-        if _marker_kind(group.keys):
-            what = "no data files beside the experiment file"
-        elif _has_matrix(group.keys):
-            what = "no cells table (cells.parquet / cells.csv.gz) and no experiment.xenium"
-        else:
-            what = "no count matrix (cell_feature_matrix.h5 / .zarr.zip or matrix.mtx) and no experiment.xenium"
         label = f"{node.display}/{group.raw and sorted(group.raw)[0] or ''}*"
-        out.append(LeftOut(label, f"10x files ({keys}) but {what}"))
+        out.append(LeftOut(label, group_reason(group)))
+    by_name = {n.name: n for n in loose}
     rest = sorted(names)
-    if len(rest) > MAX_LISTED:
-        out.append(LeftOut(node.display, f"{len(rest)} files that belong to no sample (e.g. {', '.join(rest[:3])})"))
+    special = [n for n in rest if foreign_reason(n) or by_name[n].size == 0]   # always named one by one
+    plain = [n for n in rest if n not in special]
+    out += [LeftOut(f"{node.display}/{n}", loose_reason(by_name[n])) for n in special]
+    if len(plain) > MAX_LISTED:
+        out.append(LeftOut(node.display, f"{len(plain)} files that belong to no sample (e.g. {', '.join(plain[:3])})"))
     else:
-        out += [LeftOut(f"{node.display}/{n}", "not part of a bundle or SpatialData object") for n in rest]
+        out += [LeftOut(f"{node.display}/{n}", loose_reason(by_name[n])) for n in plain]
     return out
+
+
+def group_reason(group: Group) -> str:
+    """Why a prefix group isn't a sample: every missing essential, and any 0-byte file (experiment.xenium is
+    optional, so it is never named as missing)."""
+    keys = ", ".join(sorted(group.keys))
+    empty = sorted(k for k, (n, _) in group.files.items() if n.size == 0)
+    full = {k for k, (n, _) in group.files.items() if n.size > 0}
+    if _marker_kind(group.keys) and not _has_data(group.keys):
+        why = "no data files beside the experiment file"
+    else:
+        missing = []
+        if not _has_matrix(full):
+            missing.append("count matrix (cell_feature_matrix.h5 / .zarr.zip or matrix.mtx)")
+        if not full & CELLS_KEYS:
+            missing.append("cells table (cells.parquet / cells.csv.gz)")
+        why = "no " + " and no ".join(missing) if missing else "not enough to read it"
+    zero = f"; empty (0-byte) file(s): {', '.join(empty)}, download them again" if empty else ""
+    return f"10x files ({keys}) but {why}{zero}"
 
 
 # ------------------------------------------------------------------------------------------ entries
@@ -808,8 +927,18 @@ def _entry(search: Search, path: Path) -> Found:
         if path.name.lower().endswith(UNSUPPORTED):
             return Found(left_out=[LeftOut(str(path), f"a {path.suffix} archive; only .zip, .tar, .tar.gz and .tgz "
                                                       "are read. Extract it and give the folder")])
-        return _holder(search, path) or Found(left_out=[LeftOut(
-            str(path), "a single file that is not part of a bundle; give the folder that holds the sample's files")])
+        held = _holder(search, path)
+        if held:
+            return held
+        if node.size == 0:
+            reason = "an empty file (0 bytes): download it again"
+        elif split_name(path.name) is not None:
+            reason = ("a single 10x bundle file without the rest of its bundle beside it; give the folder or archive "
+                      "that holds the sample's files (count matrix and cells table at least)")
+        else:
+            reason = foreign_reason(path.name) or ("a single file that is not part of a bundle; give the folder or "
+                                                   "archive that holds the sample's files")
+        return Found(left_out=[LeftOut(str(path), reason)])
     found = search.scan(node)
     if not found.candidates:
         return _holder(search, path) or found

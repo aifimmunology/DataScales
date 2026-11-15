@@ -91,14 +91,39 @@ def test_missing_positions_refused(tmp_path):
         load(cand, tmp_path / "s")
 
 
-def test_cells_without_position_are_left_out(tmp_path):
+def test_cells_without_position_are_kept_and_flagged(tmp_path, caplog):
+    """H5: every matrix cell stays in the table; the unplaced ones get has_position False, NaN centroids, no
+    shape, and ONE warning with the count and share."""
     folder = fb.xenium_full(tmp_path / "drop", labels=False)
     cells = pd.read_parquet(folder / "cells.parquet")
     fb.write_parquet(cells.iloc[3:], folder / "cells.parquet")
-    loaded = load(fb.candidate(folder), tmp_path / "s")
+    with caplog.at_level(logging.INFO):
+        loaded = load(fb.candidate(folder), tmp_path / "s")
     x, barcodes = h5_gex(folder / "cell_feature_matrix.h5")
-    assert loaded.table.n_obs == 27 and list(loaded.table.obs.index) == barcodes[3:]
-    assert (table_x(loaded) != x[3:]).nnz == 0
+    obs = loaded.table.obs
+    assert loaded.table.n_obs == 30 and list(obs.index) == barcodes and list(obs["cell_id"]) == barcodes
+    assert (table_x(loaded) != x).nnz == 0
+    assert list(obs["has_position"]) == [False] * 3 + [True] * 27
+    spatial = zarr.open_group(str(loaded.table.path), mode="r")["obsm"]["spatial"][:]
+    assert np.isnan(spatial[:3]).all() and np.isfinite(spatial[3:]).all()
+    assert obs["cell_area"].iloc[:3].isna().all()
+    shapes = loaded.elements["shapes"][loaded.regions[0]]          # boundaries are kept as the file has them
+    assert loaded.regions == ["cell_boundaries"] and set(barcodes[3:]) <= set(shapes.index)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and r.name == "readers"]
+    assert warnings == ["drop: 3 of 30 cells (10.0%) have no position; kept, marked obs['has_position']=False "
+                        "(no shape, NaN in obsm['spatial']; filter on it before spatial analysis)"]
+
+
+def test_unplaced_cells_with_integer_ids_and_circles(tmp_path):
+    folder = fb.xenium_xoa10(tmp_path / "rep1", n=12)
+    cells = pd.read_parquet(folder / "cells.parquet")
+    fb.write_parquet(cells.iloc[2:], folder / "cells.parquet")
+    (folder / "cell_boundaries.parquet").unlink()
+    loaded = load(fb.candidate(folder), tmp_path / "s")
+    obs = loaded.table.obs
+    assert pd.api.types.is_integer_dtype(obs["cell_id"]) and list(obs["cell_id"]) == list(range(1, 13))
+    circles = loaded.elements["shapes"]["cell_circles"]
+    assert loaded.regions == ["cell_circles"] and list(circles.index) == list(range(3, 13))
 
 
 @pytest.mark.parametrize("cell_major", [True, False])

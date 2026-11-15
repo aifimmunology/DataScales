@@ -407,7 +407,8 @@ def test_two_bundles_in_one_zip_are_two_samples_and_a_rerun_skips_both(tmp_path,
     again = run_capsule(str(store), str(archive))
     assert again["appended_samples"] == [] and sorted(again["skipped_samples"]) == ["RunA", "RunB"]
     assert snapshot(store) == before
-    assert not any((tmp_path / "scratch").glob("stage/*"))
+    left = [p for p in (tmp_path / "scratch").rglob("*") if p.is_file() and not p.name.startswith(".nfs")]
+    assert not left       # (on NFS a file still open somewhere stays as .nfs…; see the round-2 report)
 
 
 def test_geo_partial_bundle_goes_in_with_one_warning(tmp_path, run_capsule, caplog):
@@ -486,3 +487,174 @@ def test_store_location_refusals_are_one_clear_line(tmp_path, inputs_dir, run_ca
         run_capsule(str(tmp_path / "afile.txt"), str(inputs_dir / "single.zarr"))
     with pytest.raises(precheck.IngestError, match="absolute path"):
         run_capsule("rel/store.zarr", str(inputs_dir / "single.zarr"))
+
+
+# ---------------------------------------------------------------- fix round 2: critics' cases
+
+def cohort(path: Path, seed: int) -> Path:
+    """An object whose table names its samples rep1 and rep2 (sample_id column), like many downloads."""
+    import fixtures_sdata as fs
+    return fs.write(path, {"a": {"n": 6, "genes": HUMAN, "seed": seed}, "b": {"n": 5, "genes": HUMAN, "seed": seed + 1}},
+                    extra_obs={"sample_id": ["rep1"] * 6 + ["rep2"] * 5})
+
+
+def test_a_sample_whose_joint_rows_fail_is_left_out_and_the_others_go_in(tmp_path, run_capsule, caplog):
+    """critic K1/F1: repeated cell IDs (instance key elsewhere) used to commit the sample, then wedge the store."""
+    import fixtures_sdata as fs
+    fs.write(tmp_path / "in" / "bad.zarr", {"x": {"n": 6, "genes": HUMAN, "seed": 1}}, instance_key="instance_id",
+             extra_obs={"cell_id": ["c1", "c1", "c2", "c3", "c4", "c5"]})
+    fs.write(tmp_path / "in" / "good.zarr", {"y": {"n": 7, "genes": HUMAN, "seed": 2}})
+    store = tmp_path / "out.zarr"
+    with pytest.raises(precheck.IngestError, match=r"(?s)1 sample failed and was left out.*bad"):
+        run_capsule(str(store), str(tmp_path / "in"))
+    report = json.loads((Path(tmp_path / "results") / "spatial_ingest_run.json").read_text())
+    assert report["appended_samples"] == ["good"] and list(report["failed_samples"]) == ["bad"]
+    assert not any(n.startswith("bad") for k in ("shapes", "tables") for n in stores.committed(store)[k])
+    assert readback(store, ["good"])["tables"]["table"][0] == 7
+    again = run_capsule(str(store), str(tmp_path / "in" / "good.zarr"))      # the store is usable: no wedge
+    assert again["repairs"] == [] and again["skipped_samples"] == ["good"]
+
+
+def test_a_joint_append_failing_after_install_is_rolled_back(tmp_path, inputs_dir, run_capsule, monkeypatch):
+    real = joint.add
+
+    def failing(local, sid, *args, **kwargs):
+        if sid == "pair_b":
+            raise joint.JointError("pair_b: simulated failure after install")
+        return real(local, sid, *args, **kwargs)
+
+    monkeypatch.setattr(joint, "add", failing)
+    store = tmp_path / "out.zarr"
+    with pytest.raises(precheck.IngestError, match="pair_b"):
+        run_capsule(str(store), str(inputs_dir))
+    committed = stores.committed(store)
+    assert "pair_b_table" not in committed["tables"] and not any(n.startswith("pair_b") for n in committed["shapes"])
+    assert joint_obs(store)["sample_id"].value_counts().to_dict() == {"pair_a": 20, "single": 25}
+    monkeypatch.setattr(joint, "add", real)
+    report = run_capsule(str(store), str(inputs_dir))
+    assert report["appended_samples"] == ["pair_b"] and report["repairs"] == []
+
+
+def test_colliding_sample_ids_from_another_object_get_its_name(tmp_path, run_capsule):
+    """critic H4/F3: cohortB's rep1/rep2 were skipped as 'already present' (exit 0)."""
+    store = tmp_path / "out.zarr"
+    first = run_capsule(str(store), str(cohort(tmp_path / "cohortA.zarr", 1)))
+    assert sorted(first["appended_samples"]) == ["rep1", "rep2"]
+    second = run_capsule(str(store), str(cohort(tmp_path / "cohortB.zarr", 5)))
+    assert sorted(second["appended_samples"]) == ["cohortB_rep1", "cohortB_rep2"]
+    again = run_capsule(str(store), f"{tmp_path / 'cohortA.zarr'}, {tmp_path / 'cohortB.zarr'}")
+    assert again["appended_samples"] == [] and len(again["skipped_samples"]) == 4
+    both = tmp_path / "both"
+    cohort(both / "cohortC.zarr", 9), cohort(both / "cohortD.zarr", 13)
+    report = run_capsule(str(tmp_path / "two.zarr"), str(both))          # both in one run
+    assert sorted(report["appended_samples"]) == ["cohortD_rep1", "cohortD_rep2", "rep1", "rep2"]
+
+
+def test_ids_differing_only_in_case(tmp_path, run_capsule):
+    """critic M1/F4: S1 and s1 made a store spatialdata can't read."""
+    import fixtures_bundles as fb
+    import fixtures_sdata as fs
+    folder = tmp_path / "sd"
+    fs.write(folder / "S1.zarr", {"x": {"n": 5, "genes": HUMAN, "seed": 1}})
+    fs.write(folder / "s1.zarr", {"x": {"n": 6, "genes": HUMAN, "seed": 2}})
+    store = tmp_path / "out.zarr"
+    report = run_capsule(str(store), str(folder))
+    assert sorted(report["appended_samples"]) == ["S1", "sd_s1"]
+    readback(store, ["S1", "sd_s1"])
+    bundles = tmp_path / "bundles"
+    fb.xenium_full(bundles / "Run1", protein=False)
+    fb.xenium_full(bundles / "run1", seed=3, protein=False)
+    with pytest.raises(precheck.IngestError, match="Run1 and run1 .* differ only in case.*rename one folder"):
+        run_capsule(str(tmp_path / "b.zarr"), str(bundles))
+    assert not (tmp_path / "b.zarr").exists()
+
+
+def test_verify_reads_only_what_the_run_wrote(tmp_path, inputs_dir, run_capsule, monkeypatch):
+    """critic H2: verify loaded every shapes element of the store on every run."""
+    import spatialdata as sd
+    import existing as ex
+    store = tmp_path / "out.zarr"
+    run_capsule(str(store), str(inputs_dir / "pair.zarr"))
+    asked, real = [], ex.read_elements
+
+    def spy(path, wanted=None):
+        if Path(path) == store:                          # reads of the inputs don't count
+            asked.append(set(wanted) if wanted is not None else None)
+        return real(path, wanted)
+
+    monkeypatch.setattr(ex, "read_elements", spy)
+    monkeypatch.setattr(sd, "read_zarr", lambda *a, **k: pytest.fail("verify must not read the whole store"))
+    run_capsule(str(store), str(inputs_dir / "single.zarr"))
+    assert asked and None not in asked
+    assert all(name.startswith("single_") for wanted in asked for _, name in wanted)
+    asked.clear()
+    run_capsule(str(store), str(inputs_dir))                                 # a no-op rerun reads no element
+    assert asked == []
+
+
+def test_verify_error_message_itself_works(tmp_path, inputs_dir, run_capsule, monkeypatch):
+    """critic L2: `dict(counts or {})` raised on a Series and hid the verification message."""
+    store = tmp_path / "out.zarr"
+    run_capsule(str(store), str(inputs_dir / "single.zarr"))
+    monkeypatch.setattr(joint, "sample_counts", lambda local: pd.Series({"single": 3}))
+    with pytest.raises(precheck.IngestError, match=r"cells per sample \{'single': 3\} differ"):
+        main.verify(store, set())
+
+
+def test_a_second_run_on_a_locked_store_stops_with_one_line(tmp_path, inputs_dir, run_capsule):
+    """critic M4: two runs on one local store broke each other."""
+    store = tmp_path / "out.zarr"
+    run_capsule(str(store), str(inputs_dir / "single.zarr"))
+    held = stores.acquire_lock(store)
+    try:
+        with pytest.raises(stores.StoreError):
+            run_capsule(str(store), str(inputs_dir / "pair.zarr"))
+    finally:
+        stores.release_lock(held)
+    assert run_capsule(str(store), str(inputs_dir / "pair.zarr"))["appended_samples"] == ["pair_a", "pair_b"]
+
+
+def test_a_killed_runs_scratch_is_cleared_at_the_start(tmp_path, inputs_dir, run_capsule, env, monkeypatch):
+    """critic L3."""
+    stale = Path(env["SCRATCH_DIR"]) / "stage" / "old_sample"
+    stale.mkdir(parents=True)
+    (stale / "big.tif").write_bytes(b"x" * 100)
+    seen, real = [], precheck.run
+    monkeypatch.setattr(precheck, "run", lambda *a, **k: (seen.append(stale.exists()), real(*a, **k))[1])
+    run_capsule(str(tmp_path / "out.zarr"), str(inputs_dir / "single.zarr"))
+    assert seen == [False]
+
+
+def test_no_store_notice_on_a_refused_run(tmp_path, run_capsule, caplog, monkeypatch):
+    """critic L9: the /scratch store warning came before refusals that wrote nothing."""
+    import fixtures_bundles as fb
+    monkeypatch.setattr(main, "REFRESHED", {str(tmp_path): "is cleared when the run ends"})
+    monkeypatch.setattr(main, "storage_notice", lambda loc: (30, f"NOTICE {loc}"))
+    bad, _ = fb.geo_partial(tmp_path / "GSE2", positions_ok=False)
+    with pytest.raises(precheck.IngestError):
+        run_capsule(str(tmp_path / "out.zarr"), str(bad))
+    assert "NOTICE" not in caplog.text
+
+
+def test_a_second_run_on_a_locked_s3_store_stops_and_the_lock_is_released(tmp_path, inputs_dir, run_capsule,
+                                                                           monkeypatch):
+    """critic K2: two runs on one S3 store; the second sync deleted the first run's sample."""
+    moto = pytest.importorskip("moto")
+    for k, v in {"AWS_DEFAULT_REGION": "us-east-1", "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}.items():
+        monkeypatch.setenv(k, v)
+    import boto3
+    import s3
+    with moto.mock_aws():
+        boto3.client("s3").create_bucket(Bucket="bucket")
+        url = "s3://bucket/stores/locked.zarr"
+        run_capsule(url, str(inputs_dir / "single.zarr"))
+        held = s3.acquire_lock(url)
+        try:
+            with pytest.raises(s3.S3Error):
+                run_capsule(url, str(inputs_dir / "pair.zarr"))
+        finally:
+            s3.release_lock(held)
+        report = run_capsule(url, str(inputs_dir / "pair.zarr"))       # released by the run that held it
+        assert report["appended_samples"] == ["pair_a", "pair_b"]
+        keys = [o["Key"] for o in boto3.client("s3").list_objects_v2(Bucket="bucket").get("Contents", [])]
+        assert not [k for k in keys if k.endswith(s3.LOCK)]

@@ -2,11 +2,12 @@
 parts that exist, so an incomplete bundle (GEO uploads, per-file downloads, Explorer-only exports) gives
 whatever its files allow.
 
-Xenium: spatialdata-io 0.7.1's own element readers (`_XeniumCells`, `_get_labels`, `_get_polygons`,
-`_get_morphology_focus`, `_get_images`; pinned version) wherever their files exist, which gives the same
-elements as `spatialdata_io.xenium()` for a complete bundle; otherwise our builders: polygons from
-boundary parquet/csv (grouped by an integer `label_id`, else by `cell_id`), polygons from cells.zarr.zip
-(Explorer), transcripts from parquet/csv with bytes columns decoded (XOA 1.x), circles from the centroids.
+Xenium: spatialdata-io 0.7.1's own readers for labels and 2D images (`_XeniumCells`, `_get_labels`,
+`_get_morphology_focus`, `_get_images`; pinned version; images read by tiles); our builders for the rest, which
+give the same elements as `spatialdata_io.xenium()` for a complete bundle: polygons from boundary parquet/csv
+built batch by batch (grouped by an integer `label_id`, else by `cell_id`; nuclei indexed by label like
+spatialdata-io), polygons from cells.zarr.zip (Explorer), transcripts from parquet/csv (bytes columns decoded,
+XOA 1.x) or Explorer transcripts.zarr.zip, the z-stack image, circles from the centroids.
 Atera: the vendored reader (`vendor.atera`) when cells.zarr.zip exists, else circles from the centroids.
 Every element keeps spatialdata-io's names and its `Scale(1 / pixel_size)` transformation to `global`."""
 from __future__ import annotations
@@ -39,6 +40,21 @@ class Built:
     region: str = REGION
     obs_columns: dict[str, np.ndarray] = field(default_factory=dict)   # extra obs columns (table row order)
     problems: list[str] = field(default_factory=list)                 # optional parts that failed to read
+
+
+def _size(*paths: Path) -> str:
+    """Total size of files / folders for progress lines (GB = 10^9 bytes)."""
+    total = 0
+    for p in paths:
+        p = Path(p)
+        items = [q for q in p.rglob("*") if q.is_file()] if p.is_dir() else [p]
+        total += sum(q.stat().st_size for q in items if q.exists())
+    return f"{total / 1e9:.1f} GB"
+
+
+def progress(sid: str, what: str, *paths: Path) -> None:
+    """One INFO line before a long element read/build, with the size it works through (L7)."""
+    logger.info("%s: reading %s (%s)", sid, what, _size(*paths) if paths else "")
 
 
 def scale(pixel_size: float, axes=("x", "y")):
@@ -94,29 +110,93 @@ def _usable_label_id(path: Path) -> bool:
     return pq.read_table(path, columns=["label_id"]).column(0).null_count == 0
 
 
+BOUNDARY_BATCH_ROWS = 1 << 21          # vertices per boundary read batch
+
+
+def _boundary_batches(path: Path, scratch: Path):
+    """(vertex_x, vertex_y, cell_id, label_id or None) as numpy arrays per batch of ~BOUNDARY_BATCH_ROWS
+    vertices: parquet by arrow record batches, csv(.gz) by pandas chunks. Only one batch is in memory."""
+    if tables.is_parquet(path):
+        import pyarrow.parquet as pq
+
+        names = pq.read_schema(tables.plain(path, scratch)).names
+
+        def record_batches():
+            with pq.ParquetFile(tables.plain(path, scratch)) as pf:
+                for b in pf.iter_batches(batch_size=BOUNDARY_BATCH_ROWS,
+                                         columns=[c for c in ("vertex_x", "vertex_y", "cell_id", "label_id")
+                                                  if c in names]):
+                    yield {c: b.column(c).to_numpy(zero_copy_only=False) for c in b.schema.names}
+        batches = record_batches()
+    else:
+        with tables.open_text(path) as f:
+            names = list(pd.read_csv(f, nrows=0).columns)
+
+        def chunks():
+            with tables.open_text(path) as f:
+                for chunk in pd.read_csv(f, usecols=[c for c in ("vertex_x", "vertex_y", "cell_id", "label_id")
+                                                     if c in names], chunksize=BOUNDARY_BATCH_ROWS):
+                    yield {c: chunk[c].to_numpy() for c in chunk.columns}
+        batches = chunks()
+    if not {"vertex_x", "vertex_y", "cell_id"} <= set(names):
+        raise tables.TableError(f"{path.name} has no vertex_x / vertex_y / cell_id columns")
+    # label_id separates polygons only when it is an integer column without nulls in the whole file (decided
+    # once, so batches agree); csv re-exports are grouped by cell_id
+    usable = tables.is_parquet(path) and "label_id" in names and _usable_label_id(tables.plain(path, scratch))
+    for b in batches:
+        yield b["vertex_x"], b["vertex_y"], np.asarray(b["cell_id"]), (b["label_id"] if usable else None)
+
+
 def polygons_from_table(path: Path, pixel_size: float, scratch: Path, is_nucleus: bool):
-    """Polygons from a boundary parquet/csv(.gz): vertices grouped by consecutive runs of an integer
-    `label_id` (when usable) or of `cell_id`; indexed by cell_id (the first polygon of a cell is kept)."""
+    """Polygons from a boundary parquet/csv(.gz), read batch by batch (a polygon cut by a batch end is carried
+    into the next batch): vertices grouped by consecutive runs of an integer `label_id` (when usable) or of
+    `cell_id`; indexed by cell_id (first polygon of a cell kept). Only the polygons are held."""
     import geopandas as gpd
     import shapely
     from spatialdata.models import ShapesModel
 
-    df = tables.read_frame(path, scratch)
-    if not {"vertex_x", "vertex_y", "cell_id"} <= set(df.columns):
-        raise tables.TableError(f"{path.name} has no vertex_x / vertex_y / cell_id columns")
-    ids = tables.cell_keys(df["cell_id"].to_numpy())
-    label = df["label_id"] if "label_id" in df else None
-    key = label.to_numpy() if label is not None and pd.api.types.is_integer_dtype(label) and label.notna().all() else ids
-    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
-    lengths = np.diff(np.r_[starts, len(key)])
-    xy = df[["vertex_x", "vertex_y"]].to_numpy(dtype=float)
-    ok = lengths >= 3
-    group = np.repeat(np.arange(len(starts)), lengths)
-    keep_rows = np.repeat(ok, lengths)
-    rings = shapely.linearrings(xy[keep_rows], indices=np.searchsorted(np.flatnonzero(ok), group[keep_rows]))
-    gdf = gpd.GeoDataFrame({"geometry": shapely.polygons(rings)},
-                           index=pd.Index(ids[starts][ok], name="cell_id"))
-    gdf = gdf[~gdf.index.duplicated()]
+    geometries, ids, labels = [], [], []
+    carry = None
+
+    def build(x, y, cid, key, final):
+        if not len(key):
+            return None
+        starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+        cut = len(starts) if final else len(starts) - 1          # the last run may continue in the next batch
+        stop = len(key) if final else int(starts[-1])
+        if cut:
+            lengths = np.diff(np.r_[starts[:cut], stop])
+            ok = lengths >= 3
+            if ok.any():
+                rows = np.repeat(ok, lengths)
+                group = np.repeat(np.arange(cut), lengths)[rows]
+                rings = shapely.linearrings(np.column_stack([x[:stop][rows], y[:stop][rows]]),
+                                            indices=np.searchsorted(np.flatnonzero(ok), group))
+                geometries.append(shapely.polygons(rings))
+                ids.append(tables.cell_keys(cid[starts[:cut][ok]]))
+                if by_label:
+                    labels.append(np.asarray(key[starts[:cut][ok]], dtype=np.int64))
+        return None if final else (x[stop:], y[stop:], cid[stop:], key[stop:])
+
+    by_label = False
+    for x, y, cid, label in _boundary_batches(path, scratch):
+        by_label = label is not None
+        key = label if by_label else cid
+        if carry is not None:
+            x, y = np.concatenate([carry[0], x]), np.concatenate([carry[1], y])
+            cid, key = np.concatenate([carry[2], cid]), np.concatenate([carry[3], key])
+        carry = build(x, y, cid, key, final=False)
+    if carry is not None:
+        build(*carry, final=True)
+    geometry = np.concatenate(geometries) if geometries else np.array([], dtype=object)
+    cell = np.concatenate(ids) if ids else np.array([], dtype=object)
+    if is_nucleus and labels:
+        # like spatialdata-io: every nucleus kept (multinucleate cells have several), indexed by its label
+        # (= the nucleus_labels raster value), owning cell in a column
+        gdf = gpd.GeoDataFrame({"geometry": geometry, "cell_id": cell}, index=pd.Index(np.concatenate(labels)))
+    else:
+        gdf = gpd.GeoDataFrame({"geometry": geometry}, index=pd.Index(cell, name="cell_id"))
+        gdf = gdf[~gdf.index.duplicated()]
     return ShapesModel.parse(gdf, transformations={"global": scale(pixel_size)})
 
 
@@ -153,12 +233,12 @@ def _feature_names(path: Path, parquet: bool) -> pd.Index:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
 
-        pf = pq.ParquetFile(path, read_dictionary=["feature_name"])
-        for batch in pf.iter_batches(batch_size=1 << 21, columns=["feature_name"]):
-            column = batch.column(0)
-            values = column.dictionary if hasattr(column, "dictionary") else pc.unique(column)
-            for v in values.to_pylist():
-                seen.setdefault(v.decode() if isinstance(v, bytes) else str(v), None)
+        with pq.ParquetFile(path, read_dictionary=["feature_name"]) as pf:
+            for batch in pf.iter_batches(batch_size=1 << 21, columns=["feature_name"]):
+                column = batch.column(0)
+                values = column.dictionary if hasattr(column, "dictionary") else pc.unique(column)
+                for v in values.to_pylist():
+                    seen.setdefault(v.decode() if isinstance(v, bytes) else str(v), None)
     else:
         with tables.open_text(path) as f:
             for chunk in pd.read_csv(f, usecols=["feature_name"], chunksize=1 << 21):
@@ -172,7 +252,7 @@ def _row_groups_per_partition(path: Path) -> int:
     sizes from the footer's row groups, never its total, which fastparquet 1.0 files get wrong)."""
     import pyarrow.parquet as pq
 
-    meta = pq.ParquetFile(path).metadata
+    meta = pq.read_metadata(path)
     rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
     typical = int(np.median(rows)) if rows else 1
     return max(1, POINTS_PARTITION_ROWS // max(typical, 1))
@@ -273,6 +353,32 @@ def explorer_transcripts(path: Path, pixel_size: float):
 
 # --------------------------------------------------------------------------- images
 
+# Handles lazy elements keep open (TiffFile for tiled images, ZipStore for labels), by sample: they must stay
+# open until the elements are written, then `release(sid)` closes them (NFS keeps `.nfs…` files for open,
+# deleted files, which would block the scratch cleanup).
+OPEN_HANDLES: dict[str, list] = {}
+
+
+def adopt_vendor_handles(sid: str) -> None:
+    """Move the vendored reader's newly opened handles under `sid`."""
+    from vendor import _atera_common
+
+    OPEN_HANDLES.setdefault(sid, []).extend(_atera_common.OPENED)
+    _atera_common.OPENED.clear()
+
+
+def release(sid: str) -> int:
+    """Close every file handle the sample's lazy elements hold; returns how many."""
+    adopt_vendor_handles(sid)
+    handles = OPEN_HANDLES.pop(sid, [])
+    for handle in handles:
+        try:
+            handle.close()
+        except Exception:                               # noqa: BLE001 — closing is best effort
+            logger.debug("closing %r failed", handle, exc_info=True)
+    return len(handles)
+
+
 def tiled_imread(path, **_):
     """An OME-TIFF as a dask array chunked by the file's own tiles (pages as a leading axis, like
     dask_image's imread). dask_image gives each page ONE chunk — a whole 2.7 GB plane for a Prime slide — so
@@ -349,10 +455,11 @@ def _try(built: Built, what: str, fn, *args, **kwargs):
         return None
 
 
-def xenium(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.ndarray, scratch: Path) -> Built:
+def xenium(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.ndarray, scratch: Path,
+           sid: str = "") -> Built:
     """`folder` holds the bundle's chosen files under canonical names; `files` maps roles to them."""
     from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs
-    from spatialdata_io.readers.xenium import _get_images, _get_labels, _get_morphology_focus, _get_polygons, \
+    from spatialdata_io.readers.xenium import _get_images, _get_labels, _get_morphology_focus, \
         _XeniumCells
     import packaging.version
 
@@ -363,6 +470,8 @@ def xenium(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.
     cells_zarr = None
     if "cells_zarr" in files:
         cells_zarr = _try(built, "cells.zarr.zip", _XeniumCells.open, folder, version)
+        if cells_zarr is not None:
+            OPEN_HANDLES.setdefault(sid, []).append(cells_zarr.group.store)
     if cells_zarr is not None:
         for name, index in (("nucleus_labels", 0), ("cell_labels", 1)):
             label = _try(built, name, _get_labels, cells_zarr.group, index, label_kwargs)
@@ -386,25 +495,12 @@ def xenium(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.
         path = files.get(role)
         if path is None:
             continue
+        progress(sid, f"{role.replace('_', ' ')} from {path.name}", path)
         shapes = None
         if path.name.endswith(".zarr.zip"):
             ids = cells_zarr.cell_id_str if cells_zarr is not None else None
             shapes = _try(built, role, polygons_from_cells_zarr, path, pixel, ids, is_nucleus) if ids is not None else None
-        elif cells_zarr is not None and tables.is_parquet(path) and _usable_label_id(tables.plain(path, scratch)) \
-                and (cells_zarr.nucleus_indices_mapping if is_nucleus else cells_zarr.cell_indices_mapping) is not None:
-            # spatialdata-io's own reader, keyed through cells.zarr.zip (label_index for nuclei, as it does);
-            # without that mapping it would index polygons by label_id, so our builder is used instead
-            plain = tables.plain(path, scratch)
-            mapping = cells_zarr.nucleus_indices_mapping if is_nucleus else cells_zarr.cell_indices_mapping
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    shapes = _get_polygons(plain.parent, plain.name, specs, indices_mapping=mapping,
-                                           is_nucleus=is_nucleus)
-                except (AssertionError, KeyError, ValueError) as exc:
-                    logger.debug("spatialdata-io polygons failed for %s: %s", path, exc)
-                    shapes = None
-        if shapes is None and not path.name.endswith(".zarr.zip"):
+        else:   # batch-wise builder; same polygons and index as spatialdata-io's reader, a fraction of the memory
             shapes = _try(built, role, polygons_from_table, path, pixel, scratch, is_nucleus)
         if shapes is not None:
             shapes = _try(built, role, _ids_like_table, shapes, obs["cell_id"], is_nucleus)
@@ -413,11 +509,16 @@ def xenium(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.
 
     if "transcripts" in files:
         path = files["transcripts"]
+        progress(sid, f"transcripts from {path.name}", path)
         points = _try(built, "transcripts", explorer_transcripts, path, pixel) if path.name.endswith(".zarr.zip") \
             else _try(built, "transcripts", transcripts, path, pixel, scratch)
         if points is not None:
             built.elements["points"]["transcripts"] = points
 
+    images = [p for p in (folder / "morphology_focus", folder / "morphology_focus.ome.tif",
+                          folder / "morphology_mip.ome.tif") if p.exists()]
+    if images:
+        progress(sid, "images " + ", ".join(p.name for p in images), *images)
     with tiled_images():
         focus = folder / "morphology_focus"
         if focus.is_dir():
@@ -435,12 +536,14 @@ def xenium(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.
             if image is not None:
                 built.elements["images"]["morphology_mip"] = image
     if "morphology_3d" in files:
+        progress(sid, f"z-stack image {files['morphology_3d'].name}", files["morphology_3d"])
         image = _try(built, "morphology.ome.tif (z-stack)", morphology_3d, files["morphology_3d"], scratch,
                      specs.get("z_step_size"))
         if image is not None:
             built.elements["images"]["morphology"] = image
 
     _set_region(built, obs["cell_id"], spatial, obs.get("cell_area"), pixel)
+    adopt_vendor_handles(sid)
     return built
 
 
@@ -460,22 +563,25 @@ def _ids_like_table(shapes, table_ids: pd.Series, is_nucleus: bool):
 
 
 def _set_region(built: Built, cell_ids: pd.Series, spatial: np.ndarray, area, pixel: float) -> None:
-    """The table annotates cell_boundaries when every cell has one, else circles at the centroids."""
+    """The table annotates cell_boundaries when every placed cell has one, else circles at the centroids.
+    Cells without a position (obs['has_position'] False) get no shape."""
+    placed = np.isfinite(np.asarray(spatial, dtype=float)).all(axis=1)
+    ids = pd.Index(np.asarray(cell_ids))[placed]
     shapes = built.elements["shapes"].get(REGION)
     if shapes is not None:
-        uncovered = int((~pd.Index(cell_ids).isin(shapes.index)).sum())
+        uncovered = int((~ids.isin(shapes.index)).sum())
         if not uncovered:
             built.region = REGION
             return
         built.problems.append(f"{uncovered} cells have no cell boundary, so the table annotates cell circles")
-    built.elements["shapes"][CIRCLES] = circles(spatial, None if area is None else np.asarray(area),
-                                                np.asarray(cell_ids), pixel)
+    area = None if area is None else np.asarray(area, dtype=float)[placed]
+    built.elements["shapes"][CIRCLES] = circles(np.asarray(spatial)[placed], area, np.asarray(ids), pixel)
     built.region = CIRCLES
 
 
 # --------------------------------------------------------------------------- Atera
 
-def atera(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.ndarray) -> Built:
+def atera(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.ndarray, sid: str = "") -> Built:
     """Atera elements with the vendored reader (its table is lazy and dropped)."""
     built = Built()
     has_cells = "cells_zarr" in files
@@ -487,6 +593,10 @@ def atera(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.n
         pixel = _try(built, "pixel size", _get_pixel_size, folder)
     if pixel is not None:
         from vendor.atera import atera as read_atera
+
+        parts = [folder / n for n in ("cells.zarr.zip", "transcripts.zarr.zip", "morphology_2d", "morphology_3d")
+                 if (folder / n).exists()]
+        progress(sid, "Atera elements " + ", ".join(p.name for p in parts), *parts)
 
         # The reader's own (lazy) table is dropped: ours is streamed. Without cells.zarr.zip it would annotate
         # `cell_labels`, which isn't read, and spatialdata warns about it; that warning is moot here.
@@ -505,6 +615,7 @@ def atera(folder: Path, files: dict[str, Path], obs: pd.DataFrame, spatial: np.n
         pixel = DEFAULT_PIXEL_SIZE
         built.problems.append(f"pixel size unknown (no experiment.spatial, no images); {pixel} µm assumed")
     _set_region(built, obs["cell_id"], spatial, obs.get("cell_area"), pixel)
+    adopt_vendor_handles(sid)
     return built
 
 

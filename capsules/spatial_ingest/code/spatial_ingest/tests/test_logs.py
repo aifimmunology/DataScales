@@ -89,3 +89,4 @@ def test_a_clean_run_logs_no_warning(tmp_path, env, tiny_model, real):
             warned = [line for line in warned if "GENE PANELS DIFFER" not in line]
         assert warned == [], f"{attempt}: " + "\n".join(warned)
         assert "Traceback" not in out and "Done:" in out
+        assert "annizarr" not in out, f"{attempt}: annizarr chatter"     # critic L8: append progress lines

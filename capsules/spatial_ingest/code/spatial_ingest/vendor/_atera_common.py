@@ -52,6 +52,9 @@ DEFAULT_TRANSCRIPT_CHUNK_ROWS = 5_000_000
 
 _UINT32_SENTINEL = np.iinfo(np.uint32).max
 
+# spatial_ingest: file handles that lazy elements keep open (TiffFile, ZipStore); see readers.close
+OPENED: list = []
+
 
 @contextlib.contextmanager
 def _patched_ragged_vlen_chunk_decode() -> Iterator[None]:
@@ -688,6 +691,7 @@ def _tiled_imread(path: Path, imread_kwargs: Mapping[str, Any] = MappingProxyTyp
     import tifffile
 
     tf = tifffile.TiffFile(path, **imread_kwargs)
+    OPENED.append(tf)  # spatial_ingest: lazy reads keep it open; closed by readers.close after the write
     store = tf.series[0].aszarr(level=0)
     return da.from_zarr(zarr.open(store, mode="r"))
 

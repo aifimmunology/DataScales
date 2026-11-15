@@ -2,8 +2,10 @@
 archive members extracted, per-file gzip (GEO) decompressed. Only the files asked for are touched, so
 a precheck can read a matrix header without extracting a 40 GB image.
 
-Speed on shared filesystems: all members asked for from one .tar(.gz) come out of ONE pass over the stream
-(a tar has no index, so reading members one by one re-reads the archive each time); a SpatialData store in a
+Speed on shared filesystems: a tar has no index, so every read of a member re-reads (and for .tar.gz
+re-decompresses) the archive from its start. The first time any file of a sample is needed from a tar, ALL of
+that sample's files (bar the analysis outputs nobody reads, PREFETCH_SKIP) come out in that one pass, so later
+fetches by inventory, precheck and readers find them staged; a SpatialData store in a
 .zip is extracted by several threads (many small chunk files, latency-bound). Archives over 1 GB get one INFO
 line before the work starts. Sizes in messages are GB = 10^9 bytes."""
 from __future__ import annotations
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 CHUNK = 1 << 24
 BIG = 10 ** 9                       # archives larger than this get a progress line
 ZIP_THREADS = 8
+PREFETCH_SKIP = ("analysis/", "aux_outputs/", "analysis.zarr.zip", "analysis.tar.gz", "analysis_summary.html")
 
 
 def gb(size: int) -> str:
@@ -46,15 +49,21 @@ def _note_big(container: Path, what: str) -> None:
         logger.info("%s from %s (%s); this can take a few minutes …", what, container.name, gb(size))
 
 
-def _is_zip(path: Path) -> bool:
-    return path.is_file() and zipfile.is_zipfile(path)
+def is_zip(path: Path) -> bool:
+    """A zip archive by its leading signature. `zipfile.is_zipfile` alone also accepts a plain .tar whose
+    last member is a .zip (it finds that member's end-of-central-directory record)."""
+    if not path.is_file():
+        return False
+    with open(path, "rb") as f:
+        head = f.read(4)
+    return head in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08") and zipfile.is_zipfile(path)
 
 
 def _open_member(member: Member):
     """A binary stream of the member's bytes as stored (still gzipped when `member.gz`)."""
     if member.inner is None:
         return open(member.container, "rb")
-    if _is_zip(member.container):
+    if is_zip(member.container):
         zf = zipfile.ZipFile(member.container)
         stream = zf.open(member.inner)
         stream._spatial_ingest_owner = zf  # keep the archive open as long as the stream
@@ -84,7 +93,7 @@ def _copy(member: Member, target: Path) -> None:
 
 
 def _is_tar_member(member: Member) -> bool:
-    return member.inner is not None and not _is_zip(member.container)
+    return member.inner is not None and not is_zip(member.container)
 
 
 def fetch_member(member: Member, target: Path) -> Path:
@@ -142,6 +151,13 @@ def fetch(candidate: Candidate, names: Iterable[str], dest: Path) -> dict[str, P
         else:
             fetch_member(member, target)
     for container, wanted in tars.items():
+        for key, member in candidate.files.items():          # the rest of the sample, in the same pass
+            target = dest / key
+            if member.container == container and member.inner is not None and not key.startswith(PREFETCH_SKIP) \
+                    and not (target.exists() or target.is_symlink()):
+                jobs = wanted.setdefault(member.inner, [])
+                if all(t != target for _, t in jobs):
+                    jobs.append((member, target))
         _fetch_tar(container, wanted)
     return out
 
@@ -231,7 +247,7 @@ def spatialdata(candidate: Candidate, dest: Path) -> Path:
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     _note_big(member.container, f"Extracting the SpatialData object {candidate.sid}")
-    if _is_zip(member.container):
+    if is_zip(member.container):
         _unzip_store(member.container, prefix, tmp)
     else:
         _untar_store(member.container, prefix, tmp)

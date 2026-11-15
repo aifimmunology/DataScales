@@ -4,18 +4,19 @@
   "pull_request": "https://github.com/scverse/spatialdata-io/pull/426",
   "changes": [
     "imports of AteraKeys and _atera_common rewritten to this package",
-    "atera(): the morphology_3d image gets MORPHOLOGY_3D_KWARGS instead of the 2D image_models_kwargs"
+    "atera(): the morphology_3d image gets MORPHOLOGY_3D_KWARGS instead of the 2D image_models_kwargs",
+    "OPENED registry: _tiled_imread's TiffFile and atera()'s cells ZipStore are recorded so spatial_ingest can close them after the elements are written (readers.close)"
   ],
   "files": {
     "atera.py": {
       "upstream_path": "src/spatialdata_io/readers/atera.py",
       "upstream_sha256": "89306dfacea18ca785ec89943da25f275750c11c833565a978a1c7f023ae7349",
-      "vendored_sha256": "0d9fc9f30c6a403e54912317b639e8bcc32845cb6f8ec3fb5b55d51e9359164c"
+      "vendored_sha256": "c575b403ce8a3c28f32ff9df216dbb7fa1e8506baafaa1dfc810f9270dce6683"
     },
     "_atera_common.py": {
       "upstream_path": "src/spatialdata_io/readers/_atera_common.py",
       "upstream_sha256": "50169d5953dcd19e7f006ceaf8840d088e15040eef84e225734a1d26c406dc39",
-      "vendored_sha256": "7c4341b0a67027fbb398c25a8a6d4f06971e4600318fb916f8d5dca684be561c"
+      "vendored_sha256": "252624ab6d707e3ba75406500f2c02d59088d792bec3d1bfe8717371d68f98b6"
     },
     "_constants.py": {
       "upstream_path": "src/spatialdata_io/_constants/_constants.py",

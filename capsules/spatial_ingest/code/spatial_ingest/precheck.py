@@ -7,7 +7,8 @@ gets one report.
 The run stops (IngestError, one message listing every problem) when any new sample misses an essential
 part (a count matrix; a cells table with cell IDs and x/y positions), can't be split or read, has a
 species other than the store's or the other samples', shares too few genes with the CellTypist model,
-or two samples have the same ID. Everything else is reported and the run goes on:
+or two bundles have the same ID (or IDs differing only in case). A SpatialData sample whose ID is taken
+is renamed `<object>_<sid>` instead (`resolve_ids`). Everything else is reported and the run goes on:
 - items in the inputs that aren't samples: one WARNING listing them;
 - a bundle and a SpatialData object that are the only samples in one folder (e.g. a SEA-AD section's raw
   output beside its combined_spatialdata_zarr): one WARNING that they may be the same tissue; both are added;
@@ -25,7 +26,7 @@ import logging
 import os
 import tarfile
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import zarr
@@ -294,10 +295,68 @@ def panel_warning(stats: dict[str, dict], state: StoreState, union: list[str]) -
                  "table keeps its panel.", lines)
 
 
+def _object_name(s: Sample) -> str:
+    """The prefix that tells a SpatialData object's samples apart from another object's: the object's ID
+    (its .zarr name, or the meaningful parent of a generic one); its parent folder when the sample is
+    named like the object itself."""
+    name = s.candidate.sid
+    if name == s.sid:
+        name = discover.sanitize(Path(s.candidate.origin).parent.name)[0] or "object"
+    return name
+
+
+def _clash(s: Sample, claimed: dict[str, Sample], taken: dict[str, tuple[str, str | None]]) -> str | None:
+    """Why `s.sid` can't be used as it is: taken in this run by another input, taken in the store by a
+    sample from another source, or equal to another ID ignoring case (spatialdata keys are
+    case-insensitively unique). None when it is free (or is this very sample, already in the store)."""
+    low = s.sid.lower()
+    if low in claimed:
+        other = claimed[low]
+        return f"{other.sid} from {source(other)} in this run"
+    if low in taken:
+        sid, recorded = taken[low]
+        if sid != s.sid:
+            return f"{sid}, already in the store"
+        if recorded and recorded != source(s):
+            return f"{sid}, already in the store (added from {recorded})"
+    return None
+
+
+def resolve_ids(samples: list[Sample], state: StoreState) -> list[str]:
+    """Makes every sample ID usable, in place. A SpatialData sample whose ID is taken (by another input in
+    this run, by a store sample from another source, or by an ID differing only in case) is renamed
+    `<object>_<sid>` (one INFO line); identical cells under the new name are still skipped later by
+    fingerprint. Bundles get their ID from their folder: a case-only clash is a problem (the user
+    renames a folder); the same ID from another path stays "already in the store" (warned)."""
+    taken = {sid.lower(): (sid, state.records.get(sid, {}).get("source")) for sid in state.present}
+    claimed: dict[str, Sample] = {}
+    problems = []
+    for s in samples:
+        why = _clash(s, claimed, taken)
+        if why and s.kind == "spatialdata":
+            old, new = s.sid, f"{_object_name(s)}_{s.sid}"
+            s.sid = new
+            s.part = replace(s.part, sid=new) if s.part is not None else None
+            again = _clash(s, claimed, taken)
+            if again:
+                problems.append(f"{old} from {source(s)}: its ID is taken by {why}, and {new} by {again}; give the "
+                                "object another name (its folder name) or a different sample_id column.")
+            else:
+                logger.info("%s from %s is added as %s: the ID %s is taken by %s.", old, source(s), new, old, why)
+        elif why:
+            low = s.sid.lower()
+            other = claimed[low].sid if low in claimed else taken[low][0]
+            if other != s.sid:
+                problems.append(f"{other} and {s.sid} ({source(s)}) differ only in case; spatialdata can't hold both "
+                                "in one store: rename one folder.")
+        claimed.setdefault(s.sid.lower(), s)
+    return problems
+
+
 def check(samples: list[Sample], left_out: list[LeftOut], problems: list[str], state: StoreState,
           model: Path | None) -> Plan:
     """Decides the run: raises IngestError listing every problem, else logs the report and returns the Plan."""
-    problems = list(problems) + _duplicates(samples)
+    problems = list(problems) + resolve_ids(samples, state) + _duplicates(samples)
     present_ids = set(state.present)
     new = [s for s in samples if s.sid not in present_ids]
     present = [s for s in samples if s.sid in present_ids]

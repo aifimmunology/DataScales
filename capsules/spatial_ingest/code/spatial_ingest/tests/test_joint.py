@@ -3,6 +3,7 @@ import logging
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 import scipy.sparse as sp
 
@@ -258,3 +259,103 @@ def test_missing_obs_column_reads_as_broken(tmp_path, local):
     add(local, "A", F.sample_table(tmp_path / "a.zarr", "A", F.GENES, 3, 0, extra_obs={"batch": ["x"] * 3}))
     shutil.rmtree(joint.table_path(local) / "obs" / "batch")
     assert joint.sample_counts(local) is None
+
+
+# ---------------------------------------------------------------- round 2: duplicate symbols (M3), check_rows (K1), repair
+
+def panel_table(path, sid, symbols, ids, n=6, seed=0):
+    """A per-sample table with given symbols and gene_ids (through genes.symbol_var, like the readers)."""
+    import genes
+
+    var = pd.DataFrame({"gene_ids": ids, "feature_types": "Gene Expression"}, index=symbols)
+    _, sym = genes.symbol_var(var, sid)
+    t = F.table(n, list(sym.index), seed, f"{sid}_cells", dtype=np.int32)
+    t.var = sym
+    t.obs["cell_id"] = [f"c{i}" for i in range(n)]
+    t.write_zarr(path)
+    return path
+
+
+def test_duplicate_symbols_join_by_gene_id(tmp_path, local):
+    a = panel_table(tmp_path / "a.zarr", "A", ["MATR3", "MATR3", "ACTB"], ["ENSG01", "ENSG02", "ENSG03"])
+    b = panel_table(tmp_path / "b.zarr", "B", ["MATR3", "ACTB"], ["ENSG02", "ENSG03"], seed=1)
+    c = panel_table(tmp_path / "c.zarr", "C", ["MATR3", "GAPDH"], ["ENSG09", "ENSG04"], seed=2)
+    for sid, path in (("A", a), ("B", b), ("C", c)):
+        add(local, sid, path)
+    t = read(local)
+    assert list(t.var_names) == ["MATR3-ENSG01", "MATR3-ENSG02", "ACTB", "MATR3-ENSG09", "GAPDH"]
+    assert list(t.var["gene_ids"]) == ["ENSG01", "ENSG02", "ENSG03", "ENSG09", "ENSG04"]
+    source_b = ad.read_zarr(b)
+    rows_b = t[t.obs["sample_id"] == "B"]
+    assert np.array_equal(rows_b[:, "MATR3-ENSG02"].X.toarray().ravel(), source_b[:, "MATR3"].X.toarray().ravel())
+    assert rows_b[:, "MATR3-ENSG01"].X.sum() == 0
+    assert joint.read_schema(local).measured["B"] == ["MATR3-ENSG02", "ACTB"]
+
+
+def test_check_rows_finds_what_add_would_refuse(tmp_path, local):
+    good = F.sample_table(tmp_path / "a.zarr", "A", F.GENES, 5, 0, dtype=np.int16)
+    joint.check_rows(local, "A", good)                       # nothing to refuse, nothing written
+    assert joint.read_schema(local) is None
+    add(local, "A", good)
+    repeated = F.sample_table(tmp_path / "r.zarr", "R", F.GENES, 4, 1)
+    import zarr
+    from anndata.io import write_elem
+    write_elem(zarr.open_group(repeated / "obs", mode="r+"), "cell_id", np.array(["x", "x", "y", "z"], dtype=object))
+    with pytest.raises(joint.JointError, match="cell IDs repeat"):
+        joint.check_rows(local, "R", repeated)
+    big = F.sample_table(tmp_path / "big.zarr", "BIG", F.GENES, 4, 2, dtype=np.int32)
+    x = zarr.open_group(big / "X", mode="r+")
+    data = x["data"][:]
+    data[0] = 100000                                         # doesn't fit the joint table's int16
+    x["data"][:] = data
+    with pytest.raises(joint.JointError, match="don't fit"):
+        joint.check_rows(local, "BIG", big)
+    with pytest.raises(joint.JointError, match="already in the joint table"):
+        joint.check_rows(local, "A", good)
+    assert dict(joint.sample_counts(local)) == {"A": 5}
+
+
+def install(local, tmp_path, sid, **kw):
+    """A sample committed the way main installs it: elements + per-sample table, consolidated."""
+    from test_store import prepared
+
+    p = prepared(tmp_path / sid, sid, **kw)
+    stores.install_sample(local, p)
+    stores.consolidate(local)
+    return local / "tables" / f"{sid}_table"
+
+
+def test_repair_quarantines_a_sample_it_cannot_append(tmp_path, local, caplog):
+    """Critic F1: a committed sample whose joint rows fail must not wedge every later run."""
+    import zarr
+    from anndata.io import write_elem
+
+    install(local, tmp_path, "S1")
+    bad = install(local, tmp_path, "S2")
+    write_elem(zarr.open_group(bad / "obs", mode="r+"), "cell_id", np.array(["x"] * 6, dtype=object))
+    stores.consolidate(local)
+    with caplog.at_level(logging.WARNING, logger="joint"):
+        actions = joint.repair(local, ["S1", "S2"], stores.staging(local), 2)
+    stores.consolidate(local)
+    assert any("took S2 out of the store" in a for a in actions) and "S2 is taken out of the store" in caplog.text
+    assert not (local / "tables" / "S2_table").exists() and not (local / "shapes" / "S2_cells").exists()
+    assert dict(joint.sample_counts(local)) == {"S1": 6}
+    assert joint.repair(local, ["S1"], stores.staging(local), 2) == []          # the next run has nothing to do
+    import spatialdata as sd
+    assert set(sd.read_zarr(local).tables) == {"S1_table", "table"}
+
+
+def test_repair_rebuilds_an_unreadable_joint_table(tmp_path, local):
+    """Critic K3: joint metadata that doesn't match its chunks (a killed S3 sync) is rebuilt, not fatal."""
+    import json
+
+    for sid in ("S1", "S2"):
+        path = install(local, tmp_path, sid)
+        add(local, sid, path)
+    meta = joint.table_path(local) / "var" / "_index" / "values" / "zarr.json"
+    data = json.loads(meta.read_text())
+    data["shape"] = [999]
+    meta.write_text(json.dumps(data))
+    assert joint.read_schema(local).intact is False and joint.sample_counts(local) is None
+    actions = joint.repair(local, ["S1", "S2"], stores.staging(local), 2)
+    assert "rebuilt" in actions[0] and dict(joint.sample_counts(local)) == {"S1": 6, "S2": 6}

@@ -16,6 +16,13 @@ import scipy.sparse as sp
 GENES = [f"GENE{i}" for i in range(30)] + ["MT-CO1"]
 
 
+def gene_id(symbol: str) -> str:
+    """A stable Ensembl-like ID per symbol (the same gene has the same ID in every synthetic panel)."""
+    import zlib
+
+    return f"ENSG{zlib.crc32(symbol.encode()) % 10**11:011d}"
+
+
 def counts(n: int, n_genes: int, seed: int, dtype=np.float32) -> sp.csr_matrix:
     rng = np.random.default_rng(seed)
     x = sp.random(n, n_genes, density=0.3, format="csr", random_state=seed, dtype=np.float64)
@@ -30,7 +37,7 @@ def table(n: int, genes: list[str], seed: int, region: str | list[str], *, insta
                         "cell_area": np.linspace(10, 20, n)}, index=pd.Index([f"c{seed}_{i}" for i in range(n)]))
     for k, v in (extra_obs or {}).items():
         obs[k] = v
-    var = pd.DataFrame({"gene_ids": [f"ENSG{i:011d}" for i in range(len(genes))],
+    var = pd.DataFrame({"gene_ids": [gene_id(g) for g in genes],
                         "feature_types": "Gene Expression"}, index=pd.Index(genes))
     out = ad.AnnData(counts(n, len(genes), seed, dtype), obs=obs, var=var)
     out.obsm["spatial"] = np.random.default_rng(seed).uniform(0, 50, (n, 2))

@@ -97,16 +97,16 @@ def read_frame(path: Path, scratch: Path, columns: list[str] | None = None, nrow
     if is_parquet(path):
         import pyarrow.parquet as pq
 
-        pf = pq.ParquetFile(plain(path, scratch))
-        if nrows is None:
-            return pf.read(columns=columns).to_pandas()
-        batches, n = [], 0
-        for batch in pf.iter_batches(batch_size=min(nrows, 1 << 20), columns=columns):
-            batches.append(batch.to_pandas())
-            n += len(batches[-1])
-            if n >= nrows:
-                break
-        return pd.concat(batches, ignore_index=True) if batches else pf.schema_arrow.empty_table().to_pandas()
+        with pq.ParquetFile(plain(path, scratch)) as pf:          # closed: no handle left on staged files
+            if nrows is None:
+                return pf.read(columns=columns).to_pandas()
+            batches, n = [], 0
+            for batch in pf.iter_batches(batch_size=min(nrows, 1 << 20), columns=columns):
+                batches.append(batch.to_pandas())
+                n += len(batches[-1])
+                if n >= nrows:
+                    break
+            return pd.concat(batches, ignore_index=True) if batches else pf.schema_arrow.empty_table().to_pandas()
     with open_text(path) as f:
         return pd.read_csv(f, usecols=columns, nrows=nrows)
 
@@ -433,35 +433,56 @@ def write_source(m: MatrixFile, rows: np.ndarray | None, obs: pd.DataFrame, obsm
     return TableSource(out, obs, n_obs, len(columns))
 
 
-def align(barcodes: pd.Index, cells: pd.DataFrame, id_column: str = CELL_ID) -> tuple[np.ndarray, pd.DataFrame, int]:
-    """Matrix rows that have a cells-table row: (their positions, the cells rows in that order indexed by
-    barcode, number of matrix cells without a row)."""
+HAS_POSITION = "has_position"
+
+
+def _barcode_keys(barcodes: pd.Index, like: pd.Series) -> np.ndarray:
+    """The matrix barcodes as cell IDs of the cells table's key type (int64 when the table's IDs are integers
+    and every barcode is one; text otherwise)."""
+    if pd.api.types.is_integer_dtype(like):
+        try:
+            return barcodes.astype(np.int64).to_numpy()
+        except (TypeError, ValueError):
+            pass
+    return np.asarray(barcodes.astype(str), dtype=object)
+
+
+def align(barcodes: pd.Index, cells: pd.DataFrame, id_column: str = CELL_ID) -> tuple[pd.DataFrame, int]:
+    """One obs row per matrix barcode, in matrix order: the cells table's row where there is one, else only
+    the cell ID (other columns NaN). Returns (obs indexed by barcode, number of cells without a row)."""
     ids = pd.Index(cells[id_column].astype(str))
     if not ids.is_unique:
         cells = cells.loc[~ids.duplicated()]
         ids = pd.Index(cells[id_column].astype(str))
     where = ids.get_indexer(barcodes.astype(str))
-    rows = np.flatnonzero(where >= 0)
-    obs = cells.iloc[where[rows]].copy()
-    obs.index = pd.Index(barcodes[rows].astype(str))
-    return rows, obs, int(len(barcodes) - len(rows))
+    found = where >= 0
+    obs = cells.iloc[np.where(found, where, 0)].reset_index(drop=True)
+    if not found.all():
+        obs = obs.astype({c: "float64" for c in obs.columns
+                          if pd.api.types.is_integer_dtype(obs[c]) or pd.api.types.is_bool_dtype(obs[c])})
+        obs.loc[~found, [c for c in obs.columns if c != id_column]] = np.nan
+    # matched rows have cell_id == barcode, so the barcode (in the table's key type) is every row's cell ID
+    obs[id_column] = _barcode_keys(barcodes, cells[id_column])
+    obs.index = pd.Index(barcodes.astype(str))
+    return obs, int((~found).sum())
 
 
 def xenium_table(m: MatrixFile, cells: pd.DataFrame, sid: str, out: Path, scratch: Path,
                  notes: list[str]) -> TableSource:
-    """Xenium: obs = the cells table (centroids moved to obsm['spatial'], as spatialdata-io does)."""
+    """Xenium: obs = the cells table (centroids moved to obsm['spatial'], as spatialdata-io does). EVERY matrix
+    cell is kept; cells without a position get NaN centroids and obs['has_position'] = False."""
     missing = [c for c in POSITION if c not in cells]
     if missing:
         raise TableError(f"{sid}: the cells table has no {', '.join(missing)} column.")
-    rows, obs, n_unplaced = align(m.barcodes, cells)
-    if not len(rows):
-        raise TableError(f"{sid}: no cell of the count matrix is in the cells table (the files belong to "
-                         "different cell sets).")
-    if n_unplaced:
-        notes.append(f"{n_unplaced} matrix cells without a position left out")
+    obs, _ = align(m.barcodes, cells)
     spatial = obs[list(POSITION)].to_numpy(dtype=np.float64)
+    placed = np.isfinite(spatial).all(axis=1)
+    if not placed.any():
+        raise TableError(f"{sid}: no cell of the count matrix has a position in the cells table (the files "
+                         "belong to different cell sets).")
     obs = obs.drop(columns=list(POSITION))
-    return write_source(m, rows, obs, {"spatial": spatial}, sid, out, scratch)
+    obs[HAS_POSITION] = placed
+    return write_source(m, None, obs, {"spatial": spatial}, sid, out, scratch)
 
 
 def atera_table(m: MatrixFile, sid: str, out: Path, scratch: Path) -> TableSource:
@@ -471,5 +492,7 @@ def atera_table(m: MatrixFile, sid: str, out: Path, scratch: Path) -> TableSourc
     if missing:
         raise TableError(f"{sid}: the matrix obs has no {', '.join(missing)} column (cell positions).")
     obsm = dict(m.obsm)
-    obsm["spatial"] = obs[list(ATERA_POSITION)].to_numpy()
+    obsm["spatial"] = obs[list(ATERA_POSITION)].to_numpy(dtype=np.float64)
+    obs = obs.copy()
+    obs[HAS_POSITION] = np.isfinite(obsm["spatial"]).all(axis=1)
     return write_source(m, None, obs, obsm, sid, out, scratch)

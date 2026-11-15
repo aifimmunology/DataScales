@@ -45,7 +45,8 @@ def test_members_come_out_of_zip_and_tar(tmp_path):
     assert path.read_bytes() == b"gzipped parquet"
 
 
-def test_tar_members_come_out_in_one_pass(tmp_path, monkeypatch, caplog):
+def test_a_tar_sample_is_read_in_one_pass(tmp_path, monkeypatch, caplog):
+    """Inventory, precheck and readers fetch one file at a time; the tar is still streamed only once."""
     archive = pipestance_tar(tmp_path)
     (cand,) = discover.discover([str(archive)], tmp_path).candidates
     opened = []
@@ -53,12 +54,17 @@ def test_tar_members_come_out_in_one_pass(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(stage.tarfile, "open", lambda *a, **k: opened.append(a) or real_open(*a, **k))
     monkeypatch.setattr(stage, "BIG", 0)
     with caplog.at_level("INFO", logger="stage"):
-        out = stage.fetch(cand, ["cells.parquet", "transcripts.parquet", "cell_feature_matrix/"], tmp_path / "s")
-    assert len(opened) == 1
-    assert len(out) == 5 and all(p.read_bytes() == content(p.name) for p in out.values())
-    assert "Extracting 5 file(s) from" in caplog.text and " GB)" in caplog.text
-    assert stage.fetch(cand, ["cells.parquet"], tmp_path / "s") == {"cells.parquet": tmp_path / "s" / "cells.parquet"}
-    assert len(opened) == 1                                          # already staged: archive not reopened
+        out = stage.fetch(cand, ["cells.parquet"], tmp_path / "s")
+    assert len(opened) == 1 and out["cells.parquet"].read_bytes() == content("cells.parquet")
+    expected = [k for k in cand.files if not k.startswith(stage.PREFETCH_SKIP)]
+    assert f"Extracting {len(expected)} file(s) from" in caplog.text and " GB)" in caplog.text
+    for key in ("transcripts.parquet", "cell_feature_matrix/", "experiment.xenium", "morphology_focus/"):
+        for path in stage.fetch(cand, [key], tmp_path / "s").values():
+            assert path.read_bytes() == content(path.name)
+    assert len(opened) == 1                                          # every later fetch found its file staged
+    assert not (tmp_path / "s" / "analysis").exists() and not (tmp_path / "s" / "analysis.zarr.zip").exists()
+    assert stage.fetch(cand, ["analysis.zarr.zip"], tmp_path / "s")["analysis.zarr.zip"].exists()
+    assert len(opened) == 2                                          # skipped files still come when asked for
 
 
 def test_gb_is_decimal():
@@ -113,3 +119,26 @@ def test_spatialdata_from_zip_skips_junk_and_unsafe_names(tmp_path):
     assert stage.spatialdata(cand, tmp_path / "s") == root            # second call reuses the extraction
     stage.cleanup(tmp_path / "s")
     assert not (tmp_path / "s").exists()
+
+
+def test_plain_tar_ending_in_a_zip_member_is_read_as_tar(tmp_path):
+    """zipfile.is_zipfile accepts a plain .tar whose last member is a .zip; staging and discovery must not."""
+    import tarfile
+    import zipfile
+
+    import discover
+    import stage
+    from contracts import Candidate, Member
+
+    inner = tmp_path / "cells.zarr.zip"
+    with zipfile.ZipFile(inner, "w") as zf:
+        zf.writestr("zarr.json", "{}")
+    (tmp_path / "experiment.xenium").write_text("{}")
+    archive = tmp_path / "run.tar"
+    with tarfile.open(archive, "w") as tf:
+        tf.add(tmp_path / "experiment.xenium", arcname="run/experiment.xenium")
+        tf.add(inner, arcname="run/cells.zarr.zip")
+    assert zipfile.is_zipfile(archive) and not stage.is_zip(archive) and stage.is_zip(inner)
+    assert discover.ArchiveIndex(archive).zip is False
+    c = Candidate("run", "xenium", archive, files={"experiment.xenium": Member(archive, "run/experiment.xenium")})
+    assert stage.fetch(c, ["experiment.xenium"], tmp_path / "out")["experiment.xenium"].read_text() == "{}"

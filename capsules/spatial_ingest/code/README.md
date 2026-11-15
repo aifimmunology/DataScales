@@ -102,7 +102,13 @@ one of: a **Xenium bundle**, an **Atera bundle**, a **SpatialData object**, or *
   (`GSM7990532_Lung`).
 - **SpatialData:** see "Existing SpatialData" below.
 - **Characters:** letters, digits, `_`, `.` and `-`; other characters become `_` (noted in the log).
-- **Two samples with the same ID** stop the run, naming both sources.
+- **Two bundles with the same ID** stop the run, naming both sources; so do two bundle IDs that differ
+  only in case (`S1`, `s1`): spatialdata can't hold both in one store, so rename one folder.
+- **SpatialData samples whose ID is taken** (by another object in the run, by a sample already in the
+  store that came from another object, or by an ID differing only in case) are renamed
+  `<object>_<sid>` (one INFO line): two cohorts that both call their samples `rep1`, `rep2` go in as
+  `cohortA`'s `rep1`, `rep2` and `cohortB_rep1`, `cohortB_rep2`. The same names come out on a rerun, so
+  a rerun skips them as present. Identical cells are still skipped as duplicates.
 
 ### Incomplete bundles
 
@@ -111,6 +117,12 @@ A bundle needs two **essential** parts:
   exports), or an MTX triplet;
 - **cell positions**: a cells table (`cells.parquet`, `cells.csv(.gz)`, Atera `cells.zarr.zip`) with
   cell IDs and x/y centroids that match the matrix's barcodes.
+
+Every cell of the count matrix is kept. Cells the cells table gives no position are marked
+`obs["has_position"] = False` (their `obsm["spatial"]` is NaN and they get no shape), with one warning
+giving the count and %. **Filter on `has_position` before spatial analysis**: squidpy and scanpy's
+spatial functions need coordinates for every cell. A bundle is refused only when no cell has a
+position, or the cells table doesn't match the matrix at all.
 
 Everything else is **optional**: morphology images, transcripts, cell and nucleus boundaries, labels,
 `experiment.xenium`, `cells.zarr.zip`. A bundle missing optional parts is added without them, with one
@@ -194,10 +206,13 @@ traceback), and the run exits with code 1:
 | `… is read-only` | a data asset can't be written: give its S3 prefix instead |
 | `… holds cells of several samples` / `… samples can't be told apart` | see "Existing SpatialData" below |
 
-A run that fails partway keeps every sample finished before the failure:
-- it repairs what the failing sample left and verifies the store;
-- on S3 it syncs those samples back before stopping;
-- the next run continues from there.
+**A sample that fails while it is added** (an unreadable file, rows the joint table can't take, …) is
+rolled back out of the store, with one ERROR line naming it and why; the run goes on with the other
+samples, verifies the store, syncs it (S3), and then exits with code 1 and a list of the failed samples
+(`status` `failed` and an `error` in the summary CSV, `failed_samples` in the run JSON). Fix those and
+run again: the samples already in are skipped. A sample already in the store whose rows can't be put
+back into the joint table during a repair is taken out of the store with one warning, so a store never
+gets stuck failing every run.
 
 A run refused before any sample is read leaves nothing behind: a new store is created only when the
 precheck has passed. A killed run is repaired by the next one (see "Crash safety").
@@ -213,17 +228,20 @@ precheck has passed. A killed run is repaired by the next one (see "Crash safety
    1. Read it: images, transcripts and shapes stay lazy; the count matrix (Gene Expression only) is
       streamed into a compressed sparse table on scratch.
    2. Rename its elements and coordinate systems.
-   3. Build its table chunk by chunk: gene symbols, QC metrics (scanpy, mito = `MT-`), CellTypist
+   3. Build its table chunk by chunk: gene symbols, QC metrics (scanpy; mitochondrial genes `MT-` or mouse `mt-`), CellTypist
       labels if a model is given, and a fingerprint of its cells.
-   4. Refuse cells already in the store under another sample ID (same fingerprint).
-   5. Move its elements and table into the store; consolidate the metadata: the sample is now present.
-   6. Append its cells to the joint table (new genes extend it at the end); consolidate again.
-5. **Verify:** a fresh `spatialdata.read_zarr` lists every element, every table opens, and the joint
-   table holds exactly each per-sample table's cells.
-6. On S3, sync back. Only changed files are uploaded, and the root `zarr.json` goes last, so a reader
-   never sees the new samples before their files are there. A run that fails before the sync leaves
-   S3 unchanged.
-7. Scratch files of the run are deleted.
+   4. Skip cells already in the store under another sample ID (same fingerprint; one warning).
+   5. Check that the joint table can take its rows (repeated cell IDs, obs that can't be stored,
+      counts the joint dtype can't hold): a sample it can't take fails here, before anything is written.
+   6. Move its elements and table into the store; consolidate the metadata: the sample is now present.
+   7. Append its cells to the joint table (new genes extend it at the end); consolidate again. If the
+      append fails anyway, the sample is rolled back out.
+5. **Verify**, without loading what earlier runs wrote (memory doesn't grow with the store): every
+   element folder is committed and has readable metadata, names are unique ignoring case, the elements
+   this run wrote read back in full, every table opens (metadata and obs), and the joint table holds
+   exactly each per-sample table's cells.
+6. On S3, sync back (see "S3: concurrency and what readers see").
+7. Scratch files of the run are deleted (also at the start, for what a killed run left).
 
 ### Gene panels
 
@@ -340,9 +358,9 @@ value keeps the environment variable or default.
   - To add another SpatialData object, give it as a sample into a store of this capsule.
 - **S3 (recommended for a store you keep adding to):**
   - A missing store is created at the prefix; writing it is the permission check.
-  - `/scratch` needs room for the whole store plus the largest decompressed sample files (images
-    from GEO `.ome.tif.gz` can be tens of GB).
-  - There is no locking: run one job per store at a time.
+  - Every run downloads the whole store to `/scratch` first (also a run that only skips), so
+    `/scratch` needs room for the whole store plus the sample in progress (see "Disk").
+  - One run per store at a time is enforced (see "S3: concurrency and what readers see").
 - **`/results`:** a one-off build. It can be saved as a data asset, but data assets are read-only,
   so later runs can't add to it; to continue it, copy it to S3 once.
 - **`/scratch`:** cleared when the run ends; for trying things out (the run warns about it).
@@ -355,16 +373,49 @@ value keeps the environment variable or default.
     folder holding other files.
   - **Why:** a mistyped path to an existing store can't silently start a new one.
 
+### S3: concurrency and what readers see
+
+- **One run per store.** A run takes a lock object `<prefix>/.spatial_ingest_lock` (host, process,
+  start and heartbeat times) before it downloads the store, and removes it when it ends. A second run
+  on the same store stops at once with one line naming the run that holds it. A lock whose heartbeat
+  stopped (a killed run) is taken over after 60 minutes, with a warning. Before uploading, the run also
+  checks that the store's root `zarr.json` is still the one it downloaded; if not, it refuses to sync
+  ("the store changed during this run; rerun") rather than overwrite another run's samples.
+- **Local stores** are locked the same way, with a lock file beside the store
+  (`.<name>.zarr.spatial_ingest_lock`); a lock left by a process that no longer runs on this host (or,
+  from another host, older than 60 minutes) is taken over with a warning.
+- **Upload order:** new files, then changed data chunks, then the metadata files (`zarr.json`, deepest
+  first), then the root `zarr.json`, then deletions. Samples become visible to `spatialdata.read_zarr`
+  only when the root `zarr.json` (the consolidated metadata) changes, at the very end.
+- **What a reader may see during a sync:** new element folders that the root metadata doesn't list yet
+  (ignored by `read_zarr`); and the joint table `tables/table` is grown in place, so for the seconds its
+  files upload, a reader of that one table may see a mix of old and new chunks. Read the joint table of
+  an S3 store that is being written to only after the run has finished. A run killed during the sync
+  leaves the store for the next run to repair (it rebuilds the joint table from the per-sample tables
+  when needed); a first sync killed before the root `zarr.json` is cleared and redone by the next run.
+
+### Disk
+
+- **A zipped or gzipped sample** is extracted to scratch while it is read, and its elements are then
+  written into the store: plan for about **2.3× the archive's size** at the peak (e.g. a 45.7 GB Atera
+  zip needed 42.5 GB staged plus 62.4 GB written, ~105 GB). A folder input isn't copied, so it needs
+  only the store's growth (~1.4× the sample).
+- **S3 stores** add the whole existing store, downloaded to scratch on every run.
+- The staged files of a sample are deleted once it is in; scratch is cleared when the run ends and when
+  the next run starts.
+
 ### Memory and resources
 
 - Count matrices are streamed in row chunks (from `.h5`, MTX or zarr) into a sparse table on
   scratch; QC, CellTypist labels, the fingerprint and the joint-table append all work chunk by
   chunk. Images, transcripts and shapes are read lazily and written element by element.
-- Memory is therefore set by the largest element written at once, not by the number of cells or
-  samples. Use the **64 GB ("large")** resource class for Xenium Prime 5K, whole-transcriptome and
+- Memory is therefore set by the largest element written at once (and a sample's boundary polygons),
+  not by the number of samples in the store. Use the **64 GB ("large")** resource class for Xenium Prime 5K, whole-transcriptome and
   Atera samples; 16–32 GB suffices for small panels.
-- Scratch disk: the store (for S3) plus the decompressed/extracted files of the sample in progress;
-  each sample's scratch files are deleted once it is in.
+- Verification and repair read only the elements the run wrote and the tables' metadata, so a
+  no-op rerun on a large store stays small.
+- Scratch disk: see "Disk" above. Each run uses `SCRATCH_DIR` alone: two runs at once need two
+  scratch folders.
 
 ### Other settings
 

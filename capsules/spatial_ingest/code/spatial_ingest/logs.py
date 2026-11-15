@@ -31,6 +31,7 @@ DATEFMT = "%H:%M:%S"
 LOGGER_LEVELS = {
     "ome_zarr": logging.ERROR,                 # "no parent found for <Label>" is a WARNING there
     "annizarr.ops._append": logging.ERROR,     # append notes, expected for every sample after the first
+    "annizarr": logging.WARNING,               # per-append progress lines (INFO)
     "celltypist": logging.ERROR,               # progress lines, repeated per row chunk; overlap is prechecked
     "anndata": logging.WARNING,
     "spatialdata": logging.WARNING,

@@ -62,14 +62,15 @@ def stage_bundle(sample: Sample, inv: Inventory, scratch: Path) -> tuple[Path, d
     dest = inventory.stage_dir(scratch, sample.sid)
     folder = dest / "bundle"
     files: dict[str, Path] = {}
+    staged = stage.fetch(cand, list(dict.fromkeys(inv.chosen.values())), dest)   # ONE call: one pass per tar
     for role, key in inv.chosen.items():
         if key.endswith("/"):
-            staged = stage.fetch(cand, [key], dest)
             for name, path in staged.items():
-                _link(path, folder / name)
+                if name.startswith(key):
+                    _link(path, folder / name)
             files[role] = folder / key.rstrip("/")
             continue
-        path = stage.fetch(cand, [key], dest)[key]
+        path = staged[key]
         files[role] = _link(path, folder / canonical_name(role, key, cand.kind)) if role in BY_NAME else path
     if inv.chosen.get("matrix", "").endswith(".zarr.zip") and cand.kind == "atera":
         _link(files["matrix"], folder / "cell_feature_matrix.zarr.zip")
@@ -137,13 +138,18 @@ def load_bundle(sample: Sample, scratch: Path, n_jobs: int = 1) -> Loaded:
         raise ReadError(str(exc)) from exc
     spatial = np.asarray(zarr.open_group(str(out), mode="r")["obsm"]["spatial"][:])
     if m.kind == "atera_zarr":
-        built = builders.atera(folder, files, source.obs, spatial)
+        built = builders.atera(folder, files, source.obs, spatial, sample.sid)
     else:
-        built = builders.xenium(folder, files, source.obs, spatial, work)
+        built = builders.xenium(folder, files, source.obs, spatial, work, sample.sid)
     source.obs = _obs_with(source.obs, built.obs_columns, built.region)
     group = zarr.open_group(str(out), mode="r+")
     write_elem(group, "obs", source.obs)
     warn_once(sample, inv, built.problems, notes + invalid_polygons(built.elements))
+    unplaced = int((~source.obs[tables.HAS_POSITION]).sum()) if tables.HAS_POSITION in source.obs else 0
+    if unplaced:
+        logger.warning("%s: %s of %s cells (%.1f%%) have no position; kept, marked obs['%s']=False (no shape, "
+                       "NaN in obsm['spatial']; filter on it before spatial analysis)", sample.sid, f"{unplaced:,}",
+                       f"{source.n_obs:,}", 100 * unplaced / source.n_obs, tables.HAS_POSITION)
     return Loaded(built.elements, source, [built.region], REGION_KEY, INSTANCE_KEY)
 
 
@@ -154,3 +160,14 @@ def load(sample: Sample, scratch: Path, n_jobs: int = 1) -> Loaded:
 
         return existing.load_part(sample.path, sample.part, scratch)
     return load_bundle(sample, scratch, n_jobs)
+
+
+def close(sid: str) -> None:
+    """Close the file handles the sample's lazy elements hold (tiled images, label zip stores). Call it after
+    the sample's elements are written (stores.install_sample) and before its staged files are deleted — also
+    when the sample failed; afterwards those elements can't be read any more."""
+    import gc
+
+    n = builders.release(sid)
+    gc.collect()
+    logger.debug("%s: %d file handle(s) closed", sid, n)

@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_ROWS = 1_000_000          # rows of transcripts / boundaries checked against the matrix barcodes
 MIN_ASSIGNED_MATCH = 0.99        # share of a file's assigned cell IDs that must be matrix barcodes
-MIN_PLACED = 0.5                 # share of matrix cells that must have a position in the cells table
 DEFAULT_PIXEL_SIZE = 0.2125      # µm; every XOA output seen
 MATRIX_TEXT = "count matrix (cell_feature_matrix.h5, cell_feature_matrix.zarr.zip or matrix.mtx + features.tsv + barcodes.tsv)"
 CELLS_TEXT = "cell positions (cells.parquet or cells.csv with cell_id, x_centroid, y_centroid)"
@@ -112,6 +111,7 @@ class Inspector:
         self.var: pd.DataFrame | None = None
         self.n_cells: int | None = None
         self.barcodes: pd.Index | None = None
+        self.n_placed: int | None = None
 
     def path(self, key: str) -> Path:
         return stage.fetch(self.c, [key], self.dest)[key]
@@ -154,7 +154,7 @@ class Inspector:
             return
         options = self.files.variants("cells")
         zarr_key = self.files.first("cells.zarr.zip")
-        reasons = []
+        reasons, best = [], None
         for key in options + ([zarr_key] if zarr_key else []):
             try:
                 ids = self._cell_ids(key)
@@ -162,21 +162,27 @@ class Inspector:
                 reasons.append(f"{key}: {exc}")
                 continue
             placed = int(m.barcodes.isin(ids).sum())
-            if placed < MIN_PLACED * len(m.barcodes):
-                reasons.append(f"{key}: only {placed} of the matrix's {len(m.barcodes)} cells are in it")
+            if not placed:
+                reasons.append(f"{key}: none of the matrix's {len(m.barcodes)} cells are in it")
                 continue
-            self.chosen["cells"] = key
-            self.n_cells = placed
-            if placed < len(m.barcodes):
-                self.notes.append(f"{len(m.barcodes) - placed} of {len(m.barcodes)} matrix cells have no row in {key} "
-                                  "and are left out")
-            if not options:
-                self.notes.append(f"cell positions read from {key} (no cells.parquet / cells.csv)")
-            elif key != options[0]:
-                self.notes.append(f"cell positions read from {key} (not {'; '.join(reasons)})")
+            if best is None or placed > best[1]:
+                best = (key, placed)
+            if placed == len(m.barcodes):
+                break
+        if best is None:
+            why = f" ({'; '.join(reasons)})" if reasons else ""
+            self.missing_essential.append(CELLS_TEXT + why)
             return
-        why = f" ({'; '.join(reasons)})" if reasons else ""
-        self.missing_essential.append(CELLS_TEXT + why)
+        key, placed = best
+        self.chosen["cells"] = key
+        self.n_cells = len(m.barcodes)              # every matrix cell is kept, placed or not
+        self.n_placed = placed
+        if placed < len(m.barcodes):
+            self.notes.append(f"{len(m.barcodes) - placed} of {len(m.barcodes)} matrix cells have no row in {key}")
+        if not options:
+            self.notes.append(f"cell positions read from {key} (no cells.parquet / cells.csv)")
+        elif key != options[0]:
+            self.notes.append(f"cell positions read from {key} (not {'; '.join(reasons) or options[0]})")
 
     def _cell_ids(self, key: str) -> pd.Index:
         path = self.path(key)

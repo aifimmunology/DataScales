@@ -51,10 +51,26 @@ def symbol_var(var: pd.DataFrame, name: str) -> tuple[np.ndarray, pd.DataFrame]:
     ids = next((genes[c].astype(str).to_numpy() for c in ID_COLUMNS if c in genes), None)
     if ids is None and _ensembl(genes.index):
         ids = genes.index.astype(str).to_numpy()
-    out = pd.DataFrame(index=pd.Index(ad.utils.make_index_unique(pd.Index(np.asarray(symbols, dtype=object)))))
+    out = pd.DataFrame(index=unique_symbols(np.asarray(symbols, dtype=object), ids))
     out["gene_ids"] = ids if ids is not None else ""
     out["feature_types"] = GEX
     return keep, out
+
+
+def unique_symbols(symbols, ids) -> pd.Index:
+    """Gene symbols made unique without depending on file order: a symbol carried by several genes
+    becomes `<symbol>-<gene_id>` for each of them (`MATR3-ENSG00000015479`), so the same gene gets the
+    same name in every panel. Without gene_ids (or with repeated ones) the order-based `-1` suffix of
+    anndata is the fallback."""
+    symbols = pd.Index(np.asarray(symbols, dtype=object))
+    if ids is not None:
+        ids = np.asarray(ids, dtype=object)
+        repeated = symbols.duplicated(keep=False)
+        named = np.where(repeated & (ids != ""), [f"{s}-{i}" for s, i in zip(symbols, ids)], symbols)
+        symbols = pd.Index(named.astype(object))
+    if symbols.is_unique:
+        return symbols
+    return pd.Index(ad.utils.make_index_unique(symbols))
 
 
 def species(var: pd.DataFrame) -> str | None:
@@ -64,7 +80,8 @@ def species(var: pd.DataFrame) -> str | None:
 
 
 def is_mito(var_names) -> np.ndarray:
-    return np.char.startswith(np.asarray(var_names).astype(str), MITO_PREFIX)
+    """Mitochondrial genes by symbol: `MT-` in any case (human `MT-CO1`, mouse `mt-Co1`; not `Mtor`)."""
+    return np.char.startswith(np.char.upper(np.asarray(var_names).astype(str)), MITO_PREFIX.upper())
 
 
 def panel_diff(store_genes, sample_genes, n_examples: int = 5) -> dict | None:

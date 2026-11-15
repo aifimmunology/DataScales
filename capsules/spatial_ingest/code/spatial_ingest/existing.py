@@ -300,6 +300,31 @@ def _n_rows(table: Path) -> int:
     return n_obs(_open(table))
 
 
+def _sample_ids(keys: list[str], object_id: str, notes: list[tuple[int, str]]) -> dict[str, str]:
+    """Sample IDs from a table's sample column, in the characters IDs may hold (`[A-Za-z0-9_.-]`, others
+    become `_`: "Patient 1" -> `Patient_1`). Values that become equal (also case-insensitively) are
+    told apart by the object's name: `<object>_<id>`, numbered if still equal."""
+    out = {k: INVALID_CHARS.sub("_", str(k)).strip("_") or "sample" for k in keys}
+    taken: dict[str, int] = {}
+    for v in out.values():
+        taken[v.lower()] = taken.get(v.lower(), 0) + 1
+    used: set[str] = set()
+    for k in keys:
+        v = out[k]
+        if taken[v.lower()] > 1:
+            v = base = f"{object_id}_{v}"
+            n = 1
+            while v.lower() in used:
+                v, n = f"{base}_{n}", n + 1
+        used.add(v.lower())
+        out[k] = v
+    changed = {k: v for k, v in out.items() if k != v}
+    if changed:
+        notes.append((logging.INFO, "sample IDs from the sample column, in the characters IDs may hold: " +
+                      ", ".join(f"{k!r} -> {v}" for k, v in changed.items())))
+    return out
+
+
 def plan(path: Path, default_sid: str, sample_column: str) -> list[Part]:
     """The samples of the SpatialData at `path`, each with its table, regions and elements. Any
     problem with the object (no table, a table that isn't RNA counts, regions it can't split, an
@@ -393,8 +418,9 @@ def _plan(path: Path, default_sid: str, sample_column: str, notes: list[tuple[in
         notes.append((logging.WARNING, f"elements that belong to no single sample are left out: {', '.join(unplaced)}"))
     parts = []
     checked: set[str] = set()
+    named_ids = _sample_ids(list(groups), default_sid, notes) if named else {}
     for key, regions in groups.items():
-        sid = key if named else default_sid if single else f"{default_sid}_{key}"
+        sid = named_ids[key] if named else default_sid if single else f"{default_sid}_{key}"
         names = sorted({region_table[r] for r in regions}, key=lambda n: (n != "table", n))
         if len(names) > 1:
             notes.append((logging.WARNING, f"sample {sid} is annotated by several tables; keeping {names[0]}, "

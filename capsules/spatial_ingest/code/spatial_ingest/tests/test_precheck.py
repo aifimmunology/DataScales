@@ -181,3 +181,33 @@ def test_a_bundle_and_a_spatialdata_object_alone_in_one_folder_are_flagged(caplo
     with caplog.at_level(logging.INFO):   # a download folder with several bundles beside the object: no warning
         precheck.check([bundle("a"), bundle("b"), sdata("z", origin="/data/z.zarr")], [], [], precheck.StoreState(), None)
     assert warnings_of(caplog) == []
+
+
+def named(sid, obj, origin):
+    cand = Candidate(obj, "spatialdata", Path(origin), zarr=Member(Path(origin)))
+    return Sample(sid, "spatialdata", cand, part=Part(sid, "table", (f"cells-{sid}",), (), ()), path=Path(origin),
+                  var=var(HUMAN), species="human")
+
+
+def test_taken_spatialdata_ids_get_the_object_name(caplog):
+    state = precheck.StoreState(present=["rep1"], records={"rep1": {"source": "/data/cohortA.zarr"}}, genes=HUMAN,
+                                species="human", model="")
+    samples = [named("rep1", "cohortB", "/data/cohortB.zarr"), named("rep2", "cohortB", "/data/cohortB.zarr"),
+               named("rep2", "cohortC", "/data/cohortC.zarr"), named("REP1", "cohortD", "/data/cohortD.zarr")]
+    with caplog.at_level(logging.INFO):
+        plan = precheck.check(samples, [], [], state, None)
+    assert [s.sid for s in plan.samples] == ["cohortB_rep1", "rep2", "cohortC_rep2", "cohortD_REP1"]
+    assert [s.part.sid for s in plan.samples] == [s.sid for s in plan.samples]
+    assert "rep1 from /data/cohortB.zarr is added as cohortB_rep1" in caplog.text
+    # the same object again: its own sample is present (same source), so it is skipped, not renamed
+    state2 = precheck.StoreState(present=["rep1"], records={"rep1": {"source": "/data/cohortA.zarr"}}, genes=HUMAN,
+                                 species="human", model="")
+    plan = precheck.check([named("rep1", "cohortA", "/data/cohortA.zarr")], [], [], state2, None)
+    assert plan.samples == [] and plan.present == ["rep1"]
+
+
+def test_bundle_ids_differing_only_in_case_stop_the_run():
+    state = precheck.StoreState(present=["S1"], records={"S1": {"source": "/data/S1"}}, genes=HUMAN, species="human",
+                                model="")
+    with pytest.raises(precheck.IngestError, match="S1 and s1 .* differ only in case"):
+        precheck.check([bundle("s1")], [], [], state, None)

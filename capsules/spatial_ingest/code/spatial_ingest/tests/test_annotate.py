@@ -101,3 +101,11 @@ def test_zero_count_cells_raise_no_warning(tiny_model):
         w.simplefilter("always")
         annotate.celltypist_labels(adata, tiny_model)
     assert not [c for c in caught if "zero counts" in str(c.message)]
+
+
+def test_mouse_mito_genes_count_in_qc():
+    """critic L10: pct_counts_mt was 0 for mouse (`mt-`)."""
+    mouse = [g.capitalize() for g in HUMAN[:40]] + ["mt-Co1", "mt-Nd1"]
+    qc = annotate.qc_metrics(chunk(30, 1, mouse))
+    assert (qc["pct_counts_mt"] > 0).any()
+    assert list(annotate.is_mito(["MT-CO1", "mt-Co1", "Mtor", "MTHFR"])) == [True, True, False, False]

@@ -24,6 +24,10 @@ STAGING = ".spatial_ingest_staging"
 MARKER = "spatial_ingest"
 KINDS = (*existing.ELEMENT_KINDS, "tables")
 PROBE = ".write_probe"
+ELEMENTS_ATTR = "spatial_ingest_elements"     # on a per-sample table: the elements its sample installed
+LOCK_SUFFIX = ".spatial_ingest_lock"
+LOCK_STALE_MINUTES = 12 * 60                   # a lock from another host older than this is taken over
+CREATING = ".creating"
 
 
 class StoreError(RuntimeError):
@@ -98,6 +102,8 @@ def describe(path: Path) -> str:
         return "empty"
     if path.is_file():
         return "file"
+    if abandoned(path):
+        return "empty"
     kind = kind_of(root_attrs(path))
     if kind != "other":
         return kind
@@ -174,15 +180,37 @@ def probe_writable(path: Path) -> None:
 
 
 def create(path: Path) -> None:
+    """A new empty store with this capsule's marker, built beside `path` and renamed into place, so a
+    killed creation never leaves a store without the marker. An empty folder, or a store a killed
+    creation left (nothing in it, see `abandoned`), at `path` is replaced."""
     from spatialdata import SpatialData
 
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}{CREATING}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    SpatialData().write(tmp)
+    zarr.open_group(tmp, mode="r+", use_consolidated=False).attrs[MARKER] = {"version": 1}
+    consolidate(tmp)
     if path.exists():
-        path.rmdir()
-    SpatialData().write(path)
-    zarr.open_group(path, mode="r+", use_consolidated=False).attrs[MARKER] = {"version": 1}
-    consolidate(path)
+        if any(path.iterdir()) and not abandoned(path):
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise StoreError(f"{path} appeared while the new store was being created; give it again.")
+        shutil.rmtree(path)
+    os.rename(tmp, path)
     logger.info("Created a new SpatialData store at %s", path)
+
+
+def abandoned(path: Path) -> bool:
+    """A SpatialData store without this capsule's marker that holds no element and no table: what a
+    creation killed by an earlier version of this capsule left. It holds nothing, so it is recreated."""
+    meta = root_attrs(path)
+    if meta is None or kind_of(meta) != "spatialdata":
+        return False
+    if any(committed(path).values()) or any(on_disk(path).values()):
+        return False
+    allowed = {"zarr.json", "zmetadata", ".zmetadata", ".zgroup", ".zattrs", STAGING, *KINDS}
+    return all(p.name in allowed for p in path.iterdir())
 
 
 def consolidate(path: Path) -> None:
@@ -287,13 +315,84 @@ def install_sample(path: Path, prepared) -> list[str]:
     shutil.rmtree(staged, ignore_errors=True)
     elements = {k: dict(v) for k, v in prepared.elements.items() if k in existing.ELEMENT_KINDS and v}
     harden_local_writes()
-    retry_once(f"{prepared.sid}'s elements", lambda: SpatialData(**elements).write(staged, overwrite=True),
-               lambda: shutil.rmtree(staged, ignore_errors=True))
+
+    def write() -> None:
+        SpatialData().write(staged, overwrite=True)
+        sdata = SpatialData(**elements)
+        sdata.path = staged
+        for kind, items in elements.items():
+            for name, element in items.items():
+                logger.info("%s: writing %s %s (%s)", prepared.sid, kind.rstrip("s"), name, _size(kind, element))
+                sdata.write_element(name)
+
+    retry_once(f"{prepared.sid}'s elements", write, lambda: shutil.rmtree(staged, ignore_errors=True))
     moved = install(path, staged)
     shutil.rmtree(staged, ignore_errors=True)
     zarr.open_group(path, mode="a", use_consolidated=False).require_group("tables")
+    zarr.open_group(prepared.table_path, mode="r+", use_consolidated=False).attrs[ELEMENTS_ATTR] = moved
     _move(Path(prepared.table_path), table, staging(path))
     return moved + [f"tables/{table.name}"]
+
+
+def _size(kind: str, element) -> str:
+    """A short size for the progress line: shape and GB for rasters, rows for shapes, partitions for points."""
+    try:
+        if kind in ("images", "labels"):
+            arr = element
+            if hasattr(element, "children") and element.children:      # multiscale: its full resolution
+                scale = next(iter(element.children.values())).ds
+                arr = scale[next(iter(scale.data_vars))]
+            return f"{' x '.join(map(str, arr.shape))}, {arr.data.nbytes / 1e9:.2f} GB"
+        if kind == "shapes":
+            return f"{len(element)} shapes"
+        return f"{element.npartitions} partition(s)"
+    except Exception:
+        return "size unknown"
+
+
+def _sample_elements(path: Path, sid: str) -> list[str]:
+    """`kind/name` of every element a sample installed: recorded on its table at install, or (stores
+    from before the record) the elements named `<sid>` / `<sid>_…` that no longer sample ID claims."""
+    import layout
+
+    table = path / "tables" / layout.table_name(sid)
+    try:
+        recorded = zarr.open_group(table, mode="r", use_consolidated=False).attrs.get(ELEMENTS_ATTR)
+    except Exception:
+        recorded = None
+    if recorded is not None:
+        return [str(e) for e in recorded]
+    others = [t.name.removesuffix("_table") for t in (path / "tables").iterdir()
+              if t.name.endswith("_table") and t.name != table.name] if (path / "tables").is_dir() else []
+    longer = [o for o in others if o.startswith(sid) and len(o) > len(sid)]
+    out = []
+    for kind, names in on_disk(path).items():
+        if kind == "tables":
+            continue
+        for name in names:
+            if (name == sid or name.startswith(f"{sid}_")) and not any(name == o or name.startswith(f"{o}_")
+                                                                       for o in longer):
+                out.append(f"{kind}/{name}")
+    return sorted(out)
+
+
+def uninstall_sample(path: Path, sid: str) -> list[str]:
+    """Deletes a sample's elements and its table from the store. The caller consolidates (the commit
+    point); a kill before that leaves the consolidated metadata listing folders that are gone, which
+    `remove_uncommitted`'s next consolidate drops. Returns what was deleted."""
+    import layout
+
+    path = Path(path)
+    removed = []
+    for item in _sample_elements(path, sid):
+        if (path / item).is_dir():
+            shutil.rmtree(path / item)
+            removed.append(item)
+    table = path / "tables" / layout.table_name(sid)
+    if table.is_dir():
+        shutil.rmtree(table)
+        removed.append(f"tables/{table.name}")
+    return removed
 
 
 def _check_table(group: zarr.Group, elements: dict[str, set[str]]) -> None:
@@ -351,3 +450,67 @@ def verify_tables(path: Path) -> int:
     if problems:
         raise StoreError(f"{path} holds tables spatialdata can't read: " + "; ".join(problems))
     return len(listed["tables"])
+
+
+# --------------------------------------------------------------------------- one run per store
+
+def lock_path(path: Path) -> Path:
+    """The lock file of the store at `path`, beside it (the store may not exist yet): `.<name>.spatial_ingest_lock`."""
+    path = Path(path)
+    return path.parent / f".{path.name}{LOCK_SUFFIX}"
+
+
+def _alive(info: dict) -> bool:
+    """Whether the run that wrote a lock may still be running: its pid on this host, or (another host)
+    a lock younger than LOCK_STALE_MINUTES."""
+    import socket
+    import time
+
+    if info.get("host") == socket.gethostname():
+        try:
+            os.kill(int(info.get("pid", -1)), 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, ValueError, OverflowError):
+            return True
+        return True
+    return time.time() - float(info.get("started", 0)) < LOCK_STALE_MINUTES * 60
+
+
+def acquire_lock(path: Path) -> Path:
+    """Takes the store's lock (an exclusively created file) for this run; a second run on the same store
+    is refused with one line. A lock its run left behind (dead pid on this host, or older than
+    LOCK_STALE_MINUTES from another host) is taken over with a WARNING. Returns the lock file."""
+    import socket
+    import time
+
+    lock = lock_path(path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"host": socket.gethostname(), "pid": os.getpid(), "started": time.time()})
+    for attempt in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                info = json.loads(lock.read_text() or "{}")
+            except (OSError, ValueError):
+                info = {}
+            if attempt or _alive(info):
+                started = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(info.get("started", 0))))
+                raise StoreError(f"Another run is adding to {path} (host {info.get('host', '?')}, pid "
+                                 f"{info.get('pid', '?')}, started {started}); wait for it to finish, or delete "
+                                 f"{lock} if that run is gone.") from None
+            logger.warning("Taking over the lock of %s left by a run that is gone (host %s, pid %s)", path,
+                           info.get("host", "?"), info.get("pid", "?"))
+            lock.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        return lock
+    raise StoreError(f"Couldn't lock {path}.")
+
+
+def release_lock(lock: Path | None) -> None:
+    """Removes this run's lock file (a no-op for None or a lock already gone)."""
+    if lock is not None:
+        Path(lock).unlink(missing_ok=True)

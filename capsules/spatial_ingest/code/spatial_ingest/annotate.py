@@ -45,11 +45,17 @@ def _celltypist():
 
 
 def qc_metrics(adata: ad.AnnData) -> pd.DataFrame:
-    """scanpy's per-cell QC metrics (mito = `MT-` genes), without touching `adata`'s var."""
+    """scanpy's per-cell QC metrics, without touching `adata`'s var. Mitochondrial genes are `MT-` (human)
+    or `mt-` (mouse): the prefix is matched ignoring case."""
     probe = ad.AnnData(adata.X, obs=pd.DataFrame(index=adata.obs_names), var=pd.DataFrame(index=adata.var_names))
-    probe.var["mt"] = genes.is_mito(adata.var_names)
+    probe.var["mt"] = is_mito(adata.var_names)
     sc.pp.calculate_qc_metrics(probe, qc_vars=["mt"], percent_top=None, log1p=False, inplace=True)
     return probe.obs[list(QC_COLUMNS)]
+
+
+def is_mito(var_names) -> np.ndarray:
+    """Mitochondrial genes by symbol: `MT-` in any case (human `MT-CO1`, mouse `mt-Co1`); see genes.is_mito."""
+    return np.asarray(genes.is_mito(var_names), dtype=bool)
 
 
 def label_columns(model: Path) -> tuple[str, str]:

@@ -52,3 +52,16 @@ def test_as_dtype_refuses_overflow_and_counts_check():
         genes.as_dtype(sp.csr_matrix(np.array([[70000.0]])), np.dtype("int16"))
     assert genes.holds_counts(sp.csr_matrix(np.array([[1.0, 2.0]])))
     assert not genes.holds_counts(sp.csr_matrix(np.array([[0.5]])))
+
+
+def test_duplicate_symbols_are_named_by_gene_id_whatever_the_order():
+    a = pd.DataFrame({"gene_ids": ["ENSG01", "ENSG02", "ENSG03"], "feature_types": "Gene Expression"},
+                     index=["MATR3", "MATR3", "ACTB"])
+    _, va = genes.symbol_var(a, "A")
+    _, vr = genes.symbol_var(a.iloc[[1, 0, 2]], "A")
+    assert list(va.index) == ["MATR3-ENSG01", "MATR3-ENSG02", "ACTB"]
+    assert sorted(vr.index) == sorted(va.index) and vr.loc["MATR3-ENSG02", "gene_ids"] == "ENSG02"
+
+
+def test_mito_genes_in_any_case():
+    assert list(genes.is_mito(["MT-CO1", "mt-Co1", "Mt-nd1", "Mtor", "MTHFR"])) == [True, True, True, False, False]
