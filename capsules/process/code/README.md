@@ -148,12 +148,12 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 | Category | Field | `--name` | Default | What it does |
 |---|---|---|---|---|
 | Input data | Input store | `input` | empty: print usage | An AnnData `.zarr`, a SpatialData `.zarr`, or an icechunk repo; raw counts in a CSR `X` |
-| | SpatialData table (optional) | `table` | `table` | SpatialData: which `tables/<name>` |
 | | Icechunk branch (optional) | `branch` | `main` | Read from, and the results committed on (input repo, its copy, or the external repo) |
+| | SpatialData table (optional) | `table` | `table` | SpatialData: which `tables/<name>` |
 | | Subset column / values (optional) | `subset_column`, `subset_values` | — | Use only cells whose column is one of the values (`SP1, SP2`) |
-| Output: external location (optional) | External location | `external` | — | `s3://…` or a path; see Outputs below. Writing to S3 needs an AWS secret with write access attached to the capsule |
-| | External format | `external_format` | empty (`auto`) | `auto` (what's there, or zarr if new), `zarr` or `icechunk`; must match an existing store |
-| Output: copy in /results (optional) | Copy name (optional) | `results_copy` | `<name>.processed` | Used when External location is empty (leave both sections empty for the default copy). Name in `/results` (an absolute path goes there instead) |
+| Output | External location (optional) | `external` | — | `s3://…` or a path; see Outputs below. Writing to S3 needs an AWS secret with write access attached to the capsule |
+| | External format (optional) | `external_format` | empty (`auto`) | `auto` (what's there, or zarr if new), `zarr` or `icechunk`; must match an existing store |
+| | Copy name in /results (optional) | `results_copy` | `<name>.processed` | Used when External location is empty (leave both empty for the default copy, saved as a data asset). Name in `/results` (an absolute path goes there instead) |
 | | Copy format (optional) | `results_format` | empty (`auto`) | `auto` (the input's format), `zarr` or `icechunk` |
 | Embedding | Method | `method` | `PCA` | `PCA` or `scVI (train)`, see below |
 | | Batch key | `batch_key` | — | PCA: harmony on it; scVI: the batch (more keys, comma-separated: harmony uses all, scVI uses the rest as covariates). Every cell needs a value |

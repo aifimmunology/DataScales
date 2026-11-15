@@ -10,14 +10,9 @@
 		},
 		{
 			"id": "eXtErNaLoUtPuT01",
-			"name": "Output: external location (optional)",
-			"description": "Write the results to S3 or another path instead of /results. S3 writes need an AWS secret with write access attached to the capsule.",
+			"name": "Output",
+			"description": "Leave empty to save a copy in /results (a data asset). Or set an external location, such as the S3 link of an icechunk origin.",
 			"icon": "📂"
-		},
-		{
-			"id": "W3oWEbP7Z7LZFkUZ",
-			"name": "Output: copy in /results (optional)",
-			"description": "Used when no external location is set. Leave both output sections empty for the default copy."
 		},
 		{
 			"id": "GhlCWmuPGluuDV1v",
@@ -47,6 +42,15 @@
 			"value_type": "string"
 		},
 		{
+			"id": "qY4L4oOTVuK36CTF",
+			"category": "fjkkmNN0idHqHVRS",
+			"name": "Icechunk branch (optional)",
+			"param_name": "branch",
+			"description": "Icechunk only: branch to read and commit on. Empty: main.",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
 			"id": "PilPv4d0dnl7GBdw",
 			"category": "fjkkmNN0idHqHVRS",
 			"name": "SpatialData table (optional)",
@@ -55,15 +59,6 @@
 			"type": "text",
 			"value_type": "string",
 			"default_value": "table"
-		},
-		{
-			"id": "qY4L4oOTVuK36CTF",
-			"category": "fjkkmNN0idHqHVRS",
-			"name": "Icechunk branch (optional)",
-			"param_name": "branch",
-			"description": "Icechunk only: branch to read and commit on. Empty: main.",
-			"type": "text",
-			"value_type": "string"
 		},
 		{
 			"id": "UILt0zRd8uxxIKsN",
@@ -89,17 +84,17 @@
 			"category": "eXtErNaLoUtPuT01",
 			"name": "External location (optional)",
 			"param_name": "external",
-			"description": "s3://bucket/prefix or a path. Needs an AWS secret with write access.",
-			"help_text": "Icechunk input: its own S3 repo; the results are one commit on the branch. Zarr input: a new store, or results written into an existing zarr with the same cells and genes.",
+			"description": "s3://bucket/prefix or a path, e.g. an icechunk origin. S3 needs an AWS secret with write access.",
+			"help_text": "Icechunk input: its own S3 repo. Zarr input: a new store, or an existing zarr with the same cells and genes.",
 			"type": "text",
 			"value_type": "string"
 		},
 		{
 			"id": "eXtErNaLfOrMaT01",
 			"category": "eXtErNaLoUtPuT01",
-			"name": "External format",
+			"name": "External format (optional)",
 			"param_name": "external_format",
-			"description": "Empty/auto: what is there, or zarr if new. Otherwise must match what is there.",
+			"description": "Empty: what is there, or zarr if new.",
 			"type": "list",
 			"value_type": "string",
 			"extra_data": [
@@ -110,20 +105,20 @@
 		},
 		{
 			"id": "0hMt27jwwKveffpB",
-			"category": "W3oWEbP7Z7LZFkUZ",
-			"name": "Copy name (optional)",
+			"category": "eXtErNaLoUtPuT01",
+			"name": "Copy name in /results (optional)",
 			"param_name": "results_copy",
-			"description": "Name in /results. Empty: <input name>.processed. Never overwrites: -1, -2, ... is added.",
+			"description": "Used when no external location is set. Empty: <input name>.processed.",
 			"help_text": "An absolute path puts the copy there.",
 			"type": "text",
 			"value_type": "string"
 		},
 		{
 			"id": "rEsUlTsFoRmAt001",
-			"category": "W3oWEbP7Z7LZFkUZ",
+			"category": "eXtErNaLoUtPuT01",
 			"name": "Copy format (optional)",
 			"param_name": "results_format",
-			"description": "Empty/auto: the input's format. zarr or icechunk to convert (SpatialData can't be icechunk).",
+			"description": "Empty: same as the input.",
 			"type": "list",
 			"value_type": "string",
 			"extra_data": [
@@ -214,24 +209,24 @@
 			"pattern": "^\\s*([0-9]*\\.?[0-9]+(\\s*,\\s*[0-9]*\\.?[0-9]+)*\\s*,?\\s*)?$"
 		},
 		{
+			"id": "AyqX3dqph0qvuGHP",
 			"category": "D4npHhbetnHEohzx",
 			"name": "UMAP name (optional)",
 			"param_name": "umap_key",
 			"description": "obsm key for the UMAP coordinates. Empty: X_umap.",
 			"type": "text",
 			"value_type": "string",
-			"pattern": "^[A-Za-z0-9_.\\-]*$",
-			"id": "AyqX3dqph0qvuGHP"
+			"pattern": "^[A-Za-z0-9_.\\-]*$"
 		},
 		{
+			"id": "Y5uu9QbFOiTwLyt2",
 			"category": "D4npHhbetnHEohzx",
 			"name": "Leiden name (optional)",
 			"param_name": "leiden_key",
 			"description": "obs column for the clusters. Empty: leiden. Several resolutions: <name>_<resolution>.",
 			"type": "text",
 			"value_type": "string",
-			"pattern": "^[A-Za-z0-9_.\\-]*$",
-			"id": "Y5uu9QbFOiTwLyt2"
+			"pattern": "^[A-Za-z0-9_.\\-]*$"
 		},
 		{
 			"id": "uMaPcOlOrKeYsPaRm",

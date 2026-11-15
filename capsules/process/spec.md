@@ -468,3 +468,6 @@ after; both reviews' findings are fixed and tested.
   and branch-moved tests). **Before publishing, still to do by hand:** one real S3 run each with and without the
   AWS secret (icechunk asset to its own S3 repo; zarr to a new `s3://`), and a look at the panel in Code Ocean
   (empty format lists, external-first order).
+- **Panel (2026-11-15):** the two output categories are one, "Output": external location first (e.g. an icechunk
+  origin's S3 link), then the copy in /results (saved as a data asset); both optional. Order in Input data:
+  input, branch, SpatialData table, subset column, subset values. Descriptions kept to one short line.

@@ -105,8 +105,9 @@ def test_panel_matches_config():
         for option in p.get("extra_data", []):
             _cast(p["param_name"], option)
     assert all("optional" in c["description"].lower() for c in panel["categories"][:1])
-    assert [c["name"] for c in panel["categories"][:3]] == [
-        "Input data", "Output: external location (optional)", "Output: copy in /results (optional)"]
+    assert [c["name"] for c in panel["categories"][:2]] == ["Input data", "Output"]
+    order = [p["param_name"] for p in panel["parameters"]]
+    assert order.index("branch") < order.index("table") < order.index("subset_column")
     by_name = {p["param_name"]: p for p in panel["parameters"]}
     assert not by_name["results_format"].get("default_value") and not by_name["external_format"].get("default_value")
     assert not by_name["results_copy"].get("default_value") and not by_name["external"].get("default_value")
