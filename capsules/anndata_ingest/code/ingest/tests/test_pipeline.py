@@ -390,7 +390,7 @@ def test_create_can_be_rerun_after_a_create_run_failed(samples_dir, base_env, st
     bad = tmp_path / "B092-P1_SP00009-01.h5"
     bad.write_bytes(b"not an h5 file")
     files = files_of(samples_dir)
-    with pytest.raises(OSError):
+    with pytest.raises(main.IngestError, match="can't be read"):
         ingest(base_env, store_path, f"{files[0]},{bad}", "--create", "true")
     report = ingest(base_env, store_path, files[0], "--create", "true")
     assert report["appended_samples"] == ["SP00001"] and report["n_cells"] == 160

@@ -1,7 +1,8 @@
 # Capsules
 
 Sources for the Code Ocean capsules: `anndata_ingest` (formerly `ingest`), `qc`, `process` and
-`spatial_ingest`. The design, including the tested spatial findings, is in [spec.md](spec.md).
+`spatial_ingest`. Rules shared by every capsule (layout, conventions, environments, git, testing) are
+in [CLAUDE.md](CLAUDE.md); each capsule's design and findings are in its own `spec.md`.
 
 ## Environments
 
@@ -19,14 +20,8 @@ The base image and VS Code extensions are set on the page only.
 
 ### Keep the files in step with the real capsules
 
-The page can change without these files changing (an edit on the page, or packages Code Ocean picks up
-from a session). These files are what gets copied out, so **every so often, and before any release**, bring
-them up to date with what each capsule really installs:
-
-1. Read the capsule's current packages: the page's **Edit Bulk** text for pip3 and conda, or
-   `/root/capsule/.codeocean/environment.json` in a running capsule. Code Ocean regenerates that file from
-   the page on every build, so editing it changes nothing.
-2. Update `<capsule>/environment/requirements.txt`, `environment.yml` and `pixi.toml` here to match.
+The page can change without these files changing. How to bring them up to date before any release:
+[CLAUDE.md](CLAUDE.md) §6.1.
 
 ### process: pins that matter
 

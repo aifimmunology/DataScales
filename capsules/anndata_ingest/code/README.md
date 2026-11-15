@@ -17,9 +17,8 @@ thresholds, embeddings and clusters come later, from the `qc` and `process`
 capsules, on curated cells. All store operations go through
 [annizarr](https://pypi.org/project/annizarr/).
 
-**Design spec:** this capsule is `capsules/anndata_ingest` in the DataScales repo, and the repo's
-`capsules/spec.md` describes it and the other capsules (including `spatial_ingest`). In a
-workstation session the checkout may be at `/scratch/DataScales`.
+**Design spec:** this capsule is `capsules/anndata_ingest` in the DataScales repo. Its design is
+`capsules/anndata_ingest/spec.md`; rules shared by all capsules are in `capsules/CLAUDE.md`.
 
 ## Quick start
 
@@ -98,15 +97,21 @@ store at `/results/ingest_icechunk`.
 
 ### When a run stops with an error
 
-Nothing is written when a run fails before the append, and on icechunk a failed append is rolled
-back. The log's `ERROR` line says what to change:
+Inputs and CellTypist models are read before the store is opened, so most errors stop the run
+before anything is written. A run that fails later leaves an existing icechunk store unchanged (the
+failed append is rolled back); a new store may be left created but empty, and the next run fills
+it. The log's `ERROR` line says what to change:
 
 | The error says | What to do |
 |---|---|
 | `No store at … created only inside /results,/scratch` | the path to your existing store is wrong, or start a new store under `/results` or on `s3://` |
 | `… is read-only; give its writable origin` | fill in **Origin of s3** with the bucket prefix of that data asset |
 | `obs schema differs from the store's` | pick the Celltypist option the store was created with (the message names it) |
-| `holds no .h5/.h5ad samples` / `not a .h5/.h5ad file` / `not found` | check the sample paths; folders are not searched into subfolders |
+| `No .h5/.h5ad files or AnnData/SpatialData .zarr folders found` / `not a .h5/.h5ad file` / `not found` | check the sample paths; folders are not searched into subfolders |
+| `These inputs can't be read` | the listed files are truncated or not AnnData/10x files; re-copy them or leave them out |
+| `CellTypist models not found` / `can't be loaded` | pick a listed Celltypist option, or give a `.pkl` written by celltypist |
+| `shares no gene names with the store` | the sample uses other gene identifiers (symbols vs Ensembl IDs); convert them first |
+| `a plain .zarr store must be local` | on S3 use an icechunk store: drop the `.zarr` suffix |
 | `var mismatch` | the sample's genes couldn't be fitted to the store's; report it, this shouldn't happen |
 | `a .zarr input must be an AnnData, or a SpatialData` | a `.zarr` in the list is neither (no `X`/`obs`, no `tables/table`) |
 | `is MuData, which this capsule doesn't take` | write the modality you want as an AnnData (the message shows how) and ingest that |
@@ -145,6 +150,8 @@ new samples ──► read ──► QC metrics ──► CellTypist ──► S
   file name (`B092-P1_SP02425-01.h5 → SP02425`); a run with nothing new changes nothing. A generic
   10x name (`cell_feature_matrix.h5`, `filtered_feature_bc_matrix.h5`) takes its bundle folder's
   name instead, skipping folders such as `outs`; a SpatialData `.zarr` is named after its folder.
+  A different file with the same ID (a re-sequenced batch, `B093-P2_SP02425-02.h5`) is skipped too,
+  with a warning naming both files; put it in a separate store to keep both.
 - **Every commit names its samples and where each came from**: one `- <sample>: <path>` line per
   sample in the message, and `sources` (plus `fitted`, for fitted samples) in its metadata.
 
@@ -228,8 +235,9 @@ model, anything else the samples.
     the run writes through the origin. Which samples the store holds, its schema and its genes
     are read from the origin too, because the mount can lag it by several commits.
   - A read-only store without an origin is refused before any work starts.
-- **Plain zarr:** appended where it is, so it must be writable (local or S3). A data-asset
-  mount is refused.
+- **Plain zarr:** appended where it is, so it must be a writable local folder; on S3 use icechunk.
+  A data-asset mount is refused. A plain zarr has no transactions: an append that fails partway
+  leaves the samples appended before it, which a rerun then skips.
 - **Starting a store:** a storage location that holds no store yet is created at an `s3://`
   prefix (writing it is the permission check), or inside `/results` (kept with the run) or
   `/scratch` (cleared when the run ends), but not as either folder itself. Any other local path
@@ -247,16 +255,16 @@ Every setting is an environment variable named after its field in `config.Settin
 `ingest/.env.example` lists them with their defaults. Outputs go to `/results`:
 - `ingest_summary.csv`: per appended sample, cells, mean genes and mito %, doublets, and the
   number of cell types each model found;
-- `ingest_run.json`: store, snapshot ids, samples, cell and sample totals, peak memory and
-  settings.
+- `ingest_run.json`: store, snapshot ids, samples, cell and sample totals, peak memory, library
+  versions and settings.
 
 ### Locally
 
 ```bash
 cd code/ingest
-python main.py /scratch/atlas "" /data/samples "Only AIFI L1 celltypes" ""     # panel order: icechunk
+python main.py /scratch/atlas "" "Raw samples (QC, CellTypist, Scrublet)" /data/samples "Only AIFI L1 celltypes" ""  # panel order: icechunk
 python main.py --samples /data/samples --store /scratch/atlas.zarr               # or flags: plain zarr
-python -m pytest tests                                                         # ~2.5 min, synthetic data
+python -m pytest tests                                                         # ~4 min, synthetic data
 ```
 
 ## The stored object
@@ -277,13 +285,18 @@ commit's metadata naming the samples it appended and the totals after it.
 ```
 code/run              Code Ocean entrypoint: passes the app-panel values on to main.py
 code/ingest/
-├── main.py           the run: pick new samples, stage them, write them, report
+├── main.py           orchestration: open the store, stage the new inputs, write them, report
+├── precheck.py       before any write: inputs, models, readability (all problems at once); which inputs are new
+├── contracts.py      the records passed between stages (RawInput, ObjectInput, Staged) and the run's errors
+├── stage.py          annotate and project raw samples, stage existing objects, into zarr in staging
+├── genes.py          the one gene policy: panel differences, fitting to the store's genes, refusing no overlap
+├── contract.py       the obs schema and X dtype the store keeps
 ├── config.py         Settings from environment variables and app-panel values; sample-list parsing
 ├── objects.py        existing AnnData: streamed into staging with annizarr, then fitted to the store
 ├── hise.py           inputs: HISE .h5 (both layouts), AnnData .h5ad/.zarr, SpatialData tables; gene names; sample IDs
-├── annotate.py       QC metrics, CellTypist (several models), Scrublet
-├── contract.py       the obs schema, the projection, the schema and gene checks, gene-panel fitting
-├── store.py          icechunk and plain-zarr stores behind one interface
+├── annotate.py       QC metrics, CellTypist (models loaded once), Scrublet
+├── store.py          icechunk and plain-zarr stores behind one interface; recorded sample sources
+├── logs.py           one log format; known library noise silenced
 └── tests/            unit tests and end-to-end runs (raw and existing inputs, SpatialData), both store kinds
 code/models/          the bundled CellTypist models and their SOURCE.json
 code/Icechunk_annizarr_notebook.ipynb   explore a store: history, cells per sample, loading cells, old versions
@@ -291,8 +304,6 @@ code/Icechunk_annizarr_notebook.ipynb   explore a store: history, cells per samp
 
 ## Environment
 
-- **`environment/`** (`environment.yml`, `requirements.txt`) pins the packages: annizarr, icechunk,
-  zarr and anndata, shared with the other capsules, plus scanpy, CellTypist and their compiled
-  dependencies.
-- **`environment/postInstall`** installs `g++` and then annoy and Scrublet, because annoy has no
-  wheel and the packages are installed before `postInstall` runs.
+`environment/requirements.txt` and `environment.yml` pin the packages: annizarr, icechunk, zarr and
+anndata, shared with the other capsules, plus scanpy, CellTypist, Scrublet and `python-annoy` (from
+conda, as annoy has no wheel). How environments are built: `capsules/CLAUDE.md` §6.

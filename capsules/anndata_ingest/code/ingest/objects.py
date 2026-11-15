@@ -14,6 +14,7 @@ from anndata.io import read_elem, sparse_dataset, write_elem
 from annizarr import AppConfig, convert, rechunk
 
 import contract
+import genes
 import hise
 
 PER_CELL = ("obsm", "obsp", "layers", "varm", "uns")
@@ -98,12 +99,29 @@ def write_csr(parent: zarr.Group, name: str, rows, n_cols: int, dtype: np.dtype)
     group.attrs.update({"encoding-type": "csr_matrix", "encoding-version": "0.1.0", "shape": [len(indptr) - 1, n_cols]})
 
 
-def rewrite_x(root: zarr.Group, out: Path, x, columns: np.ndarray, genes: np.ndarray, dtype: np.dtype) -> None:
-    """X restricted and reordered to `genes` (missing ones zero-filled), in `dtype`, block by block."""
-    pick = contract.gene_picker(columns, genes)
-    write_csr(root, "X_fitted", (sp.csr_matrix(block @ pick, dtype=dtype) for block in blocks(x)), len(genes), dtype)
-    del root["X"]
-    os.replace(out / "X_fitted", out / "X")
+def rewrite_x(parent: zarr.Group, out: Path, name: str, x, columns: np.ndarray, wanted: np.ndarray,
+              dtype: np.dtype) -> None:
+    """`parent[name]` (X or a layer) restricted and reordered to `wanted` (missing ones zero-filled), in
+    `dtype`, block by block; `out` is the staging zarr's folder."""
+    pick = genes.gene_picker(columns, wanted)
+    write_csr(parent, f"{name}_fitted", (sp.csr_matrix(block @ pick, dtype=dtype) for block in blocks(x)),
+              len(wanted), dtype)
+    del parent[name]
+    folder = out / parent.path if parent.path else out
+    os.replace(folder / f"{name}_fitted", folder / name)
+
+
+def fit_per_gene(root: zarr.Group, out: Path, columns: np.ndarray, wanted: np.ndarray) -> list[str]:
+    """A whole object's layers on `wanted`, like X; its varm and varp (per feature, of the old features)
+    are dropped and returned."""
+    for k in list(root["layers"]) if "layers" in root else []:
+        layer = matrix(root["layers"][k])
+        rewrite_x(root["layers"], out, k, layer, columns, wanted, np.dtype(layer.dtype))
+    dropped = [f"{key}/{k}" for key in ("varm", "varp") if key in root for k in root[key]]
+    for key in ("varm", "varp"):
+        if key in root:
+            del root[key]
+    return dropped
 
 
 def stage_object(path: Path, out: Path, column: str | None, sample: str, target, keep_all: bool,
@@ -118,8 +136,9 @@ def stage_object(path: Path, out: Path, column: str | None, sample: str, target,
     var, obs = read_elem(root["var"]), read_elem(root["obs"])
 
     columns = np.asarray(var.index, dtype=object)
-    genes = columns[hise.gene_mask(var)] if target.var is None else target.var
-    diff = contract.panel_diff(genes, columns)
+    wanted = columns[hise.gene_mask(var)] if target.var is None else target.var
+    diff = genes.panel_diff(wanted, columns)
+    genes.require_shared(diff, len(wanted), name)
     x = matrix(root["X"])
     counts, top = x_stats(x)
     if target.counts and not counts:
@@ -129,9 +148,11 @@ def stage_object(path: Path, out: Path, column: str | None, sample: str, target,
     if np.issubdtype(dtype, np.integer) and top > np.iinfo(dtype).max:
         raise contract.ContractError(f"{name}: X values up to {top:g} don't fit the store's {dtype}.")
     if diff or dtype != x.dtype:
-        rewrite_x(root, out, x, columns, genes, dtype)
+        rewrite_x(root, out, "X", x, columns, wanted, dtype)
+    if diff and keep_all:
+        left_out += fit_per_gene(root, out, columns, wanted)
     if diff:
-        write_elem(root, "var", var.reindex(genes) if target.var is None else pd.DataFrame(index=pd.Index(genes)))
+        write_elem(root, "var", var.reindex(wanted) if target.var is None else pd.DataFrame(index=pd.Index(wanted)))
 
     obs["sample_id"] = obs[column].astype(str) if column else sample
     obs.index = [n if n.startswith(f"{sid}:") else f"{sid}:{n}" for sid, n in zip(obs["sample_id"], obs.index)]
@@ -141,7 +162,7 @@ def stage_object(path: Path, out: Path, column: str | None, sample: str, target,
         left_out += [f"obs/{c} (values don't fit the store's type)" for c in failed]
     write_elem(root, "obs", obs)
     zarr.consolidate_metadata(str(out))
-    note = contract.fit_note(diff) if diff and target.var is not None else ""
+    note = genes.fit_note(diff) if diff and target.var is not None else ""
     if target.var is None:
-        target.learn(genes, dtype, counts, contract.frame_kinds(obs))
+        target.learn(wanted, dtype, counts, contract.frame_kinds(obs))
     return obs, note, left_out

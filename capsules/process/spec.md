@@ -1,7 +1,50 @@
 # `process` capsule: changes and why
 
-The shared design is in [`../spec.md`](../spec.md) §5. This sheet records what was built or changed in
-this capsule, and why. Newest decisions win where they disagree with older text.
+§0 is the design summary (formerly `capsules/spec.md` §5); shared rules are in [`../CLAUDE.md`](../CLAUDE.md).
+The rest records what was built or changed in this capsule, and why. Newest decisions win where they
+disagree with older text. The 2026-11-02 rework design is [`rework_spec.md`](rework_spec.md).
+
+## 0. Design summary (moved from the former `capsules/spec.md` §5, §6.2–§6.3 and §7 on 2026-11-15)
+
+**Reworked 2026-11-02** from a command-line pipeline into an environment capsule; the design is
+[`rework_spec.md`](rework_spec.md) and the change log is the rest of this file.
+
+- **What it is, first:** the pinned RAPIDS GPU environment (`code/environment/`, copyable to other capsules) and two notebooks: out-of-core scRNA (normalize, HVG, scale, PCA, optional harmony, neighbors, UMAP, leiden, following `10-Rapids_GPU_Analysis.ipynb`) and a spatial walkthrough.
+- **Optional pipeline (2026-11-03):** `code/run`, from the App Panel (named parameters, five categories) or a terminal. Method PCA (± harmony) or scVI (train), then neighbors, UMAP and leiden at one or more resolutions, optionally on an obs subset. One `Config` dataclass modelled on `dev_tools/rapids-benchmark/rapids_benchmark.py`: the panel sets the common fields, everything else (cluster preset, GPUs, scVI training knobs, …) is a flag or environment variable. A Reproducible Run with no input exits 0 with usage. Details and the GPU test plan: §12.
+- **Inputs:** an AnnData `.zarr` or a SpatialData `.zarr` (its `tables/<name>`) by default; icechunk through commented-out cells (branch, optional S3 origin).
+- **Saving (notebooks and pipeline):** zarr input → a new full object at `/results/<stem>.processed.zarr` (SpatialData: the whole store copied, results in its table); icechunk → one commit back to the branch. Results: `obsm/X_pca` (`X_pca_harmony`), `obsm/X_umap`, `obs/leiden`, `var/highly_variable`, `layers/lognorm` (with `target_sum`), `uns/process`.
+- **scVI:** in the pipeline (train a new model; `obsm/X_scVI`, model saved to `/results/scvi_model/`); HVGs are picked on the Dask-CUDA cluster, which is closed before training.
+
+### 0.1 Environment: CUDA 13, from PyPI only, on the page
+- `process/code/environment/requirements.txt` (with `pixi.toml` beside it, kept in `code/` so people can take them from the capsule) pins exact versions of the shared pins, RAPIDS 26.10 cu13 (`cudf`, `cuml`, `cugraph`, `cuvs`, `rmm`, `dask-cuda`), `rapids-singlecell-cu13 0.18.1`, scanpy, matplotlib, torch, `scvi-tools 1.5.1`, scikit-misc and ipykernel. It also pins the CUDA-stack packages that must agree: `numba`, `numba-cuda`, `cupy-cuda13x`, `cuda-toolkit`, `dask` and `distributed`.
+- Everything else is resolved at build time. On 2026-10-23 the list resolved (`uv pip compile`, Python 3.13, x86-64 Linux) to the same 205 packages as the earlier full lock.
+- The page's `pip3` on this image is `/opt/venv/bin/pip3` (verified 2026-10-23), so page packages land in the venv the code runs in.
+- **Built and working on the GPU capsule** (user-tested 2026-10-23, before the spatial packages were added). squidpy 1.8.3, spatialdata 0.8.0 and omnipath 1.0.12 resolve with the pins (246 packages, re-checked 2026-10-27); to be added on the page.
+- **Tutorial notebooks** in `process/code/notebooks/`: `rapids_scrna_out_of_core_dask` and `rapids_spatial_atera_breast_cancer`, from rapids-singlecell's tutorials `06_out-of-core` and `08_atera_demo`, adapted for one T4. Interactive only. Each reads its input from a data asset and states the format it needs.
+- **Base image** `codeocean/cuda12-runtime-uv:main-5692e50` (uv, Python 3.13 in the venv `/opt/venv`).
+  - The wheels bring their own CUDA 13 libraries, so the image's CUDA 12 toolkit doesn't matter; the host driver does.
+  - Measured: driver 610.57.04 (CUDA up to 13.3) on a Tesla T4 (15 GB, compute capability 7.5, the oldest generation CUDA 13 supports).
+
+### 0.2 Tests (`code/notebooks/test_notebooks.sh`, on the GPU capsule)
+- each notebook runs headless on tiny AnnData `.zarr`, SpatialData `.zarr`, ingest-style (no `layers`, no `sample_id`) and icechunk stores;
+- a zarr save writes a new full copy that reads back (`anndata.read_zarr`, `sd.read_zarr`), never touches the input, and never overwrites an earlier output;
+- an icechunk save makes one commit, also twice in a row through an `ORIGIN`, and refuses when the branch moved;
+- `lognorm` matches scanpy's normalize + log1p; the shared helper cell is identical in both notebooks;
+- the pipeline (`code/test_gpu.sh`): PCA, harmony, scVI, several resolutions, a subset, SpatialData, an ingest store, icechunk through an origin twice, and the no-input Reproducible Run; the full checklist is §12.6.
+
+### 0.3 From the working notes (folded in 2026-11-15)
+- **User decisions 2026-11-02:** an environment plus notebooks capsule. Notebooks default to
+  AnnData/SpatialData zarr, with icechunk as commented-out cells. Saving on zarr writes a new full copy
+  with the results (default `/results/<stem>.processed.zarr`); on icechunk it commits back, through the
+  origin if one is given. No refusals anywhere. A write that dies midway is acceptable. *Why:* the user
+  wants process for interactive RAPIDS use, not automation, and no dead ends for first-time users.
+- **2026-11-03:** the optional App Panel / Reproducible Run pipeline (§12). scVI knobs are config fields
+  and env vars only, not on the panel. Outputs follow the notebook rules. A Reproducible Run with no input
+  exits 0 with a usage message. The README and panel must say the capsule is first an environment and
+  notebook holder.
+- **Repo state at the 2026-11-02 rework:** DataScales was fast-forwarded to f88ad34 with local changes
+  uncommitted; a stash "claude: anndata_ingest rename + spec" was kept as a backup.
+- **`resources.json`** is still `"xsmall"` and needs a GPU class (§12.6).
 
 ## 1. What the capsule is for
 - **The RAPIDS environment first.** The capsule exists to hand out a working GPU single-cell environment
@@ -35,7 +78,7 @@ code/
     missing from the files, so it was added.
 - **`pixi.toml` is for use outside Code Ocean only** (`CONDA_OVERRIDE_CUDA=13 pixi install`). Code Ocean
   never reads it. **It has not been solved yet**: installing pixi from inside the capsule was blocked.
-- **annizarr stays pinned at 0.2.3**, matching the environment page. The code also works on 0.2.4 (§7).
+- **annizarr is pinned at 0.2.4** (it was 0.2.3 until the 2026-11 updates). The code works on both (§7).
 - **Why exact pins:** this is an environment, not a library. The CUDA 13 RAPIDS wheels, torch and
   `cuda-toolkit` have to match each other, and zarr/anndata/spatialdata change fast. annizarr 0.2.4 is an
   example: it renamed `add_expr`. Without pins, a rebuild quietly installs whatever is newest that day.
@@ -112,7 +155,7 @@ Fixes from two independent reviews, each with a test:
   renamed from `annizarr_target_sum` to `target_sum`, since annizarr no longer writes or reads it.
 - **Other changes:** the matrix copy moved into `_writers/_copy.py` (used by `rechunk`), and the CPU count
   respects cgroup quotas (`_core/_system.py`). That suits Code Ocean containers.
-- **Not in 0.2.4:** `subset` and `Repo.garbage_collect`, which `../spec.md` §8 planned for qc apply.
+- **Not in 0.2.4:** `subset` and `Repo.garbage_collect`, which `../CLAUDE.md` §8 planned for qc apply.
 - **Checked:** the 38 tests pass against both 0.2.3 and 0.2.4. The `Repo` API this capsule uses (`exists`,
   `create`, `open_zarr`, `log`, `commit`, `discard`, `checkout`, `dirty`) is unchanged.
 
@@ -153,12 +196,11 @@ Fixes from two independent reviews, each with a test:
 - a 1M-cell rerun with the GPU lognorm writer.
 
 ## 10. Open
-- **scVI / scANVI integration**, in a subprocess (`../spec.md` §5.2 step 5). *(2026-11-03: scVI training is in the optional pipeline, in-process after the cluster is closed, see §12.3. scANVI is not.)*
+- **scVI / scANVI integration**, in a subprocess (the former `capsules/spec.md` §5.2 step 5, before the rework). *(2026-11-03: scVI training is in the optional pipeline, in-process after the cluster is closed, see §12.3. scANVI is not.)*
 - **Code Ocean versioned data assets** (AllenNeuralDynamics/aind-code-ocean-info#11; private, not read yet).
   The question is whether a new asset version copies everything, or can point at an icechunk repo on S3,
   where commits cost very little.
-- **ingest and qc still pin annizarr 0.2.3.** Neither calls `add_expr`; bumping them is up to their own
-  testing.
+- **ingest and qc now pin annizarr 0.2.4 too** (2026-11-15). Neither calls `add_expr`.
 
 ## 11. Rework: an environment and notebooks capsule (2026-11-02)
 Built from [`rework_spec.md`](rework_spec.md), on the user's decisions of 2026-11-02. It replaces §2, §4,

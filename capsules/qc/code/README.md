@@ -299,7 +299,7 @@ code/qc_check/
 
 The environment page pins the packages shared with the other capsules (annizarr, icechunk,
 zarr, anndata, numpy, pandas, …), plus scanpy, leidenalg, igraph and umap-learn for the
-embedding, and pyarrow, matplotlib and seaborn. `environment/postInstall` installs only
-Claude Code. The resource class is `medium` for both modes.
+embedding, and pyarrow, matplotlib and seaborn. The resource class is `medium` for both modes.
+How environments are built: `capsules/CLAUDE.md` §6; the design: `capsules/qc/spec.md`.
 
 The first embedding in a run spends about 40 s compiling UMAP's numba code.

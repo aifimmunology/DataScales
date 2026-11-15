@@ -7,7 +7,7 @@
 > longer holds for them; see `spec.md` §12.
 
 Status: **built 2026-11-02** (see `spec.md` §11). Changed while building: a `RESULTS` setting (where `umap.png`, `cluster_summary.csv` and the default `OUTPUT` go, for tests); the spatial notebook also writes `uns/spatial_process`, so it doesn't replace `uns/process`; an existing output gives `<stem>-<n>.zarr`, skipping names whose `.partial` exists; icechunk is one commented block in the settings cell that sets `repo`, and with `ORIGIN` the store is read through the origin (2026-11-03, `spec.md` §11.1). Tested on CPU only. It replaces the `run` pipeline described in `spec.md` §4–§5
-here and in `../spec.md` §5. The decisions it rests on are the user's (2026-11-02). Related decisions for
+here and in the former `capsules/spec.md` §5 (now `spec.md` §0). The decisions it rests on are the user's (2026-11-02). Related decisions for
 ingest and qc, made at the same time, are in §7.
 
 ## 1. What changes, in one paragraph
@@ -28,7 +28,7 @@ notebook just reads what it's given and writes where it's told.
 | `code/run`, `code/process/` (config, cluster, steps, store, main) and its 38 tests | The notebooks hold the same steps; one copy of the logic |
 | The CLI flags, environment variables, `run.json`, `cluster_summary.csv` | Notebook outputs replace them (§4.4) |
 | Every refusal: read-only input, `--branch qc` default, remote plain zarr, NA-batch-key exit | The user decides in the notebook; a cell that can't work fails with the library's own error |
-| `../spec.md` §5 as a pipeline (App Panel/flags table, "Where results go", reruns) | Replaced by §4 here |
+| The former `capsules/spec.md` §5 as a pipeline (App Panel/flags table, "Where results go", reruns) | Replaced by §4 here |
 
 Keep: `code/environment/` (requirements.txt, pixi.toml), `environment/postInstall`, `.codeocean/resources.json`.
 
@@ -123,7 +123,7 @@ Both keep their current step order and defaults:
   rules (§4.3). A short "icechunk instead of zarr" section points to the commented cells, and the
   SpatialData-on-icechunk limits stay (spatialdata 0.8.0: no `sdata.write()`/`read_zarr` on icechunk;
   table only).
-- **`../spec.md` §5:** a short page pointing to this file. §2.3's entrypoint rule and §8's build order change to match.
+- **The former `capsules/spec.md` §5 (now `spec.md` §0):** a short page pointing to this file. `../CLAUDE.md` §2.3's entrypoint rule and §8's build order change to match.
 - **Tests:** on the GPU capsule, run each notebook headless (`jupyter nbconvert --execute`) on tiny
   synthetic stores:
   - scRNA: AnnData `.zarr`, SpatialData `.zarr`, and icechunk with the cells uncommented;
@@ -151,7 +151,7 @@ Both keep their current step order and defaults:
   - after qc, `main` mixes curated samples and later raw appends;
   - the next qc report must know which samples are already curated. `uns/qc/decisions` carries that, and
     curated samples are not re-filtered;
-  - `../spec.md` §4.10 (the `qc` branch, GC) and §4.8 change accordingly.
+  - `../qc/spec.md` §4.10 (the `qc` branch, GC) and §4.8 change accordingly.
 
 ### 7.2 Ingest: S3 and the default location
 - **A new store at an `s3://` location is created when it's writable**, without `CREATE=true`. Today any

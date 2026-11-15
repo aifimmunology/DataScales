@@ -186,10 +186,14 @@ def create(path: Path) -> None:
     from spatialdata import SpatialData
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}{CREATING}"
-    shutil.rmtree(tmp, ignore_errors=True)
-    SpatialData().write(tmp)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+        SpatialData().write(tmp)
+    except OSError as exc:
+        raise StoreError(f"Can't create a store at {path} ({exc.strerror}); give a writable location such as "
+                         "/results/<name>.zarr or /scratch/<name>.zarr.") from None
     zarr.open_group(tmp, mode="r+", use_consolidated=False).attrs[MARKER] = {"version": 1}
     consolidate(tmp)
     if path.exists():

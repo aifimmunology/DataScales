@@ -23,9 +23,8 @@ name. Count matrices are streamed (read and written in row chunks), so no sample
 held in memory whole, and the joint table is appended in place with
 [annizarr](https://pypi.org/project/annizarr/).
 
-**Design spec:** this capsule is `capsules/spatial_ingest` in the DataScales repo. The repo's
-`capsules/spec.md` §3S describes it, and the other capsules too. In a workstation session the checkout
-may be at `/scratch/DataScales`.
+**Design spec:** this capsule is `capsules/spatial_ingest` in the DataScales repo. Its design is
+`capsules/spatial_ingest/spec.md`; rules shared by all capsules are in `capsules/CLAUDE.md`.
 
 ## Quick start
 
@@ -523,7 +522,6 @@ code/spatial_ingest/
   - shared with the other capsules: annizarr, zarr, anndata, numpy, pandas, boto3;
   - this capsule's own: spatialdata 0.8.0, spatialdata-io 0.7.1, scanpy, CellTypist, geopandas,
     pyarrow, s3fs, and moto for the S3 tests.
-  - Load it on the environment page with **Edit Bulk**.
-- **`environment/postInstall`** installs Claude Code only.
+- How environments are built and loaded: `capsules/CLAUDE.md` §6.
 - **Resources:** see "Memory and resources" above: the 64 GB ("large") class for Prime 5K,
   whole-transcriptome and Atera samples.

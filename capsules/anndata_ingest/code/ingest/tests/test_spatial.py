@@ -7,10 +7,9 @@ import scipy.sparse as sp
 import zarr
 from annizarr import Repo
 
-import contract
+import genes
 import hise
 import main
-import store as stores
 from config import load_settings
 from conftest import GENES, counts_matrix, write_hise_h5
 
@@ -67,7 +66,8 @@ def test_spatialdata_folders_are_listed_and_ingested_with_their_sources(base_env
     assert report["appended_samples"] == ["Breast_A", "Breast_B"] and report["n_cells"] == 90
     assert report["sources"] == {"Breast_A": str(a), "Breast_B": str(b)}
     head = Repo(str(store)).log()[0]
-    assert head.metadata["sources"] == report["sources"] and f"- Breast_B: {b}" in head.message
+    # the seed commit holds Breast_A; the run's commit records only what it appended
+    assert head.metadata["sources"] == {"Breast_B": str(b)} and f"- Breast_B: {b}" in head.message
     assert run(base_env, store, folder)["appended_samples"] == []
 
 
@@ -118,7 +118,7 @@ def test_a_new_store_fits_later_samples_to_the_first_samples_genes(base_env, tmp
 def test_fitting_handles_duplicate_gene_names():
     sample = ad.AnnData(sp.csr_matrix(np.array([[1, 2, 3]], dtype=np.uint32)),
                         var=pd.DataFrame(index=["A", "B", "A"]))
-    fitted = contract.conform_var(sample, ["B", "A", "C"])
+    fitted = genes.conform_var(sample, ["B", "A", "C"])
     assert fitted.X.toarray().tolist() == [[2, 1, 0]] and fitted.X.dtype == np.uint32
 
 

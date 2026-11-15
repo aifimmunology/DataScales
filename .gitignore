@@ -5,6 +5,7 @@ __pycache__/
 dev/benchmark*
 CLAUDE*
 .claude/
+!capsules/CLAUDE.md
 *0*.json
 comparisons/
 query_results/

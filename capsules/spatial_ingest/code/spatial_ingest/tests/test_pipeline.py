@@ -10,6 +10,7 @@ import zarr
 from anndata.io import read_elem, write_elem
 
 import annotate
+import config
 import joint
 import main
 import precheck
@@ -287,8 +288,9 @@ def test_a_bad_model_or_bad_inputs_stop_before_a_store_is_created(tmp_path, inpu
         run_capsule(str(store), str(inputs_dir), str(junk))
     with pytest.raises(main.USER_ERRORS, match="found in the inputs"):
         run_capsule(str(store), str(tmp_path / "results"))
-    with pytest.raises(precheck.IngestError, match="No samples given, and /data/samples doesn't exist"):
-        run_capsule(str(store), "")
+    if not Path(config.DEFAULT_SAMPLES).exists():  # a machine with /data/samples attached runs those instead
+        with pytest.raises(precheck.IngestError, match="No samples given, and /data/samples doesn't exist"):
+            run_capsule(str(store), "")
     assert not store.exists()
 
 

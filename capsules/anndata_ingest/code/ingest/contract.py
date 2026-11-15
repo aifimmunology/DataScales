@@ -1,10 +1,14 @@
-"""The store contract: a fixed obs schema, CSR uint32 counts, and the projection every sample passes through."""
+"""The store contract: a fixed obs schema, CSR uint32 counts, and the projection every sample passes through.
+Genes (which a sample keeps, and how it is fitted to the store's) are `genes`."""
 from __future__ import annotations
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+
+import genes
+from contracts import ContractError
 
 X_DTYPE = np.uint32
 OBS_INDEX = "barcodes"
@@ -23,8 +27,6 @@ SCRUBLET_COLS = {"scrublet_score": FLOAT, "predicted_doublets": INT}
 Schema = dict[str, str]
 
 
-class ContractError(ValueError):
-    """A sample the store cannot take as it is."""
 
 
 def label_columns(model: str) -> Schema:
@@ -97,62 +99,6 @@ def _as_counts(matrix) -> sp.csr_matrix:
     return x.astype(X_DTYPE)
 
 
-def _check_var(var_names: np.ndarray, expected: np.ndarray | None) -> None:
-    if expected is None or np.array_equal(var_names, np.asarray(expected, dtype=object)):
-        return
-    if len(var_names) == len(expected) and set(var_names) == set(expected):
-        found = "the same genes in a different order"
-    else:
-        found = f"{len(var_names)} genes, the store {len(expected)}, {len(set(var_names) ^ set(expected))} not shared"
-    raise ContractError(f"var mismatch: the sample has {found}; gene names and order must match the store's.")
-
-
-def panel_diff(store_genes, sample_genes, n_examples: int = 5) -> dict | None:
-    """How a sample's genes differ from the store's, or None when names and order match."""
-    store_genes, sample_genes = list(store_genes), list(sample_genes)
-    if store_genes == sample_genes:
-        return None
-    in_sample, in_store = set(sample_genes), set(store_genes)
-    only_store = [g for g in store_genes if g not in in_sample]
-    only_sample = [g for g in sample_genes if g not in in_store]
-    return {"n_shared": len(in_store & in_sample), "n_only_in_store": len(only_store),
-            "n_only_in_sample": len(only_sample), "only_in_store": only_store[:n_examples],
-            "only_in_sample": only_sample[:n_examples]}
-
-
-def describe_diff(sid: str, diff: dict) -> str:
-    if not diff["n_only_in_store"] and not diff["n_only_in_sample"]:
-        return f"{sid}: the same {diff['n_shared']} genes in a different order"
-    return (f"{sid}: {diff['n_shared']} shared, {diff['n_only_in_store']} only in the store "
-            f"(e.g. {', '.join(diff['only_in_store']) or '-'}), {diff['n_only_in_sample']} only in the sample "
-            f"(e.g. {', '.join(diff['only_in_sample']) or '-'})")
-
-
-def fit_note(diff: dict) -> str:
-    if not diff["n_only_in_store"] and not diff["n_only_in_sample"]:
-        return "genes reordered to the store's"
-    return (f"fitted to the store's genes: {diff['n_only_in_store']} zero-filled, "
-            f"{diff['n_only_in_sample']} dropped")
-
-
-def gene_picker(sample_genes, store_genes) -> sp.csr_matrix:
-    """A 0/1 matrix that maps a sample's genes onto the store's: X @ picker gives the store's genes,
-    zero for those the sample lacks. Duplicate sample genes map by their first occurrence."""
-    src = pd.Index(ad.utils.make_index_unique(pd.Index(np.asarray(sample_genes, dtype=object)))).get_indexer(
-        pd.Index(np.asarray(store_genes, dtype=object)))
-    present = src >= 0
-    return sp.csr_matrix((np.ones(present.sum(), dtype=np.float32), (src[present], np.flatnonzero(present))),
-                         shape=(len(sample_genes), len(store_genes)))
-
-
-def conform_var(adata: ad.AnnData, store_genes) -> ad.AnnData:
-    """The sample's counts on the store's genes: store genes the sample lacks are zero-filled and its
-    genes the store lacks are dropped. Annotation must run before this, on the sample's own genes."""
-    x = adata.X if sp.issparse(adata.X) else sp.csr_matrix(adata.X)
-    fitted = sp.csr_matrix(x @ gene_picker(adata.var_names, store_genes)).astype(x.dtype)
-    return ad.AnnData(fitted, obs=adata.obs.copy(), var=pd.DataFrame(index=pd.Index(np.asarray(store_genes, dtype=object))))
-
-
 def holds_counts(matrix) -> bool:
     values = matrix.data if sp.issparse(matrix) else np.asarray(matrix)
     return bool(np.all(values >= 0) and np.all(np.mod(values, 1) == 0))
@@ -207,7 +153,7 @@ def match_obs(obs: pd.DataFrame, kinds: dict[str, str]) -> tuple[pd.DataFrame, l
 def project(adata: ad.AnnData, schema: Schema, expected_var_names: np.ndarray | None = None) -> ad.AnnData:
     """A new AnnData holding exactly what the store accepts: CSR uint32 X, the schema's obs, and var."""
     var_names = np.asarray(adata.var_names, dtype=object)
-    _check_var(var_names, expected_var_names)
+    genes.check_same(var_names, expected_var_names)
     obs = pd.DataFrame(index=pd.Index(np.asarray(adata.obs_names, dtype=object), name=OBS_INDEX))
     for col, kind in schema.items():
         obs[col] = _project_column(adata.obs[col] if col in adata.obs else None, kind, adata.n_obs)
