@@ -1,11 +1,14 @@
-"""Run settings: environment variables (the field names in upper case), overridden by app-panel values."""
+"""Run settings: environment variables (the field names in upper case), overridden by app-panel values;
+and the run's logging."""
 from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import os
 import re
 import sys
+import warnings
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
@@ -122,6 +125,9 @@ class Settings:
     results_dir: str = "/results"
 
     def __post_init__(self):
+        for name in ("chunk_cells", "write_cpus"):
+            if getattr(self, name) < 1:
+                raise ConfigError(f"{name.upper()}={getattr(self, name)} must be 1 or more.")
         object.__setattr__(self, "store", clean_path(self.store))
         object.__setattr__(self, "origin", clean_path(self.origin))
         kinds = {_key(label): kind for label, kind in INPUT_TYPES.items()}
@@ -221,3 +227,52 @@ def load_settings(argv: list[str] | None = None, env: dict[str, str] | None = No
     from_args = {name: _cast(name, value) for name, value in args.items() if value not in (None, "")
                  and value.strip(_STRIP)}
     return replace(Settings(), **{**from_env, **from_args})
+
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+# Known library noise is silenced at its source, by exact logger or message (never a whole warning
+# category), so that every WARNING left asks the user to look at something, as in spatial_ingest.
+# annizarr's append notes (new categories, sorted-store contiguity) are expected for every sample after
+# the first.
+LOGGER_LEVELS = {
+    "annizarr.ops._append": logging.ERROR,
+    "celltypist": logging.ERROR,
+    "anndata": logging.WARNING,
+    "numba": logging.WARNING,
+    "botocore": logging.WARNING,
+    "urllib3": logging.WARNING,
+    "asyncio": logging.WARNING,
+}
+# (message regex, category, module regex); ZarrUserWarning subclasses UserWarning.
+NOISE = (
+    (r"Consolidated metadata is currently not part in the Zarr format 3 specification", UserWarning, ""),
+    (r"`?__version__`? is deprecated", FutureWarning, ""),
+    (r"Some cells have zero counts", UserWarning, ""),
+    (r"", FutureWarning, r"(celltypist|scanpy)(\.|$)"),
+)
+
+
+def _show_warning(message, category, filename, lineno, file=None, line=None) -> None:
+    where = filename.rsplit("/", 1)[-1]
+    logging.getLogger("py.warnings").warning("%s: %s (%s:%s)", category.__name__, str(message).strip(), where, lineno)
+
+
+class _Handler(logging.StreamHandler):
+    """The run's stdout handler (marked so `setup_logging` adds it once)."""
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """One line format on stdout; Python warnings that remain are logged as one line each. Safe to call
+    more than once."""
+    root = logging.getLogger()
+    if not any(isinstance(h, _Handler) for h in root.handlers):
+        handler = _Handler(sys.stdout)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATEFMT))
+        root.addHandler(handler)
+    root.setLevel(level)
+    for name, lvl in LOGGER_LEVELS.items():
+        logging.getLogger(name).setLevel(lvl)
+    for message, category, module in NOISE:
+        warnings.filterwarnings("ignore", message=message, category=category, module=module)
+    warnings.showwarning = _show_warning

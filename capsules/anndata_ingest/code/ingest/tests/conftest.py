@@ -5,11 +5,16 @@ from pathlib import Path
 import anndata as ad
 import h5py
 import numpy as np
+import pandas as pd
 import pytest
 import scipy.sparse as sp
+import zarr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+import main  # noqa: E402
+from config import load_settings  # noqa: E402
 
 GENES = [f"MT-{i}" for i in range(5)] + [f"GENE{i}" for i in range(495)]
 HISE_STR = {
@@ -17,6 +22,16 @@ HISE_STR = {
     "pool_id": "P1", "well_id": "W1",
 }
 SAMPLES = {"SP00001": 160, "SP00002": 180, "SP00003": 200}
+CONTROLS = ["NegControlProbe_0001", "BLANK_0001"]
+
+
+def ingest(env, store, samples, *flags, **extra):
+    """A run with these flags; `extra` adds environment variables."""
+    return main.run(load_settings(["--store", str(store), "--samples", str(samples), *flags], {**env, **extra}))
+
+
+def create(env, store, samples, *flags, **extra):
+    return ingest(env, store, samples, "--create", "true", *flags, **extra)
 
 
 def counts_matrix(n_cells: int, seed: int) -> sp.csr_matrix:
@@ -57,6 +72,26 @@ def write_hise_h5(path: Path, sample: str, n_cells: int, seed: int, genes: list[
         obs["n_mito_umis"] = np.asarray(counts[:, :5].sum(axis=1)).ravel().astype(np.uint16)
         obs["n_reads"] = (np.asarray(counts.sum(axis=1)).ravel() * 3).astype(np.uint32)
         obs["adt_umis"] = rng.integers(100, 500, size=n_cells).astype(np.uint16)
+    return path
+
+
+def write_spatialdata(path, n_cells, seed, genes=None, controls=True):
+    """A minimal SpatialData .zarr: root attrs plus a tables/table AnnData, Xenium-style var."""
+    genes = genes or GENES
+    x = counts_matrix(n_cells, seed)[:, :len(genes)]
+    names, types = list(genes), ["Gene Expression"] * len(genes)
+    if controls:
+        x = ad.AnnData(x).X
+        x = sp.hstack([x, sp.csr_matrix(np.ones((n_cells, len(CONTROLS))))]).tocsr()
+        names += CONTROLS
+        types += ["Negative Control Probe", "Unassigned Codeword"]
+    table = ad.AnnData(x.astype(np.float32), obs=pd.DataFrame(
+        {"cell_id": [f"cell{i}-1" for i in range(n_cells)]}, index=[f"cell{i}-1" for i in range(n_cells)]),
+        var=pd.DataFrame({"feature_types": types}, index=names))
+    table.obsm["spatial"] = np.zeros((n_cells, 2))
+    root = zarr.open_group(path, mode="w")
+    root.attrs["spatialdata_attrs"] = {"version": "0.2"}
+    ad.io.write_elem(root.create_group("tables"), "table", table)
     return path
 
 

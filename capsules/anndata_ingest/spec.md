@@ -49,13 +49,14 @@ The source is `capsules/anndata_ingest/` (renamed from `capsules/ingest/` on 202
 - **HISE layouts:** tenx-scrna-pipeline's observation names (`Batch`, `Pool`, `Chip`, `uuid`, …) are mapped onto the older HISE ones; labels already in a file are recomputed.
 
 ### 3.5 Code layout
-Restructured 2026-11-15 on the spatial_ingest pattern (README code map has one line per module):
-`precheck` (all input/model problems before any write) → `contracts` (RawInput, ObjectInput, Staged,
-errors) → `stage` / `objects` → `main` (orchestration only). `genes` is the one gene policy, so annizarr's
-planned "append new genes" changes one module. `store` records each sample's source (icechunk commit
+Consolidated 2026-11-15 into five modules by function (README code map): `config` (settings, panel args,
+logging) ← `inputs` (reading, precheck of every input/model problem before any write, picking new
+inputs; RawInput, ObjectInput, IngestError) ← `prepare` (QC, CellTypist, Scrublet, the one gene policy,
+the obs/X contract, staging; Staged, ContractError); `store`; `main` runs them top to bottom. Annizarr's
+planned "append new genes" changes only `prepare`'s gene functions. `store` records each sample's source (icechunk commit
 metadata, `attrs["ingest"]["sources"]` on plain zarr) so a re-sequenced file with the same ID is warned
 about. Plain zarr on S3 is refused: annizarr 0.2.4 writes remote stores as icechunk only (tested
-2026-11-15). 130 tests pass on annizarr 0.2.4 and 0.2.3.
+2026-11-15). 147 tests pass on annizarr 0.2.4 and 0.2.3 (2026-11-15).
 
 ### 3.6 Tests
 - appends without any derived elements on `main`;

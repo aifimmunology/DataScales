@@ -166,13 +166,18 @@ the scVI step), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/pro
 
 ## Modularity and future-proofing
 
-spatial_ingest is the reference. New and reworked capsules follow it:
-
+- **Few files, split by function (user, 2026-11-15).** About five modules, readable top to bottom,
+  and few comments (only for a non-obvious why). anndata_ingest is the layout reference: `main.py`
+  (the run, top to bottom), `config.py` (settings, panel args, logging), `inputs.py` (reading,
+  precheck, picking new inputs), `prepare.py` (annotation, gene policy, contract, staging), `store.py`;
+  tests in `test_inputs.py`, `test_prepare.py`, `test_run.py` and `conftest.py`. Imports flow one way
+  (config ← inputs ← prepare; store standalone; main imports all). spatial_ingest (24 modules) is
+  not consolidated yet.
 - **Precheck:** gather every problem before any write, then stop with one error listing them all.
-- **`contracts.py`:** dataclasses between stages, never tuples.
+- **Records:** dataclasses between stages, never tuples.
 - **One config dataclass.** Env vars are named after its fields (upper case), then app-panel positional
   values override. A test checks `.codeocean/app-panel.json` against the positional order.
-- **`logs.py`:** silence known library noise by exact message or logger name, nothing broader. A clean
+- **Logging:** silence known library noise by exact message or logger name, nothing broader. A clean
   run logs no WARNING line.
 - **Errors:** one user-error base class, or an explicit tuple of them. Expected errors give one log line
   and exit 1; bugs give tracebacks.

@@ -110,6 +110,7 @@ it. The log's `ERROR` line says what to change:
 | `No .h5/.h5ad files or AnnData/SpatialData .zarr folders found` / `not a .h5/.h5ad file` / `not found` | check the sample paths; folders are not searched into subfolders |
 | `These inputs can't be read` | the listed files are truncated or not AnnData/10x files; re-copy them or leave them out |
 | `CellTypist models not found` / `can't be loaded` | pick a listed Celltypist option, or give a `.pkl` written by celltypist |
+| `shares no genes with the CellTypist model` | the model needs gene symbols of its own panel; choose Celltypist Model **None** (e.g. Ensembl IDs, mouse, a targeted panel) |
 | `shares no gene names with the store` | the sample uses other gene identifiers (symbols vs Ensembl IDs); convert them first |
 | `a plain .zarr store must be local` | on S3 use an icechunk store: drop the `.zarr` suffix |
 | `var mismatch` | the sample's genes couldn't be fitted to the store's; report it, this shouldn't happen |
@@ -157,7 +158,7 @@ new samples ──► read ──► QC metrics ──► CellTypist ──► S
 
 ## The store contract
 
-`contract.project` reshapes every sample into exactly what the store accepts:
+`prepare.project` reshapes every sample into exactly what the store accepts:
 - CSR `uint32` raw counts. Fractional or negative values are refused.
 - An obs table with a fixed set of columns in a fixed order:
   - `sample_id`;
@@ -285,19 +286,12 @@ commit's metadata naming the samples it appended and the totals after it.
 ```
 code/run              Code Ocean entrypoint: passes the app-panel values on to main.py
 code/ingest/
-├── main.py           orchestration: open the store, stage the new inputs, write them, report
-├── precheck.py       before any write: inputs, models, readability (all problems at once); which inputs are new
-├── contracts.py      the records passed between stages (RawInput, ObjectInput, Staged) and the run's errors
-├── stage.py          annotate and project raw samples, stage existing objects, into zarr in staging
-├── genes.py          the one gene policy: panel differences, fitting to the store's genes, refusing no overlap
-├── contract.py       the obs schema and X dtype the store keeps
-├── config.py         Settings from environment variables and app-panel values; sample-list parsing
-├── objects.py        existing AnnData: streamed into staging with annizarr, then fitted to the store
-├── hise.py           inputs: HISE .h5 (both layouts), AnnData .h5ad/.zarr, SpatialData tables; gene names; sample IDs
-├── annotate.py       QC metrics, CellTypist (models loaded once), Scrublet
+├── main.py           the run, top to bottom: precheck, open the store, select, stage, write, commit, report
+├── config.py         Settings from environment variables and app-panel values; sample-list parsing; logging
+├── inputs.py         reading inputs (HISE .h5, 10x, AnnData, SpatialData tables); precheck; which inputs are new
+├── prepare.py        store contract, QC/CellTypist/Scrublet, gene policy, staging raw samples and existing objects
 ├── store.py          icechunk and plain-zarr stores behind one interface; recorded sample sources
-├── logs.py           one log format; known library noise silenced
-└── tests/            unit tests and end-to-end runs (raw and existing inputs, SpatialData), both store kinds
+└── tests/            test_inputs, test_prepare (unit), test_run (end to end, both store kinds)
 code/models/          the bundled CellTypist models and their SOURCE.json
 code/Icechunk_annizarr_notebook.ipynb   explore a store: history, cells per sample, loading cells, old versions
 ```
