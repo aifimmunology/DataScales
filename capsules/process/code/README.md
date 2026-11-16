@@ -21,7 +21,7 @@ code/
 ├── environment/    requirements.txt and pixi.toml: the environment's package list
 ├── notebooks/      the two notebooks, and test_notebooks.sh
 ├── run             optional: the App Panel / Reproducible Run pipeline (./run --help)
-├── process/        that pipeline (config, cluster, steps, store, report, main) and its tests
+├── process/        that pipeline (config, steps, store, runtime, main) and its tests
 └── test_gpu.sh     runs the notebook tests and the pipeline tests on a GPU
 ```
 
@@ -148,13 +148,11 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 | Category | Field | `--name` | Default | What it does |
 |---|---|---|---|---|
 | Input data | Input store | `input` | empty: print usage | An AnnData `.zarr`, a SpatialData `.zarr`, or an icechunk repo; raw counts in a CSR `X` |
-| | Icechunk branch (optional) | `branch` | `main` | Read from, and the results committed on (input repo, its copy, or the external repo) |
+| | Icechunk branch (optional) | `branch` | `main` | Read from, and the results committed on (input repo, its copy, or its S3 repo) |
 | | SpatialData table (optional) | `table` | `table` | SpatialData: which `tables/<name>` |
 | | Subset column / values (optional) | `subset_column`, `subset_values` | — | Use only cells whose column is one of the values (`SP1, SP2`) |
-| Output | External location (optional) | `external` | — | `s3://…` or a path; see Outputs below. Writing to S3 needs an AWS secret with write access attached to the capsule |
-| | External format (optional) | `external_format` | empty (`auto`) | `auto` (what's there, or zarr if new), `zarr` or `icechunk`; must match an existing store |
-| | Copy name in /results (optional) | `results_copy` | `<name>.processed` | Used when External location is empty (leave both empty for the default copy, saved as a data asset). Name in `/results` (an absolute path goes there instead) |
-| | Copy format (optional) | `results_format` | empty (`auto`) | `auto` (the input's format), `zarr` or `icechunk` |
+| Output | Output location (optional) | `output` | `s3://bucket/prefix` (the placeholder means a copy in `/results`) | `s3://…` or a local path, e.g. an icechunk origin; a name or a path under `/results` saves a copy there; see Outputs below. Writing to S3 needs an AWS secret with write access attached to the capsule |
+| | Output format (optional) | `output_format` | empty (`auto`) | `auto` (the input's format for a copy, or what is already at the location, zarr if new), `zarr` or `icechunk` |
 | Embedding | Method | `method` | `PCA` | `PCA` or `scVI (train)`, see below |
 | | Batch key | `batch_key` | — | PCA: harmony on it; scVI: the batch (more keys, comma-separated: harmony uses all, scVI uses the rest as covariates). Every cell needs a value |
 | | Highly variable genes | `n_top_genes` | 2000 | |
@@ -180,20 +178,20 @@ The panel passes named parameters (`--<name> <value>`); an empty field keeps the
 
 ### Outputs
 
-One destination per run (`process/outputs.py`), never both:
+One destination per run, from `output` and `output_format` (`process/store.py`):
 
-- **Copy in `/results`** (no external location): `results_copy`, default `<name>.processed`; never overwritten
-  (`-1`, `-2`, …), built at `.partial` and renamed. `results_format`:
+- **Copy in `/results`** (`output` empty, a bare name, or a path under `/results`; default
+  `<name>.processed`): never overwritten (`-1`, `-2`, …), built at `.partial` and renamed. `output_format`:
   - `auto`: a zarr input gets a full zarr copy (a SpatialData store whole, the results in its table); an
     icechunk input gets a copy of the repo, every branch and snapshot, with one commit on `branch`.
   - `zarr` from icechunk: the snapshot exported as zarr. `icechunk` from an AnnData zarr: a new repo with one
     commit on `branch`. A SpatialData zarr can't become icechunk (shapes and points are parquet).
-- **External location** (`external`, `s3://…` or a path), used exactly as given:
+- **Output location** (`s3://…` or any local path outside `/results`), used exactly as given:
   - **Icechunk input:** it must be the input's own repo, usually the writable S3 location behind the read-only
     data asset, holding the input's snapshot on `branch`. The data is read from there and one commit is made
     on `branch`; nothing is written if the branch moved during the run. Nothing there, a zarr, or another
     repo is an error (a likely typo).
-  - **Zarr input, nothing there:** a new store, zarr unless `external_format` is `icechunk`.
+  - **Zarr input, nothing there:** a new store, zarr unless `output_format` is `icechunk`.
   - **Zarr input, an existing zarr:** the results are written into it in place. It must have the input's layout
     (AnnData, or SpatialData with the table), cells and genes. This isn't atomic: a run that dies midway leaves
     partial results, which a rerun replaces.
@@ -243,11 +241,22 @@ their defaults in `process/config.py`, or add an `export SCVI_MAX_EPOCHS=50`-sty
 ./run --input /data/pbmc/pbmc.zarr --subset_column sample_id --subset_values SP1,SP2
 SCVI_N_LATENT=20 SCVI_MAX_EPOCHS=50 ./run --input /data/pbmc/pbmc.zarr --method scvi --batch_key sample_id
 ./run --input /data/tissue/tissue.zarr --table table      # SpatialData: the results go in the copy's table
-./run --input /data/repo --external s3://bucket/repo --branch main  # icechunk: one commit on its S3 repo
+./run --input /data/repo --output s3://bucket/repo --branch main  # icechunk: one commit on its S3 repo
 ./run --input /data/repo                                  # icechunk: a copy with the commit in /results
-./run --input /data/pbmc/pbmc.zarr --external s3://bucket/pbmc.zarr  # zarr: new, or written into in place
+./run --input /data/pbmc/pbmc.zarr --output s3://bucket/pbmc.zarr  # zarr: new, or written into in place
 GPUS=0,1 NEIGHBORS_ALGORITHM=mg_ivfflat ./run --input ... # two GPUs
 ```
+
+### Code map
+
+| File (`process/`) | Holds |
+|---|---|
+| `main.py` | the run, top to bottom: load, embed (`EMBEDDERS`: PCA, scVI), neighbors, UMAP, leiden, plots, write |
+| `config.py` | every setting, the panel arguments, checks before any GPU work |
+| `steps.py` | the GPU steps and the obs, subset and name checks |
+| `store.py` | opening the input, where the results go (`plan`, `check`, `save`), the writers |
+| `runtime.py` | the Dask-CUDA cluster and the per-step time and memory report |
+| `tests/` | `test_config.py`, `test_steps.py`, `test_store.py`, `test_run.py`, `conftest.py` |
 
 ## Tests
 
@@ -263,7 +272,7 @@ origin), runs each notebook headless with `jupyter nbconvert --execute` and savi
 object or commit holds the results and reads back. It needs a GPU and internet (OmniPath). `WORK=<dir>`
 keeps the stores and executed notebooks. The pipeline tests check the settings and the save rules, then run
 `./run` end to end (PCA, harmony, scVI, several resolutions, a subset, an ingest-style store, SpatialData,
-icechunk through its external repo and as a copy, output errors, no input); without a GPU, only the parts that need none run.
+icechunk through its S3 repo and as a copy, output errors, no input); without a GPU, only the parts that need none run.
 
 ## S3 access
 

@@ -1,7 +1,7 @@
 # Capsules: shared guide
 
 The one guide for every capsule in `capsules/`, for Claude Code and for people. Each capsule's own
-design, decisions and findings are in its `spec.md`; its user guide is `code/README.md`. Section
+design, decisions and findings are in its `spec.md` (`process`: §10 below); its user guide is `code/README.md`. Section
 numbers §1, §2, §6, §8, §9 are kept from the former `capsules/spec.md`; §3/§3S/§4/§5 moved to the
 capsule specs with their numbers.
 
@@ -10,7 +10,7 @@ capsule specs with their numbers.
 | `anndata_ingest/` | [anndata_ingest/spec.md](anndata_ingest/spec.md) | built |
 | `spatial_ingest/` | [spatial_ingest/spec.md](spatial_ingest/spec.md) | built 2026-11-11; **the reference for structure** |
 | `qc/` | [qc/spec.md](qc/spec.md) | design (§4) plus what the build changed |
-| `process/` | [process/spec.md](process/spec.md), [process/rework_spec.md](process/rework_spec.md) | built; environment + notebooks, optional pipeline |
+| `process/` | §10 below (no spec file) | built; environment + notebooks, optional pipeline; consolidated to 5 modules 2026-11-16 |
 
 ## Overview
 
@@ -77,7 +77,7 @@ capsules/
 ├── spatial_ingest/         │
 ├── qc/                     │ each folder is one complete capsule root
 └── process/                ┘
-    ├── spec.md             the capsule's design, decisions, findings
+    ├── spec.md             the capsule's design, decisions, findings (process has none: §10)
     ├── code/               run (entrypoint), <package>/, tests/, README.md
     ├── environment/        requirements.txt, environment.yml (if conda is needed), pixi.toml, postInstall
     ├── .codeocean/         resources.json, app-panel.json
@@ -147,11 +147,11 @@ Written per sample by the ingest:
 | Cell-type labels | `<model>_label`, `<model>_prob` per CellTypist model; by default `pbmc_clean_AIFI_L1_2024`, `_L2_2024`, `_L3_2024` | categorical / float64 |
 | Hashing / ADT QC (report only) | `hto_category` (multiplexed pools), `adt_qc_flag` (CITE-seq) | categorical. Empty for samples without hashing or CITE-seq |
 
-Written by `process`: `obs/leiden`, `obsm/X_pca`, `obsm/X_pca_harmony` (if integrated; `X_scVI` from
-the scVI step), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/process`.
+Written by `process`: `obs/leiden` (name set by `leiden_key`; `<name>_<res>` for several resolutions), `obsm/X_pca`,
+`obsm/X_pca_harmony` (if integrated; `X_scVI` from the scVI step), `obsm/X_umap` (name set by `umap_key`), `var/highly_variable`, `layers/lognorm`, `uns/process`.
 
 ### 2.3 Entrypoint and code style
-- **Entrypoint** (ingest, spatial_ingest, qc; `process`: see its spec):
+- **Entrypoint** (ingest, spatial_ingest, qc; `process`: see §10):
   - `code/run` passes app-panel parameters positionally. An empty value falls back to an env var, then a default.
   - One `main.py`, with a `<Capsule>Error(RuntimeError)` (or a user-error base class, see below) for
     user-facing failures: one log line, exit code 1.
@@ -172,7 +172,9 @@ the scVI step), `obsm/X_umap`, `var/highly_variable`, `layers/lognorm`, `uns/pro
   precheck, picking new inputs), `prepare.py` (annotation, gene policy, contract, staging), `store.py`;
   tests in `test_inputs.py`, `test_prepare.py`, `test_run.py` and `conftest.py`. Imports flow one way
   (config ← inputs ← prepare; store standalone; main imports all). spatial_ingest (24 modules) is
-  not consolidated yet.
+  not consolidated yet. process is consolidated too (2026-11-16): `main.py`, `config.py`, `steps.py`,
+  `store.py` (input, where results go, writers), `runtime.py` (Dask-CUDA cluster, time/memory report); tests in
+  `test_config.py`, `test_steps.py`, `test_store.py`, `test_run.py`, `conftest.py`.
 - **Precheck:** gather every problem before any write, then stop with one error listing them all.
 - **Records:** dataclasses between stages, never tuples.
 - **One config dataclass.** Env vars are named after its fields (upper case), then app-panel positional
@@ -253,19 +255,19 @@ Run all three tracks before calling work done; subagents can run them in paralle
   |---|---|---|
   | ingest | page (`requirements.txt`, `environment.yml`) | scanpy, celltypist, scrublet (pip); `python-annoy`, `gh` (conda) |
   | qc | page (`requirements.txt`) | scanpy, leidenalg, igraph, umap-learn (downsampled embedding); pyarrow, matplotlib, seaborn |
-  | process | page (`requirements.txt`) | RAPIDS, torch and scvi-tools, pinned (process spec §0); squidpy, spatialdata, omnipath for the tutorial notebooks |
+  | process | page (`requirements.txt`) | RAPIDS, torch and scvi-tools, pinned (§10); squidpy, spatialdata, omnipath for the tutorial notebooks |
   | spatial_ingest | page (`requirements.txt`) | spatialdata 0.8.0, spatialdata-io 0.7.1 (+ vendored Atera reader), scanpy, celltypist, geopandas, pyarrow, s3fs (spatial_ingest spec §3S.11) |
 
 - **CPU capsules:** transitive dependencies aren't locked. A released image is built once and frozen; if
   a rebuild breaks, pin the offending package on the page.
-- **`process`: CUDA 13, from PyPI only, on the page.** Pins and verification: process spec §0.
+- **`process`: CUDA 13, from PyPI only, on the page.** Pins and verification: §10.
 - **numpy 2.4.6 everywhere:** cudf 26.10 needs `numba < 0.65`, and numba 0.64 supports only
   `numpy < 2.5`. The CPU capsules resolve with it too.
 
 ### 6.3 Base images
 - **CPU capsules:** `codeocean/mambaforge3:24.5.0-0-python3.12.4-ubuntu22.04` (conda Python 3.12 in `/opt/conda`).
 - **`process`:** `codeocean/cuda12-runtime-uv:main-5692e50` (uv, Python 3.13 in the venv `/opt/venv`);
-  driver and GPU details in process spec §0.
+  driver and GPU details in §10.
 - **annizarr:** 0.2.4 from PyPI (0.2.3 before). It imports on Python 3.12 (the `TypeIs` fix is in), and the ingest's
   63 tests pass against it with numpy 2.4.6.
 
@@ -295,7 +297,7 @@ Run all three tracks before calling work done; subagents can run them in paralle
    meanwhile (qc §4.10).
 5. `qc`, apply mode: icechunk (a commit on `main`) first, then plain zarr.
 6. `process`: built as a pipeline on 2026-10-30, **reworked into an environment + notebooks capsule on
-   2026-11-02** (process spec).
+   2026-11-02** (§10).
 7. Subtree-push each capsule to its own Code Ocean capsule.
 8. `anndata_ingest`: SpatialData-table inputs, gene-panel fitting, source paths in commits, custom
    `.pkl` **(done 2026-10-30)**; S3 creation without `CREATE`, dropping results on append **(done 2026-11-02)**.
@@ -315,3 +317,39 @@ Run all three tracks before calling work done; subagents can run them in paralle
 - **Using RAPIDS in other capsules:** a capsule with its own environment could install
   `process/code/environment/requirements.txt` into a separate venv (`/opt/rapids`) from `postInstall`,
   with a Jupyter kernel. Untested whether Code Ocean exposes the GPU to a non-GPU base image.
+
+## 10. The process capsule
+
+Design summary; the file-level code map is in `process/code/README.md`. Earlier change logs are in git history
+(`process/spec.md`, `process/rework_spec.md`, removed 2026-11-16).
+
+- **What it is, first:** the pinned RAPIDS GPU environment (`code/environment/`, copyable to other capsules)
+  and two interactive notebooks (out-of-core scRNA, spatial walkthrough, adapted for one T4). An environment
+  and notebooks capsule, not automation; first-time users get no dead ends.
+- **Optional pipeline:** `code/run`, from the App Panel (named parameters) or a terminal: PCA (± harmony) or
+  scVI (train), then neighbors, UMAP and leiden at one or more resolutions, optionally on an obs subset. One
+  `Config` dataclass; the panel sets the common fields, the rest (cluster, GPUs, scVI knobs) are flags or
+  upper-case environment variables. A Reproducible Run with no input exits 0 with usage.
+- **Five modules:** `main.py` (run; `EMBEDDERS` registry), `config.py`, `steps.py`, `store.py` (input, output
+  planning, writers), `runtime.py` (Dask-CUDA cluster, step report); tests beside them.
+- **Output (one box, `output` + `output_format`):** empty or the placeholder `s3://bucket/prefix` = a copy in
+  `/results` (`<stem>.processed`, never overwritten); a bare name or a path under `/results` = a copy there;
+  `s3://` or any other path = written to directly: icechunk input commits onto its own repo, zarr input gets a
+  new store or results written into an existing zarr with the same cells and genes. Checked before any GPU work;
+  S3 needs an AWS secret with write access (a put/delete probe runs first). If the icechunk branch gets another
+  commit during the run, nothing is saved (`BranchMoved`).
+- **Results:** `umap_key` / `leiden_key` set the names (custom names are refused if the store already has
+  them from something else). scVI: the Dask cluster is closed before training; the model goes to
+  `/results/scvi_model/`.
+- **Environment:** CUDA 13 wheels from PyPI only, on the page. `requirements.txt` (+ `pixi.toml`, kept in
+  `code/environment/`) pins the shared pins, RAPIDS 26.10 cu13, `rapids-singlecell-cu13 0.18.1`, torch,
+  `scvi-tools 1.5.1`, and the packages that must agree (`numba`, `numba-cuda`, `cupy-cuda13x`, `cuda-toolkit`,
+  `dask`, `distributed`); the rest resolves at build time (246 packages with squidpy, spatialdata, omnipath).
+  Base image `codeocean/cuda12-runtime-uv:main-5692e50` (Python 3.13 in `/opt/venv`); the wheels bring CUDA 13,
+  so the host driver matters (measured 610.57.04 on a Tesla T4, 15 GB, compute capability 7.5, the oldest CUDA
+  13 supports). The page's `pip3` is `/opt/venv/bin/pip3`.
+- **Tests:** `python -m pytest process/tests` (101, GPU capsule); `./test_gpu.sh` adds the notebooks and the
+  pipeline end to end; `notebooks/test_notebooks.sh` runs each notebook headless. Real S3 is untested.
+- **Open:** `resources.json` is still `"xsmall"` and needs a GPU class; gather every precheck problem into one
+  error; one user-error base class; `Results` (the pipeline's schema) could leave `store.py` if a second output
+  type appears.

@@ -323,7 +323,7 @@ Apply runs also write `apply_summary.csv` (per sample: before, after, removed by
 ### 4.15 Decisions from the working notes (user, 2026-11-02)
 - **qc apply:** on zarr, write the subset to the output location. On icechunk, make a new commit on
   **main** holding only the curated cells, with a raw tag first and no GC. annizarr 0.2.4 has no subset
-  or garbage_collect. (Also `../process/rework_spec.md` §7.1.)
+  or garbage_collect.
 - **qc on spatial stores** was first skipped (PBMC assumptions); the build added a `spatial` profile (Part 2).
 
 ---

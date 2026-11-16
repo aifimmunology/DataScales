@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from anndata.io import read_elem
 
-from config import LEIDEN_DEFAULT, UMAP_DEFAULT, Config
+from config import HARMONY_KEY, LEIDEN_DEFAULT, PCA_KEY, UMAP_DEFAULT, Config
 from store import InputError
 
 
@@ -151,7 +151,7 @@ def train_scvi(counts, obs: pd.DataFrame, genes: pd.Index, keys: list[str], cfg:
 def neighbors(graph: ad.AnnData, basis: str, cfg: Config) -> None:
     import rapids_singlecell as rsc
 
-    n_pcs = min(cfg.n_pcs, graph.obsm[basis].shape[1]) if basis.startswith("X_pca") else None
+    n_pcs = min(cfg.n_pcs, graph.obsm[basis].shape[1]) if basis in (PCA_KEY, HARMONY_KEY) else None
     rsc.pp.neighbors(graph, n_neighbors=cfg.n_neighbors, n_pcs=n_pcs, use_rep=basis,
                      algorithm=cfg.neighbors_algorithm, rng=cfg.random_seed)
 
@@ -161,7 +161,7 @@ def umap(graph: ad.AnnData, cfg: Config) -> None:
 
     rsc.tl.umap(graph, min_dist=cfg.umap_min_dist, init_pos="spectral", n_components=cfg.umap_n_components,
                 rng=cfg.random_seed)
-    graph.obsm["X_umap"] = to_host(graph.obsm["X_umap"]).astype(np.float32)
+    graph.obsm[UMAP_DEFAULT] = to_host(graph.obsm[UMAP_DEFAULT]).astype(np.float32)
 
 
 def leiden(graph: ad.AnnData, cfg: Config) -> None:

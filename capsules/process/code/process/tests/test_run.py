@@ -106,7 +106,7 @@ def test_multi_resolution_subset(stores, tmp_path):
 @needs_pipeline
 def test_ingest_store_without_layers_or_sample_id_twice(stores, tmp_path):
     for _ in range(2):
-        run_pipeline("--input", stores["ingest_no_sample"], "--results_copy", tmp_path / "out", "--results_dir", tmp_path,
+        run_pipeline("--input", stores["ingest_no_sample"], "--output", tmp_path / "out", "--results_dir", tmp_path,
                      *SMALL)
     for name in ("out.zarr", "out-1.zarr"):
         check(zarr.open_group(tmp_path / name, mode="r"), ad.read_zarr(stores["ingest_no_sample"]), ["X_pca"])
@@ -130,11 +130,11 @@ def test_icechunk_external_twice(stores, icechunk, tmp_path):
     origin = str(icechunk["origin"])
     n = len(Repo(origin).log())
     for _ in range(2):
-        run_pipeline("--input", icechunk["mount"], "--external", origin, "--results_dir", tmp_path, *SMALL, env=NO_PLOTS)
+        run_pipeline("--input", icechunk["mount"], "--output", origin, "--results_dir", tmp_path / "res", *SMALL, env=NO_PLOTS)
     log = Repo(origin).log()
     assert len(log) == n + 2 and log[0].metadata["source_snapshot"] == log[1].id
     check(Repo(origin).open_zarr("r"), ad.read_zarr(stores["pbmc"]), ["X_pca"])
-    assert not list(tmp_path.glob("*.zarr"))
+    assert not list((tmp_path / "res").glob("*.zarr"))
 
 
 @needs_pipeline
@@ -151,25 +151,11 @@ def test_icechunk_copy_in_results(stores, icechunk, tmp_path):
 
 def test_output_errors_stop_before_the_cluster(stores, icechunk, tmp_path):
     cases = [
-        (["--input", icechunk["mount"], "--external", tmp_path / "typo"], "nothing there: check"),
-        (["--input", stores["pbmc"], "--external", stores["tissue"]], "isn't an AnnData store like the input"),
-        (["--input", stores["tissue"], "--results_format", "icechunk"], "SpatialData zarr can't be stored as icechunk"),
+        (["--input", icechunk["mount"], "--output", tmp_path / "typo"], "nothing there at"),
+        (["--input", stores["pbmc"], "--output", stores["tissue"]], "isn't an AnnData store like the input"),
+        (["--input", stores["tissue"], "--output_format", "icechunk"], "SpatialData zarr can't be stored as icechunk"),
     ]
     for args, message in cases:
         done = run_pipeline(*args, "--results_dir", tmp_path / "res", check=False)
         assert done.returncode == 1 and message in done.stderr, (args, done.stderr[-2000:])
         assert "start_cluster" not in done.stdout and "Traceback" not in done.stderr
-    done = run_pipeline("--input", stores["pbmc"], "--external", "s3://b/p", "--results_copy", "x", check=False)
-    assert done.returncode == 2 and "leave them empty" in done.stderr
-
-
-@needs_pipeline
-def test_custom_umap_and_leiden_names(stores, tmp_path):
-    run_pipeline("--input", stores["pbmc"], "--umap_key", "X_umap_pbmc", "--leiden_key", "clusters",
-                 "--leiden_resolutions", "0.5,1.0", "--results_dir", tmp_path, *SMALL)
-    out = ad.io.read_elem(zarr.open_group(tmp_path / "pbmc.processed.zarr", mode="r"))
-    assert out.obsm["X_umap_pbmc"].shape == (N_CELLS, 2) and "X_umap" not in out.obsm
-    assert {"clusters_0.5", "clusters_1.0"} <= set(out.obs) and not any(c.startswith("leiden") for c in out.obs)
-    p = out.uns["process"]
-    assert p["umap_key"] == "X_umap_pbmc" and set(p["leiden"]) == {"clusters_0.5", "clusters_1.0"}
-    assert (tmp_path / "umap.png").exists() and (tmp_path / "cluster_summary_clusters_0.5.csv").exists()

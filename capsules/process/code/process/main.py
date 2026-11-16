@@ -2,7 +2,7 @@
 
 load -> h2d -> normalize/log1p -> HVG -> PCA path: rechunk/persist -> scale -> PCA -> harmony (with a batch key)
                                       -> scVI path: gather the HVG counts -> close the cluster -> train scVI
--> neighbors -> UMAP -> leiden (one per resolution) -> save (outputs.py: a copy in /results, or an external location)
+-> neighbors -> UMAP -> leiden (one per resolution) -> save (store.py: a copy in /results, or an output location)
 
 dask-cuda spawns its workers, and spawn re-imports __main__ in each: keep module level free of work.
 """
@@ -17,7 +17,7 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUME
 from dataclasses import asdict, dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from config import Config, ConfigError, load_config  # noqa: E402
+from config import HARMONY_KEY, PCA_KEY, SCVI_KEY, Config, ConfigError, load_config  # noqa: E402
 
 USAGE = """\
 This capsule is mainly a RAPIDS GPU environment with two notebooks (code/notebooks/); open them in
@@ -29,9 +29,19 @@ and press Run. From a terminal: code/run --input /data/<asset>/<name>.zarr [--fl
 lists every setting, and each one can also be set as an upper-case environment variable.
 
 The results go in a new copy in /results (<name>.processed.zarr, or an icechunk repo for an icechunk input),
-or to an external location: an icechunk input's own S3 repo (one commit), or a new or existing zarr.
+or to the output location you give (s3://bucket/prefix or a local path): an icechunk input's own repo (one
+commit), or a new or existing zarr.
 See code/README.md, "Optional: run from the App Panel or as a Reproducible Run".
 """
+
+
+@dataclass
+class Embedding:
+    graph: object
+    basis: str
+    uns: dict
+    lognorm: object = None
+    hv: object = None
 
 
 @dataclass
@@ -51,14 +61,13 @@ def load(cfg: Config) -> Loaded:
     from anndata.io import read_elem
 
     import steps
-    from cluster import set_zarr_config
-    import outputs
-    from store import open_source
+    from runtime import set_zarr_config
+    from store import check, open_source, plan
 
     set_zarr_config(cfg.zarr_concurrency, cfg.zarr_max_workers)
-    dest = outputs.plan(cfg)
+    dest = plan(cfg)
     src = open_source(cfg.input, cfg.table, cfg.branch, dest.location if dest.mode == "commit" else "")
-    outputs.check(dest, src)
+    check(dest, src)
     group = src.group
     steps.check_names(group, cfg)
     n_cells, n_genes = group["X"].attrs["shape"]
@@ -76,8 +85,8 @@ def load(cfg: Config) -> Loaded:
     return Loaded(src, dest, obs, read_elem(group["var"]), counts, steps.slice_rows(counts, rows), rows, n_cells)
 
 
-def embed_pca(cfg: Config, data: Loaded, adata, hv, gpu, report) -> tuple:
-    """Scale -> PCA, then harmony when batch keys are given; returns the graph AnnData, its basis and uns."""
+def embed_pca(cfg: Config, data: Loaded, adata, hv, gpu, report) -> Embedding:
+    """Scale -> PCA, then harmony when batch keys are given."""
     import anndata as ad
 
     import steps
@@ -87,13 +96,13 @@ def embed_pca(cfg: Config, data: Loaded, adata, hv, gpu, report) -> tuple:
         X_pca, variance = steps.scale_pca(adata, cfg)
     graph = ad.AnnData(obs=data.obs, obsm={"X_pca": X_pca})
     if not cfg.batch_keys:
-        return graph, "X_pca", {"pca_variance_ratio": variance}
+        return Embedding(graph, PCA_KEY, {"pca_variance_ratio": variance})
     with report.step("harmony"):
         steps.harmony(graph, cfg.batch_keys, cfg)
-    return graph, "X_pca_harmony", {"pca_variance_ratio": variance}
+    return Embedding(graph, HARMONY_KEY, {"pca_variance_ratio": variance})
 
 
-def embed_scvi(cfg: Config, data: Loaded, adata, hv, gpu, report) -> tuple:
+def embed_scvi(cfg: Config, data: Loaded, adata, hv, gpu, report) -> Embedding:
     """Gather the HVG counts, close the Dask cluster so torch owns the GPU, train scVI."""
     import anndata as ad
     import numpy as np
@@ -108,16 +117,15 @@ def embed_scvi(cfg: Config, data: Loaded, adata, hv, gpu, report) -> tuple:
     model_dir = free_path(cfg.model_dir.rstrip("/"))
     with report.step("scvi"):
         latent = steps.train_scvi(counts, data.obs, data.var.index[hv], cfg.batch_keys, cfg, model_dir)
-    return ad.AnnData(obs=data.obs, obsm={"X_scVI": latent}), "X_scVI", {"scvi_model": model_dir}
+    return Embedding(ad.AnnData(obs=data.obs, obsm={SCVI_KEY: latent}), SCVI_KEY, {"scvi_model": model_dir})
 
 
-# method name (the values of config.METHODS) -> the function that makes the embedding. A new method is one
-# function here, its name in config.METHODS and its key in config.EMBEDDING_KEYS.
 EMBEDDERS = {"pca": embed_pca, "scvi": embed_scvi}
 
 
-def embed(cfg: Config, data: Loaded, gpu, report) -> tuple:
-    """normalize -> HVG -> the chosen embedder; returns the graph AnnData, its basis, lognorm, HVGs and uns."""
+def embed(cfg: Config, data: Loaded, gpu, report) -> Embedding:
+    """normalize -> HVG -> the embedder of cfg.method (a new method: a function in EMBEDDERS, its name in
+    config.METHODS and its obsm key in config.EMBEDDING_KEYS)."""
     import steps
 
     with report.step("h2d_normalize"):
@@ -126,33 +134,34 @@ def embed(cfg: Config, data: Loaded, gpu, report) -> tuple:
     with report.step("hvg"):
         hv = steps.highly_variable(adata, cfg)
         adata = adata[:, hv].copy()
-    graph, basis, uns = EMBEDDERS[cfg.method](cfg, data, adata, hv, gpu, report)
-    return graph, basis, lognorm, hv, uns
+    emb = EMBEDDERS[cfg.method](cfg, data, adata, hv, gpu, report)
+    emb.lognorm, emb.hv = lognorm, hv
+    return emb
 
 
-def write(cfg: Config, data: Loaded, graph, basis: str, lognorm, hv, uns: dict) -> str:
+def write(cfg: Config, data: Loaded, emb: Embedding) -> str:
     import numpy as np
 
     import steps
-    import outputs
-    from config import UMAP_DEFAULT
-    from store import EMBEDDINGS, Results
+    from config import EMBEDDING_KEYS, UMAP_DEFAULT
+    from store import Results, save
 
+    graph, basis = emb.graph, emb.basis
     leiden = cfg.leiden_keys
     clusters = ", ".join(f"{k}: {graph.obs[k].nunique()} clusters" for k in leiden)
     results = Results(
-        lognorm=lognorm, target_sum=cfg.target_sum, highly_variable=hv,
+        lognorm=emb.lognorm, target_sum=cfg.target_sum, highly_variable=emb.hv,
         obsm={cfg.umap_key if k == UMAP_DEFAULT else k: steps.full_rows(v, data.rows, data.n_cells)
-              for k, v in graph.obsm.items() if k in EMBEDDINGS + (UMAP_DEFAULT,)},
+              for k, v in graph.obsm.items() if k in EMBEDDING_KEYS + (UMAP_DEFAULT,)},
         obs={k: steps.full_column(graph.obs[k], data.rows, data.n_cells) for k in leiden},
         leiden_key=cfg.leiden_key,
-        uns={**uns, "input": cfg.input, "table": data.src.table, "snapshot": data.src.snapshot, "method": cfg.method,
+        uns={**emb.uns, "input": cfg.input, "table": data.src.table, "snapshot": data.src.snapshot, "method": cfg.method,
              "basis": basis, "umap_key": cfg.umap_key, "batch_keys": np.array(cfg.batch_keys, dtype=str), "target_sum": cfg.target_sum,
              "leiden": dict(leiden), "n_cells": graph.n_obs,
              "subset": {"column": cfg.subset_column, "values": np.array(cfg.subset, dtype=str)},
              "settings": asdict(cfg)},
     )
-    written = outputs.save(data.dest, data.src, results.write,
+    written = save(data.dest, data.src, results.write,
                            f"Process: {cfg.method} ({basis}), {clusters} over {graph.n_obs:,} cells", cfg.branch,
                            {"method": cfg.method, "basis": basis, "leiden": dict(leiden), "n_cells": graph.n_obs})
     print(f"{clusters}; {written}")
@@ -180,8 +189,7 @@ def plots(graph, cfg: Config) -> None:
 
 def run(cfg: Config) -> str:
     import steps
-    from cluster import GpuCluster
-    from report import Report, header
+    from runtime import GpuCluster, Report, header
 
     report, gpu = Report(cfg.sample_interval_s, tuple(cfg.gpu_ids)), GpuCluster(cfg)
     n_gpus, written = 0, "NOT WRITTEN"
@@ -192,21 +200,21 @@ def run(cfg: Config) -> str:
             gpu.start()
         n_gpus = gpu.n_workers
         print(header(cfg, n_gpus))
-        graph, basis, lognorm, hv, uns = embed(cfg, data, gpu, report)
+        emb = embed(cfg, data, gpu, report)
         with report.step("neighbors"):
-            steps.neighbors(graph, basis, cfg)
+            steps.neighbors(emb.graph, emb.basis, cfg)
         with report.step("umap"):
-            steps.umap(graph, cfg)
+            steps.umap(emb.graph, cfg)
         with report.step("leiden"):
-            steps.leiden(graph, cfg)
-        if cfg.plots:  # before the write, so a failed write still leaves them; a failed plot never blocks the write
+            steps.leiden(emb.graph, cfg)
+        if cfg.plots:
             try:
                 with report.step("plots"):
-                    plots(graph, cfg)
+                    plots(emb.graph, cfg)
             except Exception as exc:
                 print(f"warning: plots skipped ({type(exc).__name__}: {exc})")
         with report.step("write"):
-            written = write(cfg, data, graph, basis, lognorm, hv, uns)
+            written = write(cfg, data, emb)
     finally:
         gpu.close()
         if report.rows:

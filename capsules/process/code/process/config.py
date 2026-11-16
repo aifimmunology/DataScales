@@ -9,9 +9,11 @@ from pathlib import Path
 
 METHODS = {"pca": "pca", "scvi": "scvi", "scvi (train)": "scvi"}
 RMM_MODES = ("managed", "pool", "none")
-PATHS = ("input", "external", "results_dir", "scvi_model_dir")
+PATHS = ("input", "results_dir", "scvi_model_dir")
+OUTPUT_PLACEHOLDER = "s3://bucket/prefix"
 FORMATS = ("auto", "zarr", "icechunk")
-EMBEDDING_KEYS = ("X_pca", "X_pca_harmony", "X_scVI")  # obsm keys the pipeline owns besides the UMAP
+PCA_KEY, HARMONY_KEY, SCVI_KEY = "X_pca", "X_pca_harmony", "X_scVI"
+EMBEDDING_KEYS = (PCA_KEY, HARMONY_KEY, SCVI_KEY)
 UMAP_DEFAULT, LEIDEN_DEFAULT = "X_umap", "leiden"
 NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _BOOLS = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
@@ -42,11 +44,9 @@ class Config:
     leiden_key: str = LEIDEN_DEFAULT         # obs column name (prefix when there are several resolutions)
     # App Panel: UMAP plots
     color_keys: str = "batch_id,chip_id,pbmc_clean_AIFI_L1_2024_label,leiden"  # obs columns; leiden = the clusters
-    # App Panel: output (outputs.py), the copy in results_dir or an external location, never both
-    results_copy: str = ""             # name in results_dir (absolute: that path); "" is <stem>.processed
-    results_format: str = "auto"       # auto (the input's) | zarr | icechunk
-    external: str = ""                 # s3:// or a path; icechunk input: its own repo, zarr input: new or existing zarr
-    external_format: str = "auto"      # auto (what's there, zarr if new) | zarr | icechunk; must match what's there
+    # App Panel: output (store.py): "" saves a copy in results_dir
+    output: str = ""                   # s3://, a path, or a name; a name or a path under results_dir is a copy there
+    output_format: str = "auto"        # auto | zarr | icechunk; auto: the input's format (copy) or what is there (else)
 
     results_dir: str = "/results"
     sample_key: str = "sample_id"      # counted per cluster when the store has it
@@ -139,8 +139,16 @@ class Config:
             resolutions = self.resolutions
         except ValueError:
             raise ConfigError(f"leiden_resolutions must be numbers separated by commas, got {self.leiden_resolutions!r}") from None
-        if not resolutions or min(resolutions) <= 0:
+        if not resolutions or not all(0 < r < float("inf") for r in resolutions):
             raise ConfigError("leiden_resolutions needs at least one positive number")
+        try:
+            self.gpu_ids
+        except ValueError:
+            raise ConfigError(f"gpus must be numbers separated by commas, got {self.gpus!r}") from None
+        if not 0 < self.rmm_pool_size <= 1:
+            raise ConfigError(f"rmm_pool_size must be above 0 and at most 1, got {self.rmm_pool_size}")
+        if ".." in Path(self.output).parts and not self.output.startswith("/") and "://" not in self.output:
+            raise ConfigError("output can't contain '..'; a name is saved in /results, or give a full path")
         for name, low, high in (("n_top_genes", 50, None), ("n_comps", 2, None), ("n_neighbors", 2, None),
                                 ("umap_min_dist", 0, 1)):
             value = getattr(self, name)
@@ -148,15 +156,10 @@ class Config:
                 limit = f"at least {low}" if high is None else f"between {low} and {high}"
                 raise ConfigError(f"{name} must be {limit}, got {value}")
         self._validate_names()
-        for name in ("results_format", "external_format"):
-            if getattr(self, name) not in FORMATS:
-                raise ConfigError(f"{name} must be one of {', '.join(FORMATS)}, got {getattr(self, name)!r}")
-        if self.external and (self.results_copy or self.results_format != "auto"):
-            raise ConfigError("results_copy and results_format are for the copy in results_dir; with an external "
-                              "location, leave them empty (use external_format)")
-        for name in ("results_copy", "results_dir"):
-            if "://" in getattr(self, name):
-                raise ConfigError(f"{name} is a local path; for s3:// use external")
+        if self.output_format not in FORMATS:
+            raise ConfigError(f"output_format must be one of {', '.join(FORMATS)}, got {self.output_format!r}")
+        if "://" in self.results_dir:
+            raise ConfigError("results_dir is a local path; for s3:// use output")
         if self.subset_column and not self.subset:
             raise ConfigError(f"subset_column {self.subset_column!r} is set but subset_values is empty: add the values to keep, or clear the column")
         return self
@@ -207,5 +210,7 @@ def load_config(argv: list[str] | None = None, env: dict[str, str] | None = None
     from_env = {n: _cast(n, env[n.upper()]) for n in _TYPES if env.get(n.upper(), "").strip()}
     from_args = {n: _cast(n, v) for n, v in vars(parser().parse_args(argv)).items() if v is not None and v.strip()}
     cfg = replace(Config(), **{**from_env, **from_args})
+    if cfg.output.strip().rstrip("/") == OUTPUT_PLACEHOLDER:
+        cfg = replace(cfg, output="")
     cwd = env.get("PROCESS_CWD") or os.getcwd()
     return replace(cfg, **{n: _absolute(getattr(cfg, n), cwd) for n in PATHS}).validate()
