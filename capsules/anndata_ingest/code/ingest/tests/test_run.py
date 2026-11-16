@@ -302,9 +302,9 @@ def test_panel_values_in_any_shape_reach_the_run(samples_dir, base_env, tmp_path
     store = str(tmp_path / "store")
     samples = f'["{files[0]}",\n {samples_dir}/ ; {files[1]}]'
     env = {**base_env, "RUN_CELLTYPIST": "true", "CREATE": "true"}
-    report = main.run(load_settings([f" {store}/ ", "", samples, "None"], env))
+    report = main.run(load_settings(["raw", samples, f" {store}/ ", "", "auto", "None", ""], env))
     assert report["appended_samples"] == ["SP00001", "SP00002", "SP00003"]
-    report = main.run(load_settings([store, str(samples_dir / "*.h5"), "None"], env))
+    report = main.run(load_settings([str(samples_dir / "*.h5"), store, "None"], env))
     assert report["appended_samples"] == [] and report["store"] == store
 
 
@@ -389,7 +389,7 @@ def test_main_reads_positional_panel_values_from_the_command_line(samples_dir, b
     for key, value in base_env.items():
         monkeypatch.setenv(key, value)
     store = str(tmp_path / "store")
-    monkeypatch.setattr("sys.argv", ["main.py", store, "", str(samples_dir), "None"])
+    monkeypatch.setattr("sys.argv", ["main.py", "raw", str(samples_dir), store, "", "auto", "None", ""])
     monkeypatch.setenv("CREATE", "true")
     assert main.main() == 0 and stores.n_obs(root_of(store)) == sum(SAMPLES.values())
 
@@ -499,6 +499,31 @@ def test_an_unknown_dropdown_value_lists_the_options(samples_dir, base_env, tmp_
 def test_a_plain_zarr_on_s3_is_refused():
     with pytest.raises(stores.StoreError, match="must be local"):
         stores.open_store("s3://bucket/atlas.zarr")
+
+
+def test_the_new_store_format_picks_the_kind_of_a_new_store_only(samples_dir, base_env, tmp_path):
+    sample = sorted(samples_dir.glob("*.h5"))[0]
+    assert isinstance(stores.open_store(str(tmp_path / "a"), new_format="zarr"), stores.ZarrStore)
+    assert isinstance(stores.open_store(str(tmp_path / "b.zarr"), new_format="icechunk"), stores.IcechunkStore)
+    with pytest.raises(stores.StoreError, match="must be local"):
+        stores.open_store("s3://bucket/atlas", new_format="zarr")
+    plain = tmp_path / "plain"
+    assert ingest(base_env, plain, sample, "--create", "true", "--store-format", "zarr")["kind"] == "zarr"
+    assert isinstance(stores.open_store(str(plain), new_format="icechunk"), stores.ZarrStore)
+
+
+def test_a_new_store_format_on_an_existing_store_is_ignored_with_a_warning(samples_dir, base_env, tmp_path, caplog):
+    files = files_of(samples_dir)
+    store = tmp_path / "store"
+    create(base_env, store, files[0])
+    report = ingest(base_env, store, files[1], "--store-format", "zarr")
+    assert report["kind"] == "icechunk" and report["appended_samples"] == ["SP00002"]
+    assert "already holds a store (icechunk); New store format = zarr is ignored" in caplog.text
+
+
+def test_the_placeholder_store_is_refused_before_any_work(samples_dir, base_env):
+    with pytest.raises(inputs.IngestError, match="still the placeholder"):
+        main.run(load_settings(["--samples", str(samples_dir)], base_env))
 
 
 def test_an_icechunk_repo_named_zarr_opens_as_icechunk(samples_dir, base_env, tmp_path):

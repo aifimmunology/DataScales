@@ -155,9 +155,10 @@ class ZarrStore:
             zarr.consolidate_metadata(self.path)
 
 
-def open_store(path: str, origin: str = "") -> IcechunkStore | ZarrStore:
-    """`.zarr` paths and local folders holding a plain zarr group are AnnData zarr stores; anything
-    else is an icechunk repo."""
+def open_store(path: str, origin: str = "", new_format: str = "auto") -> IcechunkStore | ZarrStore:
+    """An existing store keeps its kind: a local icechunk repo, or a local folder holding a plain zarr
+    group. Otherwise `new_format` picks the kind of the store to create: "icechunk", "zarr", or "auto"
+    (a `.zarr` path is a plain AnnData zarr, anything else an icechunk repo)."""
     if not path:
         raise StoreError("No store given; set the store path (a data asset, local path, or s3:// URL).")
     if Path(path).suffix.lower() in (".h5", ".h5ad", ".h5mu", ".loom"):
@@ -165,14 +166,31 @@ def open_store(path: str, origin: str = "") -> IcechunkStore | ZarrStore:
                          "can't be appended to. Give a new path inside /results to start a store.")
     if _is_local_repo(path):
         return IcechunkStore(path, origin)
-    if path.rstrip("/").endswith(".zarr") or _is_plain_zarr(path):
-        if "://" in path:
-            raise StoreError(f"{path}: a plain .zarr store must be local (annizarr writes remote stores as icechunk only); on S3 use an icechunk repo (drop the "
-                             ".zarr suffix, e.g. s3://bucket/prefix/atlas).")
-        if origin:
-            raise StoreError("origin applies to icechunk stores only; a plain zarr is written where it is.")
-        return ZarrStore(path)
-    return IcechunkStore(path, origin)
+    if _is_plain_zarr(path):
+        return _zarr_store(path, origin)
+    if new_format == "zarr" and "://" in path and _remote_repo_exists(path):
+        return IcechunkStore(path, origin)  # an existing remote repo keeps its kind
+    if new_format == "auto":
+        new_format = "zarr" if path.rstrip("/").endswith(".zarr") else "icechunk"
+    return _zarr_store(path, origin) if new_format == "zarr" else IcechunkStore(path, origin)
+
+
+def _zarr_store(path: str, origin: str) -> ZarrStore:
+    if "://" in path:
+        raise StoreError(f"{path}: a plain zarr store must be local (annizarr writes remote stores as icechunk "
+                         "only); on S3 choose the Icechunk format (and drop any .zarr suffix, e.g. "
+                         "s3://bucket/prefix/atlas).")
+    if origin:
+        raise StoreError("origin applies to icechunk stores only; a plain zarr is written where it is.")
+    return ZarrStore(path)
+
+
+def _remote_repo_exists(path: str) -> bool:
+    """Whether an icechunk repo is already there; unreachable counts as no (the zarr refusal follows)."""
+    try:
+        return Repo.exists(path)
+    except Exception:
+        return False
 
 
 def _probe_writable(path: str) -> None:

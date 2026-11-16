@@ -14,13 +14,25 @@ from pathlib import Path
 
 SAMPLE_SUFFIXES = (".h5", ".h5ad", ".h5mu")
 SAMPLE_KINDS = ".h5/.h5ad files or AnnData/SpatialData .zarr folders"
-PANEL = ("store", "origin", "input_type", "samples", "celltypist_models", "celltypist_pkl")
+# The app panel's parameters, in its order (Code Ocean passes their values positionally in this order).
+PANEL = ("input_type", "samples", "store", "origin", "store_format", "celltypist_models", "celltypist_pkl")
 INPUT_TYPES = {
     "Raw samples (QC, CellTypist, Scrublet)": "raw",
     "Existing AnnData or SpatialData table (as is)": "existing",
     "raw": "raw",
     "existing": "existing",
 }
+# The app panel's New store format dropdown; only used when the store doesn't exist yet.
+STORE_FORMATS = {
+    "Auto (.zarr path is zarr, else icechunk)": "auto",
+    "Icechunk": "icechunk",
+    "Zarr": "zarr",
+    "auto": "auto",
+    "icechunk": "icechunk",
+    "zarr": "zarr",
+}
+# The default Storage Location; a run refuses it until it's replaced with a real store location.
+PLACEHOLDER_STORE = "s3://bucket/prefix"
 BUNDLED_MODELS = Path(__file__).resolve().parents[1] / "models"
 DATA_DIR = Path("/data")
 AIFI_L1 = "pbmc_clean_AIFI_L1_2024"
@@ -54,6 +66,7 @@ def _key(text: str) -> str:
 
 _PRESETS = {_key(label): models for label, models in CELLTYPIST_PRESETS.items()}
 _INPUT_KEYS = {_key(label) for label in INPUT_TYPES}
+_FORMATS = {_key(label): kind for label, kind in STORE_FORMATS.items()}
 
 
 def split_list(raw: str) -> list[str]:
@@ -107,8 +120,9 @@ def _expand(entry: str) -> list[Path]:
 @dataclass(frozen=True)
 class Settings:
     samples: str = "/data/samples"
-    store: str = "/results/ingest_icechunk"
+    store: str = PLACEHOLDER_STORE
     origin: str = ""
+    store_format: str = "auto"  # kind of a new store: auto, icechunk or zarr; an existing store keeps its kind
     input_type: str = "raw"
     sample_column: str = "sample_id"
     create: bool = False
@@ -134,6 +148,9 @@ class Settings:
         if _key(self.input_type) not in kinds:
             raise ConfigError(f"Input type {self.input_type!r} is not one of {list(INPUT_TYPES)[:2]}.")
         object.__setattr__(self, "input_type", kinds[_key(self.input_type)])
+        if _key(self.store_format) not in _FORMATS:
+            raise ConfigError(f"Store format {self.store_format!r} is not one of {list(STORE_FORMATS)[:3]}.")
+        object.__setattr__(self, "store_format", _FORMATS[_key(self.store_format)])
 
     @property
     def existing(self) -> bool:
@@ -189,30 +206,36 @@ def parser() -> argparse.ArgumentParser:
 
 
 def panel_values(values: list[str]) -> dict[str, str]:
-    """The app panel's positional values (store, origin, input type, samples, Celltypist model, custom
-    .pkl) as settings.
+    """The app panel's positional values (input type, samples, store, origin, new store format, Celltypist
+    model, custom .pkl) as settings.
 
-    Code Ocean may leave out an empty optional value, which shifts the rest, so after the store
-    each value is placed by what it looks like: a dropdown label, an s3:// origin, a .pkl, or samples."""
+    Code Ocean may leave out an empty optional value, which shifts the rest, so a shorter list is placed by
+    what each value looks like: a dropdown label or a .pkl; the remaining paths, in order, are the
+    samples, the store and an s3:// origin (a single path is the store)."""
     if len(values) > len(PANEL):
         raise ConfigError(f"Expected at most {len(PANEL)} app-panel values ({', '.join(PANEL)}), got {values}.")
     if len(values) == len(PANEL):
         return dict(zip(PANEL, values))
-    out = {"store": values[0]} if values else {}
-    for value in values[1:]:
+    out: dict[str, str] = {}
+    paths: list[str] = []
+    for value in values:
         text = value.strip(_STRIP)
         if not text:
             continue
         if _key(text) in _INPUT_KEYS:
             out["input_type"] = value
+        elif _key(text) in _FORMATS:
+            out["store_format"] = value
         elif _key(text) in _PRESETS:
             out["celltypist_models"] = value
-        elif re.match(r"^[a-z0-9]+://", text) and "origin" not in out:
-            out["origin"] = value
         elif all(item.lower().endswith(".pkl") for item in split_list(text)):
             out["celltypist_pkl"] = value
         else:
-            out["samples"] = value
+            paths.append(value)
+    if len(paths) > 3:
+        raise ConfigError(f"Expected samples, store and origin among the app-panel values, got {paths}.")
+    names = ("store",) if len(paths) == 1 else ("samples", "store", "origin")
+    out.update(zip(names, paths))
     return out
 
 

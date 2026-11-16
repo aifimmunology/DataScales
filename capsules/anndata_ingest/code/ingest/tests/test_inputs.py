@@ -60,20 +60,27 @@ def test_the_default_models_are_the_bundled_aifi_models():
 
 def test_panel_values_are_positional_and_survive_a_dropped_origin():
     raw = "Raw samples (QC, CellTypist, Scrublet)"
-    full = panel_values(["/results/s", "s3://b/p", raw, "/data/samples", "None", ""])
-    assert full == {"store": "/results/s", "origin": "s3://b/p", "input_type": raw, "samples": "/data/samples",
-                    "celltypist_models": "None", "celltypist_pkl": ""}
-    assert panel_values(["/results/s", "/data/samples", "Only AIFI L1 celltypes"]) == {
-        "store": "/results/s", "samples": "/data/samples", "celltypist_models": "Only AIFI L1 celltypes"}
-    assert panel_values(["/results/s", "s3://b/p", "/data/x.h5"]) == {
-        "store": "/results/s", "origin": "s3://b/p", "samples": "/data/x.h5"}
-    s = load_settings(["/results/s", "", raw, "/data/samples", "AIFI L1, L2, L3 celltypes"], {})
-    assert s.store == "/results/s" and s.origin == "" and s.model_names() == Settings().model_names()
-    assert panel_values(["/results/s", "/data/samples", "None", "/data/m/a.pkl"])["celltypist_pkl"] == "/data/m/a.pkl"
-    existing = load_settings(["s3://b/p", "", "Existing AnnData or SpatialData table (as is)", "/data/x.h5ad"], {})
-    assert existing.existing and existing.samples == "/data/x.h5ad" and existing.origin == ""
-    with pytest.raises(ConfigError, match="at most 6"):
-        panel_values(["a", "b", "c", "d", "e", "f", "g"])
+    full = panel_values([raw, "/data/samples", "/results/s", "s3://b/p", "Icechunk", "None", ""])
+    assert full == {"input_type": raw, "samples": "/data/samples", "store": "/results/s", "origin": "s3://b/p",
+                    "store_format": "Icechunk", "celltypist_models": "None", "celltypist_pkl": ""}
+    assert panel_values(["/data/samples", "/results/s", "Only AIFI L1 celltypes"]) == {
+        "samples": "/data/samples", "store": "/results/s", "celltypist_models": "Only AIFI L1 celltypes"}
+    assert panel_values(["/data/x.h5", "/results/s", "s3://b/p"]) == {
+        "samples": "/data/x.h5", "store": "/results/s", "origin": "s3://b/p"}
+    assert panel_values(["/results/s"]) == {"store": "/results/s"}
+    s = load_settings([raw, "/data/samples", "/results/s", "", "Zarr", "AIFI L1, L2, L3 celltypes", ""], {})
+    assert s.store == "/results/s" and s.origin == "" and s.store_format == "zarr"
+    assert s.model_names() == Settings().model_names()
+    short = load_settings([raw, "/data/samples", "/results/s", "Auto (.zarr path is zarr, else icechunk)", "None"], {})
+    assert short.store == "/results/s" and short.store_format == "auto" and short.model_names() == []
+    assert panel_values(["/data/samples", "/results/s", "None", "/data/m/a.pkl"])["celltypist_pkl"] == "/data/m/a.pkl"
+    existing = load_settings(["Existing AnnData or SpatialData table (as is)", "/data/x.h5ad", "s3://b/p", ""], {})
+    assert existing.existing and existing.samples == "/data/x.h5ad" and existing.store == "s3://b/p"
+    assert existing.origin == ""
+    with pytest.raises(ConfigError, match="at most 7"):
+        panel_values(["a", "b", "c", "d", "e", "f", "g", "h"])
+    with pytest.raises(ConfigError, match="Store format"):
+        Settings(store_format="parquet")
     with pytest.raises(ConfigError, match="Input type"):
         Settings(input_type="processed")
 
@@ -149,6 +156,7 @@ def test_the_app_panel_matches_the_positional_order():
     by_name = dict(zip(config.PANEL, params))
     assert set(by_name["input_type"]["extra_data"]) <= set(config.INPUT_TYPES)
     assert set(by_name["celltypist_models"]["extra_data"]) <= set(config.CELLTYPIST_PRESETS)
+    assert set(by_name["store_format"]["extra_data"]) <= set(config.STORE_FORMATS)
     assert by_name["store"]["default_value"] == config.Settings().store
 
 

@@ -28,7 +28,7 @@ from annizarr.errors import AnzError
 import inputs
 import prepare
 import store as stores
-from config import ConfigError, Settings, load_settings, setup_logging
+from config import PLACEHOLDER_STORE, ConfigError, Settings, load_settings, setup_logging
 from inputs import IngestError
 from prepare import Staged
 
@@ -54,8 +54,14 @@ def storage_warning(location: str) -> str | None:
 
 def open_store(settings: Settings) -> stores.IcechunkStore | stores.ZarrStore:
     """Opens the store, creating it when it doesn't exist yet and its location allows that."""
-    store = stores.open_store(settings.store, settings.origin)
+    if settings.store == PLACEHOLDER_STORE:
+        raise IngestError(f"Storage Location is still the placeholder {PLACEHOLDER_STORE}. Replace it with your "
+                          "own s3://bucket/prefix (attach an AWS secret with write access) or a /results/<name> path.")
+    store = stores.open_store(settings.store, settings.origin, settings.store_format)
     fresh = not store.exists()
+    if not fresh and settings.store_format not in ("auto", store.kind):
+        logger.warning("%s already holds a store (%s); New store format = %s is ignored (it applies only to a "
+                       "new store).", store.location, store.kind, settings.store_format)
     if fresh and store.location != settings.store and Repo.exists(settings.store):
         raise IngestError(f"{settings.store} holds a store but its origin {store.location} doesn't; check the "
                           "Origin of s3 (a mistyped origin would start a new, separate store).")

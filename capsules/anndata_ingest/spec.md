@@ -32,7 +32,7 @@ The source is `capsules/anndata_ingest/` (renamed from `capsules/ingest/` on 202
   - **MuData** is refused by name (`.h5mu`, or a zarr with `mod`/`encoding-type: MuData`), with how to write a modality as AnnData.
 
 ### 3.2 App panel
-`store`, `origin`, `Input type` (Raw samples · Existing AnnData or SpatialData table), `samples`, `Celltypist Model` (raw samples only; a dropdown: AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None), `Custom Celltypist model` (optional `.pkl` file(s) that replace the dropdown, e.g. a model trained for a spatial panel), passed positionally in that order; when Code Ocean drops an empty optional value, values are placed by shape. Defaults make a Reproducible Run ingest `/data/samples` into a new store at `/results/ingest_icechunk`. Every other setting is an environment variable named after its `Settings` field, in upper case.
+`Input type` (Raw samples · Existing AnnData or SpatialData table), `samples`, `store`, `origin`, `New store format` (2026-11-16; Auto · Icechunk · Zarr, the kind of a store that doesn't exist yet; Auto keeps the old rule, a `.zarr` path is a plain zarr), `Celltypist Model` (raw samples only; a dropdown: AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None), `Custom Celltypist model` (optional `.pkl` file(s) that replace the dropdown, e.g. a model trained for a spatial panel), passed positionally in that order (Sample Information first since 2026-11-16); when Code Ocean drops an empty optional value, dropdown labels and `.pkl` values are placed by shape and the remaining paths, in order, are samples, store, origin. The default store is the placeholder `s3://bucket/prefix` (2026-11-16, replacing `/results/ingest_icechunk`), so a Reproducible Run needs the Storage Location replaced first. Every other setting is an environment variable named after its `Settings` field, in upper case.
 
 ### 3.3 Outputs
 - **The commit on `main`** (the seed commit too, since 2026-11-05): the message lists one `- <sample>: <source path>` line per sample (with the fitting, if any); the metadata records `pipeline`, `annizarr` version, `appended_samples`, `sources` (sample → path), `fitted` (sample → how it was fitted), `n_cells` and `n_samples`.
@@ -77,7 +77,7 @@ about. Plain zarr on S3 is refused: annizarr 0.2.4 writes remote stores as icech
 - **Gene mismatch** (user, 2026-10-29/30): warn with the diff, then fit the sample to the store's var
   (zero-fill missing genes, drop extras, record `fitted` in the commit). Done 2026-10-30. The user will
   add "append new genes" to annizarr later.
-- **CellTypist:** a dropdown plus an optional custom `.pkl` field (`CELLTYPIST_PKL`, panel value 5) that
+- **CellTypist:** a dropdown plus an optional custom `.pkl` field (`CELLTYPIST_PKL`, panel value 7) that
   overrides it. Spatial defaults to None.
 - **Rerun:** samples already present are skipped. Commits list each sample and its source path.
 - **Input type dropdown (2026-11-04),** in this capsule (no separate import capsule): Raw samples

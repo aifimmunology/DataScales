@@ -2,52 +2,31 @@
 	"version": 1,
 	"categories": [
 		{
-			"id": "hNshNesucRS8w1XA",
-			"name": "Central Storage",
-			"description": "information on the storage that the sample(s) will be added to.",
-			"icon": "🗄️"
-		},
-		{
 			"id": "sxamMh7IcKwbGyOs",
 			"name": "Sample Information",
-			"description": "What is being added to the store: raw samples, or existing AnnData / SpatialData tables.",
+			"description": "What you're adding: raw samples or existing AnnData / SpatialData tables.",
 			"icon": "🧫"
+		},
+		{
+			"id": "hNshNesucRS8w1XA",
+			"name": "Output Storage",
+			"description": "Where the samples are stored.",
+			"icon": "🗄️"
 		},
 		{
 			"id": "JQPe5zIaMaeicuwR",
 			"name": "Run params",
-			"description": "Raw samples only: CellTypist labels added to each sample. Ignored for existing AnnData / SpatialData tables, which go in as they are.",
+			"description": "CellTypist labels for raw samples. Ignored for existing tables.",
 			"icon": "⚙️"
 		}
 	],
 	"parameters": [
 		{
-			"id": "4I12NzX5Uo8yP6oM",
-			"category": "hNshNesucRS8w1XA",
-			"name": "Storage Location",
-			"description": "Icechunk repo (data asset, local path or s3://bucket/prefix) or .zarr folder the samples are added to. If it does not exist, it is created at an s3:// prefix you can write to, or inside /results or /scratch.",
-			"help_text": "A store you will keep adding to belongs on S3. /data is read-only; a store in /results can be saved as a data asset but is then read-only too, and /scratch is cleared when the run ends.",
-			"type": "text",
-			"value_type": "string",
-			"default_value": "/results/ingest_icechunk",
-			"required": true
-		},
-		{
-			"id": "CwzYftWPQ5bWqno2",
-			"category": "hNshNesucRS8w1XA",
-			"name": "Origin of s3 (optional)",
-			"description": "If the storage is a read-only data asset linked to an S3 bucket, the bucket location to write to. EX: s3://bucket/prefix",
-			"help_text": "Optional; only needed when writing to an external data asset that has a linked s3 bucket",
-			"type": "text",
-			"value_type": "string",
-			"pattern": "^(s3://.+)?$"
-		},
-		{
 			"id": "Ty3nRk8wQp2LmZa6",
 			"category": "sxamMh7IcKwbGyOs",
 			"name": "Input type",
-			"description": "Raw samples get QC metrics, CellTypist labels and Scrublet scores. Existing AnnData / SpatialData tables go in as they are (nothing recomputed; a new store from one object keeps its layers and embeddings, later objects add cells, counts and the store's obs columns), identified by their sample_id column, or the file name without one.",
-			"help_text": "Both kinds can go into the same store. A different column can name the samples with the SAMPLE_COLUMN environment variable.",
+			"description": "Raw samples get QC metrics, CellTypist labels and Scrublet scores. Existing tables are added as they are, with nothing recomputed.",
+			"help_text": "Both kinds can go in the same store. Samples are identified by their sample_id column, or by file name if there isn't one. Set SAMPLE_COLUMN to use a different column.",
 			"type": "list",
 			"value_type": "string",
 			"default_value": "Raw samples (QC, CellTypist, Scrublet)",
@@ -60,17 +39,53 @@
 			"id": "aqK0Q6vLFi4lB9bh",
 			"category": "sxamMh7IcKwbGyOs",
 			"name": "List of paths to samples",
-			"description": "Raw samples (.h5/.h5ad files, SpatialData .zarr folders) or existing AnnData (.h5ad, AnnData .zarr, SpatialData .zarr tables), folders holding them, or globs, separated by commas. EX: /data/samples, /data/atlas.h5ad",
-			"help_text": "Paths must be inside data assets attached to this capsule. Folders are not searched recursively. Samples already in the store are skipped. MuData isn't supported; ingest a modality as AnnData.",
+			"description": "Files, folders or globs, separated by commas. Accepts .h5, .h5ad, AnnData .zarr and SpatialData .zarr. EX: /data/samples, /data/atlas.h5ad",
+			"help_text": "Paths must be inside attached data assets. Folders aren't searched recursively. Samples already in the store are skipped. MuData isn't supported.",
 			"type": "text",
 			"value_type": "string",
 			"default_value": "/data/samples"
 		},
 		{
+			"id": "4I12NzX5Uo8yP6oM",
+			"category": "hNshNesucRS8w1XA",
+			"name": "Storage Location",
+			"description": "Icechunk repo or .zarr folder to add samples to. Accepts a data asset, local path or s3://bucket/prefix. Created if it doesn't exist.",
+			"help_text": "Use S3 for a store you'll keep adding to. /data is read-only, a store in /results becomes read-only once saved as a data asset, and /scratch is cleared when the run ends.",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "s3://bucket/prefix",
+			"required": true
+		},
+		{
+			"id": "CwzYftWPQ5bWqno2",
+			"category": "hNshNesucRS8w1XA",
+			"name": "Origin of s3 (optional)",
+			"description": "S3 location to write to when the storage is a read-only data asset linked to a bucket. EX: s3://bucket/prefix",
+			"help_text": "Only needed for an external data asset with a linked S3 bucket.",
+			"type": "text",
+			"value_type": "string",
+			"pattern": "^(s3://.+)?$"
+		},
+		{
+			"id": "Fq3sTz8LmW2kXc5R",
+			"category": "hNshNesucRS8w1XA",
+			"name": "New store format",
+			"description": "Format of the store when it doesn't exist yet. Ignored for an existing store, which keeps its format.",
+			"help_text": "Auto makes a .zarr path a plain AnnData zarr and anything else an icechunk repo. Icechunk keeps a history of every run; a plain zarr must be a local path, not S3.",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "Auto (.zarr path is zarr, else icechunk)",
+			"extra_data": [
+				"Auto (.zarr path is zarr, else icechunk)",
+				"Icechunk",
+				"Zarr"
+			]
+		},
+		{
 			"id": "d7VFKtzWt1oafeYk",
 			"category": "JQPe5zIaMaeicuwR",
 			"name": "Celltypist Model",
-			"description": "Which CellTypist models label the cells. A store built from raw samples accepts only the option it was created with; one seeded from an existing AnnData keeps its own columns and warns about the rest.",
+			"description": "CellTypist models used to label the cells. A store only accepts the option it was created with.",
 			"type": "list",
 			"value_type": "string",
 			"default_value": "AIFI L1, L2, L3 celltypes",
@@ -85,8 +100,8 @@
 			"id": "Pk7xQm2RcTn4LwVb",
 			"category": "JQPe5zIaMaeicuwR",
 			"name": "Custom Celltypist model (.pkl, optional)",
-			"description": "A CellTypist model file to use instead of the dropdown, e.g. one trained for a spatial gene panel. Several can be separated by commas. EX: /data/models/my_model.pkl",
-			"help_text": "Leave empty to use the dropdown. The model's name (the file name without .pkl) names the label columns, so keep using the same file for one store.",
+			"description": "Your own CellTypist model instead of the dropdown, e.g. for a spatial gene panel. Separate several with commas. EX: /data/models/my_model.pkl",
+			"help_text": "Leave empty to use the dropdown. The file name sets the label column names, so keep using the same file for a store.",
 			"type": "text",
 			"value_type": "string",
 			"pattern": "^(.+\\.pkl\\s*(,\\s*.+\\.pkl\\s*)*)?$"

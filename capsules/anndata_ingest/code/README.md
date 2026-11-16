@@ -1,5 +1,7 @@
 # anndata ingest
 
+Important: add your aws secret before working with external s3 storages
+
 A Code Ocean capsule that grows one single-cell AnnData store, run by run. It takes two kinds of input,
 picked with **Input type** on the App Panel:
 
@@ -31,10 +33,11 @@ write the modality you want as an AnnData first.
 
    | Field | What to enter | Example |
    |---|---|---|
-   | **Storage Location** | where the store is, or should be created | `/results/my_store` |
-   | **Origin of s3** (optional) | only for a store on a data asset linked to S3: that bucket prefix | `s3://my-bucket/my_store` |
    | **Input type** | Raw samples, or Existing AnnData or SpatialData table (as is) | Raw samples (default) |
    | **List of paths to samples** | files and/or folders, separated by commas | `/data/samples, /data/more/x.h5ad` |
+   | **Storage Location** | where the store is, or should be created | `/results/my_store` |
+   | **Origin of s3** (optional) | only for a store on a data asset linked to S3: that bucket prefix | `s3://my-bucket/my_store` |
+   | **New store format** | only when the store doesn't exist yet: Auto, Icechunk or Zarr | Auto (default) |
    | **Celltypist Model** (raw samples only) | which cell-type labels to add | AIFI L1, L2, L3 (default) |
    | **Custom Celltypist model** (optional, raw samples only) | a `.pkl` used instead of the dropdown | `/data/models/xenium_panel.pkl` |
 
@@ -46,8 +49,8 @@ write the modality you want as an AnnData first.
 4. Explore the store with **`Icechunk_annizarr_notebook.ipynb`**: history, cell counts per sample
    and cell type, loading cells into scanpy, reading older versions.
 
-A **Reproducible Run** (no changes to the panel) ingests every sample in `/data/samples` into a new
-store at `/results/ingest_icechunk`.
+The default **Storage Location**, `s3://bucket/prefix`, is a placeholder: replace it with your own
+S3 prefix (attach an AWS secret with write access) or a `/results/<name>` path, or the run stops at the store.
 
 ### Common tasks
 
@@ -202,20 +205,21 @@ SHA-256, and a test checks them.
 
 ### Code Ocean app
 
-`code/run` is the entrypoint. It takes six positional app-panel parameters, in panel order; an
+`code/run` is the entrypoint. It takes seven positional app-panel parameters, in panel order; an
 empty value keeps the environment variable or default:
 
 | # | category | parameter | meaning | default |
 |---|---|---|---|---|
-| 1 | Central Storage | Storage Location | an icechunk repo (data asset, local path, `s3://bucket/prefix`) or a plain zarr folder; created when missing (see below) | `/results/ingest_icechunk` |
-| 2 | Central Storage | Origin of s3 (optional) | the writable `s3://` prefix behind a read-only icechunk data asset | none |
-| 3 | Sample Information | Input type | Raw samples (QC, CellTypist, Scrublet) · Existing AnnData or SpatialData table (as is) | Raw samples |
-| 4 | Sample Information | List of paths to samples | `.h5`/`.h5ad` files, AnnData/SpatialData `.zarr` folders, folders of them, or globs | `/data/samples` |
-| 5 | Run params | Celltypist Model (raw samples only) | AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None | AIFI L1, L2, L3 |
-| 6 | Run params | Custom Celltypist model (optional, raw samples only) | `.pkl` file(s), comma-separated, used instead of the dropdown | none |
+| 1 | Sample Information | Input type | Raw samples (QC, CellTypist, Scrublet) · Existing AnnData or SpatialData table (as is) | Raw samples |
+| 2 | Sample Information | List of paths to samples | `.h5`/`.h5ad` files, AnnData/SpatialData `.zarr` folders, folders of them, or globs | `/data/samples` |
+| 3 | Output Storage | Storage Location | an icechunk repo (data asset, local path, `s3://bucket/prefix`) or a plain zarr folder; created when missing (see below) | `s3://bucket/prefix` (a placeholder to replace) |
+| 4 | Output Storage | Origin of s3 (optional) | the writable `s3://` prefix behind a read-only icechunk data asset | none |
+| 5 | Output Storage | New store format | a new store's kind: Auto (a `.zarr` path is a plain zarr, else icechunk) · Icechunk · Zarr; an existing store keeps its kind | Auto |
+| 6 | Run params | Celltypist Model (raw samples only) | AIFI L1, L2, L3 · AIFI L1 only · Immune_All High and Low · None | AIFI L1, L2, L3 |
+| 7 | Run params | Custom Celltypist model (optional, raw samples only) | `.pkl` file(s), comma-separated, used instead of the dropdown | none |
 
-A **Reproducible Run** therefore ingests every sample in `/data/samples` into a new icechunk store
-at `/results/ingest_icechunk`.
+The default **Storage Location**, `s3://bucket/prefix`, is a placeholder: replace it with your own
+S3 prefix (attach an AWS secret with write access) or a `/results/<name>` path, or the run stops at the store.
 
 **Samples** are separated by commas, semicolons or newlines; quotes, brackets, spaces and trailing
 slashes are ignored, so `/data/samples/, /data/x.h5ad` and `["/data/samples", "/data/x.h5ad"]` mean
@@ -246,6 +250,10 @@ model, anything else the samples.
   one. Set `CREATE=true` to create elsewhere.
   - Creation refuses a folder that holds other files. A local folder holding a plain zarr group
     is appended as a plain zarr even without the `.zarr` suffix; a `.h5`/`.h5ad` file is refused.
+  - **New store format** (`STORE_FORMAT`) picks the kind of a new store: Auto (default) makes a
+    `.zarr` path a plain zarr and anything else icechunk; Icechunk or Zarr override the suffix.
+    Zarr on an `s3://` path is refused. An existing store keeps its kind and the run warns that
+    the setting was ignored.
 - **Appending drops results built for the old cells:** embeddings, graphs and layers (`obsm`,
   `obsp`, `layers`), `raw` and `uns/process`, with a warning, recorded in the commit metadata as
   `dropped`. On icechunk they stay in the store's history; on a plain zarr they're gone.
@@ -263,7 +271,7 @@ Every setting is an environment variable named after its field in `config.Settin
 
 ```bash
 cd code/ingest
-python main.py /scratch/atlas "" "Raw samples (QC, CellTypist, Scrublet)" /data/samples "Only AIFI L1 celltypes" ""  # panel order: icechunk
+python main.py "Raw samples (QC, CellTypist, Scrublet)" /data/samples /scratch/atlas "" Icechunk "Only AIFI L1 celltypes" ""  # panel order
 python main.py --samples /data/samples --store /scratch/atlas.zarr               # or flags: plain zarr
 python -m pytest tests                                                         # ~4 min, synthetic data
 ```
