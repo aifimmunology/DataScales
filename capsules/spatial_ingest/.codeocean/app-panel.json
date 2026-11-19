@@ -26,7 +26,7 @@
 			"category": "wSeSzj9xFi8wEAAx",
 			"name": "Storage Location",
 			"description": "A SpatialData .zarr (local path or s3://bucket/prefix) the samples are added to. If it doesn't exist, it is created at an s3:// prefix you can write to, or at a .zarr path inside /results or /scratch (e.g. /results/spatialdata.zarr).",
-			"help_text": "A store you will keep adding to belongs on S3 (it is copied to /scratch, grown there and synced back). /results is a one-off build: saved as a data asset it is read-only. /scratch is cleared when the run ends. /data is read-only. One run per store at a time.",
+			"help_text": "A store you will keep adding to belongs on S3 (it is copied to /scratch, grown there and synced back); S3 needs an AWS secret with write access to the bucket attached to the capsule. /results is a one-off build: saved as a data asset it is read-only. /scratch is cleared when the run ends (quick tests only). /data is read-only. One run per store at a time.",
 			"type": "text",
 			"value_type": "string",
 			"default_value": "/results/spatialdata.zarr",

@@ -1,17 +1,4 @@
-"""Grow one SpatialData `.zarr` from Xenium/Atera bundles and existing SpatialData objects (spec §3S).
-
-Per run:
-1. open the store (local, or a working copy of an S3 store) and repair what a killed run left;
-2. precheck: find every sample in the inputs (kinds detected from their files), check what each new
-   sample needs before anything is written, and report (precheck.py);
-3. create the store, only now that there is something to add;
-4. one sample at a time: read it (lazy elements, counts streamed to scratch), prepare it (renamed
-   elements, its table with QC and labels, written chunk-wise), refuse cells already in the store,
-   install its elements and table (one consolidate = present), append its rows to the joint table
-   (gene and obs union; consolidate again);
-5. verify the store, sync it back to S3, write the run JSON and summary CSV, clear scratch.
-
-A failure keeps every sample finished before it (repaired, verified, synced)."""
+"""Grows one SpatialData .zarr from Xenium/Atera bundles and existing SpatialData objects, one sample at a time."""
 from __future__ import annotations
 
 import json
@@ -28,68 +15,74 @@ from pathlib import Path
 import pandas as pd
 import zarr
 
-import annotate
-import discover
-import existing
-import genes
-import inventory
-import joint
-import layout
-import logs
-import precheck
-import readers
-import s3
-import sample as prep
+import config
+import inputs
+import prepare
 import store as stores
-from config import ConfigError, Settings, load_settings
-from contracts import NAMES, Plan, Sample
-from logs import block
-from precheck import IngestError
+from config import NAMES, Plan, Sample, Settings, UserError, block, load_settings
+from prepare import IngestError
 
 logger = logging.getLogger("spatial_ingest")
 
+USAGE = """\
+spatial_ingest adds Xenium and Atera bundles and SpatialData objects to one SpatialData .zarr (the store), with
+a joint single-cell table of every sample's cells.
+
+No samples were found, so nothing ran: List of paths to samples is empty or left at {default}, and
+{default} doesn't exist ({data}).
+
+To run it, attach your data as a data asset, open the App Panel, fill in List of paths to samples (e.g.
+/data/<your data asset>) and Storage Location (/results/spatialdata.zarr for a one-off store; an s3:// prefix,
+with an AWS secret attached, for a store you keep adding to), and press Run. A Reproducible Run adds the
+samples of a data asset mounted at {default}. See code/README.md, "Quick start"."""
 REFRESHED = {"/scratch": "is cleared when the run ends",
              "/results": "belongs to this run: saved as a data asset it is read-only, so later runs can't add to it"}
 SUMMARY_COLUMNS = ["sample_id", "kind", "source", "status", "n_cells", "genes_in_panel", "genes_shared",
                    "genes_added", "celltypist_genes_shared", "mean_genes", "mean_total_counts",
-                   "n_celltypist_labels", "n_cells_without_position", "seconds", "error"]
-
-
-def _module_errors(*modules) -> list[type[Exception]]:
-    """The `…Error` classes a module defines (its user-facing errors)."""
-    return [v for module in modules for k, v in vars(module).items()
-            if k.endswith("Error") and isinstance(v, type) and issubclass(v, Exception)
-            and v.__module__ == module.__name__]
-
-
-# Errors that describe the inputs, the settings or the store: one line in the log, exit code 1.
-USER_ERRORS = tuple(dict.fromkeys([
-    IngestError, ConfigError, discover.InputError, existing.SplitError, genes.PanelError, joint.JointError,
-    stores.StoreError, s3.S3Error, annotate.AnnotateError, *_module_errors(prep, readers, inventory)]))
+                   "n_celltypist_cell_types", "n_cells_zero_counts", "n_cells_without_position", "seconds",
+                   "note", "error"]
+TOTALS = {"n_samples": None, "n_cells": None, "n_elements": None}
 
 
 @dataclass
 class Run:
     """What a run did, for the outputs."""
     settings: Settings
-    local: Path
+    local: Path | None = None
     started: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     repairs: list[str] = field(default_factory=list)
     rows: list[dict] = field(default_factory=list)
-    fitted: dict[str, str] = field(default_factory=dict)
+    gene_notes: dict[str, str] = field(default_factory=dict)
     left_out: list[dict] = field(default_factory=list)
     union_genes: int = 0
+    totals: dict = field(default_factory=lambda: dict(TOTALS))
     synced: dict | None = None
     downloaded: dict = field(default_factory=dict)
     created: bool = False
     written: set[str] = field(default_factory=set)      # kind/name of what this run installed (verified in full)
     failed: list[str] = field(default_factory=list)     # one line per sample that failed and was rolled back
+    error: str | None = None
 
 
-# ---------------------------------------------------------------- the store
+def no_samples(settings: Settings) -> bool:
+    """The samples list was left at /data/samples and that folder doesn't exist."""
+    return settings.default_samples and not Path(config.DEFAULT_SAMPLES).exists()
+
+
+def usage() -> str:
+    data = config.DATA_DIR
+    held = sorted(p.name for p in data.iterdir())[:20] if data.is_dir() else []
+    where = f"{data} holds: {', '.join(held)}" if held else f"{data} is empty: no data asset is attached"
+    return USAGE.format(default=config.DEFAULT_SAMPLES, data=where)
+
+
+def one_line(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    return text if isinstance(exc, UserError) else f"{type(exc).__name__}: {text}"
+
 
 def storage_notice(location: str) -> tuple[int, str] | None:
-    """(level, text) about a store that won't last: a WARNING under /scratch (deleted), INFO under /results."""
+    """(level, text) about a store that won't last past the run."""
     if "://" in location:
         return None
     path = Path(location).resolve()
@@ -102,7 +95,6 @@ def storage_notice(location: str) -> tuple[int, str] | None:
 
 
 def no_store_here(settings: Settings, local: Path) -> IngestError:
-    """Why a missing local store can't be created at `local`, and where to put it instead."""
     roots = settings.create_root_list()
     if local.resolve() in roots:
         return IngestError(f"{local} is a folder for stores, not a store: give a .zarr path inside it, e.g. "
@@ -116,9 +108,7 @@ def no_store_here(settings: Settings, local: Path) -> IngestError:
 
 
 def open_store(settings: Settings) -> tuple[Path, bool, dict]:
-    """The local path the run works on (the store itself, or a fresh copy of the S3 store in scratch),
-    whether the store must still be created, and the S3 copy's file stats. A new store is only
-    created once a sample is ready to go in, so a run refused early leaves nothing behind."""
+    """The local store path (or a copy of the S3 store), whether it must be created, and the copy's file stats."""
     if not settings.remote:
         if not Path(settings.store).is_absolute():
             raise IngestError(f"Storage Location {settings.store!r} must be an absolute path (e.g. "
@@ -134,8 +124,8 @@ def open_store(settings: Settings) -> tuple[Path, bool, dict]:
         if fresh and local.suffix != ".zarr":
             logger.info("The new store %s has no .zarr extension; it is a SpatialData .zarr all the same.", local)
         return local, fresh, {}
-    meta = s3.root_meta(settings.store)
-    local = Path(settings.scratch_dir) / "store" / (s3.split(settings.store)[1].rsplit("/", 1)[-1] or "store.zarr")
+    meta = stores.root_meta(settings.store, settings.s3_lock_stale_minutes)
+    local = settings.work_dir / "store" / (stores.split(settings.store)[1].rsplit("/", 1)[-1] or "store.zarr")
     shutil.rmtree(local, ignore_errors=True)
     if meta is None:
         return local, True, {}
@@ -145,29 +135,25 @@ def open_store(settings: Settings) -> tuple[Path, bool, dict]:
     kind = stores.kind_of(meta)
     if kind != "ours":
         stores.refuse(settings.store, kind, True)
-    return local, False, s3.download(settings.store, local, settings.s3_workers)
+    return local, False, stores.download(settings.store, local, settings.s3_workers)
 
 
 def table_path(local: Path, sid: str) -> Path:
-    return local / "tables" / layout.table_name(sid)
+    return local / "tables" / stores.table_name(sid)
 
 
 def sample_sizes(local: Path, sids: list[str]) -> dict[str, int]:
-    """Cells per sample, from the per-sample tables' obs index alone."""
-    return {sid: stores.n_obs(zarr.open_group(table_path(local, sid), mode="r")) for sid in sids}
+    return {sid: inputs.n_obs(zarr.open_group(table_path(local, sid), mode="r")) for sid in sids}
 
 
 def repair(local: Path, settings: Settings) -> list[str]:
-    """Removes what a killed run left (staging, uncommitted element folders), then `joint.repair`: the
-    joint table rebuilt from the per-sample tables when inconsistent or unreadable, present samples
-    missing from it appended, and a present sample that can't be appended taken out of the store
-    (quarantined, one warning) so no store is left failing every run. Consolidates."""
+    """Removes what a killed run left and brings the joint table in line with the per-sample tables."""
     actions = stores.remove_uncommitted(local)
     for action in actions:
         logger.warning("Repair: %s", action)
-    present = precheck.present_samples(local)
-    models = {sid: str(record.get("celltypist_model", "")) for sid, record in precheck.records(local, present).items()}
-    joint_actions = joint.repair(local, present, stores.staging(local), settings.write_cpus, models)
+    present = prepare.present_samples(local)
+    models = {sid: str(record.get("celltypist_model", "")) for sid, record in prepare.records(local, present).items()}
+    joint_actions = stores.repair_joint(local, present, stores.staging(local), settings.write_cpus, models)
     for action in joint_actions:
         logger.warning("Repair: %s", action)
     shutil.rmtree(local / stores.STAGING, ignore_errors=True)
@@ -175,11 +161,7 @@ def repair(local: Path, settings: Settings) -> list[str]:
     return actions + list(joint_actions)
 
 
-# ---------------------------------------------------------------- one sample
-
 def roll_back(local: Path, sid: str, settings: Settings) -> None:
-    """Takes a sample whose joint rows failed back out of the store (elements and table), and repairs
-    the joint table, so the store is as it was before the sample."""
     shutil.rmtree(local / stores.STAGING, ignore_errors=True)
     stores.uninstall_sample(local, sid)
     stores.consolidate(local)
@@ -188,57 +170,56 @@ def roll_back(local: Path, sid: str, settings: Settings) -> None:
 
 def add_sample(local: Path, item: Sample, settings: Settings, model: Path | None,
                seen: dict[str, str], written: set[str]) -> tuple[dict, str]:
-    """One sample into the store: read, prepared (its table staged on scratch), skipped with one warning
-    when its cells are already in the store under another ID (`seen`: fingerprint -> sample ID; e.g. a
-    bundle and a SpatialData object made from it in one run), installed (present at the next
-    consolidate), then its rows appended to the joint table. The joint rows are checked before the
-    install; if the append still fails, the sample is rolled back out of the store. `written` collects
-    the `kind/name` of every element and table installed (verify reads those in full).
-    Returns (summary row, fit note)."""
+    """Reads, prepares and installs one sample, then appends its rows to the joint table."""
     started = time.monotonic()
-    scratch = Path(settings.scratch_dir)
-    loaded = readers.load(item, scratch, settings.n_jobs)
+    scratch = settings.work_dir
+    loaded = prepare.load(item, scratch)
     if loaded.table.n_obs == 0:
         logger.warning("%s has no cells; skipped.", item.sid)
         return {"status": "skipped (no cells)", "n_cells": 0}, ""
-    prepared = prep.prepare(loaded, item, model, scratch)
+    prepared = prepare.prepare(loaded, item, model, scratch)
     if prepared.fingerprint in seen:
         other = seen[prepared.fingerprint]
         logger.warning("%s holds the same cells as %s, which is already in the store; %s is skipped (leave it out "
                        "of the inputs to avoid this).", item.sid, other, item.sid)
         shutil.rmtree(prepared.table_path, ignore_errors=True)
         return {"status": f"skipped (same cells as {other})", "n_cells": prepared.stats.get("n_cells")}, ""
-    joint.check_rows(local, item.sid, prepared.table_path)     # what joint.add would refuse, before any write
+    stores.check_joint_rows(local, item.sid, prepared.table_path)  # what add_joint_rows would refuse, before any write
     written.update(stores.install_sample(local, prepared))
     stores.consolidate(local)
     try:
-        note = joint.add(local, item.sid, table_path(local, item.sid), stores.staging(local), settings.write_cpus,
-                         model.stem if model else "")
+        note = stores.add_joint_rows(local, item.sid, table_path(local, item.sid), stores.staging(local),
+                                     settings.write_cpus, model.stem if model else "")
     except BaseException:
         roll_back(local, item.sid, settings)
         raise
     stores.consolidate(local)
     seen[prepared.fingerprint] = item.sid
     stats = prepared.stats
-    row = {"status": "appended", "n_cells": stats.get("n_cells"), "mean_genes": stats.get("mean_genes"),
-           "mean_total_counts": stats.get("mean_total_counts"),
-           "n_celltypist_labels": stats.get("n_celltypist_labels", 0),
+    row = {"status": "appended", "n_cells": stats.get("n_cells"), "mean_genes": tenth(stats.get("mean_genes")),
+           "mean_total_counts": tenth(stats.get("mean_total_counts")),
+           "n_celltypist_cell_types": stats.get("n_celltypist_labels", 0),
+           "n_cells_zero_counts": stats.get("n_cells_zero_counts", 0),
            "n_cells_without_position": stats.get("n_cells_without_position", 0),
            "seconds": round(time.monotonic() - started, 1)}
     logger.info("%s: added, %s cells (%s s)", item.sid, row["n_cells"], row["seconds"])
     return row, note or ""
 
 
+def tenth(value: float | None) -> float | None:
+    return None if value is None else round(float(value), 1)
+
+
 def release(scratch: Path, item: Sample, rest: list[Sample]) -> None:
-    """Deletes what was staged for `item`'s input once no later sample comes from the same input."""
+    """Deletes what was staged for `item`'s input once no later sample comes from it."""
     if any(s.candidate.sid == item.candidate.sid for s in rest):
         return
-    shutil.rmtree(scratch / precheck.STAGE / item.candidate.sid, ignore_errors=True)
+    shutil.rmtree(inputs.stage_dir(scratch, item.candidate.sid), ignore_errors=True)
 
 
 def clear_scratch(settings: Settings, local: Path) -> None:
-    """Deletes the run's scratch files, keeping the S3 working copy (scratch/store) and the store itself."""
-    scratch = Path(settings.scratch_dir)
+    """Deletes the run's scratch files, keeping the S3 working copy and a store inside that folder."""
+    scratch = settings.work_dir
     if not scratch.is_dir():
         return
     for child in scratch.iterdir():
@@ -250,14 +231,8 @@ def clear_scratch(settings: Settings, local: Path) -> None:
             child.unlink(missing_ok=True)
 
 
-# ---------------------------------------------------------------- verify and outputs
-
 def verify(local: Path, written: set[str]) -> dict:
-    """Checks the store without loading what earlier runs wrote: every element folder is committed and
-    every committed one is there with readable metadata, names are unique ignoring case (spatialdata
-    refuses case variants), the elements this run wrote (`written`: `kind/name`) read back in full,
-    every table opens (metadata and obs, `stores.verify_tables`), and the joint table holds every
-    sample's cells. Memory doesn't grow with the store."""
+    """Checks the store without loading what earlier runs wrote."""
     listed, found = stores.committed(local), stores.on_disk(local)
     for kind in stores.KINDS:
         if listed[kind] != found[kind]:
@@ -272,15 +247,15 @@ def verify(local: Path, written: set[str]) -> dict:
             names[name.lower()] = f"{kind}/{name}"
             if kind != "tables" and not (local / kind / name / "zarr.json").is_file():
                 raise IngestError(f"Verification failed: {kind}/{name} has no zarr.json.")
-    mine = {tuple(w.split("/", 1)) for w in written if w.split("/", 1)[0] in existing.ELEMENT_KINDS}
+    mine = {tuple(w.split("/", 1)) for w in written if w.split("/", 1)[0] in stores.ELEMENT_KINDS}
     if mine:
-        _, unreadable = existing.read_elements(local, mine)
+        _, unreadable = prepare.read_elements(local, mine)
         if unreadable:
             raise IngestError("Verification failed: " + "; ".join(f"{k}: {v}" for k, v in unreadable.items()))
     stores.verify_tables(local)
-    present = precheck.present_samples(local)
+    present = prepare.present_samples(local)
     sizes = sample_sizes(local, present)
-    counts = joint.sample_counts(local) if present else {}
+    counts = stores.sample_counts(local) if present else {}
     held = {str(k): int(v) for k, v in counts.items()} if counts is not None else None
     if held != sizes:
         raise IngestError(f"Verification failed: the joint table's cells per sample {held} differ from the "
@@ -302,11 +277,14 @@ def versions() -> dict:
     return out
 
 
-def write_results(run: Run, totals: dict) -> dict:
+def write_results(run: Run) -> dict:
     settings = run.settings
+    local = run.local if run.local is not None and run.local.is_dir() else None
     report = {
+        "status": "failed" if run.error else "succeeded",
+        "error": run.error,
         "store": settings.store,
-        "local_copy": str(run.local) if settings.remote else None,
+        "local_copy": str(run.local) if settings.remote and run.local else None,
         "repairs": run.repairs,
         "appended_samples": [r["sample_id"] for r in run.rows if r["status"] == "appended"],
         "failed_samples": {r["sample_id"]: r.get("error") for r in run.rows if r["status"] == "failed"},
@@ -316,9 +294,9 @@ def write_results(run: Run, totals: dict) -> dict:
         "kinds": {r["sample_id"]: r["kind"] for r in run.rows if r.get("kind")},
         "left_out": run.left_out,
         "joint_genes": run.union_genes,
-        "fitted": run.fitted,
-        **totals,
-        "store_size_gb": round(store_size(run.local) / 1024**3, 3),
+        "gene_notes": run.gene_notes,
+        **run.totals,
+        "store_size_gb": round(store_size(local) / 1024**3, 3) if local else None,
         "s3_sync": run.synced,
         "versions": versions(),
         "started": run.started,
@@ -333,37 +311,31 @@ def write_results(run: Run, totals: dict) -> dict:
     return report
 
 
-def finish(state: Run) -> dict:
-    """Verifies the store, syncs it back to S3, and writes the outputs."""
+def finish(state: Run) -> None:
     shutil.rmtree(state.local / stores.STAGING, ignore_errors=True)
-    totals = verify(state.local, state.written)
+    state.totals = verify(state.local, state.written)
     if state.settings.remote:
-        state.synced = s3.sync(state.local, state.settings.store, state.settings.s3_workers, state.downloaded)
-    return write_results(state, totals)
+        state.synced = stores.sync(state.local, state.settings.store, state.settings.s3_workers, state.downloaded)
 
-
-# ---------------------------------------------------------------- the run
 
 def plural(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
 def add_all(state: Run, plan: Plan, model: Path | None) -> None:
-    """Adds the plan's samples in order. A sample that fails is rolled back out of the store and noted
-    (`state.failed`); the run goes on with the others. Raises only when the store itself can't be
-    brought back to a consistent state."""
+    """A sample that fails is rolled back and noted; the run goes on with the others."""
     settings, local = state.settings, state.local
-    scratch = Path(settings.scratch_dir)
-    records = {} if state.created else precheck.records(local, precheck.present_samples(local))
+    scratch = settings.work_dir
+    records = {} if state.created else prepare.records(local, prepare.present_samples(local))
     seen = {r["fingerprint"]: sid for sid, r in records.items() if r.get("fingerprint")}
     for i, item in enumerate(plan.samples):
-        where = f"{item.sid} ({precheck.source(item)})"
-        base = {"sample_id": item.sid, "kind": item.kind, "source": precheck.source(item),
+        where = f"{item.sid} ({prepare.source(item)})"
+        base = {"sample_id": item.sid, "kind": item.kind, "source": prepare.source(item),
                 **{k: v for k, v in plan.panels.get(item.sid, {}).items() if k in SUMMARY_COLUMNS}}
         try:
             row, note = add_sample(local, item, settings, model, seen, state.written)
         except Exception as exc:
-            if isinstance(exc, USER_ERRORS):
+            if isinstance(exc, UserError):
                 message = " ".join(str(exc).split())
                 logger.error("%s failed and was left out: %s", where, message)
             else:
@@ -378,48 +350,68 @@ def add_all(state: Run, plan: Plan, model: Path | None) -> None:
             state.rows.append({**base, "status": "failed", "error": message})
             continue
         finally:
-            readers.close(item.sid)           # lazy elements' file handles, before their staged files go
+            prepare.close(item.sid)           # lazy elements' file handles, before their staged files go
             release(scratch, item, plan.samples[i + 1:])
         if note:
-            state.fitted[item.sid] = note
+            state.gene_notes[item.sid] = note
         state.rows.append({**base, **row})
 
 
 def take_locks(settings: Settings, stack: ExitStack) -> None:
-    """One run per store: an S3 lock object (before the download), released when the run ends."""
     if settings.remote:
-        stack.callback(s3.release_lock, s3.acquire_lock(settings.store))
+        stack.callback(stores.release_s3_lock, stores.acquire_s3_lock(settings.store, settings.s3_lock_stale_minutes))
 
 
 def run(settings: Settings) -> dict:
-    model = settings.model_file()
-    if model is not None:
-        annotate.load_model(model)
-    with ExitStack() as stack:
-        take_locks(settings, stack)
-        local, fresh, downloaded = open_store(settings)
-        if not settings.remote:
-            stack.callback(stores.release_lock, stores.acquire_lock(local))
-        clear_scratch(settings, local)          # what a killed earlier run left
-        stack.callback(clear_scratch, settings, local)
-        return run_locked(settings, model, local, fresh, downloaded)
+    """The run; the run JSON and summary CSV are written also when it fails."""
+    state = Run(settings)
+    try:
+        model = settings.model_file()
+        if model is not None:
+            prepare.load_model(model)
+        with ExitStack() as stack:
+            take_locks(settings, stack)
+            state.local, fresh, state.downloaded = open_store(settings)
+            if not settings.remote:
+                stack.callback(stores.release_lock, stores.acquire_lock(state.local))
+            clear_scratch(settings, state.local)          # what a killed earlier run left
+            stack.callback(clear_scratch, settings, state.local)
+            run_locked(state, model, fresh)
+    except BaseException as exc:
+        state.error = one_line(exc)
+        try:
+            write_results(state)
+        except Exception as again:
+            logger.error("The run JSON couldn't be written either: %s", one_line(again))
+        raise
+    return write_results(state)
 
 
-def run_locked(settings: Settings, model: Path | None, local: Path, fresh: bool, downloaded: dict) -> dict:
-    """The run, holding the store's lock: repair, precheck, create, add, verify/sync, outputs."""
+def summary_rows(state: Run, plan: Plan, fresh: bool) -> None:
+    recorded = prepare.records(state.local, plan.present) if plan.present else {}
+    for sid in plan.present:
+        given = plan.panels.get(sid, {}).get("source")
+        stored = recorded.get(sid, {}).get("source") or given
+        state.rows.append({"sample_id": sid, "kind": plan.panels.get(sid, {}).get("kind"), "source": stored,
+                           "status": "skipped (present)",
+                           "note": f"this run's input: {given}" if given and given != stored else None})
+    panels = [plan.panels[s.sid] for s in plan.samples if "genes_shared" in plan.panels.get(s.sid, {})]
+    if fresh and len(panels) == 1:
+        panels[0]["genes_shared"] = 0
+
+
+def run_locked(state: Run, model: Path | None, fresh: bool) -> None:
+    settings, local = state.settings, state.local
     logger.info("Store %s%s", settings.store, f" (working copy {local})" if settings.remote else "")
-    state = Run(settings, local, downloaded=downloaded)
     if not fresh:
         state.repairs = repair(local, settings)
-    plan = precheck.run(settings, local, fresh, model, Path(settings.scratch_dir))
+    plan = prepare.precheck(settings, local, fresh, model, settings.work_dir)
     notice = storage_notice(settings.store)
     if notice and (plan.samples or not fresh):
         logger.log(*notice)
     state.left_out = [{"path": x.path, "reason": x.reason} for x in plan.left_out]
     state.union_genes = len(plan.union_genes)
-    state.rows += [{"sample_id": sid, "kind": plan.panels.get(sid, {}).get("kind"),
-                    "source": plan.panels.get(sid, {}).get("source"), "status": "skipped (present)"}
-                   for sid in plan.present]
+    summary_rows(state, plan, fresh)
     if fresh:
         if not plan.samples:
             raise IngestError(f"There is no store at {settings.store} yet and nothing new to add to one.")
@@ -429,24 +421,28 @@ def run_locked(settings: Settings, model: Path | None, local: Path, fresh: bool,
     if state.created and not stores.committed(local)["tables"]:
         shutil.rmtree(local, ignore_errors=True)   # every sample failed: leave no empty store behind
         raise IngestError(block("Every sample failed, so no store was created:", state.failed))
-    report = finish(state)
+    finish(state)
     added = pd.Series([NAMES.get(r["kind"], r["kind"]) for r in state.rows if r["status"] == "appended"],
                       dtype=object).value_counts()
-    logger.info("Done: %s holds %d cells from %s; this run added %s.", settings.store, report["n_cells"],
-                plural(report["n_samples"], "sample"), ", ".join(plural(n, k) for k, n in added.items()) or "nothing")
+    logger.info("Done: %s holds %d cells from %s; this run added %s.", settings.store, state.totals["n_cells"],
+                plural(state.totals["n_samples"], "sample"),
+                ", ".join(plural(n, k) for k, n in added.items()) or "nothing")
     if state.failed:
         synced = " and synced" if settings.remote else ""
         were = "was" if len(state.failed) == 1 else "were"
         raise IngestError(block(f"{plural(len(state.failed), 'sample')} failed and {were} left out; the others are "
                                 f"in the store{synced}. Fix these and run again:", state.failed))
-    return report
 
 
 def main(argv: list[str] | None = None) -> int:
-    logs.setup()
+    config.setup_logging()
     try:
-        run(load_settings(argv))
-    except USER_ERRORS as exc:
+        settings = load_settings(argv)
+        if no_samples(settings):
+            logger.info("%s", usage())
+            return 0
+        run(settings)
+    except UserError as exc:
         logger.error("%s", exc)
         return 1
     return 0

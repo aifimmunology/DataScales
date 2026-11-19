@@ -33,14 +33,14 @@ The capsule is in `capsules/spatial_ingest/`; its `code/README.md` documents it 
   - **CellTypist:** the joint schema takes its model from that record, never from obs columns; the `.pkl` is loaded before any sample is read.
   - **Failures:** a failing sample triggers repair, verification and, on S3, a sync of the samples finished before it.
   - **Repair** always ends with a consolidate.
-  - **Atera:** `morphology_3d` is read only when the bundle has it.
+  - **Atera:** `morphology_3d` is never read (see "3D z-stacks" in §3S.0).
   - **S3 sync** trusts files unchanged since the download (same size and mtime) without hashing them.
   - **Names:** a sample of several regions whose cell IDs repeat gets joint names `<sid>:<region>:<cell_id>`. Element-name collisions are checked across kinds.
 - **Second review pass:**
   - joint rows are built before a sample is written, so the joint table can't reject a committed sample;
   - S3 stores are judged from their root `zarr.json` before any download, folder-marker keys are skipped, and the working copy goes in `SCRATCH_DIR/store/`;
   - the fingerprint hashes the exact CSR counts.
-- **Tested:** 53 tests, about 3 min.
+- **Tested:** 42 unit tests, under a minute (2026-11-18: cut from 357 to a small suite like anndata_ingest's).
 - **Tested** (45 tests at first build):
   - synthetic single- and multi-sample objects;
   - SIGKILL at three points (an element write, the joint staging, the per-sample table rename), each repaired by the next run;
@@ -49,11 +49,20 @@ The capsule is in `capsules/spatial_ingest/`; its `code/README.md` documents it 
   - the joint table into `anndata_ingest`'s existing mode.
 - **Robustness rework (user decisions 2026-11-13, after 260 test cases on 83 public datasets):**
   - **No Input type:** the panel is Storage Location, List of paths to samples, Custom CellTypist `.pkl`. Each sample's kind (Xenium, Atera, SpatialData) is detected from its files; kinds mix in one run. Older 4-value calls and `INPUT_TYPE` are accepted, the input type ignored (INFO). `~` expanded, `.pkl` any case.
-  - **Discovery** (`discover.py`): archives (`.zip`, `.tar(.gz)`, `.tgz`) listed, not extracted; every bundle root at any depth is a sample; per-file prefixes (10x downloads, GEO `GSM…_`, `MB263-`) grouped one sample per prefix; GEO per-file `.gz` decompressed to scratch on demand (`stage.py`); old SpatialData layouts and `.zarr.zip`; junk ignored silently; anything else left out with one warning.
-  - **Precheck** (`precheck.py`) before any write: every bundle's inventory (essential: count matrix; cells table with IDs + x/y matching the matrix), every SpatialData split, species, duplicate IDs, CellTypist overlap (refuse below max(10, 5% of the model's genes), warn below 50%). Any problem stops the run with one message listing every sample's problem; optional parts missing are one warning line per sample.
+  - **Discovery** (`inputs.py`): archives (`.zip`, `.tar(.gz)`, `.tgz`) listed, not extracted; every bundle root at any depth is a sample; per-file prefixes (10x downloads, GEO `GSM…_`, `MB263-`) grouped one sample per prefix; GEO per-file `.gz` decompressed to scratch on demand; old SpatialData layouts and `.zarr.zip`; junk ignored silently; anything else left out with one warning.
+  - **Precheck** (`prepare.py`) before any write: every bundle's inventory (essential: count matrix; cells table with IDs + x/y matching the matrix), every SpatialData split, species, duplicate IDs, CellTypist overlap (refuse below max(10, 5% of the model's genes), warn below 50%). Any problem stops the run with one message listing every sample's problem; optional parts missing are one warning line per sample.
   - **Joint table = union** of genes and obs columns (supersedes §3S.1 "first sample's genes"): new genes extend var at the end; `var["n_samples_measured"]` and `uns/spatial_ingest/measured_genes/<sid>` tell measured zeros from filled ones; differing panels get one strong warning in the precheck.
   - **Out-of-core:** count matrices streamed to CSR zarr on scratch and processed in row chunks (QC, labels, fingerprint, joint append). Resource class: 64 GB ("large").
-  - **Logging** (`logs.py`): library noise silenced at its source; a clean run logs no WARNING line. celltypist is imported inside `warnings.catch_warnings()` (it disables UserWarning/FutureWarning/RuntimeWarning globally on import).
+  - **Logging** (`config.py`): library noise silenced at its source; a clean run logs no WARNING line. celltypist is imported inside `warnings.catch_warnings()` (it disables UserWarning/FutureWarning/RuntimeWarning globally on import).
+- **Modules (5, as anndata_ingest):** `main.py` (the run), `config.py` (settings, logging, records, `UserError`), `inputs.py` (discovery, staging, bundle inventory; count matrices and cells tables streamed to CSR on scratch, gene policy), `prepare.py` (precheck; reading a sample: SpatialData objects split per sample, lazy bundle elements; per-sample QC, CellTypist, table), `store.py` (local store, installs, repair, locks, element names; the joint table; S3 copy, sync and lock), `vendor/`. Imports flow one way: config ← inputs ← store ← prepare ← main.
+- **Release fixes (2026-11-16):**
+  - A Reproducible Run with no samples (List of paths left at `/data/samples`, which doesn't exist) logs usage and exits 0; a typed path that doesn't exist is still an error. Every missing input is reported in one error, with up to 3 close names from its folder.
+  - The run works in `<SCRATCH_DIR>/spatial_ingest/` (`SCRATCH_DIR` now defaults to `/scratch`) and clears only that folder; an S3 store's working copy is in its `store/`.
+  - The run JSON and summary CSV are written also when the run fails (`status`, one-line `error`). Run JSON: `fitted` renamed `gene_notes`. Summary: means to 1 decimal; `genes_shared` 0 for the only sample of a new store; `n_celltypist_labels` renamed `n_celltypist_cell_types`; `n_cells_zero_counts` added; a skipped present sample shows its recorded source, with this run's path in `note`.
+  - **2026-11-18:** 3D z-stacks are not stored (Xenium `morphology.ome.tif`, Atera `morphology_3d/`): they were about 2/3 of the store and 60% of the run time, and the 2D focus/mip image is what gets used. A z-stack that is a bundle's only image is stored as its max projection (`morphology_mip`). S3 lock stale limit 60 → 10 min so a run killed out of memory blocks the next one only briefly; the precheck warns when a sample has over 100k cells on a machine under 24 GB.
+  - `N_JOBS` removed (unused); `S3_LOCK_STALE_MINUTES` is a `Settings` field.
+  - Repair takes a sample out of the store only on data errors; I/O errors stop the run. The precheck matches genes by gene_id (Ensembl versions stripped), as the joint table does, and logs an INFO line per sample for symbols split by gene_id. Colliding SpatialData IDs get the object prefix in any input order. The joint X dtype is at least 32-bit. S3 errors are one line (access denied: attach an AWS secret); an empty prefix (a whole bucket) is refused; the S3 lock heartbeat survives transient errors. `pct_counts_mt` is NaN when a panel has no mitochondrial genes. The panel-difference warning is reworded (still a WARNING); the mixed-species message names the odd sample.
+  - Tests: the app panel against `config.PANEL`, and an import canary for the private APIs of pinned libraries (`tests/test_run.py`).
 
 ### 3S.1 Decisions (user, 2026-11-05)
 - **Store:** always a plain SpatialData `.zarr`, never icechunk (§3S.2). The Storage Location is a local path (written or grown in place) or an `s3://` prefix (copied to `/scratch`, grown there, synced back; §3S.6).
@@ -106,23 +115,23 @@ Fields, passed positionally in this order (as `anndata_ingest` §3.2 in `../annd
 2. **Input type** (dropdown, default the first): `Xenium bundle (folder or .zip)` · `Atera bundle (folder or .zip)` · `Existing SpatialData (.zarr)`. One type per run; run again for another type into the same store.
 3. **Samples** (text, default `/data/samples`): bundle folders, bundle `.zip` files, SpatialData `.zarr` folders, folders holding them, or globs, comma/semicolon/newline separated (`anndata_ingest`'s `split_list`). A folder that is itself a bundle (has `experiment.xenium` for Xenium, `experiment.spatial` for Atera) is one sample; otherwise its direct children are the samples (not recursive).
 4. **Custom CellTypist model** (optional `.pkl` file): labels added to every new sample; empty = no labels.
-- Every other setting is an environment variable named after its `Settings` field in upper case (`CREATE`, `SCRATCH_DIR`, `N_JOBS`).
+- Every other setting is an environment variable named after its `Settings` field in upper case (`CREATE`, `SCRATCH_DIR`, `WRITE_CPUS`).
 - No `origin` field: there is no icechunk, and a data-asset mount of a plain zarr is read-only; S3 is given directly.
 
 ### 3S.6 Store location
 - **Local path:** written in place. Writability is probed as in `../CLAUDE.md` §2.1 (`.write_probe`); a read-only mount is refused before any work. A path in `/results` gets the same warning as `anndata_ingest` (one-off build; can't be appended to after it becomes a data asset).
 - **`s3://` prefix**, per run:
-  1. If the prefix holds a root `zarr.json`, copy the whole store to `/scratch/spatial_ingest/<store name>` (boto3, parallel); none = a new store, created there.
+  1. If the prefix holds a root `zarr.json`, copy the whole store to `<SCRATCH_DIR>/spatial_ingest/store/<store name>` (boto3, parallel); none = a new store, created there.
   2. Run every step below on that local copy.
   3. Sync back as `s3sync.py` does: upload new and changed files (compared by S3 ETag, computing the multipart ETag with boto3's 8 MiB part size), delete remote keys no longer present locally, the root `zarr.json` last, so a reader never sees new consolidated metadata before its files. A run that fails before the sync leaves S3 unchanged.
   - `/scratch` needs room for the whole store plus the new samples (and extracted zips). Copying only the `zarr.json` files and `tables/` is a possible later saving; not in v1.
-  - No locking: one run per store at a time (stated in the README and panel help).
+  - **Locks** (one run per store): a local store has a lock file beside it (`.<name>.zarr.spatial_ingest_lock`, created exclusively), taken over when its pid is dead on the same host, or after 12 h from another host. An S3 store has a lock object `<prefix>/.spatial_ingest_lock` (conditional put) whose heartbeat the run refreshes, taken over after `S3_LOCK_STALE_MINUTES` (default 10; heartbeat every 2.5 min) without one. Before uploading, `sync` also checks that the root `zarr.json` is still the downloaded one.
 - **Growing a store across Code Ocean runs:** use S3. `/results` is cleared each run and a saved data asset is read-only, so a `/results` store is a single build; to continue it, copy it to S3 once and point later runs there.
 - **Refused:** an icechunk repo (`annizarr.Repo.exists`), an AnnData zarr, or a non-empty folder that isn't a SpatialData store.
 
 ### 3S.7 Reading inputs
 - **Xenium:** `spatialdata_io.xenium(path, n_jobs=N_JOBS)` with reader defaults.
-- **Atera:** the vendored reader `atera(path, morphology_3d_images=True)`.
+- **Atera:** the vendored reader `atera(path)`; 3D images are not read (2026-11-18).
   - Vendored as `code/spatial_ingest/vendor/atera.py` + `_atera_common.py` from `10XGenomics/spatialdata-io@738204de` (PR #426, unreviewed), with a `SOURCE.json` of the commit and file checksums. Imports rewritten to the package; nothing else changed except the fix below.
   - **`morphology_3d` fix:** the reader passes the same `image_models_kwargs` to 2D and 3D images, and the 3D parse fails (chunks of the wrong length, then scale factor 2 along `z`). The 3D call gets its own kwargs `{"chunks": (1, 1, 4096, 4096), "scale_factors": [{"z": 1, "y": 2, "x": 2}] * 2}` (verified on the tiny bundle: 3-level pyramid, `z` kept at 5).
   - X comes back as a dask array (int32); it is computed and converted to CSR.
@@ -140,7 +149,7 @@ Fields, passed positionally in this order (as `anndata_ingest` §3.2 in `../annd
   - X: raw counts, CSR, int64 `indptr`, the first sample's dtype (Xenium float32, Atera int32); later samples cast (counts must fit);
   - var: the first sample's symbols, `gene_ids`, `feature_types`;
   - `uns["spatial_ingest"]`: the gene panel's source sample and the CellTypist model, so a later run with a different model is refused, as in `anndata_ingest`.
-- **QC:** `scanpy.pp.calculate_qc_metrics(qc_vars=["mt"], percent_top=None, log1p=False)` per sample, mito = `MT-` prefix (`anndata_ingest`'s `contract.is_mito`). Spatial panels usually carry no mitochondrial genes, so `pct_counts_mt` is mostly 0; mouse `mt-` isn't matched (same as `anndata_ingest`).
+- **QC:** `scanpy.pp.calculate_qc_metrics(qc_vars=["mt"], percent_top=None, log1p=False)` per sample, mito = `MT-` prefix (`anndata_ingest`'s `contract.is_mito`). Spatial panels usually carry no mitochondrial genes. As built: `MT-` is matched in any case (so mouse `mt-` too), and `pct_counts_mt` is NaN when a panel has none.
 
 ### 3S.9 Presence, crash safety and repair
 - **Present:** a sample is present when `tables/<sid>_table` is in the root consolidated metadata. Present samples are skipped (logged), even with a different input type.

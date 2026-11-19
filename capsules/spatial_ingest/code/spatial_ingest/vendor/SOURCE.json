@@ -5,7 +5,7 @@
   "changes": [
     "imports of AteraKeys and _atera_common rewritten to this package",
     "atera(): the morphology_3d image gets MORPHOLOGY_3D_KWARGS instead of the 2D image_models_kwargs",
-    "OPENED registry: _tiled_imread's TiffFile and atera()'s cells ZipStore are recorded so spatial_ingest can close them after the elements are written (readers.close)"
+    "OPENED registry: _tiled_imread's TiffFile and atera()'s cells ZipStore are recorded so spatial_ingest can close them after the elements are written (readers.release)"
   ],
   "files": {
     "atera.py": {

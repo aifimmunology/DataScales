@@ -1,8 +1,4 @@
-"""Run settings: environment variables (the field names in upper case), overridden by app-panel values.
-
-The app panel has three fields: Storage Location, List of paths to samples, Custom CellTypist .pkl.
-What each sample is (Xenium, Atera, SpatialData) is detected from its files, so the old Input type
-field, still sent by saved panels and older scripts, is accepted and ignored with one INFO line."""
+"""Run settings from the environment and the app panel, logging, and the records passed between steps."""
 from __future__ import annotations
 
 import argparse
@@ -10,16 +6,23 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, fields, replace
+import warnings
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
+
+import pandas as pd
 
 logger = logging.getLogger("spatial_ingest.config")
 
+
+class UserError(Exception):
+    """A failure the user can fix: logged as one line, exit code 1."""
+
+
 PANEL = ("store", "samples", "celltypist_pkl")
 OLD_PANEL = ("store", "input_type", "samples", "celltypist_pkl")
-# Labels and short names of the removed Input type field.
+# Labels of the removed Input type field.
 OLD_INPUT_TYPES = ("Xenium bundle (folder or .zip)", "Atera bundle (folder or .zip)", "Existing SpatialData (.zarr)")
-OLD_INPUT_NAMES = ("xenium", "atera", "spatialdata", "existing")
 DATA_DIR = Path("/data")
 DEFAULT_SAMPLES = "/data/samples"
 _BOOLS = {"1": True, "true": True, "yes": True, "y": True, "on": True,
@@ -30,7 +33,7 @@ IGNORED_NOTE = ("The Input type setting ({value!r}) is no longer needed and is i
                 "detected from its files.")
 
 
-class ConfigError(ValueError):
+class ConfigError(UserError, ValueError):
     """A setting that can't be read as its type."""
 
 
@@ -41,17 +44,13 @@ def _key(text: str) -> str:
 _OLD_LABELS = {_key(label) for label in OLD_INPUT_TYPES}
 
 
-def is_old_input_type(text: str, short_names: bool = False) -> bool:
-    """A value of the removed Input type field: a panel label, or (when `short_names`) xenium/atera/…;
-    a bare short name in a positional value could be a relative path, so it only counts when asked."""
-    key = _key(text)
-    return key in _OLD_LABELS or (short_names and key in OLD_INPUT_NAMES)
+def is_old_input_type(text: str) -> bool:
+    """A label of the removed Input type field (a bare `xenium` could be a path, so it isn't one)."""
+    return _key(text) in _OLD_LABELS
 
 
 def unwrap(text: str) -> str:
-    """`text` without surrounding spaces, without quotes or brackets that wrap ALL of it (`"a b"`, `(x)`),
-    and without a stray opening or closing bracket or quote left by splitting a list (`["a"` -> a); a
-    bracket that belongs to a name (`tiny_atera (1)`) stays."""
+    """Strips spaces and wrapping quotes/brackets, and stray ones left by splitting a list."""
     text, previous = text.strip(), None
     while text != previous:
         previous = text
@@ -68,19 +67,12 @@ def unwrap(text: str) -> str:
     return text
 
 
-def _shown(value: str) -> str:
-    """A value as the user gave it, for messages."""
-    return unwrap(value)
-
-
 def split_list(raw: str) -> list[str]:
-    """Items of a comma, semicolon or newline separated list: spaces, and quotes or brackets that wrap the
-    whole list or a whole item, removed (`["a", "b"]` -> a, b); brackets inside a name are kept."""
+    """Items of a comma, semicolon or newline separated list."""
     return [item for item in (unwrap(part) for part in _LIST_SEP.split(raw)) if item]
 
 
 def clean_path(raw: str) -> str:
-    """A path value without quotes and a trailing `/`, with `~` expanded (s3:// URLs untouched)."""
     path = unwrap(raw)
     if path.startswith("~"):
         path = os.path.expanduser(path)
@@ -102,11 +94,11 @@ class Settings:
     sample_column: str = "sample_id"
     create: bool = False
     create_roots: str = "/results,/scratch"
-    scratch_dir: str = "/scratch/spatial_ingest"
+    scratch_dir: str = "/scratch"
     results_dir: str = "/results"
-    n_jobs: int = 4
     write_cpus: int = 8
     s3_workers: int = 16
+    s3_lock_stale_minutes: float = 10.0
 
     def __post_init__(self):
         object.__setattr__(self, "store", clean_path(self.store))
@@ -117,15 +109,17 @@ class Settings:
         return self.store.startswith("s3://")
 
     @property
+    def work_dir(self) -> Path:
+        return Path(self.scratch_dir) / "spatial_ingest"
+
+    @property
     def default_samples(self) -> bool:
-        """The samples list was left at its default (a Reproducible Run, or an empty panel field)."""
         return split_list(self.samples) == [DEFAULT_SAMPLES]
 
     def sample_entries(self) -> list[str]:
         return split_list(self.samples)
 
     def model_file(self) -> Path | None:
-        """The custom CellTypist model's path (`~` expanded, relative paths looked up under /data)."""
         if not self.celltypist_pkl:
             return None
         path = in_data(Path(self.celltypist_pkl))
@@ -138,8 +132,7 @@ class Settings:
         return [Path(r).resolve() for r in split_list(self.create_roots)]
 
     def may_create(self, location: str) -> bool:
-        """New stores go at an s3:// prefix, inside the create roots (not a root itself), or anywhere
-        when `create` allows it."""
+        """New stores go at an s3:// prefix, inside a create root (not the root itself), or anywhere with `create`."""
         if self.create or "://" in location:
             return True
         path = Path(location).resolve()
@@ -161,24 +154,18 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Add Xenium/Atera bundles and SpatialData objects to one SpatialData .zarr.")
     for name in (*PANEL, "create"):
         p.add_argument(f"--{name.replace('_', '-')}", dest=name)
-    p.add_argument("--input-type", dest="input_type", help=argparse.SUPPRESS)  # removed; accepted and ignored
+    p.add_argument("--input-type", dest="input_type", help=argparse.SUPPRESS)  # removed, still accepted
     return p
 
 
 def panel_values(values: list[str]) -> dict[str, str]:
-    """The app panel's positional values (store, samples, custom .pkl) as settings.
-
-    Four values are an older panel's call (store, input type, samples, .pkl): the input type is
-    ignored. Three values are the current panel, in order, unless the second is an old input-type
-    label. Code Ocean may leave out an empty optional value, which shifts the rest, so otherwise
-    each value after the store is placed by what it looks like: an old input-type label (ignored),
-    a .pkl (any case), or samples."""
+    """The app panel's positional values as settings; 4 values are the older panel with an input type."""
     if len(values) > len(OLD_PANEL):
         raise ConfigError(f"Expected at most {len(PANEL)} app-panel values ({', '.join(PANEL)}; an older panel's 4 "
                           f"with the input type are accepted too), got {len(values)}: {values}.")
     if len(values) == len(OLD_PANEL):
         if unwrap(values[1]):
-            logger.info(IGNORED_NOTE.format(value=_shown(values[1])))
+            logger.info(IGNORED_NOTE.format(value=unwrap(values[1])))
         return {name: value for name, value in zip(OLD_PANEL, values) if name != "input_type"}
     if len(values) == len(PANEL) and not is_old_input_type(unwrap(values[1])):
         return dict(zip(PANEL, values))
@@ -188,7 +175,7 @@ def panel_values(values: list[str]) -> dict[str, str]:
         if not text:
             continue
         if is_old_input_type(text):
-            logger.info(IGNORED_NOTE.format(value=_shown(value)))
+            logger.info(IGNORED_NOTE.format(value=text))
         elif text.lower().endswith(".pkl"):
             out["celltypist_pkl"] = value
         else:
@@ -199,7 +186,7 @@ def panel_values(values: list[str]) -> dict[str, str]:
 def load_settings(argv: list[str] | None = None, env: dict[str, str] | None = None) -> Settings:
     env = os.environ if env is None else env
     if env.get("INPUT_TYPE", "").strip():
-        logger.info(IGNORED_NOTE.format(value=_shown(env["INPUT_TYPE"])))
+        logger.info(IGNORED_NOTE.format(value=unwrap(env["INPUT_TYPE"])))
     from_env = {name: _cast(name, env[name.upper()]) for name in _TYPES if env.get(name.upper())}
     argv = sys.argv[1:] if argv is None else list(argv)
     args = panel_values(argv) if argv and not argv[0].startswith("--") else vars(parser().parse_args(argv))
@@ -209,3 +196,198 @@ def load_settings(argv: list[str] | None = None, env: dict[str, str] | None = No
     from_args = {name: _cast(name, value) for name, value in args.items()
                  if value not in (None, "") and unwrap(value)}
     return replace(Settings(), **{**from_env, **from_args})
+
+
+FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+DATEFMT = "%H:%M:%S"
+
+# Library loggers: their INFO chatter goes, real warnings stay unless listed at ERROR.
+LOGGER_LEVELS = {
+    "ome_zarr": logging.ERROR,                 # "no parent found for <Label>" is a WARNING there
+    "annizarr.ops._append": logging.ERROR,     # append notes, expected for every sample after the first
+    "annizarr": logging.WARNING,               # per-append progress lines (INFO)
+    "celltypist": logging.ERROR,               # progress lines per row chunk
+    "anndata": logging.WARNING,
+    "spatialdata": logging.WARNING,
+    "spatialdata_io": logging.WARNING,
+    "numcodecs": logging.WARNING,
+    "distributed": logging.WARNING,
+    "numba": logging.WARNING,
+    "matplotlib": logging.WARNING,
+    "PIL": logging.WARNING,
+    "fsspec": logging.WARNING,
+    "s3fs": logging.WARNING,
+    "botocore": logging.WARNING,
+    "boto3": logging.WARNING,
+    "urllib3": logging.WARNING,
+    "aiobotocore": logging.WARNING,
+    "asyncio": logging.WARNING,
+}
+
+# Python warnings that are noise here: (message regex, category, module regex).
+NOISE = (
+    (r"Object at .* is not recognized as a component of a Zarr hierarchy", "ZarrUserWarning", ""),
+    (r"Consolidated metadata is currently not part in the Zarr format 3 specification", "ZarrUserWarning", ""),
+    (r".*reading array from closed file", "UserWarning", ""),
+    (r".*The index of the dataframe is not monotonic increasing", "UserWarning", ""),
+    (r"SpatialData is not stored in the most current format", "UserWarning", ""),
+    (r"`?__version__`? is deprecated", "FutureWarning", ""),
+    (r"Some cells have zero counts", "UserWarning", ""),
+    (r"", "FutureWarning", r"(celltypist|scanpy)(\.|$)"),
+)
+
+
+def _category(name: str) -> type[Warning]:
+    if name == "ZarrUserWarning":
+        try:
+            from zarr.errors import ZarrUserWarning
+            return ZarrUserWarning
+        except ImportError:
+            return UserWarning
+    return {"UserWarning": UserWarning, "FutureWarning": FutureWarning}[name]
+
+
+def quiet_warnings() -> None:
+    for message, category, module in NOISE:
+        warnings.filterwarnings("ignore", message=message, category=_category(category), module=module)
+
+
+def _show(message, category, filename, lineno, file=None, line=None) -> None:
+    where = filename.rsplit("/", 1)[-1]
+    logging.getLogger("py.warnings").warning("%s: %s (%s:%s)", category.__name__, str(message).strip(), where, lineno)
+
+
+class _Handler(logging.StreamHandler):
+    pass
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    root = logging.getLogger()
+    if not any(isinstance(h, _Handler) for h in root.handlers):
+        handler = _Handler(sys.stdout)
+        handler.setFormatter(logging.Formatter(FORMAT, DATEFMT))
+        root.addHandler(handler)
+    root.setLevel(level)
+    for name, lvl in LOGGER_LEVELS.items():
+        logging.getLogger(name).setLevel(lvl)
+    quiet_warnings()
+    warnings.showwarning = _show
+
+
+def block(title: str, lines: list[str]) -> str:
+    """A title line and indented items, logged as one record."""
+    return "\n".join([title, *(f"  - {line}" for line in lines)])
+
+
+NAMES = {"xenium": "Xenium bundle", "atera": "Atera bundle", "spatialdata": "SpatialData object"}
+
+
+@dataclass(frozen=True)
+class Member:
+    """A file on disk, or a member (`inner`) of an archive; `gz` is a per-file gzip to decompress when staged."""
+    container: Path
+    inner: str | None = None
+    gz: bool = False
+    size: int = 0
+
+    @property
+    def display(self) -> str:
+        return f"{self.container}!{self.inner}" if self.inner else str(self.container)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A bundle (`files` maps canonical 10x names to where they are) or a SpatialData object (`zarr`)."""
+    sid: str
+    kind: str                                # xenium, atera or spatialdata
+    origin: Path                             # what the user's entry resolved to (folder, archive, .zarr)
+    files: dict[str, Member] = field(default_factory=dict)
+    zarr: Member | None = None
+    notes: tuple[str, ...] = ()              # logged at INFO
+
+
+@dataclass(frozen=True)
+class LeftOut:
+    path: str
+    reason: str
+
+
+@dataclass
+class Discovery:
+    candidates: list[Candidate]
+    left_out: list[LeftOut]
+
+
+@dataclass
+class Inventory:
+    """What a bundle holds, from file names and small reads only."""
+    sid: str
+    kind: str
+    chosen: dict[str, str]                   # role -> canonical file name in Candidate.files
+    missing_essential: list[str]
+    missing_optional: list[str]
+    var: pd.DataFrame | None                 # raw features, as in the file
+    n_cells: int | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Part:
+    """One sample of an existing SpatialData object."""
+    sid: str
+    table: str | None
+    regions: tuple[str, ...]
+    elements: tuple[tuple[str, str], ...]
+    tags: tuple[str, ...]
+
+
+@dataclass
+class Sample:
+    sid: str
+    kind: str
+    candidate: Candidate
+    inventory: Inventory | None = None       # bundles
+    part: Part | None = None                 # SpatialData samples
+    path: Path | None = None                 # SpatialData: the readable (staged) store root
+    var: pd.DataFrame | None = None          # Gene Expression var, indexed by symbol
+    species: str | None = None
+
+
+@dataclass
+class Plan:
+    samples: list[Sample]
+    present: list[str]
+    left_out: list[LeftOut]
+    union_genes: list[str]                   # joint table's genes after this run
+    panels: dict[str, dict]                  # sid -> {"genes_in_panel", "genes_shared", "species"}
+
+
+@dataclass
+class TableSource:
+    """A sample's counts as a CSR AnnData zarr on scratch, with its obs in memory."""
+    path: Path
+    obs: pd.DataFrame
+    n_obs: int
+    n_vars: int
+
+
+@dataclass
+class Loaded:
+    elements: dict[str, dict[str, object]]
+    table: TableSource
+    regions: list[str]
+    region_key: str | None
+    instance_key: str | None
+    tags: tuple[str, ...] = ()
+
+
+@dataclass
+class Prepared:
+    sid: str
+    elements: dict[str, dict[str, object]]
+    table_path: Path
+    obs: pd.DataFrame
+    var: pd.DataFrame
+    fingerprint: str
+    region_key: str | None
+    stats: dict = field(default_factory=dict)

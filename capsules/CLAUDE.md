@@ -8,7 +8,7 @@ capsule specs with their numbers.
 | Capsule | Spec | Status |
 |---|---|---|
 | `anndata_ingest/` | [anndata_ingest/spec.md](anndata_ingest/spec.md) | built |
-| `spatial_ingest/` | [spatial_ingest/spec.md](spatial_ingest/spec.md) | built 2026-11-11; **the reference for structure** |
+| `spatial_ingest/` | [spatial_ingest/spec.md](spatial_ingest/spec.md) | built 2026-11-11; robustness rework 2026-11-14 (public-data testing, crash/S3 safety); consolidated to 5 modules (anndata_ingest layout) 2026-11-18; release review in progress |
 | `qc/` | [qc/spec.md](qc/spec.md) | design (§4) plus what the build changed |
 | `process/` | §10 below (no spec file) | built; environment + notebooks, optional pipeline; consolidated to 5 modules 2026-11-16 |
 
@@ -20,7 +20,7 @@ spatial ingest that builds one SpatialData object from Xenium and Atera bundles:
 | # | Capsule | Hardware | Writes | Job |
 |---|---|---|---|---|
 | 1 | `anndata_ingest/` | CPU, sized to the largest **sample** | `main` | Two input types: raw samples (.h5, .h5ad, SpatialData tables) get per-sample QC metrics, CellTypist, Scrublet; existing AnnData / SpatialData tables go in as they are. Both append to one AnnData store. No whole-store analysis |
-| 1S | `spatial_ingest/` (built 2026-11-11) | CPU, ~16 GB per Xenium sample | one joint SpatialData `.zarr` on a local path, or synced to an `s3://` prefix (never icechunk) | Append Xenium/Atera bundles (folders or `.zip`) and existing SpatialData (single- or multi-sample, split per sample): per-sample elements and table, plus one symbol-indexed joint single-cell table |
+| 1S | `spatial_ingest/` | CPU, `large` (64 GB); ≤ ~12 GB peak per sample with the streamed matrix | one joint SpatialData `.zarr` on a local path, or synced to an `s3://` prefix (never icechunk) | Append Xenium/Atera bundles (folders, `.zip`, `.tar.gz`, GEO-style files; kind detected automatically) and existing SpatialData with a table (single- or multi-sample, split per sample): per-sample elements and table, plus one joint single-cell table over the union of genes |
 | 2 | `qc/` | CPU; I/O-bound when applying | nothing by default; with `apply`, a commit on `main` (icechunk) or a new zarr | QC report for proposed thresholds, with a downsampled embedding. With `apply` and reviewed decisions, writes the passing cells as the curated object |
 | 3 | `process/` | **GPU, CUDA 13** (rapids-singlecell + Dask, scvi-tools) | a new zarr, or a commit (icechunk) | First the shared RAPIDS environment with guide notebooks (out-of-core scRNA, spatial); optionally an App Panel / Reproducible Run pipeline: PCA (± harmony) or scVI, then neighbors, UMAP, leiden |
 
@@ -171,8 +171,14 @@ Written by `process`: `obs/leiden` (name set by `leiden_key`; `<name>_<res>` for
   (the run, top to bottom), `config.py` (settings, panel args, logging), `inputs.py` (reading,
   precheck, picking new inputs), `prepare.py` (annotation, gene policy, contract, staging), `store.py`;
   tests in `test_inputs.py`, `test_prepare.py`, `test_run.py` and `conftest.py`. Imports flow one way
-  (config ← inputs ← prepare; store standalone; main imports all). spatial_ingest (24 modules) is
-  not consolidated yet. process is consolidated too (2026-11-16): `main.py`, `config.py`, `steps.py`,
+  (config ← inputs ← prepare; store standalone; main imports all). spatial_ingest has the same 5 modules
+  (2026-11-18, ~6.5k lines): `main.py`, `config.py` (settings, logging, shared records, `UserError`), `inputs.py`
+  (discovery in folders/archives, staging, per-sample inventory, count matrices and cells tables streamed to CSR,
+  gene policy), `prepare.py` (precheck, reading a sample: SpatialData objects split per sample and bundle elements,
+  per-sample QC/CellTypist), `store.py` (store, joint table, repair, locks, element names, S3 sync and lock);
+  `vendor/` holds the vendored Atera reader; tests in `test_inputs.py`, `test_prepare.py`, `test_store.py`,
+  `test_run.py`, `conftest.py`. Imports flow config ← inputs ← store ← prepare ← main.
+  process is consolidated too (2026-11-16): `main.py`, `config.py`, `steps.py`,
   `store.py` (input, where results go, writers), `runtime.py` (Dask-CUDA cluster, time/memory report); tests in
   `test_config.py`, `test_steps.py`, `test_store.py`, `test_run.py`, `conftest.py`.
 - **Precheck:** gather every problem before any write, then stop with one error listing them all.
@@ -285,7 +291,7 @@ Run all three tracks before calling work done; subagents can run them in paralle
 |---|---|
 | ingest | `medium`; it depends on the largest sample, not the store. About 1 minute per 30k-cell sample with CellTypist and Scrublet |
 | qc | `medium`, for both modes. The report reads only a few obs columns plus a fixed-size embedding sample; apply streams X out of core (qc §4.10). Apply is I/O-bound, roughly 12 minutes per 1M cells from local disk, slower from S3 |
-| spatial_ingest | ≥ 32 GB RAM: ~16 GB peak per Xenium Prime 5K sample, one sample in memory at a time; `/scratch` for the S3 store copy plus the largest unzipped bundle. After the 2026-11-13 rework: 64 GB ("large") |
+| spatial_ingest | `large` (64 GB). One sample in memory at a time; the matrix is streamed (measured peaks 8–11 GB on Xenium 5K / Atera kidney samples). `/scratch` needs the S3 store copy plus about 2.3× the largest zipped bundle |
 | process | A GPU machine (the T4 has 15 GB). One GPU with ≥ 15 GB VRAM handled 5M cells in about 15 minutes in the notebook's benchmark, on a faster GPU than a T4; above about 13M cells, ≥ 30 GB VRAM. Host RAM must absorb the spill |
 
 ## 8. Build order
@@ -301,7 +307,7 @@ Run all three tracks before calling work done; subagents can run them in paralle
 7. Subtree-push each capsule to its own Code Ocean capsule.
 8. `anndata_ingest`: SpatialData-table inputs, gene-panel fitting, source paths in commits, custom
    `.pkl` **(done 2026-10-30)**; S3 creation without `CREATE`, dropping results on append **(done 2026-11-02)**.
-9. `spatial_ingest`: **built 2026-11-11** (spatial_ingest spec §3S.0).
+9. `spatial_ingest`: **built 2026-11-11** (spatial_ingest spec §3S.0); robustness rework and crash/concurrency safety 2026-11-14 (b0fbe83, 806fa97); consolidated 2026-11-16; release review (software + user critiques) 2026-11-16.
 
 ## 9. Open questions
 - **annizarr 0.2.4 shipped without `subset` and `Repo.garbage_collect`** (checked 2026-10-30). It
